@@ -127,7 +127,7 @@ only supplies the HTTP/3 stream and codec layer."
            :open-p t))
       (error (condition)
         (when control-stream
-          (ignore-errors
+          (http-kit::%with-http-cleanup
             (funcall closer control-stream :condition condition)))
         (error condition)))))
 
@@ -347,7 +347,8 @@ is re-signaled."
              (error (condition)
                (setf failure condition)
                (when on-error
-                 (ignore-errors (funcall on-error condition state)))
+                 (http-kit::%with-http-cleanup
+                   (funcall on-error condition state)))
                (error condition)))
         (funcall closer stream :condition failure)))))
 
@@ -1264,6 +1265,7 @@ request model was constructed."
            (error (condition)
              (setf failure condition)
              (when on-error
-               (ignore-errors (funcall on-error condition request)))
+               (http-kit::%with-http-cleanup
+                 (funcall on-error condition request)))
              (error condition)))
       (funcall closer stream :condition failure))))

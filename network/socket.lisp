@@ -192,7 +192,8 @@ CLOSE-HTTP-TCP-LISTENER."
                 :closed-p nil)))
         (unless retained-p
           (when socket
-            (ignore-errors (sb-bsd-sockets:socket-close socket)))))))
+            (http-kit::%with-http-cleanup
+              (sb-bsd-sockets:socket-close socket)))))))
 
   (defun %network-accept-socket
       (listener deadline clock-function)
@@ -270,9 +271,10 @@ stream's read timeout after a connection is accepted."
                          peer-port))))
         (unless retained-p
           (when stream
-            (ignore-errors (close stream :abort t)))
+            (http-kit::%with-http-cleanup
+              (close stream :abort t)))
           (when accepted-socket
-            (ignore-errors
+            (http-kit::%with-http-cleanup
               (sb-bsd-sockets:socket-close accepted-socket)))))))
 
   (defun %network-connect-socket (socket address port deadline clock-function)
@@ -324,9 +326,11 @@ stream's read timeout after a connection is accepted."
                stream)
           (unless retained-p
             (when stream
-              (ignore-errors (close stream :abort t)))
+              (http-kit::%with-http-cleanup
+                (close stream :abort t)))
             (when socket
-              (ignore-errors (sb-bsd-sockets:socket-close socket)))))))))
+              (http-kit::%with-http-cleanup
+                (sb-bsd-sockets:socket-close socket)))))))))
 
   (defun %network-resolve-entries (host deadline clock-function)
     (%network-check-deadline deadline clock-function :resolve)
@@ -440,13 +444,15 @@ perform TLS or proxy negotiation."
     (let ((socket (http-network-listener-socket listener)))
       (setf (http-network-listener-socket listener) nil)
       (when socket
-        (ignore-errors (sb-bsd-sockets:socket-close socket)))))
+        (http-kit::%with-http-cleanup
+          (sb-bsd-sockets:socket-close socket)))))
   nil)
 
 (defun close-http-tcp-stream (stream)
   "Close a stream returned by OPEN-HTTP-TCP-STREAM."
   (when stream
-    (ignore-errors (close stream :abort t)))
+    (http-kit::%with-http-cleanup
+      (close stream :abort t)))
   nil)
 
 #+sbcl

@@ -251,8 +251,8 @@
              (values (first result)
                      (second result)
                      (%http1-session-output-octets output-path))))
-      (ignore-errors (delete-file input-path))
-      (ignore-errors (delete-file output-path)))))
+      (http-kit::%with-http-cleanup (delete-file input-path))
+      (http-kit::%with-http-cleanup (delete-file output-path)))))
 
 (deftest http1-session-keep-alive-and-eof
   (let ((seen '()))

@@ -4,12 +4,12 @@
 (progn
   (defun %network-test-close-stream (stream)
     (when stream
-      (ignore-errors (close stream :abort t)))
+      (http-kit::%with-http-cleanup (close stream :abort t)))
     nil)
 
   (defun %network-test-close-socket (socket)
     (when socket
-      (ignore-errors (sb-bsd-sockets:socket-close socket)))
+      (http-kit::%with-http-cleanup (sb-bsd-sockets:socket-close socket)))
     nil)
 
   (defun %network-test-listener ()
@@ -110,7 +110,8 @@
             (%network-test-close-stream server-stream)
             (%network-test-close-socket accepted-socket)
             (%network-test-close-socket listener)
-            (ignore-errors (sb-thread:join-thread server-thread)))
+            (http-kit::%with-http-cleanup
+              (sb-thread:join-thread server-thread)))
           (unless server-thread
             (%network-test-close-socket listener))))))
 
@@ -185,7 +186,8 @@
              (ensure-equal "127.0.0.1" peer-address)
              (ensure-true (plusp peer-port)))
         (when server-thread
-          (ignore-errors (sb-thread:join-thread server-thread)))
+          (http-kit::%with-http-cleanup
+            (sb-thread:join-thread server-thread)))
         (close-http-tcp-listener listener))))
 
 #+sbcl
@@ -251,7 +253,8 @@
            (ensure-equal "127.0.0.1" accepted-address)
            (ensure-true (plusp accepted-port)))
       (when server-thread
-        (ignore-errors (sb-thread:join-thread server-thread)))
+        (http-kit::%with-http-cleanup
+          (sb-thread:join-thread server-thread)))
       (close-http-tcp-listener listener))))
 
 #-sbcl

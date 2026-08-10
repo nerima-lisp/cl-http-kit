@@ -90,7 +90,7 @@ SETTINGS, stream identifiers, HPACK decoder state, and control frames."
            :detail (type-of connection)))
   (unless (%http2-connection-closed-p connection)
     (setf (%http2-connection-closed-p connection) t)
-    (ignore-errors
+    (http-kit::%with-http-cleanup
       (funcall (%http2-connection-close-stream connection)
                (%http2-connection-stream connection))))
   connection)

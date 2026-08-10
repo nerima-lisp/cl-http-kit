@@ -461,7 +461,8 @@ address resolution when a SOCKS5 (rather than SOCKS5H) proxy is selected."
                  stream)
             (unless retained-p
               (when stream
-                (ignore-errors (funcall close-stream stream)))))
+                (http-kit::%with-http-cleanup
+                  (funcall close-stream stream)))))
         (http-error (condition)
           (error condition))
         (error (condition)
