@@ -58,7 +58,7 @@ for the package layout and transport integration boundary.
 | System | Purpose |
 | --- | --- |
 | cl-http-kit | HTTP message model, HTTP/1.1 wire format, HTTP/1.x server sessions, transport callbacks, deadlines, limits, conditions, and recording sessions |
-| cl-http-kit/client | URI, authentication, cookies, cache, proxy, redirect, retry, HTTP/1.1 connection-pool, and WebSocket client/server-session policies |
+| cl-http-kit/client | URI, authentication, cookies, cache, proxy, redirect, retry, HTTP/1.1 connection-pool, multipart body, Server-Sent Events, and WebSocket client/server-session policies |
 | cl-http-kit/http2 | HTTP/2 client and injected-stream server-session boundaries |
 | cl-http-kit/http3 | HTTP/3 frames, SETTINGS, QPACK static/literal/Huffman codecs with caller-owned dynamic tables, and injected-QUIC client/request-stream server-session boundaries |
 | cl-http-kit/network | Optional SBCL TCP/DNS stream opener, IPv4/IPv6 listener, and HTTP/1 listener service |
