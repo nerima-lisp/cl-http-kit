@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title">
+  <title id="title">cl-http-kit</title>
+  <rect width="64" height="64" rx="12" fill="#2d6cdf"/>
+  <path d="M16 18h32v8H25v12h19v8H16z" fill="#fff"/>
+  <path d="M37 18h11v8H37zm0 20h11v8H37z" fill="#b9d2ff"/>
+</svg>
