@@ -125,9 +125,12 @@ callbacks with ASDF system cl-http-kit/http3.
 
 This system writes the HTTP/3 control-stream prefix and SETTINGS, encodes and
 decodes client request streams, and provides a server session for one injected
-request stream. It provides static-table QPACK, but does not implement QUIC
-packets, loss recovery, TLS, ALPN, native sockets, or native HTTP/3 connection
-and stream acceptance; the QUIC layer must provide those callbacks.
+request stream. It provides static, literal, and Huffman QPACK representations
+plus caller-owned dynamic tables. Dynamic-table instruction streams are exposed
+to the caller and are not synchronized automatically. The system does not
+implement QUIC packets, loss recovery, TLS, ALPN, native sockets, or native
+HTTP/3 connection and stream acceptance; the QUIC layer must provide those
+callbacks.
 
 Load metrics integration when cl-observability-kit is available:
 
@@ -136,4 +139,4 @@ Load metrics integration when cl-observability-kit is available:
 ```
 
 Continue with [Core Concepts](guide/core-concepts.md) for the value model, or
-the [API Reference](reference/api.md) for all exported symbols.
+the [API Reference](reference/api.md) for the primary exported symbols.

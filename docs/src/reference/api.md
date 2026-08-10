@@ -1,8 +1,10 @@
 # API Reference
 
-This page lists the exported symbols of the registered ASDF systems. Common
-arguments such as timeout, deadline, byte limits, and clock-function are
-accepted by the direct and CPS transport APIs where shown.
+This page documents the primary exported symbols of the registered ASDF
+systems. Package definition files remain authoritative for lower-level and
+auxiliary exports not described here. Common arguments such as timeout,
+deadline, byte limits, and clock-function are accepted by the direct and CPS
+transport APIs where shown.
 
 ## Core package
 

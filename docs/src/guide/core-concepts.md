@@ -72,10 +72,11 @@ boundary and an HTTP/1 listener service without changing that core contract.
 
 The optional cl-http-kit/http3 system applies the same separation to HTTP/3:
 it handles client request streams and one injected server request stream,
-including request-stream frames and static-table QPACK, while the application
-supplies QUIC stream creation, byte writes, reads, closure, and
-connection-level stream dispatch. QUIC packet processing, TLS, ALPN, and
-native HTTP/3 acceptance remain outside this system.
+including request-stream frames and static, literal, and Huffman QPACK
+representations with caller-owned dynamic tables. The application supplies
+QUIC stream creation, byte writes, reads, closure, instruction-stream
+synchronization, and connection-level stream dispatch. QUIC packet processing,
+TLS, ALPN, and native HTTP/3 acceptance remain outside this system.
 
 ## High-level client policies
 

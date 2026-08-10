@@ -63,6 +63,7 @@ for the package layout and transport integration boundary.
 | cl-http-kit/http3 | HTTP/3 frames, SETTINGS, QPACK static/literal/Huffman codecs with caller-owned dynamic tables, and injected-QUIC client/request-stream server-session boundaries |
 | cl-http-kit/network | Optional SBCL TCP/DNS stream opener, IPv4/IPv6 listener, and HTTP/1 listener service |
 | cl-http-kit/observability | Request and error counters backed by cl-observability-kit |
+| cl-http-kit/test | Internal test runner for the core and optional systems |
 
 ## Documentation
 

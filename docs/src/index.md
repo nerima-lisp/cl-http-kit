@@ -10,8 +10,9 @@ network boundary.
   sessions, and transport callbacks.
 - [Core Concepts](guide/core-concepts.md) explains message values, octets,
   deadlines, limits, and callback styles.
-- [API Reference](reference/api.md) lists the public symbols of each registered
-  system.
+- [API Reference](reference/api.md) documents the primary public symbols of
+  each registered runtime system; package definitions remain authoritative for
+  lower-level exports.
 
 ## Systems
 
@@ -25,6 +26,7 @@ The repository currently documents these ASDF systems:
 | cl-http-kit/http3 | HTTP/3 request-stream framing, static/literal/Huffman QPACK codecs with caller-owned dynamic tables, and injected-QUIC client/server-session boundaries |
 | cl-http-kit/network | Optional native SBCL TCP, DNS, and HTTP/1 listener service |
 | cl-http-kit/observability | Request and error counters |
+| cl-http-kit/test | Internal test runner for the core and optional systems |
 
 ## Scope
 
