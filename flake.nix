@@ -10,7 +10,7 @@
     };
 
     cl-observability-kit = {
-      url = "github:nerima-lisp/cl-observability-kit/6dcd6f8ec45685cb35f3962213d47d87337a8c7d";
+      url = "github:nerima-lisp/cl-observability-kit/5d447256db014b8111b4441d1884bb5332447c9d";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.cl-weave.follows = "cl-weave";
     };
@@ -39,7 +39,7 @@
     };
 
     paredit-cli = {
-      url = "github:takeokunn/paredit-cli";
+      url = "github:takeokunn/paredit-cli/v1.6.0";
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
@@ -144,7 +144,13 @@
             ];
             text = ''
               export CL_SOURCE_REGISTRY="''${CL_SOURCE_REGISTRY:-$PWD//:${sourceRegistry}}"
-              exec cl-weave run cl-http-kit/test --fail-with-no-tests "$@"
+              test_timeout_ms="''${CL_WEAVE_TEST_TIMEOUT_MS:-30000}"
+              max_workers="''${CL_WEAVE_MAX_WORKERS:-1}"
+              exec cl-weave run cl-http-kit/test \
+                --test-timeout-ms "$test_timeout_ms" \
+                --max-workers "$max_workers" \
+                --bail true \
+                --fail-with-no-tests "$@"
             '';
           };
 
@@ -163,17 +169,21 @@
             ];
             text = ''
               export CL_SOURCE_REGISTRY="''${CL_SOURCE_REGISTRY:-$PWD//:${sourceRegistry}}"
-              coverage_report_directory="''${CL_HTTP_KIT_COVERAGE_DIR:-coverage}"
+              coverage_root="$(realpath -m -- "$PWD")"
+              coverage_report_directory="$(realpath -m -- "''${CL_HTTP_KIT_COVERAGE_DIR:-coverage}")"
               case "$coverage_report_directory" in
-                ""|/|.)
-                  echo "Coverage directory must be a non-root path." >&2
+                "$coverage_root")
+                  echo "Coverage directory must not be the repository root." >&2
+                  exit 1
+                  ;;
+                "$coverage_root"/*) ;;
+                *)
+                  echo "Coverage directory must be inside the repository." >&2
                   exit 1
                   ;;
               esac
-              case "$coverage_report_directory" in
-                */) ;;
-                *) coverage_report_directory="$coverage_report_directory/" ;;
-              esac
+              test_timeout_ms="''${CL_WEAVE_TEST_TIMEOUT_MS:-30000}"
+              max_workers="''${CL_WEAVE_MAX_WORKERS:-1}"
               mkdir -p "$coverage_report_directory"
               find "$coverage_report_directory" \
                 -mindepth 1 \
@@ -204,7 +214,11 @@
                 --coverage-exclude http2/hpack-huffman-data.lisp \
                 --coverage-exclude http2/transport-data.lisp \
                 --coverage-exclude http2/transport-declarations.lisp \
+                --coverage-min-expression 100 \
                 --coverage-min-branch 100 \
+                --test-timeout-ms "$test_timeout_ms" \
+                --max-workers "$max_workers" \
+                --bail true \
                 --coverage-report-directory "$coverage_report_directory" \
                 --fail-with-no-tests "$@"
               perl scripts/check-coverage.pl "$coverage_report_directory"
@@ -304,7 +318,11 @@
                 cp -R ${source}/. "$work/"
                 cd "$work"
                 export CL_SOURCE_REGISTRY="$PWD//:${sourceRegistry}"
-                cl-weave run cl-http-kit/test --fail-with-no-tests
+                cl-weave run cl-http-kit/test \
+                  --test-timeout-ms "''${CL_WEAVE_TEST_TIMEOUT_MS:-30000}" \
+                  --max-workers "''${CL_WEAVE_MAX_WORKERS:-1}" \
+                  --bail true \
+                  --fail-with-no-tests
                 touch "$out"
               '';
 
