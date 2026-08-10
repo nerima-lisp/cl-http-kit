@@ -43,7 +43,7 @@ files.
 | Path | Contents |
 | --- | --- |
 | src/ | Core HTTP model, conditions, HTTP/1.1 wire processing, transport, recording session, and observability implementation |
-| client/ | Optional high-level URI, authentication, cookie, cache, proxy, redirect, and retry policies |
+| client/ | Optional high-level URI, authentication, cookie, cache, proxy, redirect, retry, multipart body, Server-Sent Events, and WebSocket policies |
 | http2/ | Optional HTTP/2 framing, client, and injected-stream server-session boundaries |
 | http3/ | Optional HTTP/3 framing, QPACK, and injected-stream client/server-session boundaries |
 | network/ | Optional native SBCL TCP, DNS, and HTTP/1 listener service |
