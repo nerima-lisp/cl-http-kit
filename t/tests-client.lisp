@@ -59,7 +59,7 @@
     (ensure-equal "multipart/form-data; boundary=boundary" content-type)
     (let ((parts (parse-http-multipart-body
                   body
-                  "multipart/form-data; boundary=\"boundary\"")))
+                  :content-type "multipart/form-data; boundary=\"boundary\"")))
       (ensure-equal 2 (length parts))
       (let ((field (first parts))
             (upload (second parts)))
@@ -79,12 +79,12 @@
        (list (make-http-multipart-part :name "field" :value "value"))
        :boundary "boundary")
     (signals http-size-limit-exceeded
-      (parse-http-multipart-body body content-type :max-parts 0))
+      (parse-http-multipart-body body :content-type content-type :max-parts 0))
     (signals http-size-limit-exceeded
-      (parse-http-multipart-body body content-type :max-body-bytes 2))
+      (parse-http-multipart-body body :content-type content-type :max-body-bytes 2))
     (signals http-protocol-error
       (parse-http-multipart-body body
-                                 "multipart/form-data; boundary=other"))))
+                                 :content-type "multipart/form-data; boundary=other"))))
 
 (deftest client-cookie-jar
   (let* ((jar (make-http-cookie-jar :clock-function (lambda () 1000)))
