@@ -4,7 +4,7 @@
   :description "A portable, binary-safe HTTP client substrate."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.1.0"
+  :version "0.2.0"
   :depends-on ()
   :pathname "src"
   :serial t
@@ -35,7 +35,7 @@
   :description "Optional cl-observability-kit metrics for cl-http-kit."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.1.0"
+  :version "0.2.0"
   :depends-on ("cl-http-kit" "cl-observability-kit")
   :pathname "src"
   :serial t
@@ -47,7 +47,7 @@
   :description "The optional HTTP/2 transport for cl-http-kit."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.1.0"
+  :version "0.2.0"
   :depends-on ("cl-http-kit")
   :pathname "http2"
   :serial t
@@ -77,14 +77,21 @@
   :description "The high-level HTTP client policies and request orchestration layer."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.1.0"
+  :version "0.2.0"
   :depends-on ("cl-http-kit")
   :pathname "client"
   :serial t
   :components ((:file "package")
                (:file "conditions")
                (:file "data")
-               (:file "encoding")
+               (:file "multipart")
+               (:file "websocket-frame")
+               (:file "websocket-crypto")
+               (:file "websocket-handshake")
+               (:file "websocket-message")
+               (:file "sse-data")
+               (:file "sse-parser")
+               (:file "sse-serialize")
                (:file "uri")
                (:file "date")
                (:file "auth")
@@ -99,7 +106,7 @@
   :description "Optional native TCP and DNS boundary for cl-http-kit."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.1.0"
+  :version "0.2.0"
   :depends-on ("cl-http-kit")
   :pathname "network"
   :serial t
@@ -110,7 +117,7 @@
   :description "Optional HTTP/3 framing, QPACK, and injected QUIC transport boundary."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.1.0"
+  :version "0.2.0"
   :depends-on ("cl-http-kit" "cl-http-kit/http2")
   :pathname "http3"
   :serial t
