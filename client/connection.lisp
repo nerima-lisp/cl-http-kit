@@ -52,7 +52,7 @@
 
 (defun %pool-close (pool stream)
   (when stream
-    (ignore-errors
+    (http-kit::%with-http-cleanup
       (funcall (%http-connection-pool-close-stream pool) stream)))
   nil)
 

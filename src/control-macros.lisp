@@ -22,3 +22,11 @@
               :message ,message
               :operation ,operation
               :cause condition))))
+
+(defmacro %with-http-cleanup (&body body)
+  "Run cleanup code without replacing the original failure with a cleanup error."
+  `(handler-case
+       (progn ,@body)
+     (error (condition)
+       (declare (ignore condition))
+       nil))) ; paredit:ignore handler-case-swallows-error -- cleanup must not mask the original condition.
