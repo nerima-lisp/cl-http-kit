@@ -1069,6 +1069,72 @@ client frames by default, automatically answers Ping frames, echoes a valid
 peer Close frame, and reports protocol, size, or handler errors through the
 close frame and ON-ERROR callback.
 
+## Server-Sent Events
+
+Server-Sent Events support is included by the optional `cl-http-kit/client`
+system and shares its `HTTP-KIT/CLIENT` package.
+
+### `http-sse-event`
+
+The server-sent-event structure type.
+
+### `http-sse-event-p`
+
+Return true when the object is an HTTP-SSE-EVENT.
+
+### `make-http-sse-event`
+
+Construct an event with make-http-sse-event (&key (event "message") (data "")
+id retry comments). EVENT and DATA must be strings without line breaks; ID
+must be a string without line breaks or NUL when supplied; RETRY must be a
+non-negative integer when supplied; COMMENTS may be a string or a list of
+strings and is emitted as SSE comment lines.
+
+### `http-sse-event-event`
+
+Return the event's field name, defaulting to "message".
+
+### `http-sse-event-data`
+
+Return the event's data string.
+
+### `http-sse-event-id`
+
+Return the event's optional ID string.
+
+### `http-sse-event-retry`
+
+Return the event's optional retry field as a non-negative integer.
+
+### `http-sse-event-comments`
+
+Return the event's associated comment lines.
+
+### `parse-http-sse-events`
+
+Parse a complete SSE body into a list of HTTP-SSE-EVENT values. The signature
+is parse-http-sse-events (input &key max-events max-line-bytes
+max-data-bytes). INPUT is a UTF-8 string or an octet vector. The parser
+recognizes CRLF, LF, and CR line endings, strips a leading UTF-8 BOM, and
+dispatches a final event at end of input even without a trailing blank line.
+Each limit is a safety bound; passing NIL for a limit disables it.
+
+### `read-http-sse-events`
+
+Read SSE events from an already-open stream. The signature is
+read-http-sse-events (stream &key max-events max-line-bytes max-data-bytes
+on-event (collect-events-p t)). STREAM may be binary or character. ON-EVENT,
+when supplied, is called with each dispatched HTTP-SSE-EVENT as it arrives.
+The call returns the collected event list when COLLECT-EVENTS-P is true,
+otherwise NIL.
+
+### `serialize-http-sse-event`
+
+Serialize one HTTP-SSE-EVENT to UTF-8 octets ending in a blank line, suitable
+for writing to an SSE response body. Comment lines are emitted first, then
+event, id, retry, and one or more data lines split on the event's own line
+breaks.
+
 ## Example
 
 ```lisp
