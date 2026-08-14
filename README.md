@@ -63,7 +63,7 @@ for the package layout and transport integration boundary.
 | System | Purpose |
 | --- | --- |
 | cl-http-kit | HTTP message model, HTTP/1.1 wire format, HTTP/1.x server sessions, transport callbacks, deadlines, limits, conditions, and recording sessions |
-| cl-http-kit/client | URI, authentication, cookies, cache, proxy, redirect, retry, HTTP/1.1 connection-pool, multipart body, Server-Sent Events, and WebSocket client/server-session policies |
+| cl-http-kit/client | URI, authentication, cookies, cache, content-coding selection, ALPN protocol helpers, proxy, redirect, retry, HTTP/1.1 connection-pool, multipart body, Server-Sent Events, and WebSocket client/server-session policies |
 | cl-http-kit/http2 | HTTP/2 client and injected-stream server-session boundaries |
 | cl-http-kit/http3 | HTTP/3 frames, SETTINGS, QPACK static/literal/Huffman codecs with caller-owned dynamic tables, and injected-QUIC client/request-stream server-session boundaries |
 | cl-http-kit/network | Optional SBCL TCP/DNS stream opener, IPv4/IPv6 listener, and HTTP/1 listener service |
@@ -107,7 +107,11 @@ The documentation build is described in
 
 The library owns HTTP message validation, HTTP/1.1 framing, HTTP/1.x request
 and response sessions, bounded body handling, high-level request policies, and
-small composition boundaries. The optional `cl-http-kit/http2` system supplies
+small composition boundaries. The optional client system adds cookie-jar
+partitioning and SameSite request context, content-coding adapter selection,
+cache request-directive handling with 304 metadata refresh, and ALPN protocol
+name helpers while leaving compressor implementations, dialing, and TLS/ALPN
+negotiation to the application. The optional `cl-http-kit/http2` system supplies
 both a client and a server session over caller-provided binary I/O. The
 optional `cl-http-kit/http3` system supplies client and per-request server
 stream framing with static/literal/Huffman QPACK and caller-owned dynamic-table

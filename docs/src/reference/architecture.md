@@ -88,8 +88,9 @@ I/O scheduling and error continuation policy outside the protocol code.
 ## Optional high-level client system
 
 The cl-http-kit/client system consumes core request and response values and
-composes URI resolution, authentication, cookies, cache, proxy, redirect,
-retry, and HTTP/1.1 connection-pool policies. Its `http-client-send` operation
+composes URI resolution, authentication, cookies, cache, content-coding
+selection, ALPN protocol helpers, proxy, redirect, retry, and HTTP/1.1
+connection-pool policies. Its `http-client-send` operation
 delegates actual I/O to an injected transport function, stream callbacks, or a
 callback-driven connection pool. Socket creation, DNS, TLS, and ALPN remain
 outside this system.

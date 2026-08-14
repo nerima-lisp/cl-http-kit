@@ -21,7 +21,7 @@ The repository currently documents these ASDF systems:
 | System | Responsibility |
 | --- | --- |
 | cl-http-kit | HTTP messages, HTTP/1.1, HTTP/1.x server sessions, transport callbacks, limits, deadlines, conditions, and recording sessions |
-| cl-http-kit/client | URI, authentication, cookies, cache, proxy, redirect, retry, HTTP/1.1 connection-pool, and WebSocket client/server-session policies |
+| cl-http-kit/client | URI, authentication, cookies, cache, content-coding selection, ALPN protocol helpers, proxy, redirect, retry, HTTP/1.1 connection-pool, and WebSocket client/server-session policies |
 | cl-http-kit/http2 | HTTP/2 client and injected-stream server-session boundaries |
 | cl-http-kit/http3 | HTTP/3 request-stream framing, static/literal/Huffman QPACK codecs with caller-owned dynamic tables, and injected-QUIC client/server-session boundaries |
 | cl-http-kit/network | Optional native SBCL TCP, DNS, and HTTP/1 listener service |
@@ -32,8 +32,10 @@ The repository currently documents these ASDF systems:
 
 The core system handles validation, serialization, parsing, bounded body
 materialization, HTTP/1.x server sessions, and deterministic transport
-composition. The client system adds reusable request policies and an
-owner-thread HTTP/1.1 connection pool. It also includes RFC 6455 frame,
+composition. The client system adds reusable request policies, cookie
+partitioning and SameSite request context, content-coding and ALPN helper
+APIs, cache request-directive handling, and an owner-thread HTTP/1.1
+connection pool. It also includes RFC 6455 frame,
 message, close-payload, HTTP upgrade, and upgraded server-session helpers in
 the `http-kit/websocket` package. The optional HTTP/2 system adds client and
 server sessions over injected I/O. The optional HTTP/3 system adds client and

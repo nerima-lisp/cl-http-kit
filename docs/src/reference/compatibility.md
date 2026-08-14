@@ -75,11 +75,19 @@ unsupported-feature conditions.
 ## High-level client
 
 The optional `cl-http-kit/client` system supplies reusable URI, authentication,
-cookie, cache, proxy, redirect, retry, and HTTP/1.1 connection-pool policies
-around core messages. The pool is an owner-thread, callback-driven boundary;
+cookie, cache, content-coding selection, ALPN protocol-name, proxy, redirect,
+retry, and HTTP/1.1 connection-pool policies around core messages. The pool is
+an owner-thread, callback-driven boundary;
 applications still provide the transport function or stream callbacks. The
 optional network system can provide native TCP and DNS setup on SBCL, while
 TLS and ALPN remain application-owned.
+
+The cookie layer enforces host-only, prefix, SameSite, and partitioned-cookie
+constraints and lets the request path provide SameSite context and a top-level
+partition key. The cache layer evaluates request directives such as `no-store`,
+`no-cache`, `max-age=0`, `min-fresh`, and `max-stale`, can return stale entries
+when policy allows, and merges cache metadata from a 304 revalidation response
+without discarding the stored body.
 
 Client transport functions use one canonical keyword contract: they receive
 the timeout, deadline, size limits, proxy context, request-body producer,

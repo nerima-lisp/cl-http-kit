@@ -630,7 +630,8 @@ The cookie structure type.
 
 Construct a cookie. The signature is
 make-http-cookie (&key name value domain (path "/") expires max-age secure-p
-http-only-p same-site (host-only-p nil) (creation-time (get-universal-time))).
+http-only-p same-site partitioned-p partition-key (host-only-p nil)
+(creation-time (get-universal-time))).
 
 ### `http-cookie-name`
 
@@ -676,6 +677,14 @@ Return true when the cookie is host-only.
 
 Return the cookie creation time.
 
+### `http-cookie-partitioned-p`
+
+Return true when the cookie is partitioned.
+
+### `http-cookie-partition-key`
+
+Return the top-level site key associated with a partitioned cookie.
+
 ### `http-cookie-jar`
 
 The cookie-jar structure type.
@@ -692,11 +701,14 @@ Return the cookie snapshot held by a jar.
 ### `http-cookie-jar-accept-response`
 
 Accept response cookies for a request URI. The signature is
-http-cookie-jar-accept-response (jar request-uri response &key now).
+http-cookie-jar-accept-response (jar request-uri response &key now
+partition-key).
 
 ### `http-cookie-jar-cookie-header`
 
-Return the Cookie header value applicable to a request URI.
+Return the Cookie header value applicable to a request URI. The request path can
+also supply NOW, PARTITION-KEY, SAME-SITE-CONTEXT, and METHOD to enforce
+partitioned and SameSite delivery rules.
 
 ### `http-cookie-jar-clear`
 
@@ -769,6 +781,60 @@ Return whether timeout conditions are retryable.
 ### `http-retry-policy-retry-on-connection-error-p`
 
 Return whether connection conditions are retryable.
+
+## Content coding and protocol helpers
+
+### `http-content-coding`
+
+The content-coding adapter structure type.
+
+### `http-content-coding-p`
+
+Return true when the object is an HTTP-CONTENT-CODING.
+
+### `make-http-content-coding`
+
+Construct an adapter with make-http-content-coding (&key name encoder decoder).
+The application supplies encoder and decoder functions; this package does not
+choose a compression implementation.
+
+### `http-content-coding-name`
+
+Return the normalized lower-case content-coding token.
+
+### `http-content-coding-encoder`
+
+Return the encoder function, when present.
+
+### `http-content-coding-decoder`
+
+Return the decoder function, when present.
+
+### `parse-http-accept-encoding`
+
+Parse an Accept-Encoding header into a list of (NAME . QUALITY) pairs.
+
+### `http-select-content-coding`
+
+Select the best supported content coding for an Accept-Encoding value. It
+returns the original supported coding object, `"identity"`, or NIL.
+
+### `http-content-coding-encode`
+
+Encode octets with an HTTP-CONTENT-CODING adapter.
+
+### `http-content-coding-decode`
+
+Decode octets with an HTTP-CONTENT-CODING adapter.
+
+### `http-alpn-protocol-name`
+
+Normalize an ALPN protocol alias such as `:http1`, `:http2`, or `:http3` to
+its wire token.
+
+### `http-select-protocol`
+
+Select the first offered ALPN protocol that is also supported locally.
 
 ## Cache
 
@@ -853,8 +919,8 @@ Return a cache key for a request or URI.
 
 Look up a request in a cache. The signature is
 http-cache-lookup (cache request &key now); it returns three values: the
-response when fresh or NIL, a state of :FRESH, :STALE, or :MISS, and the
-matching cache entry when available.
+response when available, a state of :FRESH, :STALE, :STALE-ALLOWED, or :MISS,
+and the matching cache entry when available.
 
 ### `http-cache-store`
 
@@ -931,7 +997,8 @@ make-http-client (&key transport-function open-stream close-stream
 connection-pool
 default-headers cookie-jar cache redirect-policy retry-policy proxy
 auth-provider clock-function wall-clock-function sleep-function
-max-header-bytes max-body-bytes on-request on-response). Exactly one
+max-header-bytes max-body-bytes cookie-partition-key
+cookie-same-site-context on-request on-response). Exactly one
 of transport-function, open-stream, or connection-pool must be supplied.
 The connection pool owns pooled stream opening and closing; close-stream is
 optional for the direct stream transport boundary.
@@ -956,6 +1023,14 @@ Return the client's cookie jar.
 ### `http-client-cache`
 
 Return the client's cache.
+
+### `http-client-cookie-partition-key`
+
+Return the default top-level partition key used for cookie policy.
+
+### `http-client-cookie-same-site-context`
+
+Return the default SameSite request context used for cookie policy.
 
 ### `http-client-redirect-policy`
 
