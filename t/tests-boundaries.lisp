@@ -195,14 +195,14 @@
                  :stream-id 1
                  :payload (octets 65))))
     (ensure-true
-     (http-kit/http2::%h2-append-data-frame frame 200 body "GET" 1))
+     (%test-h2-append-data-frame frame 200 body "GET" 1))
     (ensure-equal (octets 65) body)
     (signals http-kit:http-size-limit-exceeded
-      (http-kit/http2::%h2-append-data-frame frame 200 body "GET" 1))
+      (%test-h2-append-data-frame frame 200 body "GET" 1))
     (signals http-protocol-error
-      (http-kit/http2::%h2-append-data-frame frame nil body "GET" 10))
+      (%test-h2-append-data-frame frame nil body "GET" 10))
     (signals http-protocol-error
-      (http-kit/http2::%h2-append-data-frame frame 200 body "HEAD" 10))
+      (%test-h2-append-data-frame frame 200 body "HEAD" 10))
     (let ((nil-method-frame
             (http-kit/http2::%make-h2-frame
              :length 0
@@ -211,7 +211,7 @@
              :stream-id 1
              :payload (octets))))
       (ensure-true
-       (http-kit/http2::%h2-append-data-frame
+       (%test-h2-append-data-frame
         nil-method-frame 200
         (make-array 0 :element-type '(unsigned-byte 8)
                     :adjustable t :fill-pointer 0)
@@ -225,7 +225,7 @@
                  :stream-id 1
                  :payload (octets 66))))
     (ensure-equal nil
-                  (http-kit/http2::%h2-append-data-frame
+                  (%test-h2-append-data-frame
                    frame 200 body "GET" 10))
     (ensure-equal (octets 66) body))
   (let ((no-body-frame
@@ -236,7 +236,7 @@
            :stream-id 1
            :payload (octets 65))))
     (signals http-protocol-error
-      (http-kit/http2::%h2-append-data-frame
+      (%test-h2-append-data-frame
        no-body-frame 204
        (make-array 0 :element-type '(unsigned-byte 8)
                    :adjustable t :fill-pointer 0)
@@ -249,7 +249,7 @@
            :stream-id 1
            :payload (octets 65))))
     (signals http-protocol-error
-      (http-kit/http2::%h2-append-data-frame
+      (%test-h2-append-data-frame
        padded-frame 200
        (make-array 0 :element-type '(unsigned-byte 8)
                    :adjustable t :fill-pointer 0)
@@ -262,7 +262,7 @@
            :stream-id 3
            :payload (octets))))
     (signals http-unsupported-feature
-      (http-kit/http2::%h2-append-data-frame
+      (%test-h2-append-data-frame
        other-stream-frame 200
        (make-array 0 :element-type '(unsigned-byte 8)
                    :adjustable t :fill-pointer 0)

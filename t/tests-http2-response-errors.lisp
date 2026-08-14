@@ -140,7 +140,7 @@
                       :element-type '(unsigned-byte 8)
                       :initial-element 0)))
     (multiple-value-bind (end-stream new-body-length data-length)
-        (http-kit/http2::%h2-append-data-frame
+        (%test-h2-append-data-frame
          (h2-frame-object http-kit/http2::+http2-data-type+ 0 1 payload)
          200 body "GET" 2000000)
       (ensure-true (not end-stream))

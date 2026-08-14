@@ -6,7 +6,7 @@
   result)
 
 (defun %sse-append-string (result string)
-  (%sse-append-octets result (http-utf8-octets string)))
+  (%sse-append-octets result (cl-codec-kit:string-to-octets string :encoding :utf-8)))
 
 (defun %sse-emit-line (result prefix value)
   (%sse-append-string result prefix)

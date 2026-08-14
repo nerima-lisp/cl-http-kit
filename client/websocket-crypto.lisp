@@ -182,8 +182,8 @@
        (length decoded)))
     (%websocket-base64-encode
      (%websocket-sha1
-      (let* ((key (http-utf8-octets sec-websocket-key))
-             (guid (http-utf8-octets +websocket-close-guid+))
+      (let* ((key (cl-codec-kit:string-to-octets sec-websocket-key :encoding :utf-8))
+             (guid (cl-codec-kit:string-to-octets +websocket-close-guid+ :encoding :utf-8))
              (input (make-array (+ (length key) (length guid))
                                 :element-type '(unsigned-byte 8))))
         (replace input key)

@@ -194,7 +194,7 @@
       (nreverse (%sse-state-events state))))
 
 (defun %sse-input-octets (input)
-  (cond ((stringp input) (http-utf8-octets input))
+  (cond ((stringp input) (cl-codec-kit:string-to-octets input :encoding :utf-8))
         ((%client-octet-vector-p input) (%copy-client-octets input))
         (t
          (%sse-protocol-error
@@ -244,7 +244,7 @@ COLLECT-EVENTS-P is true, otherwise NIL."
           (error () nil)) ; paredit:ignore handler-case-swallows-error -- streams may hide their element type; binary reading is the safe fallback.
         (loop for character = (read-char stream nil :eof)
               until (eq character :eof)
-              do (loop for byte across (http-utf8-octets (string character))
+              do (loop for byte across (cl-codec-kit:string-to-octets (string character) :encoding :utf-8)
                        do (%sse-state-feed-byte state byte)))
         (loop for byte = (read-byte stream nil :eof)
               until (eq byte :eof)

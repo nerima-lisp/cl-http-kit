@@ -430,7 +430,7 @@
       (ensure-equal 1 settings-ack-count)
       (http-kit/http2:close-http2-connection connection)))
 
-  (deftest http2-public-client-adapter-streams-produced-body
+  (deftest http2-public-client-streams-produced-body
     (let* ((body (make-array 65536
                              :element-type '(unsigned-byte 8)
                              :initial-element #x5a))

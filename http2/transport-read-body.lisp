@@ -116,7 +116,7 @@ Content-Length without rescanning a non-collecting response body."
             :operation :http2-read
             :detail arguments))))
 
-(defun %h2-append-data-frame*
+(defun %h2-append-data-frame
     (frame status body body-length request-method max-body-bytes
      on-body-chunk collect-body-p expected-stream-id)
   (%h2-validate-response-stream-id (%h2-frame-stream-id frame)
@@ -151,31 +151,3 @@ Content-Length without rescanning a non-collecting response body."
     (values (/= 0 (logand (%h2-frame-flags frame) +http2-end-stream-flag+))
             new-body-length
             (length payload))))
-
-(defun %h2-append-data-frame (frame status body &rest arguments)
-  "Append a DATA frame, accepting both the legacy and streaming call forms.
-
-The legacy internal helper accepted REQUEST-METHOD and MAX-BODY-BYTES after
-BODY.  The streaming form additionally supplies BODY-LENGTH, ON-BODY-CHUNK,
-and COLLECT-BODY-P.  Keeping the adapter here lets older integrations use the
-same framing checks while the response reader tracks flow-control bytes."
-  (cond
-    ((= (length arguments) 2)
-     (apply #'%h2-append-data-frame*
-            frame status body (length body)
-            (first arguments) (second arguments) nil t (list 1)))
-    ((= (length arguments) 5)
-     (apply #'%h2-append-data-frame*
-            frame status body
-            (first arguments) (second arguments) (third arguments)
-            (fourth arguments) (fifth arguments) (list 1)))
-    ((= (length arguments) 6)
-     (apply #'%h2-append-data-frame*
-            frame status body
-            (first arguments) (second arguments) (third arguments)
-            (fourth arguments) (fifth arguments) (list (sixth arguments))))
-    (t
-     (error 'http-kit:http-protocol-error
-            :message "Invalid HTTP/2 DATA append arguments."
-            :operation :http2-read
-            :detail arguments))))

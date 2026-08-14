@@ -65,7 +65,6 @@
    #:http-uri-origin
    #:http-same-origin-p
    ;; Encoding and entity construction
-   #:http-utf8-octets
    #:http-percent-encode
    #:http-form-urlencode
    #:http-form-urlencoded-octets
@@ -227,8 +226,6 @@
                 #:make-http-request
                 #:send-http-request-over-open-stream
                 #:%monotonic-time)
-  (:import-from #:http-kit/client
-                #:http-utf8-octets)
   (:export
    #:websocket-frame
    #:websocket-frame-p

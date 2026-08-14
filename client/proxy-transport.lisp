@@ -200,7 +200,7 @@
 
 (defun %proxy-socks-address (host remote-dns-p resolve-host)
   (if remote-dns-p
-      (let ((octets (http-utf8-octets host)))
+      (let ((octets (cl-codec-kit:string-to-octets host :encoding :utf-8)))
         (when (or (zerop (length octets)) (> (length octets) 255))
           (%proxy-error "A SOCKS5 domain name must fit in one octet length." host))
         (let ((builder (%proxy-byte-builder)))
@@ -248,8 +248,8 @@
          (%proxy-error "The SOCKS5 proxy rejected every authentication method."
                        :authentication))
         ((and use-auth-p (= method 2))
-         (let ((user-octets (http-utf8-octets username))
-               (password-octets (http-utf8-octets password)))
+         (let ((user-octets (cl-codec-kit:string-to-octets username :encoding :utf-8))
+               (password-octets (cl-codec-kit:string-to-octets password :encoding :utf-8)))
            (when (or (> (length user-octets) 255)
                      (> (length password-octets) 255))
              (%proxy-error "SOCKS5 username and password must fit in one octet lengths."

@@ -144,6 +144,15 @@ explicit at the client boundary."
                            (aref masking-key (mod index 4)))))
     result))
 
+(defun %websocket-extended-width (payload-length)
+  (when (>= payload-length (ash 1 63))
+    (%websocket-protocol-error
+     "A WebSocket payload length exceeds the 63-bit wire limit."
+     payload-length))
+  (cond ((<= payload-length 125) 0)
+        ((<= payload-length #xffff) 2)
+        (t 8)))
+
 (defun serialize-websocket-frame (frame)
   "Serialize FRAME to its wire representation as an octet vector."
   (unless (websocket-frame-p frame)
@@ -155,14 +164,8 @@ explicit at the client boundary."
          (payload (websocket-frame-payload frame)))
     (%websocket-validate-frame-components
      fin-p opcode mask-p masking-key payload)
-    (let* ((payload-length (length payload))
-           (extended-width (cond ((<= payload-length 125) 0)
-                                 ((<= payload-length #xffff) 2)
-                                 ((< payload-length (ash 1 63)) 8)
-                                 (t
-                                  (%websocket-protocol-error
-                                   "A WebSocket payload length exceeds the 63-bit wire limit."
-                                   payload-length))))
+     (let* ((payload-length (length payload))
+            (extended-width (%websocket-extended-width payload-length))
            (header-length (+ 2 extended-width (if mask-p 4 0)))
            (wire (make-array (+ header-length payload-length)
                              :element-type '(unsigned-byte 8)))

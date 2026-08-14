@@ -38,6 +38,11 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
+    cl-codec-kit = {
+      url = "github:nerima-lisp/cl-codec-kit";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+
     paredit-cli = {
       url = "github:takeokunn/paredit-cli/v1.6.0";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -58,6 +63,7 @@
       cl-boundary-kit,
       cl-date-kit,
       cl-host-kit,
+      cl-codec-kit,
       paredit-cli,
       treefmt-nix,
       ...
@@ -89,6 +95,7 @@
           boundary = cl-boundary-kit.packages.${system}.default;
           date = cl-date-kit.packages.${system}.default;
           host = cl-host-kit.packages.${system}.default;
+          codec = cl-codec-kit.packages.${system}.default;
           paredit = paredit-cli.packages.${system}.default;
         in
         {
@@ -100,12 +107,26 @@
               boundary
               date
               host
+              codec
               paredit
               pkgs.sbcl
               pkgs.coreutils
               pkgs.perl
               pkgs.ripgrep
             ];
+            shellHook = ''
+              export CL_SOURCE_REGISTRY="''${CL_SOURCE_REGISTRY:-$PWD//:${
+                pkgs.lib.concatStringsSep ":" [
+                  "${clWeave}/share/common-lisp/source//"
+                  "${observability}//"
+                  "${concurrent}//"
+                  "${boundary}//"
+                  "${date}//"
+                  "${host}//"
+                  "${codec}//"
+                ]
+              }}"
+            '';
           };
         }
       );
@@ -119,6 +140,7 @@
           boundary = cl-boundary-kit.packages.${system}.default;
           date = cl-date-kit.packages.${system}.default;
           host = cl-host-kit.packages.${system}.default;
+          codec = cl-codec-kit.packages.${system}.default;
           paredit = paredit-cli.packages.${system}.default;
           sourceRegistry = pkgs.lib.concatStringsSep ":" [
             "${clWeave}/share/common-lisp/source//"
@@ -127,6 +149,7 @@
             "${boundary}//"
             "${date}//"
             "${host}//"
+            "${codec}//"
           ];
           appMeta = {
             description = "Common Lisp HTTP client quality gate";
@@ -141,8 +164,12 @@
               boundary
               date
               host
-            ];
+              codec
+          ];
             text = ''
+              test_home="''${TMPDIR:-/tmp}/cl-http-kit-test-$$"
+              mkdir -p "$test_home"
+              export HOME="$test_home"
               export CL_SOURCE_REGISTRY="''${CL_SOURCE_REGISTRY:-$PWD//:${sourceRegistry}}"
               test_timeout_ms="''${CL_WEAVE_TEST_TIMEOUT_MS:-30000}"
               max_workers="''${CL_WEAVE_MAX_WORKERS:-1}"
@@ -163,11 +190,15 @@
               boundary
               date
               host
+              codec
               pkgs.coreutils
               pkgs.findutils
               pkgs.perl
             ];
             text = ''
+              coverage_home="''${TMPDIR:-/tmp}/cl-http-kit-coverage-$$"
+              mkdir -p "$coverage_home"
+              export HOME="$coverage_home"
               export CL_SOURCE_REGISTRY="''${CL_SOURCE_REGISTRY:-$PWD//:${sourceRegistry}}"
               coverage_root="$(realpath -m -- "$PWD")"
               coverage_report_directory="$(realpath -m -- "''${CL_HTTP_KIT_COVERAGE_DIR:-coverage}")"
@@ -196,6 +227,7 @@
                 --coverage-system cl-http-kit \
                 --coverage-system cl-http-kit/http2 \
                 --coverage-system cl-http-kit/observability \
+                --coverage-system cl-http-kit/client \
                 --coverage-exclude src/package.lisp \
                 --coverage-exclude src/conditions.lisp \
                 --coverage-exclude src/model-declarations.lisp \
@@ -214,6 +246,9 @@
                 --coverage-exclude http2/hpack-huffman-data.lisp \
                 --coverage-exclude http2/transport-data.lisp \
                 --coverage-exclude http2/transport-declarations.lisp \
+                --coverage-exclude client/package.lisp \
+                --coverage-exclude client/conditions.lisp \
+                --coverage-exclude client/data.lisp \
                 --coverage-min-expression 100 \
                 --coverage-min-branch 100 \
                 --test-timeout-ms "$test_timeout_ms" \
@@ -286,6 +321,7 @@
           boundary = cl-boundary-kit.packages.${system}.default;
           date = cl-date-kit.packages.${system}.default;
           host = cl-host-kit.packages.${system}.default;
+          codec = cl-codec-kit.packages.${system}.default;
           paredit = paredit-cli.packages.${system}.default;
           source = pkgs.lib.cleanSource ./.;
           sourceRegistry = pkgs.lib.concatStringsSep ":" [
@@ -295,6 +331,7 @@
             "${boundary}//"
             "${date}//"
             "${host}//"
+            "${codec}//"
           ];
         in
         {
@@ -308,6 +345,7 @@
                   boundary
                   date
                   host
+                  codec
                 ];
               }
               ''

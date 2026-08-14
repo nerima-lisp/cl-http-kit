@@ -11,6 +11,21 @@
   (declare (ignore description))
   `(expect ,actual :to-equalp ,expected)) ; paredit:ignore macro-parameter-reordering -- cl-weave EXPECT takes the actual expression before the expected matcher value.
 
+(defmacro with-test-client ((client transport-function &rest options) &body body)
+  "Bind CLIENT to a client using the in-process transport fake.
+
+The transport boundary has a deliberately complete keyword contract.  Keeping
+that construction in one test macro makes individual scenarios describe only
+the behavior they exercise and prevents test doubles from drifting apart."
+  `(let ((,client (make-http-client
+                   :transport-function ,transport-function
+                   ,@options)))
+     ,@body))
+
+(defun %test-h2-append-data-frame (frame status body request-method max-body-bytes)
+  (http-kit/http2::%h2-append-data-frame
+   frame status body (length body) request-method max-body-bytes nil t 1))
+
 (defun octets (&rest values)
   (let ((result (make-array (length values)
                             :element-type '(unsigned-byte 8))))

@@ -85,7 +85,7 @@
     (%websocket-protocol-error "The WebSocket close code is not permitted." code))
   (unless (stringp reason)
     (%websocket-protocol-error "The WebSocket close reason must be a string." reason))
-  (let ((reason-octets (http-utf8-octets reason)))
+  (let ((reason-octets (cl-codec-kit:string-to-octets reason :encoding :utf-8)))
     (when (> (length reason-octets) 123)
       (%websocket-size-error
        "A WebSocket close reason exceeded its 123-octet limit."
@@ -188,7 +188,7 @@ otherwise consumed while the data message is assembled."
   (cond ((%websocket-octet-vector-p payload)
          (%websocket-copy-octets payload))
         ((and (= opcode 1) (stringp payload))
-         (http-utf8-octets payload))
+         (cl-codec-kit:string-to-octets payload :encoding :utf-8))
         (t
          (%websocket-protocol-error
           "A WebSocket data message must be octets, or a text string for opcode 1."
@@ -293,7 +293,7 @@ Returns the number of frames and the payload length."
            (cond ((%websocket-octet-vector-p payload)
                   payload)
                  ((stringp payload)
-                  (http-utf8-octets payload))
+                  (cl-codec-kit:string-to-octets payload :encoding :utf-8))
                  (t
                   (%websocket-protocol-error
                    "A WebSocket control payload must be octets or a string."

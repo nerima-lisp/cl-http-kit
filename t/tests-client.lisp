@@ -22,17 +22,15 @@
 (deftest client-request-trailers-through-policy
   (let ((seen nil)
         (trailers (list (make-http-header "X-Checksum" "abc"))))
-    (let* ((client
-             (make-http-client
-              :cache nil
-              :transport-function
-              (lambda (request &key proxy-plan &allow-other-keys)
-                (declare (ignore proxy-plan))
-                (setf seen request)
-                (client-test-response 200))))
-           (request (http-client-request
-                     client "POST" "http://example.test/upload"
-                     :trailers trailers)))
+    (with-test-client (client
+                       (lambda (request &key proxy-plan &allow-other-keys)
+                         (declare (ignore proxy-plan))
+                         (setf seen request)
+                         (client-test-response 200))
+                       :cache nil)
+      (let ((request (http-client-request
+                      client "POST" "http://example.test/upload"
+                      :trailers trailers)))
       (ensure-equal "abc"
                     (http-header-value
                      (http-request-trailers request) "X-Checksum"))
@@ -105,20 +103,18 @@
 (deftest client-cache-integration
   (let ((calls 0)
         (cache (make-http-cache :clock-function (lambda () 1000))))
-    (let* ((client
-             (make-http-client
-              :cache cache
-              :transport-function
-              (lambda (request &key proxy-plan &allow-other-keys)
-                (declare (ignore request proxy-plan))
-                (incf calls)
-                (client-test-response
-                 200
-                 :headers (list (make-http-header
-                                 "Cache-Control" "max-age=60"))
-                 :body (ascii "cached")))))
-           (request (http-client-request client "GET"
-                                         "http://example.test/resource")))
+    (with-test-client (client
+                       (lambda (request &key proxy-plan &allow-other-keys)
+                         (declare (ignore request proxy-plan))
+                         (incf calls)
+                         (client-test-response
+                          200
+                          :headers (list (make-http-header
+                                          "Cache-Control" "max-age=60"))
+                          :body (ascii "cached")))
+                       :cache cache)
+      (let ((request (http-client-request client "GET"
+                                          "http://example.test/resource")))
       (multiple-value-bind (response effective)
           (http-client-send client request)
         (ensure-equal 200 (http-response-status response))
@@ -128,7 +124,7 @@
         (ensure-equal 200 (http-response-status response))
         (ensure-equal request effective))
       (ensure-equal 1 calls)
-      (ensure-equal 1 (length (http-cache-entries cache))))))
+      (ensure-equal 1 (length (http-cache-entries cache))))))))
 
 (deftest client-cache-keeps-get-when-head-is-stored
   (let* ((cache (make-http-cache :clock-function (lambda () 1000)))
@@ -167,30 +163,28 @@
         (uris nil)
         (request-events 0)
         (response-events 0))
-    (let* ((client
-             (make-http-client
-              :cache nil
-              :on-request (lambda (request attempt)
-                            (declare (ignore request attempt))
-                            (incf request-events))
-              :on-response (lambda (response request attempt)
-                             (declare (ignore response request attempt))
-                             (incf response-events))
-              :transport-function
-              (lambda (request &key proxy-plan &allow-other-keys)
-                (declare (ignore proxy-plan))
-                (incf calls)
-                (push (http-request-method request) methods)
-                (push (http-uri-string (http-request-uri request)) uris)
-                (if (= calls 1)
-                    (client-test-response
-                     302
-                     :headers (list (make-http-header
-                                     "Location" "/final")))
-                    (client-test-response 200 :body (ascii "done"))))))
-           (request (http-client-request client "POST"
-                                         "http://example.test/start"
-                                         :body (ascii "payload"))))
+    (with-test-client (client
+                       (lambda (request &key proxy-plan &allow-other-keys)
+                         (declare (ignore proxy-plan))
+                         (incf calls)
+                         (push (http-request-method request) methods)
+                         (push (http-uri-string (http-request-uri request)) uris)
+                         (if (= calls 1)
+                             (client-test-response
+                              302
+                              :headers (list (make-http-header
+                                              "Location" "/final")))
+                             (client-test-response 200 :body (ascii "done"))))
+                       :cache nil
+                       :on-request (lambda (request attempt)
+                                     (declare (ignore request attempt))
+                                     (incf request-events))
+                       :on-response (lambda (response request attempt)
+                                      (declare (ignore response request attempt))
+                                      (incf response-events)))
+      (let ((request (http-client-request client "POST"
+                                          "http://example.test/start"
+                                          :body (ascii "payload"))))
       (multiple-value-bind (response effective)
           (http-client-send client request)
         (ensure-equal 200 (http-response-status response))
@@ -201,7 +195,7 @@
                       (mapcar #'cons (reverse methods) (reverse uris)))
         (ensure-equal 2 calls)
         (ensure-equal 2 request-events)
-        (ensure-equal 2 response-events)))))
+        (ensure-equal 2 response-events))))))
 
 (deftest client-redirect-drops-trailers-when-method-changes
   (let ((calls 0)

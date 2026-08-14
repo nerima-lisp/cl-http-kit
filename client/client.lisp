@@ -8,7 +8,7 @@
     ((null body)
      (%client-empty-octets))
     ((stringp body)
-     (http-utf8-octets body))
+     (cl-codec-kit:string-to-octets body :encoding :utf-8))
     ((and (arrayp body) (= (array-rank body) 1))
      (let ((octets (make-array (array-total-size body)
                                :element-type '(unsigned-byte 8))))
@@ -62,9 +62,7 @@
                      :trailers (if trailers-supplied-p
                                    trailers
                                    (http-kit:http-request-trailers request))
-                     :body (if (null body)
-                               (%client-empty-octets)
-                               body)))
+                     :body (or body (%client-empty-octets))))
 
 (defun %client-monotonic-time ()
   (/ (float (get-internal-real-time))
@@ -323,12 +321,12 @@ headers replace client default headers with the same case-insensitive name."
    :trailers (if trailers-supplied-p
                  trailers
                  (http-kit:http-request-trailers request))
-   :body (if (null body)
-             (http-request-body request)
-             (%client-body-octets body))))
+   :body (if body
+             (%client-body-octets body)
+             (http-request-body request))))
 
 (defun %client-validate-collect-body-p (value)
-  (unless (member value '(nil t) :test #'eq)
+  (unless (member value '(nil t))
     (%client-protocol-error
      "The body collection flag must be NIL or T."
      value))
@@ -364,8 +362,7 @@ headers replace client default headers with the same case-insensitive name."
 
 (defun %client-retry-status-p (policy response)
   (member (http-response-status response)
-          (http-retry-policy-statuses policy)
-          :test #'eql))
+          (http-retry-policy-statuses policy)))
 
 (defun %client-retryable-condition-p (policy condition)
   (or (and (typep condition 'http-timeout)
@@ -400,25 +397,14 @@ headers replace client default headers with the same case-insensitive name."
                  :max-header-bytes (http-client-max-header-bytes client)
                  :max-body-bytes (http-client-max-body-bytes client)
                  :proxy (http-client-proxy client)
-                 :proxy-plan proxy-plan))
+                 :proxy-plan proxy-plan
+                 :request-body-function request-body-function
+                 :request-body-length request-body-length
+                 :on-body-chunk on-body-chunk
+                 :on-information on-information
+                 :collect-body-p collect-body-p))
          (effective-request
            (%client-request-with-proxy-authorization request proxy-plan)))
-    ;; Preserve compatibility with transports that predate the streaming
-    ;; keywords while exposing them whenever the caller uses the feature.
-    (when on-body-chunk
-      (setf arguments
-            (append arguments (list :on-body-chunk on-body-chunk))))
-    (when on-information
-      (setf arguments
-            (append arguments (list :on-information on-information))))
-    (when (or request-body-function request-body-length)
-      (setf arguments
-            (append arguments
-                    (list :request-body-function request-body-function
-                          :request-body-length request-body-length))))
-    (unless collect-body-p
-      (setf arguments
-            (append arguments (list :collect-body-p nil))))
     (let ((response
             (apply (http-client-transport-function client)
                    effective-request
@@ -526,6 +512,148 @@ headers replace client default headers with the same case-insensitive name."
           (setf headers (%client-header-set headers "Authorization" value)))))
     (%client-request-with request :headers headers)))
 
+(in-package #:http-kit/client)
+
+(defun %client-store-response (client request response)
+  "Update CLIENT's cache for the completed REQUEST and RESPONSE."
+  (when (http-client-cache client)
+    (cond
+      ((= (http-response-status response) 304)
+       (http-cache-store (http-client-cache client) request response))
+      ((%client-cacheable-method-p request)
+       (http-cache-store (http-client-cache client) request response))
+      ((%client-mutating-method-p request)
+       (http-cache-invalidate (http-client-cache client) request)))))
+
+(defun %client-follow-redirect-p
+    (prepared next-request request-body-function request-body-factory)
+  "Whether NEXT-REQUEST can safely reuse the request body producer."
+  (and next-request
+       (or (null request-body-function)
+           request-body-factory
+           (not (string-equal
+                 (http-request-method next-request)
+                 (http-request-method prepared))))))
+
+(defun %client-validate-send-options
+    (client request request-body-function request-body-factory
+            request-body-length on-body-chunk on-information collect-body-p)
+  "Validate the boundary arguments accepted by HTTP-CLIENT-SEND."
+  (unless (http-client-p client)
+    (%client-protocol-error "The client must be an HTTP-CLIENT." client))
+  (unless (http-request-p request)
+    (%client-protocol-error "The request must be an HTTP-REQUEST." request))
+  (%client-validate-request-body-stream
+   request request-body-function request-body-factory request-body-length)
+  (when on-body-chunk
+    (%ensure-function on-body-chunk
+                      "The response body callback must be a function."))
+  (when on-information
+    (%ensure-function on-information
+                      "The informational response callback must be a function."))
+  (%client-validate-collect-body-p collect-body-p))
+
+(defun http-client-send
+    (client request &key timeout deadline redirect-policy retry-policy
+                         request-body-function request-body-factory
+                         request-body-length
+                         on-body-chunk on-information (collect-body-p t))
+  "Execute REQUEST with redirects, retries, cookies, cache, auth, and proxy policy.
+
+Returns the final HTTP-RESPONSE as the primary value and the effective
+HTTP-REQUEST as a secondary value.  TIMEOUT and DEADLINE are passed through to
+the configured transport boundary.  REQUEST-BODY-FACTORY, when supplied,
+must return a fresh producer function on every invocation.  Streaming request
+bodies without a factory are sent once and are not automatically retried or
+resent across same-method redirects."
+  (%client-validate-send-options
+   client request request-body-function request-body-factory
+   request-body-length on-body-chunk on-information collect-body-p)
+  (let* ((redirect-policy (or redirect-policy
+                             (http-client-redirect-policy client)))
+         (retry-policy (or retry-policy
+                           (http-client-retry-policy client)))
+         (initial-uri (http-request-uri request))
+         (current-request request)
+         (redirect-count 0)
+         (stale-entry nil))
+    (unless (http-redirect-policy-p redirect-policy)
+      (%client-protocol-error "The redirect policy must be an HTTP-REDIRECT-POLICY."
+                              redirect-policy))
+    (unless (http-retry-policy-p retry-policy)
+      (%client-protocol-error "The retry policy must be an HTTP-RETRY-POLICY."
+                              retry-policy))
+    (when (and (http-client-cache client)
+               (%client-cacheable-method-p current-request))
+      (multiple-value-bind (response state entry)
+          (http-cache-lookup (http-client-cache client) current-request)
+        (when (eq state :fresh)
+          (%client-deliver-body-chunk response on-body-chunk)
+          (when (http-client-on-response client)
+            (funcall (http-client-on-response client) response current-request 0))
+          (return-from http-client-send (values response current-request)))
+        (when (eq state :stale)
+          (setf stale-entry entry
+                current-request (%client-conditional-request
+                                 current-request entry)))))
+    (loop
+      (let* ((redirect-p (plusp redirect-count))
+             (prepared (%client-prepare-request
+                        client current-request initial-uri :redirect-p redirect-p))
+             (proxy-plan (http-proxy-plan
+                          (http-client-proxy client)
+                          (http-request-uri prepared))))
+        (let ((response
+                (%client-attempt client prepared proxy-plan retry-policy
+                                 :timeout timeout :deadline deadline
+                                 :request-body-function request-body-function
+                                 :request-body-factory request-body-factory
+                                 :request-body-length request-body-length
+                                 :on-body-chunk on-body-chunk
+                                 :on-information on-information
+                                 :collect-body-p collect-body-p)))
+          (when (and stale-entry (= (http-response-status response) 304))
+            (setf response (%client-response-merge-304
+                            (http-cache-entry-response stale-entry)
+                            response))
+            (%client-deliver-body-chunk response on-body-chunk))
+          (let* ((redirect-request
+                   (and (member (http-response-status response)
+                                (http-redirect-policy-statuses redirect-policy))
+                        (%client-header-value
+                         (http-response-headers response) "Location")))
+                 (next-request
+                   (and redirect-request
+                        (%client-redirect-request
+                         prepared response redirect-policy initial-uri
+                         redirect-count)))
+                 (follow-redirect-p
+                   (%client-follow-redirect-p
+                    prepared next-request request-body-function
+                    request-body-factory)))
+            (if follow-redirect-p
+                (if (>= redirect-count
+                        (http-redirect-policy-max-redirects redirect-policy))
+                    (%client-redirect-limit-error
+                     (http-request-uri prepared)
+                     redirect-count)
+                    (progn
+                      (unless (string-equal
+                               (http-request-method next-request)
+                               (http-request-method prepared))
+                        (setf request-body-function nil
+                              request-body-factory nil
+                              request-body-length nil))
+                      (setf current-request next-request)
+                      (setf redirect-count (1+ redirect-count)
+                            stale-entry nil)
+                      (when (and (http-client-cache client)
+                                 (%client-mutating-method-p current-request))
+                        (http-cache-clear (http-client-cache client)))))
+                (progn
+                  (%client-store-response client prepared response)
+                  (return (values response prepared))))))))))
+
 (defun %client-response-merge-304 (cached response)
   (let* ((new-headers (http-response-headers response))
          (names (remove-duplicates (mapcar #'http-header-name new-headers)
@@ -545,7 +673,7 @@ headers replace client default headers with the same case-insensitive name."
   (cond
     ((= status 303)
      (if (string-equal method "HEAD") "HEAD" "GET"))
-    ((and (member status '(301 302) :test #'eql)
+    ((and (member status '(301 302))
           (string-equal method "POST"))
      "GET")
     (t method)))
@@ -556,7 +684,7 @@ headers replace client default headers with the same case-insensitive name."
   (let ((location (%client-header-value
                    (http-response-headers response) "Location")))
     (unless location
-      (return-from %client-redirect-request nil))
+      (return-from %client-redirect-request))
     (let* ((target (resolve-http-uri (http-request-uri request) location))
            (old-scheme (http-uri-scheme (http-request-uri request)))
            (new-scheme (http-uri-scheme target))
@@ -613,131 +741,3 @@ headers replace client default headers with the same case-insensitive name."
                      headers "If-Modified-Since"
                      (http-cache-entry-last-modified entry))))
     (%client-request-with request :headers headers)))
-
-(defun http-client-send
-    (client request &key timeout deadline redirect-policy retry-policy
-                         request-body-function request-body-factory
-                         request-body-length
-                         on-body-chunk on-information (collect-body-p t))
-  "Execute REQUEST with redirects, retries, cookies, cache, auth, and proxy policy.
-
-Returns the final HTTP-RESPONSE as the primary value and the effective
-HTTP-REQUEST as a secondary value.  TIMEOUT and DEADLINE are passed through to
-the configured transport boundary.  REQUEST-BODY-FACTORY, when supplied,
-must return a fresh producer function on every invocation.  Streaming request
-bodies without a factory are sent once and are not automatically retried or
-resent across same-method redirects."
-  (unless (http-client-p client)
-    (%client-protocol-error "The client must be an HTTP-CLIENT." client))
-  (unless (http-request-p request)
-    (%client-protocol-error "The request must be an HTTP-REQUEST." request))
-  (%client-validate-request-body-stream
-   request request-body-function request-body-factory request-body-length)
-  (when on-body-chunk
-    (%ensure-function on-body-chunk
-                      "The response body callback must be a function."))
-  (when on-information
-    (%ensure-function on-information
-                      "The informational response callback must be a function."))
-  (%client-validate-collect-body-p collect-body-p)
-  (let* ((redirect-policy (or redirect-policy
-                             (http-client-redirect-policy client)))
-         (retry-policy (or retry-policy
-                           (http-client-retry-policy client)))
-         (initial-uri (http-request-uri request))
-         (current-request request)
-         (redirect-count 0)
-         (stale-entry nil))
-    (unless (http-redirect-policy-p redirect-policy)
-      (%client-protocol-error "The redirect policy must be an HTTP-REDIRECT-POLICY."
-                              redirect-policy))
-    (unless (http-retry-policy-p retry-policy)
-      (%client-protocol-error "The retry policy must be an HTTP-RETRY-POLICY."
-                              retry-policy))
-    (when (and (http-client-cache client)
-               (%client-cacheable-method-p current-request))
-      (multiple-value-bind (response state entry)
-          (http-cache-lookup (http-client-cache client) current-request)
-        (when (eq state :fresh)
-          (%client-deliver-body-chunk response on-body-chunk)
-          (when (http-client-on-response client)
-            (funcall (http-client-on-response client) response current-request 0))
-          (return-from http-client-send (values response current-request)))
-        (when (eq state :stale)
-          (setf stale-entry entry
-                current-request (%client-conditional-request
-                                 current-request entry)))))
-    (loop
-      (let* ((redirect-p (plusp redirect-count))
-             (prepared (%client-prepare-request
-                        client current-request initial-uri :redirect-p redirect-p))
-             (proxy-plan (http-proxy-plan
-                          (http-client-proxy client)
-                          (http-request-uri prepared))))
-        (multiple-value-bind (response)
-            (%client-attempt client prepared proxy-plan retry-policy
-                             :timeout timeout :deadline deadline
-                             :request-body-function request-body-function
-                             :request-body-factory request-body-factory
-                             :request-body-length request-body-length
-                             :on-body-chunk on-body-chunk
-                             :on-information on-information
-                             :collect-body-p collect-body-p)
-          (when (and stale-entry (= (http-response-status response) 304))
-            (setf response (%client-response-merge-304
-                            (http-cache-entry-response stale-entry)
-                            response))
-            (%client-deliver-body-chunk response on-body-chunk))
-          (let* ((redirect-request
-                   (and (member (http-response-status response)
-                                (http-redirect-policy-statuses redirect-policy)
-                                :test #'eql)
-                        (%client-header-value
-                         (http-response-headers response) "Location")))
-                 (next-request
-                   (and redirect-request
-                        (%client-redirect-request
-                         prepared response redirect-policy initial-uri
-                         redirect-count)))
-                 (follow-redirect-p
-                   (and next-request
-                        (or (null request-body-function)
-                            request-body-factory
-                            (not (string-equal
-                                  (http-request-method next-request)
-                                  (http-request-method prepared)))))))
-            (if follow-redirect-p
-                (if (>= redirect-count
-                        (http-redirect-policy-max-redirects redirect-policy))
-                    (%client-redirect-limit-error
-                     (http-request-uri prepared)
-                     redirect-count)
-                    (progn
-                      (when (not (string-equal
-                                  (http-request-method next-request)
-                                  (http-request-method prepared)))
-                        (setf request-body-function nil
-                              request-body-factory nil
-                              request-body-length nil))
-                      (setf current-request next-request)
-                      (setf redirect-count (1+ redirect-count)
-                            stale-entry nil)
-                      (when (and (http-client-cache client)
-                                 (%client-mutating-method-p current-request))
-                        (http-cache-clear (http-client-cache client)))))
-                (progn
-                  (when (http-client-cache client)
-                    (if (= (http-response-status response) 304)
-                        (http-cache-store
-                         (http-client-cache client)
-                         prepared
-                         response)
-                        (if (%client-cacheable-method-p prepared)
-                            (http-cache-store
-                             (http-client-cache client)
-                             prepared
-                             response)
-                            (when (%client-mutating-method-p prepared)
-                              (http-cache-invalidate
-                               (http-client-cache client) prepared)))))
-                  (return (values response prepared))))))))))

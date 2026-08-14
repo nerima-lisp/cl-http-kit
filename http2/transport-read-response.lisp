@@ -118,7 +118,7 @@
                   (return-from %h2-read-response response))))
              ((= type +http2-data-type+)
               (multiple-value-bind (end-stream new-body-length data-length)
-                  (%h2-append-data-frame*
+                  (%h2-append-data-frame
                    frame status body body-length request-method max-body-bytes
                    on-body-chunk collect-body-p expected-stream-id)
                 (setf body-length new-body-length)

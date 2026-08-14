@@ -78,12 +78,13 @@
   :author "nerima-lisp"
   :license "MIT"
   :version "0.2.0"
-  :depends-on ("cl-http-kit")
+  :depends-on ("cl-http-kit" "cl-codec-kit")
   :pathname "client"
   :serial t
   :components ((:file "package")
                (:file "conditions")
                (:file "data")
+               (:file "form")
                (:file "multipart")
                (:file "websocket-frame")
                (:file "websocket-crypto")

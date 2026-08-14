@@ -1178,7 +1178,7 @@ active."
                                            :detail stream-id))
                                   (multiple-value-bind (end-stream-p new-body-length
                                                         payload-length)
-                                      (%h2-append-data-frame*
+                                      (%h2-append-data-frame
                                        frame
                                        (%h2-batch-entry-status entry)
                                        (%h2-batch-entry-body-vector entry)

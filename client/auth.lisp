@@ -8,7 +8,7 @@
     (loop for index from 0 below (length octets) by 3
           for remaining = (- (length octets) index)
           for first = (aref octets index)
-          for second = (and (> remaining 1) (aref octets (+ index 1)))
+          for second = (and (> remaining 1) (aref octets (1+ index)))
           for third = (and (> remaining 2) (aref octets (+ index 2)))
           for combined = (+ (ash first 16)
                             (ash (or second 0) 8)
@@ -38,7 +38,7 @@
     (%client-protocol-error "Basic authentication requires a valid password."
                             password))
   (let* ((credentials (concatenate 'string username ":" password))
-         (encoded (%base64-encode-octets (http-utf8-octets credentials))))
+         (encoded (%base64-encode-octets (cl-codec-kit:string-to-octets credentials :encoding :utf-8))))
     (concatenate 'string "Basic " encoded)))
 
 (defun http-bearer-authorization (token)
