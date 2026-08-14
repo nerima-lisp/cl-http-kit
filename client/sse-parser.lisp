@@ -60,7 +60,7 @@
     (let ((event
             (%make-http-sse-event
              :event (if (and (%sse-state-event-field state)
-                            (plusp (length (%sse-state-event-field state))))
+                             (not (string= (%sse-state-event-field state) "")))
                         (%sse-state-event-field state)
                         "message")
              :data (with-output-to-string (result)
@@ -82,7 +82,7 @@
   state)
 
 (defun %sse-parse-retry (octets)
-  (when (and (plusp (length octets))
+  (when (and (plusp (array-total-size octets))
              (loop for byte across octets
                    always (<= #x30 byte #x39)))
     (parse-integer (%sse-utf8-string octets))))
@@ -181,7 +181,7 @@
   (when (%sse-state-pending-cr-p state)
     (setf (%sse-state-pending-cr-p state) nil)
     (%sse-state-finish-line state))
-  (when (plusp (length (%sse-state-line state)))
+  (when (plusp (fill-pointer (%sse-state-line state)))
     (%sse-state-finish-line state))
   ;; A final event without a blank line is useful for complete finite bodies;
   ;; a live stream still dispatches normally as soon as it receives a blank

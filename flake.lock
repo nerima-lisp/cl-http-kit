@@ -221,6 +221,7 @@
       },
       "original": {
         "owner": "nerima-lisp",
+        "ref": "v0.5.0",
         "repo": "cl-codec-kit",
         "type": "github"
       }
@@ -1038,17 +1039,17 @@
         "treefmt-nix": "treefmt-nix_45"
       },
       "locked": {
-        "lastModified": 1786354337,
-        "narHash": "sha256-LI1rfa3mbfm5DV+IUHEI/uKTyw3bUdJozX4eB8zT/AE=",
+        "lastModified": 1786360527,
+        "narHash": "sha256-e76lQVaHA5fBoK7wtUMuZs0ogCijrYvEQaORaxRUeao=",
         "owner": "nerima-lisp",
         "repo": "cl-observability-kit",
-        "rev": "5d447256db014b8111b4441d1884bb5332447c9d",
+        "rev": "1a49cfc400abb1af7ea381cb57cce5aad3f73d6c",
         "type": "github"
       },
       "original": {
         "owner": "nerima-lisp",
+        "ref": "v0.1.0",
         "repo": "cl-observability-kit",
-        "rev": "5d447256db014b8111b4441d1884bb5332447c9d",
         "type": "github"
       }
     },

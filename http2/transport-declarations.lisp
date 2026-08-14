@@ -42,3 +42,39 @@
   (local-goaway-last-stream-id nil)
   (draining-p nil)
   (closed-p nil))
+
+(defun http2-connection-open-p (connection)
+  (and (http2-connection-p connection)
+       (not (%http2-connection-closed-p connection))))
+
+(defun http2-connection-session-started-p (connection)
+  (and (http2-connection-p connection)
+       (%http2-connection-session-started-p connection)))
+
+(defun http2-connection-peer-max-frame-size (connection)
+  (when (http2-connection-p connection)
+    (%http2-connection-peer-max-frame-size connection)))
+
+(defun http2-connection-peer-max-table-size (connection)
+  (when (http2-connection-p connection)
+    (%http2-connection-peer-max-table-size connection)))
+
+(defun http2-connection-peer-initial-window-size (connection)
+  (when (http2-connection-p connection)
+    (%http2-connection-peer-initial-window-size connection)))
+
+(defun http2-connection-peer-connection-window-size (connection)
+  (when (http2-connection-p connection)
+    (%http2-connection-peer-connection-window-size connection)))
+
+(defun http2-connection-goaway-last-stream-id (connection)
+  (when (http2-connection-p connection)
+    (%http2-connection-goaway-last-stream-id connection)))
+
+(defun http2-connection-local-goaway-last-stream-id (connection)
+  (when (http2-connection-p connection)
+    (%http2-connection-local-goaway-last-stream-id connection)))
+
+(defun http2-connection-draining-p (connection)
+  (and (http2-connection-p connection)
+       (%http2-connection-draining-p connection)))

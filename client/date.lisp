@@ -16,7 +16,7 @@
     (nreverse tokens)))
 
 (defun %date-integer (string)
-  (and (plusp (length string))
+  (and (not (string= string ""))
        (every (lambda (character)
                 (and (char>= character #\0) (char<= character #\9)))
               string)

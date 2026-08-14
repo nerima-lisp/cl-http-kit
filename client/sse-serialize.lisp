@@ -68,7 +68,7 @@
        retry))
     (dolist (comment comments)
       (%sse-emit-line result ":" comment))
-    (when (and (plusp (length event-name))
+    (when (and (not (string= event-name ""))
                (not (string= event-name "message")))
       (%sse-emit-line result "event:" event-name))
     (when id

@@ -1,4 +1,4 @@
-(in-package #:http-kit/test)
+(in-package #:http-kit/test-core)
 
 (deftest request-serialization
   (let* ((request (make-http-request

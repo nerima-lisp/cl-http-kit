@@ -37,7 +37,7 @@
      (http-kit/http2::%h2-request-fields request))
     (ensure-true
      (plusp
-      (length
+      (array-total-size
        (http-kit/http2::%h2-request-wire request 32768 1000 1000)))))
   (let ((request
           (make-http-request

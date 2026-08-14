@@ -146,7 +146,7 @@ Content-Length without rescanning a non-collecting response body."
     (when collect-body-p
       (loop for octet across payload
             do (vector-push-extend octet body)))
-    (when (and on-body-chunk (plusp (length payload)))
+    (when (and on-body-chunk (plusp (array-total-size payload)))
       (funcall on-body-chunk payload))
     (values (/= 0 (logand (%h2-frame-flags frame) +http2-end-stream-flag+))
             new-body-length

@@ -62,7 +62,7 @@
       for octet = (%source-read-byte source deadline clock-function)
       do (when (eq octet :eof)
          (if (and allow-eof-p
-                  (zerop (length builder))
+                  (zerop (fill-pointer builder))
                   (= bytes header-used))
              (return (values :eof bytes))
              (error 'http-protocol-error

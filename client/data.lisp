@@ -174,7 +174,7 @@ character in that range is a decimal digit, apart from an optional sign when
 
 (defun make-http-multipart-part
     (&key name value filename content-type)
-  (unless (and (stringp name) (plusp (length name)))
+  (unless (and (stringp name) (not (string= name "")))
     (%client-protocol-error "A multipart part requires a non-empty name." name))
   (unless (or (stringp value)
               (and (arrayp value) (= (array-rank value) 1)))
@@ -228,7 +228,7 @@ character in that range is a decimal digit, apart from an optional sign when
                           (string= (string left) (string right))))
     (%client-protocol-error "Proxy scheme must be HTTP, HTTPS, SOCKS5, or SOCKS5H."
                             scheme))
-  (unless (and (stringp host) (plusp (length host)))
+  (unless (and (stringp host) (not (string= host "")))
     (%client-protocol-error "A proxy requires a non-empty host." host))
   (%ensure-positive-integer port "A proxy port must be a positive integer.")
   (when (> port 65535)

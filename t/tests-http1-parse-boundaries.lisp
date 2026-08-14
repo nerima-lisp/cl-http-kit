@@ -1,4 +1,4 @@
-(in-package #:http-kit/test)
+(in-package #:http-kit/test-core)
 
 (deftest http1-input-and-line-boundaries
   (let* ((wire (concatenate-octets

@@ -1,4 +1,4 @@
-(in-package #:http-kit/test)
+(in-package #:http-kit/test-core)
 
 (deftest message-model-boundaries
   (dolist (entry '((100 "Continue")
@@ -50,15 +50,21 @@
                   (http-header-value (http-response-trailers response)
                                      "x-trailer"))
     (ensure-equal (octets 1 2 3) (http-response-body response))
-    (let ((printed (princ-to-string response)))
-      (ensure-true (search "status=299" printed))
-      (ensure-true (search "body-bytes=3" printed))))
+    (ensure-summary=
+     "HTTP/1.1 299 Application-defined headers=1 trailers=1 body-bytes=3"
+     (http-response-summary response)))
   (let* ((request (make-http-request
                    :method "GET"
                    :uri "http://127.0.0.1/"))
-         (printed (princ-to-string request)))
-    (ensure-true (search "GET http://127.0.0.1/" printed))
-    (ensure-true (not (search "?<redacted>" printed))))
+         (summary (http-request-summary request)))
+    (ensure-summary=
+     "GET http://127.0.0.1/ headers=0 trailers=0 body-bytes=0"
+     summary)
+    (ensure-summary-contains
+     summary
+     "GET"
+     "http://127.0.0.1/"
+     "body-bytes=0"))
   (signals http-protocol-error
     (make-http-request :method nil :uri "http://127.0.0.1/"))
   (signals http-protocol-error
@@ -112,8 +118,12 @@
     (ensure-equal "fallback" (http-header-value headers "x-missing" "fallback"))
     (ensure-true (http-header-present-p headers "x-object"))
     (ensure-true (not (http-header-present-p headers "x-missing")))
-    (ensure-true (search "visible"
-                        (princ-to-string (make-http-header "X-Visible" "visible")))))
+    (ensure-printed=
+     "#<HTTP-HEADER X-Visible: visible>"
+     (make-http-header "X-Visible" "visible"))
+    (ensure-printed=
+     "#<HTTP-HEADER Authorization: <redacted>>"
+     (make-http-header "Authorization" "secret-token")))
   (signals http-invalid-header
     (make-http-request :method "GET"
                        :uri "http://127.0.0.1/"

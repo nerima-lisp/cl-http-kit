@@ -89,7 +89,7 @@
                               +http2-end-stream-flag+)))))))
 
 (defun %h2-regular-header-valid-p (name value)
-  (unless (and (plusp (length name))
+  (unless (and (not (string= name ""))
                (string= name (string-downcase name)))
     (error 'http-kit:http-invalid-header
            :message "HTTP/2 header field names must be lowercase."
@@ -119,7 +119,7 @@
     (dolist (field fields)
       (let ((name (car field))
             (value (cdr field)))
-        (unless (plusp (length name))
+        (unless (string/= name "")
           (error 'http-kit:http-invalid-header
                  :message "HTTP/2 header field names cannot be empty."
                  :operation :http2-headers
@@ -171,7 +171,7 @@
   (mapcar (lambda (field)
             (let ((name (car field))
                   (value (cdr field)))
-              (unless (plusp (length name))
+              (unless (string/= name "")
                 (error 'http-kit:http-invalid-header
                        :message "HTTP/2 trailer field names cannot be empty."
                        :operation :http2-trailers

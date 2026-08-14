@@ -91,4 +91,5 @@
    #:read-http3-control-stream
    #:serve-http3-control-stream
    #:send-http3-request
+   #:send-http3-request/cps
    #:serve-http3-request-stream))

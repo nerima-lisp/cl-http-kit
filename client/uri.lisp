@@ -54,7 +54,7 @@
                               (char= (char path (1- (length path))) #\/)))
          (stack nil))
     (dolist (segment segments)
-      (cond ((or (zerop (length segment)) (string= segment ".")) nil)
+      (cond ((or (string= segment "") (string= segment ".")) nil)
             ((string= segment "..")
              (when stack (pop stack)))
             (t (push segment stack))))
@@ -110,7 +110,7 @@ fresh HTTP-URI value with dot segments removed from its path."
               (has-query-p (not (null query-position)))
               (reference-query (and has-query-p
                                     (subseq reference (1+ query-position))))
-              (path (cond ((zerop (length reference-path))
+              (path (cond ((string= reference-path "")
                            (http-uri-path base))
                           ((char= (char reference-path 0) #\/) reference-path)
                           (t (%merge-relative-path
@@ -118,7 +118,7 @@ fresh HTTP-URI value with dot segments removed from its path."
                               reference-path))))
               (query (if has-query-p
                          reference-query
-                         (if (zerop (length reference-path))
+                         (if (string= reference-path "")
                              (http-uri-query base)
                              nil))))
          (make-http-uri :scheme (http-uri-scheme base)

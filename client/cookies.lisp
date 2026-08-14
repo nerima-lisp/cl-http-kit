@@ -5,7 +5,7 @@
 
 (defun %cookie-name-p (name)
   (and (stringp name)
-       (plusp (length name))
+       (not (string= name ""))
        (every (lambda (character)
                 (let ((code (char-code character)))
                   (and (<= #x21 code #x7e)
@@ -43,10 +43,10 @@
   (unless (%cookie-value-p value)
     (%client-protocol-error "Cookie values cannot contain controls or semicolons."
                             value))
-  (unless (and (stringp domain) (plusp (length domain)))
+  (unless (and (stringp domain) (not (string= domain "")))
     (%client-protocol-error "Cookies require a non-empty domain." domain))
   (unless (and (stringp path)
-               (plusp (length path))
+               (not (string= path ""))
                (char= (char path 0) #\/))
     (%client-protocol-error "Cookie paths must begin with '/'." path))
   (when (and expires (not (integerp expires)))
@@ -144,7 +144,7 @@
                                              (length set-cookie)))))
           (unless (%cookie-value-p value)
             (setf invalid t))
-          (dolist (attribute (when (plusp (length attribute-string))
+          (dolist (attribute (when (not (string= attribute-string ""))
                                (loop with start = 1
                                      for separator = (position #\; set-cookie
                                                               :start start)
@@ -159,7 +159,7 @@
                     (attribute-value (and attribute-value
                                           (%cookie-trim attribute-value))))
                 (cond ((string= attribute-name "domain")
-                       (when (and attribute-value (plusp (length attribute-value)))
+                       (when (and attribute-value (not (string= attribute-value "")))
                          (setf domain (string-downcase
                                        (if (char= (char attribute-value 0) #\.)
                                            (subseq attribute-value 1)
@@ -167,7 +167,7 @@
                                host-only-p nil)))
                       ((string= attribute-name "path")
                        (when (and attribute-value
-                                  (plusp (length attribute-value))
+                                  (not (string= attribute-value ""))
                                   (char= (char attribute-value 0) #\/))
                          (setf path attribute-value)))
                       ((string= attribute-name "expires")
@@ -186,7 +186,7 @@
                              (setf same-site
                                    (intern (string-upcase value) :keyword))))))))))
           (when (or invalid
-                    (zerop (length domain))
+                    (string= domain "")
                     (not (%cookie-domain-match-p (http-uri-host request-uri)
                                                  domain)))
             (return-from %cookie-parse-set-cookie nil))

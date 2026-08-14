@@ -91,7 +91,7 @@
         (setf bytes updated-bytes)
         (let* ((separator (position #\; line))
                (size-text (%trim-ows (if separator (subseq line 0 separator) line))))
-          (unless (and (plusp (length size-text))
+          (unless (and (not (string= size-text ""))
                        (every (lambda (character) (%hex-character-p character))
                               size-text))
             (error 'http-protocol-error

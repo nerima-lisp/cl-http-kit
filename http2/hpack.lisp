@@ -140,7 +140,7 @@
 
 (defun %hpack-name-p (name)
   (and (stringp name)
-       (plusp (length name))
+       (not (string= name ""))
        (if (char= (char name 0) #\:)
            (and (> (length name) 1)
                 (http-kit::%header-name-p (subseq name 1)))
@@ -148,7 +148,7 @@
 
 (defun %hpack-validate-field (name value)
   (unless (and (stringp name)
-               (plusp (length name))
+               (not (string= name ""))
                (string= name (string-downcase name))
                (%hpack-name-p name))
     (error 'http-invalid-header

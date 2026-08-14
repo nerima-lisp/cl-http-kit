@@ -28,7 +28,7 @@
       (values version code reason))))
 
 (defun %parse-response-header-line (line)
-  (when (and (plusp (length line))
+  (when (and (not (string= line ""))
              (find (char line 0) '(#\Space #\Tab)))
     (error 'http-invalid-header
            :message "Obsolete folded response headers are not accepted."
@@ -50,27 +50,12 @@
       (multiple-value-bind (line updated-bytes)
           (%read-crlf-line source deadline clock-function max-header-bytes bytes)
         (setf bytes updated-bytes)
-        (if (zerop (length line))
+        (if (string= line "")
             (return (values (nreverse headers) bytes))
             (push (%parse-response-header-line line) headers))))))
 
 (defun %split-comma-values (values)
-  (let ((result '()))
-    (dolist (value values (nreverse result))
-      (let ((start 0))
-        (loop
-          for position = (position #\, value :start start)
-          for piece = (%trim-ows (subseq value start position))
-          do (when (zerop (length piece))
-               (error 'http-invalid-header
-                      :message "A comma-separated header contains an empty item."
-                      :operation :response-parse
-                      :name "transfer-encoding"
-                      :reason :empty-item))
-             (push (string-downcase piece) result)
-             (if position
-                 (setf start (1+ position))
-                 (return)))))))
+  (%parse-http1-transfer-codings values :response-parse "transfer-encoding"))
 
 (defun %response-content-length (headers)
   (let ((values (http-header-values headers "content-length")))

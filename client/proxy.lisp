@@ -43,7 +43,7 @@
     (and token-host
          (or (null token-port) (= token-port port))
          (let ((token-host (string-downcase token-host)))
-           (if (and (plusp (length token-host))
+           (if (and (not (string= token-host ""))
                     (char= (char token-host 0) #\.))
                (let ((domain (subseq token-host 1))
                      (offset (- (length host) (length (subseq token-host 1)))))
@@ -66,7 +66,7 @@
              (port (%http-uri-effective-port uri)))
         (some (lambda (token)
                 (or (string= token "*")
-                    (and (plusp (length token))
+                    (and (not (string= token ""))
                          (%proxy-host-token-match-p host port token))))
               (%proxy-no-proxy-tokens (http-proxy-no-proxy proxy))))))
 

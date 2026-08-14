@@ -26,7 +26,7 @@
            :operation :http2-write
            :detail request-body-length))
   (when (and request-body-function
-             (plusp (length (http-kit:http-request-body request))))
+             (plusp (array-total-size (http-kit:http-request-body request))))
     (error 'http-kit:http-protocol-error
            :message "A request body producer cannot be combined with an in-memory request body."
            :operation :http2-write
@@ -41,7 +41,7 @@
            :message "An HTTP/2 request body producer must return a one-dimensional octet array or NIL."
            :operation :http2-write
            :detail (type-of chunk)))
-  (when (zerop (length chunk))
+  (when (zerop (array-total-size chunk))
     (error 'http-kit:http-protocol-error
            :message "An HTTP/2 request body producer returned an empty chunk."
            :operation :http2-write
@@ -87,7 +87,7 @@
    (lambda (header)
      (let* ((name (string-downcase (http-kit:http-header-name header)))
             (value (http-kit:http-header-content header)))
-       (when (or (zerop (length name))
+       (when (or (string= name "")
                  (char= (char name 0) #\:))
          (error 'http-kit:http-invalid-header
                 :message "HTTP/2 request trailers cannot contain pseudo-header fields."
@@ -159,8 +159,8 @@
            (frames (%h2-header-frames
                    block
                    (and (null request-body-function)
-                         (zerop (length body))
-                         (null trailer-fields))
+                        (zerop (array-total-size body))
+                        (null trailer-fields))
                                       outgoing-frame-size stream-id)))
       (values
        (%h2-concat

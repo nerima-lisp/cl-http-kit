@@ -11,7 +11,7 @@
              (end (or comma length))
              (token (string-trim '(#\Space #\Tab)
                                  (subseq value start end))))
-        (when (plusp (length token))
+        (when (not (string= token ""))
           (push token tokens))
         (if comma
             (setf start (1+ comma))
@@ -31,7 +31,7 @@
 
 (defun %websocket-token-string-p (value)
   (and (stringp value)
-       (plusp (length value))
+       (not (string= value ""))
        (loop for character across value
              for code = (char-code character)
              always (and (<= #x21 code #x7e)

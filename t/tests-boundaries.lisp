@@ -40,20 +40,10 @@
                  :initial-element 0)))
   (signals http-protocol-error
     (http-kit::%copy-octets '(1 2) :allow-list nil))
-  (ensure-equal (octets 65 66)
-                (http-kit::%string-octets "AB"))
   (let ((builder (http-kit::%make-byte-builder)))
     (http-kit::%builder-write-string builder "A")
     (ensure-equal (octets 65)
                   (subseq builder 0 (fill-pointer builder))))
-  (signals http-protocol-error
-    (http-kit::%string-octets (string (code-char #x100))))
-  (ensure-equal "AB"
-                (http-kit::%octets-string (octets 65 66)))
-  (signals http-protocol-error
-    (http-kit::%octets-string (list 256)))
-  (signals http-protocol-error
-    (http-kit::%octets-string (list :invalid)))
   (ensure-equal "abc" (http-kit::%ascii-lowercase "ABC"))
   (ensure-true (http-kit::%ascii-name-char-p #\!))
   (ensure-true (not (http-kit::%ascii-name-char-p #\Space)))

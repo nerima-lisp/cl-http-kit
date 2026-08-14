@@ -8,9 +8,23 @@
                 #:expect-not
                 #:gen-integer
                 #:it
-                  #:it-property
-                  #:run-all
-                  #:signals)
+                #:it-property
+                #:run-all
+                #:signals)
+  (:import-from #:http-kit/test-core
+                #:ascii
+                #:binary-test-output
+                #:binary-test-stream
+                #:concatenate-octets
+                #:deftest
+                #:ensure-equal
+                #:ensure-printed-contains
+                #:ensure-printed=
+                #:ensure-summary-contains
+                #:ensure-summary=
+                #:ensure-true
+                #:octets
+                #:octets-as-string)
   (:import-from #:observability-kit
                 #:make-metric-registry
                 #:metric-sample-labels

@@ -8,7 +8,7 @@
           for comma = (position #\, value :start start)
           for piece = (http-kit::%trim-ows
                        (subseq value start comma))
-          do (when (zerop (length piece))
+          do (when (string= piece "")
                (error 'http-kit:http-invalid-header
                       :message "An HTTP/2 comma-separated header contains an empty item."
                       :operation :http2-headers

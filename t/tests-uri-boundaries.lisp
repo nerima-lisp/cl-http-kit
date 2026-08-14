@@ -1,4 +1,4 @@
-(in-package #:http-kit/test)
+(in-package #:http-kit/test-core)
 
 (deftest uri-authority-and-component-boundaries
   (dolist (authority '(""
@@ -51,9 +51,9 @@
     (ensure-equal "https://[2001:db8::1]:443/"
                   (http-uri-string uri)
                   "URI without query")
-    (let ((printed (with-output-to-string (stream)
-                     (write uri :stream stream :escape nil))))
-      (ensure-true (not (search "?<redacted>" printed))))))
+    (ensure-printed=
+     "#<HTTP-URI https://[2001:db8::1]:443/>"
+     uri)))
 
 (deftest uri-parser-and-printing-boundaries
   (signals http-invalid-uri
@@ -67,10 +67,10 @@
     (ensure-equal "http://example.com/"
                   (http-uri-string uri)
                   "default path round trip"))
-  (let* ((uri (parse-http-uri "http://example.com/path?secret=value"))
-         (printed (with-output-to-string (stream)
-                    (write uri :stream stream :escape nil))))
-    (ensure-true (search "?<redacted>" printed)
-                 "URI printing redacts query")
-    (ensure-true (not (search "secret=value" printed))
-                 "URI printing omits query contents")))
+  (let ((uri (parse-http-uri "http://example.com/path?secret=value")))
+    (ensure-printed=
+     "#<HTTP-URI http://example.com/path?<redacted>>"
+     uri)
+    (ensure-true
+     (not (search "secret=value" (princ-to-string uri)))
+     "URI printing omits query contents")))

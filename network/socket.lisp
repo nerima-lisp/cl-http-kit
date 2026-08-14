@@ -65,7 +65,7 @@
   (defconstant +network-ipv6-address-type+ 30)
 
   (defun %network-address-entries (host)
-    (unless (and (stringp host) (plusp (length host)))
+    (unless (and (stringp host) (string/= host ""))
       (%network-connection-error (or host "<unknown>") 0 :resolve))
     (multiple-value-bind (first second)
         (sb-bsd-sockets:get-host-by-name host)
@@ -365,7 +365,7 @@ This is the raw endpoint boundary consumed by
 HTTP-KIT/CLIENT:MAKE-HTTP-PROXY-STREAM-OPENER.  It deliberately does not
 perform TLS or proxy negotiation."
     (multiple-value-bind (host port) (%network-endpoint request proxy-plan)
-      (unless (and (stringp host) (plusp (length host))
+      (unless (and (stringp host) (string/= host "")
                    (%network-valid-port-p port))
         (%network-connection-error (or host "<unknown>") (or port 0)
                                    :endpoint proxy-plan))

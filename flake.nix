@@ -10,7 +10,7 @@
     };
 
     cl-observability-kit = {
-      url = "github:nerima-lisp/cl-observability-kit/5d447256db014b8111b4441d1884bb5332447c9d";
+      url = "github:nerima-lisp/cl-observability-kit/v0.1.0";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.cl-weave.follows = "cl-weave";
     };
@@ -39,7 +39,7 @@
     };
 
     cl-codec-kit = {
-      url = "github:nerima-lisp/cl-codec-kit";
+      url = "github:nerima-lisp/cl-codec-kit/v0.5.0";
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
@@ -113,6 +113,9 @@
               pkgs.coreutils
               pkgs.perl
               pkgs.ripgrep
+              pkgs.python3Packages.mkdocs
+              pkgs.python3Packages.mkdocs-material
+              pkgs.python3Packages.pymdown-extensions
             ];
             shellHook = ''
               export CL_SOURCE_REGISTRY="''${CL_SOURCE_REGISTRY:-$PWD//:${
@@ -153,6 +156,32 @@
           ];
           appMeta = {
             description = "Common Lisp HTTP client quality gate";
+          };
+
+          testCore = pkgs.writeShellApplication {
+            name = "cl-http-kit-test-core";
+            runtimeInputs = [
+              clWeave
+              observability
+              concurrent
+              boundary
+              date
+              host
+              codec
+            ];
+            text = ''
+              test_home="''${TMPDIR:-/tmp}/cl-http-kit-test-core-$$"
+              mkdir -p "$test_home"
+              export HOME="$test_home"
+              export CL_SOURCE_REGISTRY="''${CL_SOURCE_REGISTRY:-$PWD//:${sourceRegistry}}"
+              test_timeout_ms="''${CL_WEAVE_TEST_TIMEOUT_MS:-30000}"
+              max_workers="''${CL_WEAVE_MAX_WORKERS:-1}"
+              exec cl-weave run cl-http-kit/test-core \
+                --test-timeout-ms "$test_timeout_ms" \
+                --max-workers "$max_workers" \
+                --bail true \
+                --fail-with-no-tests "$@"
+            '';
           };
 
           test = pkgs.writeShellApplication {
@@ -215,6 +244,7 @@
               esac
               test_timeout_ms="''${CL_WEAVE_TEST_TIMEOUT_MS:-30000}"
               max_workers="''${CL_WEAVE_MAX_WORKERS:-1}"
+              coverage_timeout_seconds="''${CL_HTTP_KIT_COVERAGE_TIMEOUT_SECONDS:-900}"
               mkdir -p "$coverage_report_directory"
               find "$coverage_report_directory" \
                 -mindepth 1 \
@@ -222,10 +252,13 @@
                 -type f \
                 -name '*.html' \
                 -delete
-              cl-weave run cl-http-kit/test \
+              CL_HTTP_KIT_COVERAGE_TIMEOUT_SECONDS="$coverage_timeout_seconds" \
+                perl -e 'alarm $ENV{CL_HTTP_KIT_COVERAGE_TIMEOUT_SECONDS}; exec @ARGV' \
+                cl-weave run cl-http-kit/test \
                 --coverage \
                 --coverage-system cl-http-kit \
                 --coverage-system cl-http-kit/http2 \
+                --coverage-system cl-http-kit/http3 \
                 --coverage-system cl-http-kit/observability \
                 --coverage-system cl-http-kit/client \
                 --coverage-exclude src/package.lisp \
@@ -294,6 +327,11 @@
             program = "${test}/bin/cl-http-kit-test";
             meta = appMeta;
           };
+          test-core = {
+            type = "app";
+            program = "${testCore}/bin/cl-http-kit-test-core";
+            meta = appMeta;
+          };
           test = {
             type = "app";
             program = "${test}/bin/cl-http-kit-test";
@@ -335,6 +373,35 @@
           ];
         in
         {
+          test-core =
+            pkgs.runCommand "cl-http-kit-test-core"
+              {
+                nativeBuildInputs = [
+                  clWeave
+                  observability
+                  concurrent
+                  boundary
+                  date
+                  host
+                  codec
+                ];
+              }
+              ''
+                export HOME="$TMPDIR/home"
+                mkdir -p "$HOME"
+                work="$TMPDIR/cl-http-kit"
+                mkdir -p "$work"
+                cp -R ${source}/. "$work/"
+                cd "$work"
+                export CL_SOURCE_REGISTRY="$PWD//:${sourceRegistry}"
+                cl-weave run cl-http-kit/test-core \
+                  --test-timeout-ms "''${CL_WEAVE_TEST_TIMEOUT_MS:-30000}" \
+                  --max-workers "''${CL_WEAVE_MAX_WORKERS:-1}" \
+                  --bail true \
+                  --fail-with-no-tests
+                touch "$out"
+              '';
+
           test =
             pkgs.runCommand "cl-http-kit-test"
               {

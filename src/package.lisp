@@ -36,6 +36,7 @@
    #:http-request-authority
    #:http-request-path
    #:http-request-query
+   #:http-request-summary
    #:http-response
    #:http-response-p
    #:make-http-response
@@ -45,6 +46,7 @@
    #:http-response-headers
    #:http-response-trailers
    #:http-response-body
+   #:http-response-summary
    #:http-response-stream
    #:http-response-stream-p
    #:make-http-response-stream
