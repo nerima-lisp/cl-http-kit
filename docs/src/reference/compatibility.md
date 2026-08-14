@@ -81,6 +81,13 @@ applications still provide the transport function or stream callbacks. The
 optional network system can provide native TCP and DNS setup on SBCL, while
 TLS and ALPN remain application-owned.
 
+Client transport functions use one canonical keyword contract: they receive
+the timeout, deadline, size limits, proxy context, request-body producer,
+response callbacks, and `collect-body-p` keyword arguments described by the
+client API. Older transports that accept only a subset of these keywords are
+not supported; define the complete boundary or use the provided stream or
+connection-pool constructors.
+
 ## WebSocket
 
 The `http-kit/websocket` package is loaded by `cl-http-kit/client`. It provides

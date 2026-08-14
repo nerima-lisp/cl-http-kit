@@ -78,6 +78,13 @@ socket setup, peer unidirectional-stream acceptance, connection-level stream
 dispatch, or a native HTTP/3 listener. The surrounding QUIC implementation
 must provide those boundaries.
 
+The implementation is split by responsibility: `transport.lisp` owns shared
+control-stream, frame, settings, and header helpers; `transport-client.lisp`
+owns response parsing and client request execution; and
+`transport-server.lisp` owns request-stream parsing and response production.
+The client entry points also expose CPS variants so an application can keep
+I/O scheduling and error continuation policy outside the protocol code.
+
 ## Optional high-level client system
 
 The cl-http-kit/client system consumes core request and response values and

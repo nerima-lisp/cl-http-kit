@@ -8,16 +8,30 @@ documentation configuration.
 From the repository root:
 
 ```sh
+nix run .#test-core
 nix run .#test
 nix run .#coverage
 nix run .#lint
 nix flake check --all-systems
 ```
 
-The test app runs the core, client, HTTP/2, HTTP/3, network, observability, and
-test systems.
-Coverage produces the repository's coverage report, and lint checks the source
-tree. The flake check evaluates the declared systems and checks.
+The `test-core` app runs the core-only suite without optional transport or
+client subsystems. The `test` app runs the full suite for the core, client,
+HTTP/2, HTTP/3, network, observability, and test systems.
+Coverage produces the repository's coverage report and enforces the configured
+expression and branch thresholds; it also verifies that the generated HTML
+index is non-empty. Lint checks the source tree with paredit-cli. The flake
+check evaluates the declared systems and checks.
+
+Prefer cl-weave properties for byte-domain invariants and other exhaustive
+wire-safe boundaries, then keep example-based tests for protocol scenarios and
+diagnostics.
+For HTTP/1 wire serialization boundaries, prefer table-style helper macros so
+request and response fixtures stay aligned while boundary-specific assertions remain explicit.
+
+When validating a dirty worktree, use `nix build path:.#checks.aarch64-darwin.test
+--no-link --print-build-logs` so untracked source files are included. A plain
+Git-backed flake source intentionally contains only tracked files.
 
 ## Documentation
 
@@ -29,8 +43,8 @@ mkdocs build --strict -f docs/mkdocs.yml
 ```
 
 The MkDocs command requires MkDocs Material to be available in the developer's
-environment. The current flake exposes test, coverage, and lint apps but does
-not expose a docs app.
+environment. The current flake exposes `test-core`, `test`, `coverage`, and
+`lint` apps but does not expose a docs app.
 
 Documentation changes should keep README.md as a short entry point and put
 detail in docs/src. Use one H1 per page, H2 and H3 headings, tagged code
@@ -49,7 +63,7 @@ files.
 | network/ | Optional native SBCL TCP, DNS, and HTTP/1 listener service |
 | t/ | Tests and test-system definitions |
 | docs/src/ | Published documentation pages and assets |
-| flake.nix | Development shell and test, coverage, and lint apps |
+| flake.nix | Development shell and test-core, test, coverage, and lint apps |
 
 ## Review checklist
 

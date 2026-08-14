@@ -37,8 +37,13 @@ by an application or a test:
   (let ((response
           (http-kit:send-recorded-http-request session request)))
     (list (http-kit:http-response-status response)
+          (http-kit:http-request-summary request)
+          (http-kit:http-response-summary response)
           (http-kit:http-response-body response))))
-;; => (200 #(79 75))
+;; => (200
+;;     "GET https://example.test/health headers=0 trailers=0 body-bytes=0"
+;;     "HTTP/1.1 200 OK headers=1 trailers=0 body-bytes=2"
+;;     #(79 75))
 ```
 
 ## Install
@@ -63,6 +68,7 @@ for the package layout and transport integration boundary.
 | cl-http-kit/http3 | HTTP/3 frames, SETTINGS, QPACK static/literal/Huffman codecs with caller-owned dynamic tables, and injected-QUIC client/request-stream server-session boundaries |
 | cl-http-kit/network | Optional SBCL TCP/DNS stream opener, IPv4/IPv6 listener, and HTTP/1 listener service |
 | cl-http-kit/observability | Request and error counters backed by cl-observability-kit |
+| cl-http-kit/test-core | Internal core-only test runner without optional subsystems |
 | cl-http-kit/test | Internal test runner for the core and optional systems |
 
 ## Documentation
@@ -79,11 +85,20 @@ for the package layout and transport integration boundary.
 
 ```sh
 nix develop
+nix run .#test-core
 nix run .#test
 nix run .#coverage
 nix run .#lint
 nix flake check --all-systems
 ```
+
+`.#test-core` is the deterministic gate for the core-only suite, while
+`.#test` runs the full registered test system. `.#lint` uses paredit-cli's
+structural Lisp inspection, while `.#coverage` runs cl-weave with expression
+and branch thresholds and writes the report below `coverage/`. Coverage
+instrumentation can be more expensive than the test run; set
+`CL_HTTP_KIT_COVERAGE_TIMEOUT_SECONDS` when running it in a slower
+environment.
 
 The documentation build is described in
 [Project Development](https://nerima-lisp.github.io/cl-http-kit/project/development/).

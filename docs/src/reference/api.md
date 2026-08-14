@@ -557,10 +557,6 @@ Return the scheme-and-authority origin for a URI.
 
 Return true when two URIs have the same origin.
 
-### `http-utf8-octets`
-
-Encode a string as its UTF-8 octet vector.
-
 ### `http-percent-encode`
 
 Encode a string for URI use. The signature is
@@ -939,6 +935,11 @@ max-header-bytes max-body-bytes on-request on-response). Exactly one
 of transport-function, open-stream, or connection-pool must be supplied.
 The connection pool owns pooled stream opening and closing; close-stream is
 optional for the direct stream transport boundary.
+
+The injected transport-function must accept the complete keyword boundary used
+by the client, including timeout, deadline, limits, proxy context, request-body
+callbacks, response callbacks, and collect-body-p. Partial legacy keyword
+signatures are intentionally unsupported.
 
 ### `http-client-transport-function`
 
