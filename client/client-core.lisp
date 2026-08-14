@@ -4,6 +4,7 @@
     (&key transport-function open-stream close-stream connection-pool
           (default-headers nil)
           (cookie-jar (make-http-cookie-jar))
+          cookie-partition-key cookie-same-site-context
           (cache nil)
           (redirect-policy (make-http-redirect-policy))
           (retry-policy (make-http-retry-policy))
@@ -66,6 +67,19 @@ RESOLVE-HOST customize the injected stream boundary when OPEN-STREAM is used."
     (%ensure-function on-response "The response hook must be a function."))
   (unless (http-cookie-jar-p cookie-jar)
     (%client-protocol-error "The client cookie jar must be an HTTP-COOKIE-JAR." cookie-jar))
+  (when (and cookie-partition-key
+             (or (not (stringp cookie-partition-key))
+                 (string= cookie-partition-key "")))
+    (%client-protocol-error
+     "The client cookie partition key must be a non-empty string or NIL."
+     cookie-partition-key))
+  (when (and cookie-same-site-context
+             (not (member cookie-same-site-context
+                         '(:same-site :cross-site)
+                         :test #'string-equal)))
+    (%client-protocol-error
+     "The client cookie SameSite context must be SAME-SITE, CROSS-SITE, or NIL."
+     cookie-same-site-context))
   (when cache
     (unless (http-cache-p cache)
       (%client-protocol-error "The client cache must be an HTTP-CACHE." cache)))
@@ -100,6 +114,8 @@ RESOLVE-HOST customize the injected stream boundary when OPEN-STREAM is used."
      :connection-pool connection-pool
      :default-headers (%client-normalize-headers default-headers)
      :cookie-jar cookie-jar
+     :cookie-partition-key cookie-partition-key
+     :cookie-same-site-context cookie-same-site-context
      :cache cache
      :redirect-policy redirect-policy
      :retry-policy retry-policy

@@ -103,12 +103,28 @@
    #:http-cookie-same-site
    #:http-cookie-host-only-p
    #:http-cookie-creation-time
+   #:http-cookie-partitioned-p
+   #:http-cookie-partition-key
    #:http-cookie-jar
    #:make-http-cookie-jar
    #:http-cookie-jar-cookies
    #:http-cookie-jar-accept-response
    #:http-cookie-jar-cookie-header
    #:http-cookie-jar-clear
+   ;; Content coding
+   #:http-content-coding
+   #:http-content-coding-p
+   #:make-http-content-coding
+   #:http-content-coding-name
+   #:http-content-coding-encoder
+   #:http-content-coding-decoder
+   #:parse-http-accept-encoding
+   #:http-select-content-coding
+   #:http-content-coding-encode
+   #:http-content-coding-decode
+   ;; Protocol negotiation
+   #:http-alpn-protocol-name
+   #:http-select-protocol
    ;; Policies
    #:http-redirect-policy
    #:make-http-redirect-policy
@@ -187,6 +203,8 @@
    #:http-client-connection-pool
    #:http-client-default-headers
    #:http-client-cookie-jar
+   #:http-client-cookie-partition-key
+   #:http-client-cookie-same-site-context
    #:http-client-cache
    #:http-client-redirect-policy
    #:http-client-retry-policy

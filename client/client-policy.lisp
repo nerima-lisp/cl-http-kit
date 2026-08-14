@@ -17,7 +17,10 @@
     (let ((cookie-value
             (http-cookie-jar-cookie-header
              (http-client-cookie-jar client)
-             (http-request-uri request))))
+             (http-request-uri request)
+             :partition-key (http-client-cookie-partition-key client)
+             :same-site-context (http-client-cookie-same-site-context client)
+             :method (http-request-method request))))
       (when cookie-value
         (setf headers (%client-header-set headers "Cookie" cookie-value))))
     (when (and (http-client-auth-provider client)

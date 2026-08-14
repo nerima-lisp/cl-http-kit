@@ -95,6 +95,46 @@
                   (http-cookie-jar-cookie-header
                    jar "http://other.example/dashboard" :now 1001))))
 
+(deftest client-cookie-jar-enforces-partitioning-and-prefixes
+  (let* ((jar (make-http-cookie-jar :clock-function (lambda () 1000)))
+         (partition-key "https://top.example")
+         (response (client-test-response
+                    200
+                    :headers
+                    (list (make-http-header
+                           "Set-Cookie"
+                           "__Host-sid=abc; Secure; Path=/; SameSite=None; Partitioned")
+                          (make-http-header
+                           "Set-Cookie"
+                           "__Host-bad=def; Path=/")
+                          (make-http-header
+                           "Set-Cookie"
+                           "insecure=ghi; Path=/; SameSite=None")))))
+    (http-cookie-jar-accept-response
+     jar "https://example.test/login" response
+     :now 1000
+     :partition-key partition-key)
+    (ensure-equal "__Host-sid=abc"
+                  (http-cookie-jar-cookie-header
+                   jar "https://example.test/dashboard"
+                   :now 1001
+                   :partition-key partition-key
+                   :same-site-context :same-site
+                   :method "GET"))
+    (ensure-equal nil
+                  (http-cookie-jar-cookie-header
+                   jar "https://example.test/dashboard"
+                   :now 1001
+                   :partition-key "https://other.example"
+                   :same-site-context :same-site
+                   :method "GET"))
+    (ensure-equal nil
+                  (http-cookie-jar-cookie-header
+                   jar "https://example.test/dashboard"
+                   :now 1001
+                   :same-site-context :same-site
+                   :method "GET"))))
+
 (deftest client-cache-integration
   (let ((calls 0)
         (cache (make-http-cache :clock-function (lambda () 1000))))
@@ -151,6 +191,123 @@
       (ensure-equal "HEAD" (http-request-method head-request))
       (ensure-equal 200 (http-response-status response)))
     (ensure-equal 2 (length (http-cache-entries cache)))))
+
+(deftest client-content-coding-selection
+  (let* ((adapter (make-http-content-coding
+                   :name "br"
+                   :decoder #'identity))
+         (parsed (parse-http-accept-encoding "gzip;q=0.1, br;q=0.8, identity;q=0")))
+    (ensure-equal '(("gzip" . 0.1) ("br" . 0.8) ("identity" . 0))
+                  parsed)
+    (ensure-true (eq adapter
+                     (http-select-content-coding
+                      "gzip;q=0.1, br;q=0.8, identity;q=0"
+                      (list "gzip" adapter))))
+    (ensure-equal nil
+                  (http-select-content-coding
+                   "gzip;q=0, *;q=0, identity;q=0"
+                   (list "gzip" adapter)))
+    (ensure-equal "identity"
+                  (http-select-content-coding
+                   ""
+                   (list "gzip" adapter)))
+    (ensure-equal nil
+                  (http-select-content-coding
+                   "gzip;q=0.5"
+                   (list "br" adapter)))))
+
+(deftest client-protocol-alpn-selection
+  (ensure-equal "http/1.1" (http-alpn-protocol-name :http1))
+  (ensure-equal "h2" (http-alpn-protocol-name "HTTP2"))
+  (ensure-equal "h3" (http-alpn-protocol-name "http-3"))
+  (ensure-equal nil (http-alpn-protocol-name "spdy"))
+  (ensure-equal "h2"
+                (http-select-protocol
+                 '("spdy/3" "h2" "http/1.1")
+                 '(:http1 :http2))))
+
+(deftest client-cache-request-directives
+  (let* ((cache (make-http-cache :clock-function (lambda () 1000)))
+         (request (make-http-request
+                   :method "GET"
+                   :uri "http://example.test/cache"))
+         (response (client-test-response
+                    200
+                    :headers (list (make-http-header
+                                    "Cache-Control" "max-age=1"))
+                    :body (ascii "cached"))))
+    (http-cache-store cache request response :now 1000)
+    (multiple-value-bind (cached-response state entry)
+        (http-cache-lookup
+         cache
+         (make-http-request
+          :method "GET"
+          :uri "http://example.test/cache"
+          :headers (list (make-http-header "Cache-Control" "max-stale=10")))
+         :now 1005)
+      (declare (ignore entry))
+      (ensure-equal :stale-allowed state)
+      (ensure-equal "cached"
+                    (octets-as-string (http-response-body cached-response))))
+    (multiple-value-bind (cached-response state entry)
+        (http-cache-lookup
+         cache
+         (make-http-request
+          :method "GET"
+          :uri "http://example.test/cache"
+          :headers (list (make-http-header "Cache-Control" "no-store")))
+         :now 1001)
+      (declare (ignore cached-response entry))
+      (ensure-equal :miss state))))
+
+(deftest client-cache-revalidation-refreshes-stored-response
+  (let ((calls 0)
+        (seen-if-none-match nil)
+        (seen-bodies nil)
+        (now 1000))
+    (with-test-client (client
+                       (lambda (request &key proxy-plan &allow-other-keys)
+                         (declare (ignore proxy-plan))
+                         (incf calls)
+                         (setf seen-if-none-match
+                               (http-header-value
+                                (http-request-headers request)
+                                "If-None-Match"))
+                         (if (= calls 1)
+                             (client-test-response
+                              200
+                              :headers (list (make-http-header "ETag" "\"v1\"")
+                                             (make-http-header
+                                              "Cache-Control" "max-age=0"))
+                              :body (ascii "cached"))
+                             (client-test-response
+                              304
+                              :headers (list (make-http-header
+                                              "Cache-Control" "max-age=60")))))
+                       :cache (make-http-cache :clock-function (lambda () now)))
+      (let ((request (http-client-request client "GET"
+                                          "http://example.test/resource")))
+        (multiple-value-bind (response effective)
+            (http-client-send client request)
+          (ensure-equal 200 (http-response-status response))
+          (ensure-equal request effective))
+        (setf now 1001)
+        (multiple-value-bind (response effective)
+            (http-client-send client request)
+          (ensure-equal 200 (http-response-status response))
+          (ensure-equal request effective)
+          (ensure-equal "cached" (octets-as-string (http-response-body response))))
+        (ensure-equal "\"v1\"" seen-if-none-match)
+        (setf now 1002)
+        (multiple-value-bind (response effective)
+            (http-client-send
+             client request
+             :on-body-chunk (lambda (chunk)
+                              (push (octets-as-string chunk) seen-bodies)))
+          (ensure-equal 200 (http-response-status response))
+          (ensure-equal request effective))
+        (ensure-equal 2 calls)
+        (ensure-equal '("cached") seen-bodies))))
 
 (deftest client-proxy-plans
   (let ((proxy (make-http-proxy :scheme :http

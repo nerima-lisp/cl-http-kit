@@ -110,7 +110,8 @@
               (http-cookie-jar-accept-response
                (http-client-cookie-jar client)
                (http-request-uri request)
-               response)
+               response
+               :partition-key (http-client-cookie-partition-key client))
               (if (and (< attempt max-attempts)
                        retryable-request-p
                        (%client-retry-status-p policy response))

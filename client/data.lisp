@@ -203,7 +203,9 @@ character in that range is a decimal digit, apart from an optional sign when
   http-only-p
   same-site
   host-only-p
-  creation-time)
+  creation-time
+  partitioned-p
+  partition-key)
 
 (defstruct (http-cookie-jar
              (:constructor %make-http-cookie-jar)
@@ -258,6 +260,8 @@ character in that range is a decimal digit, apart from an optional sign when
   connection-pool
   (default-headers nil)
   cookie-jar
+  cookie-partition-key
+  cookie-same-site-context
   cache
   redirect-policy
   retry-policy
