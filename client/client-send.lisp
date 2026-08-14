@@ -9,7 +9,7 @@
 
 (defun %client-deliver-body-chunk (response on-body-chunk)
   (let ((body (http-response-body response)))
-    (when (and on-body-chunk (consp body))
+    (when (and on-body-chunk body)
       (funcall on-body-chunk body)))
   response)
 
@@ -70,6 +70,11 @@ resent across same-method redirects."
           (when (http-client-on-response client)
             (funcall (http-client-on-response client) response current-request 0))
           (return-from http-client-send (values response current-request)))
+        (when (eq state :stale-allowed)
+          (%client-deliver-body-chunk response on-body-chunk)
+          (when (http-client-on-response client)
+            (funcall (http-client-on-response client) response current-request 0))
+          (return-from http-client-send (values response current-request)))
         (when (eq state :stale)
           (setf stale-entry entry
                 current-request (%client-conditional-request
@@ -89,11 +94,13 @@ resent across same-method redirects."
                                  :request-body-length request-body-length
                                  :on-body-chunk on-body-chunk
                                  :on-information on-information
-                                 :collect-body-p collect-body-p)))
+                                 :collect-body-p collect-body-p))
+              (revalidated-p nil))
           (when (and stale-entry (= (http-response-status response) 304))
             (setf response (%client-response-merge-304
                             (http-cache-entry-response stale-entry)
-                            response))
+                            response)
+                  revalidated-p t)
             (%client-deliver-body-chunk response on-body-chunk))
           (let* ((redirect-request
                    (and (member (http-response-status response)
@@ -129,5 +136,10 @@ resent across same-method redirects."
                                  (%client-mutating-method-p current-request))
                         (http-cache-clear (http-client-cache client)))))
                 (progn
-                  (%client-store-response client prepared response)
+                  (if revalidated-p
+                      (when (http-client-cache client)
+                        (http-cache-store (http-client-cache client)
+                                          prepared
+                                          response))
+                      (%client-store-response client prepared response))
                   (return (values response prepared))))))))))

@@ -99,16 +99,35 @@
                              (string= "GET" (http-cache-entry-method entry))))
                       (%http-cache-entries cache))))))
 
+(defun %cache-min-fresh-failed-p (entry request now)
+  (let ((min-fresh (%cache-request-min-fresh request)))
+    (and min-fresh
+         (< (- (http-cache-entry-expires-at entry) now)
+            min-fresh))))
+
+(defun %cache-stale-allowed-p (entry request now)
+  (let ((max-stale (%cache-request-max-stale request)))
+    (and max-stale
+         (>= now (http-cache-entry-expires-at entry))
+         (not (%cache-request-no-cache-p request))
+         (not (%cache-response-must-revalidate-p
+               (http-response-headers (http-cache-entry-response entry))))
+         (or (eq max-stale :unbounded)
+             (<= (- now (http-cache-entry-expires-at entry))
+                 max-stale)))))
+
 (defun http-cache-lookup (cache request &key now)
   "Look up REQUEST and return (VALUES RESPONSE STATE ENTRY).
 
-STATE is :FRESH, :STALE, or :MISS.  ENTRY is an opaque snapshot useful to
-the client implementation for conditional revalidation."
+STATE is :FRESH, :STALE, :STALE-ALLOWED, or :MISS.  ENTRY is an opaque
+snapshot useful to the client implementation for conditional revalidation."
   (unless (http-cache-p cache)
     (%client-protocol-error "Expected an HTTP-CACHE value." cache))
   (unless (http-request-p request)
     (%client-protocol-error "Cache lookup requires an HTTP-REQUEST." request))
   (unless (member (http-request-method request) '("GET" "HEAD") :test #'string=)
+    (return-from http-cache-lookup (values nil :miss nil)))
+  (when (%cache-request-no-store-p request)
     (return-from http-cache-lookup (values nil :miss nil)))
   (let* ((now (or now (funcall (%http-cache-clock-function cache))))
          (entry (%cache-find-entry cache request)))
@@ -118,11 +137,20 @@ the client implementation for conditional revalidation."
           (cons entry
                 (delete entry (%http-cache-entries cache))))
     (setf (http-cache-entry-accessed-at entry) now)
-    (if (< now (http-cache-entry-expires-at entry))
-        (values (%cache-entry-response-for-request entry request)
-                :fresh
-                (%cache-copy-entry entry))
-        (values nil :stale (%cache-copy-entry entry)))))
+    (let ((copy (%cache-copy-entry entry)))
+      (cond
+        ((and (< now (http-cache-entry-expires-at entry))
+              (not (%cache-request-no-cache-p request))
+              (not (%cache-min-fresh-failed-p entry request now)))
+         (values (%cache-entry-response-for-request entry request)
+                 :fresh
+                 copy))
+        ((%cache-stale-allowed-p entry request now)
+         (values (%cache-entry-response-for-request entry request)
+                 :stale-allowed
+                 copy))
+        (t
+         (values nil :stale copy))))))
 
 (defun %cache-remove-key (cache key &optional method)
   (setf (%http-cache-entries cache)
@@ -144,23 +172,23 @@ the client implementation for conditional revalidation."
   (let* ((method (http-request-method request))
          (now (or now (funcall (%http-cache-clock-function cache))))
          (headers (http-response-headers response))
-         (vary (%cache-vary-fields headers)))
+         (vary (%cache-vary-fields headers))
+         (directives (%cache-control-directives headers))
+         (request-no-store-p (%cache-request-no-store-p request))
+         (public-p (%cache-directive-present-p directives "public")))
     (unless (and (member method '("GET" "HEAD") :test #'string=)
                  (%cache-valid-status-p (http-response-status response))
                  (not (eq vary :star))
-                 (not (%cache-directive (%cache-control-directives headers)
-                                        "no-store"))
+                 (not request-no-store-p)
+                 (not (%cache-directive-present-p directives "no-store"))
                  (not (and (http-header-present-p headers "Set-Cookie")
-                           (not (%cache-directive
-                                 (%cache-control-directives headers)
-                                 "public"))))
+                           (not public-p)))
                  (multiple-value-bind (authorization-present)
                      (values (http-header-present-p
                               (http-request-headers request)
                               "Authorization"))
                    (or (not authorization-present)
-                       (%cache-directive (%cache-control-directives headers)
-                                         "public"))))
+                       public-p)))
       (return-from http-cache-store nil))
     (multiple-value-bind (cacheable-p expires-at)
         (%cache-freshness response now)
