@@ -119,6 +119,8 @@
   :components ((:file "package")
                (:file "conditions")
                (:file "data")
+               (:file "content-coding")
+               (:file "protocol")
                (:file "form")
                (:file "multipart")
                (:file "multipart-serialize")
