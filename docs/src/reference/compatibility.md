@@ -62,6 +62,8 @@ serve-http2-session provides the corresponding server-side session boundary
 over a caller-supplied binary stream. It handles the HTTP/2 preface, SETTINGS,
 HPACK, stream state, flow control, request bodies, response framing, and
 session limits; it does not accept sockets or provide TLS/ALPN negotiation.
+HPACK Huffman strings use the RFC 7541 Appendix B code table for encoding and
+decoding.
 
 ## HTTP/3
 
