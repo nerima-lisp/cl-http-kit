@@ -16,7 +16,8 @@ that the core cannot safely construct.
 
 The response parser supports:
 
-- informational responses, except for the unsupported protocol switch status;
+- informational responses and the terminal 101 protocol-switch response,
+  leaving upgraded bytes unread;
 - fixed-length bodies with exact byte accounting;
 - chunked bodies and trailers;
 - close-delimited bodies;
@@ -42,12 +43,19 @@ supports it.
 The HTTP/2 connection API supports reusable, owner-thread connections,
 stream-id allocation, request multiplexing within a batch, flow-controlled
 request and response bodies, GOAWAY/draining state, and an optional
-`http2-connection-manager` with origin-keyed reuse and an LRU connection cap.
+`http2-connection-manager` with origin-keyed reuse, an LRU connection cap, and
+optional idle expiry and maximum connection lifetime. The manager can retry once on a new connection when a
+peer explicitly reports that an unstreamed request was not processed through
+GOAWAY or `REFUSED_STREAM`; body producers are never replayed automatically.
 The manager is cooperative and callback-driven: the application still
-provides the stream, socket, TLS, ALPN, proxy negotiation, and retry policy.
-The peer must send a non-ACK `SETTINGS` frame first; server push and protocol
-switching are unsupported. Unknown extension frames are ignored as permitted
-by HTTP/2. Unsupported features are reported with
+provides the stream, socket, TLS, ALPN, proxy negotiation, and broader retry
+policy.
+The peer must send a non-ACK `SETTINGS` frame first. RFC 8441 Extended CONNECT
+is supported when the peer advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL`;
+HTTP/1.1-style `101 Switching Protocols` is not valid on HTTP/2. The client
+advertises `SETTINGS_ENABLE_PUSH=0`; a subsequent `PUSH_PROMISE` is rejected as
+`PROTOCOL_ERROR`. Unknown extension frames are ignored as permitted by HTTP/2.
+Unsupported features are reported with
 `HTTP-UNSUPPORTED-FEATURE`.
 
 serve-http2-session provides the corresponding server-side session boundary
@@ -62,13 +70,30 @@ request-stream framing over callbacks supplied by a QUIC implementation. It
 supports a client and serve-http3-request-stream for one injected server
 request stream, including request/response headers and trailers, DATA frames,
 content-length checks, static and literal QPACK field sections, HPACK Huffman
-strings, and caller-owned QPACK dynamic-table references.
+strings, caller-owned QPACK dynamic-table references, and Extended CONNECT
+`:protocol` pseudo-headers for transports that negotiate the capability.
+The client connection manager reuses injected QUIC clients by origin and
+supports LRU capacity, idle expiry, and maximum connection lifetime policies.
+Its high-level transport adapter supports in-memory and streaming request
+bodies plus response-body and ordered informational-response callbacks; proxy
+routing currently raises an explicit unsupported error. Per-request response
+header-byte, field-count, and body limits can be stricter than the retained
+connection defaults.
 
 The boundary does not provide QUIC packets, loss recovery, congestion control,
-TLS 1.3, ALPN, native sockets, peer unidirectional-stream acceptance,
-connection-level stream dispatch, automatic QPACK instruction-stream
-synchronization, or a native HTTP/3 server. Those capabilities must be
-supplied by the surrounding transport.
+TLS 1.3, ALPN, native sockets, a connection-level accept loop, or a native
+HTTP/3 server. The injected
+transport can pass accepted peer unidirectional streams to
+`accept-http3-peer-unidirectional-stream` for fragmented-prefix classification
+and control/QPACK attachment, or to
+`process-http3-peer-unidirectional-stream` to classify and apply the first
+control or QPACK input. It remains responsible for accepting streams, invoking
+the matching reader on later readiness notifications, and discarding unknown
+extension streams.
+The client can advertise `MAX_PUSH_ID`, receive promised responses on injected
+push streams, and cancel pushes. The server boundary can emit a push promise
+and its matching push stream when the surrounding QUIC transport supplies the
+required callbacks.
 Invalid or deliberately unsupported protocol features raise public protocol or
 unsupported-feature conditions.
 
@@ -79,8 +104,57 @@ cookie, cache, content-coding selection, ALPN protocol-name, proxy, redirect,
 retry, and HTTP/1.1 connection-pool policies around core messages. The pool is
 an owner-thread, callback-driven boundary;
 applications still provide the transport function or stream callbacks. The
-optional network system can provide native TCP and DNS setup on SBCL, while
-TLS and ALPN remain application-owned.
+optional network system can provide native TCP and DNS setup on SBCL. The
+separate `cl-http-kit/tls` system provides cl+ssl client and server wrappers;
+server-certificate verification in the client wrapper defaults to required
+and the request host is passed as cl+ssl's hostname, while trust-root setup,
+alternate certificate policy, and ALPN-based protocol dispatch remain
+application-owned.
+Origin 401 and proxy 407 challenges are parsed with the RFC 9110
+challenge grammar and can be answered by separate provider callbacks. Each
+provider receives at most one safe replay opportunity; streamed responses and
+non-replayable request bodies suppress automatic origin or forward-proxy
+replay. A rejected CONNECT tunnel is closed and reopened at most once when the
+proxy provider supplies credentials for its parsed challenge.
+The client enables an in-memory RFC 6797 HSTS store by default. Valid secure
+responses can add, replace, expire, or remove host policies; matching HTTP
+requests and redirect targets are upgraded before transport selection. IP
+literals and insecure responses cannot establish policy. Applications can
+inject a store to retain policy across client instances, clear it explicitly,
+or pass `:strict-transport-store nil` to disable HSTS.
+The client also enables an in-memory RFC 7838 alternative-service store by
+default. It learns valid `Alt-Svc` response fields, accounts for `Age`, applies
+the default `ma`, handles `clear`, expiry, and `persist=1`, and can discard
+non-persistent alternatives when the network changes. Applications select from
+the discovered services and remove a rejected service after a 421 response.
+The client does not automatically reroute requests: the transport boundary must
+authenticate the certificate for the origin, send the origin as TLS SNI, and
+preserve proxy policy before an alternative can be used safely. Pass
+`:alternative-service-store nil` to disable discovery.
+Collected client responses automatically decode `gzip` and `deflate`
+`Content-Encoding` values, including stacked codings, and remove stale
+`Content-Encoding` and `Content-Length` fields. Decoding can be disabled with
+`:automatic-decompression-p nil`. Additional codings such as `br` and `zstd`
+can be supplied as decoder functions without imposing compression-library
+dependencies on the core system. Eligible requests advertise the registered
+codings with `Accept-Encoding` unless the caller supplies that field. The configured body limit is checked against
+both transport bytes and each decoded representation, and bounded decoding stops
+before allocating an unbounded expanded body. Streaming body callbacks
+receive the encoded transport bytes and remain application-owned.
+The private response cache honors RFC 5861 `stale-if-error` on requests and
+responses after retries are exhausted for 500, 502, 503, 504, timeout, and
+connection errors. Cache fallback eligibility is independent of whether the
+retry policy retries those conditions. This fallback is limited to collected responses because a
+streaming callback might already have observed bytes from the failed response.
+RFC 5861 `stale-while-revalidate` is supported when a
+`:stale-while-revalidate-scheduler` is configured. The scheduler receives a
+revalidation function and owns asynchronous execution and duplicate-request
+coalescing; returning false makes the request perform normal synchronous
+validation. Serving stale updates `Age`, honors the response window, and is
+suppressed by explicit request revalidation directives.
+Fresh authenticated responses also honor RFC 8246 `immutable` for ordinary
+`max-age=0` reloads. The extension is ignored for plain HTTP and for explicit
+`no-cache` force reloads.
 
 The cookie layer enforces host-only, prefix, SameSite, and partitioned-cookie
 constraints and lets the request path provide SameSite context and a top-level
@@ -108,14 +182,23 @@ an already-open stream and leave that stream available for frame I/O. The
 frame API exposes masking explicitly: callers
 must supply masking keys or a per-frame key function when producing masked
 frames. It does not open sockets, perform TLS or ALPN, or negotiate
-extensions. Client handshake key generation and connection lifecycle remain
-application-owned.
+extensions. Extension fields use strict RFC 6455 token and quoted-string
+parsing, and RFC 7692 `permessage-deflate` offer/response parameters are
+validated. The client handshake returns normalized negotiated extensions as
+its third value. Message reads and writes accept application-provided raw
+DEFLATE codec functions; only this explicit opt-in permits RSV1, and expanded
+messages remain subject to the configured size limit. The codec owns context
+takeover, window settings, and the RFC 7692 DEFLATE tail transformation.
+`make-websocket-client-key` validates and Base64-encodes 16 octets
+from an application-supplied cryptographically secure random source;
+`make-websocket-upgrade-request` can invoke that source directly. The entropy
+source itself and connection lifecycle remain application-owned.
 
 serve-websocket-session serves an already-upgraded stream: it requires masked
 client frames by default, automatically answers Ping frames, echoes a valid
 peer Close frame, dispatches complete messages to a handler, and closes with
 an appropriate protocol or size code on errors. It does not open sockets,
-perform TLS or ALPN, negotiate extensions, or generate client handshake keys.
+perform TLS or ALPN, or choose extension and codec policy.
 
 ## Native network boundary
 
@@ -123,9 +206,10 @@ perform TLS or ALPN, negotiate extensions, or generate client handshake keys.
 DNS resolution and deadline-aware connect/read operations. It also provides
 an IPv4/IPv6 listening socket boundary: `open-http-tcp-listener` binds and
 listens, `accept-http-tcp-stream` accepts one binary stream and returns peer
-address metadata, and `close-http-tcp-listener` closes the listener. It
-intentionally does not implement TLS, ALPN, or proxy negotiation, so those
-concerns remain replaceable callbacks at the application boundary.
+address metadata, and `close-http-tcp-listener` closes the listener. It keeps
+TLS, ALPN, and proxy negotiation outside the socket opener. Applications can
+compose the separate `cl-http-kit/tls` cl+ssl wrappers around accepted or
+connected streams while retaining control of certificate and protocol policy.
 
 serve-http1-listener combines accept and serve-http1-session dispatch for a
 caller-owned listener, with connection limits and accept/error callbacks.

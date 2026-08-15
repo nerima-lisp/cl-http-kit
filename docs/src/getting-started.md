@@ -102,9 +102,15 @@ HTTP/1 session dispatch for the requested number of connections; applications
 that need HTTP/2 or protocol selection can keep using
 `accept-http-tcp-stream` and dispatch to `serve-http2-session` themselves.
 
-This boundary deliberately does not negotiate TLS, ALPN, or proxies. Supply
-those policies through the client's callbacks or use an application-owned
-transport when they are required.
+The socket boundary itself does not negotiate TLS, ALPN, or proxies. To wrap
+its binary streams with cl+ssl, load `cl-http-kit/tls` and compose
+`http-kit/tls:make-http-tls-upgrader` with the client opener or
+`http-kit/tls:make-http-tls-server-wrapper` with accepted server streams. The
+client wrapper defaults to `:verify :required` and passes the request host as
+cl+ssl's `:hostname` argument. Applications still own trust-root setup,
+client-certificate policy, the advertised ALPN protocol list, and dispatch
+after ALPN selection. The server wrapper requires both a certificate and its
+private key.
 
 ## Optional systems
 
@@ -116,9 +122,16 @@ stream:
 (asdf:load-system "cl-http-kit/client")
 ```
 
-The client system adds URI, authentication, cookie, cache, proxy, redirect,
-and retry policies around the core messages. It still receives an
-application-provided transport function or stream callback.
+The client system adds URI, authentication, RFC 9110 challenge parsing and safe
+single-retry origin and forward-proxy authentication, cookie, cache, proxy,
+redirect, and retry policies around the core messages. Collected response bodies are
+automatically decoded for `gzip` and `deflate` content codings, and eligible
+requests advertise those codings with `Accept-Encoding`; pass
+`:automatic-decompression-p nil` to `make-http-client` to retain the encoded
+body. The body-size limit is enforced while decoding, so compressed responses
+cannot allocate an unbounded expanded body. Streaming body callbacks
+receive transport bytes and are not automatically decoded. The client still
+receives an application-provided transport function or stream callback.
 
 Load HTTP/3 request-stream support when the application supplies QUIC stream
 callbacks with ASDF system cl-http-kit/http3.

@@ -63,10 +63,11 @@ for the package layout and transport integration boundary.
 | System | Purpose |
 | --- | --- |
 | cl-http-kit | HTTP message model, HTTP/1.1 wire format, HTTP/1.x server sessions, transport callbacks, deadlines, limits, conditions, and recording sessions |
-| cl-http-kit/client | URI, authentication, cookies, cache, content-coding selection, ALPN protocol helpers, proxy, redirect, retry, HTTP/1.1 connection-pool, multipart body, Server-Sent Events, and WebSocket client/server-session policies |
+| cl-http-kit/client | URI, authentication, cookies, RFC 6797 HSTS, RFC 7838 Alt-Svc discovery, RFC 9111 cache with RFC 5861 `stale-if-error`, proxy, redirect, retry, gzip/deflate response decoding, HTTP/1.1 connection-pool, multipart body, Server-Sent Events, and WebSocket client/server-session policies |
 | cl-http-kit/http2 | HTTP/2 client and injected-stream server-session boundaries |
 | cl-http-kit/http3 | HTTP/3 frames, SETTINGS, QPACK static/literal/Huffman codecs with caller-owned dynamic tables, and injected-QUIC client/request-stream server-session boundaries |
 | cl-http-kit/network | Optional SBCL TCP/DNS stream opener, IPv4/IPv6 listener, and HTTP/1 listener service |
+| cl-http-kit/tls | Optional cl+ssl client/server TLS stream wrappers with certificate verification and ALPN |
 | cl-http-kit/observability | Request and error counters backed by cl-observability-kit |
 | cl-http-kit/test-core | Internal core-only test runner without optional subsystems |
 | cl-http-kit/test | Internal test runner for the core and optional systems |
@@ -119,13 +120,19 @@ references over caller-provided QUIC streams;
 QUIC packets, loss recovery, congestion control, TLS 1.3, ALPN, sockets, and
 native HTTP/3 connection/server acceptance remain outside that boundary. The
 optional `cl-http-kit/network` system supplies native TCP, DNS, and an HTTP/1
-listener service on SBCL; TLS, ALPN, and application-specific proxy
-negotiation remain callback policies. The optional client system also supplies
+ listener service on SBCL; `cl-http-kit/tls` supplies cl+ssl-backed TLS upgrade
+ and accepted-stream wrappers (usable with `serve-http1-listener`'s
+ `:stream-wrapper`) while keeping TLS optional. ALPN selection remains
+ an explicit client option, and application-specific proxy negotiation remains a
+ callback policy. The optional client system also supplies
 an owner-thread HTTP/1.1 connection pool and RFC 6455 frame, message,
 close-payload, HTTP upgrade, client-side 101 handshake, and upgraded server
-session helpers. WebSocket key generation, dialing, TLS/ALPN, extension
-negotiation, and masking-key generation remain application-owned; the server
-session handles Ping/Pong and the close handshake it owns.
+session helpers. WebSocket extension grammar and RFC 7692 negotiation
+parameters are validated, with application-injected compression codecs for
+negotiated message processing. WebSocket key generation, dialing, TLS/ALPN,
+extension selection, codec state, and masking-key generation remain
+application-owned; the server session handles Ping/Pong and the close
+handshake it owns.
 
 ## Support
 
