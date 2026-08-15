@@ -26,6 +26,11 @@
       (%h2-put-u32 payload 0 increment)
       (%h2-send-control writer +http2-window-update-type+ 0 stream-id payload))))
 
+(defun %h2-send-rst-stream (writer stream-id error-code)
+  (let ((payload (make-array 4 :element-type '(unsigned-byte 8))))
+    (%h2-put-u32 payload 0 error-code)
+    (%h2-send-control writer +http2-rst-stream-type+ 0 stream-id payload)))
+
 (defun %h2-validate-settings-frame (frame writer)
   (unless (zerop (%h2-frame-stream-id frame))
     (error 'http-kit:http-protocol-error
@@ -49,7 +54,8 @@
 (defun %h2-control-frame-p (type)
   (member type (list +http2-settings-type+ +http2-ping-type+
                      +http2-window-update-type+ +http2-goaway-type+
-                     +http2-rst-stream-type+ +http2-priority-type+)
+                     +http2-rst-stream-type+ +http2-priority-type+
+                     +http2-priority-update-type+)
           :test #'=))
 
 (defun %h2-handle-control-frame (frame writer &optional (expected-stream-id 1))
@@ -132,4 +138,9 @@
        ;; active streams can validate and ignore it without violating the
        ;; wire protocol.
        nil)
+      ((= type +http2-priority-update-type+)
+       (error 'http-kit:http-protocol-error
+              :message "An HTTP/2 server cannot send PRIORITY_UPDATE."
+              :operation :http2-control
+              :detail (list stream-id (length payload))))
       (t nil))))

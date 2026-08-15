@@ -483,7 +483,7 @@ perform TLS or proxy negotiation."
 
   (defun serve-http1-listener
       (listener handler &key max-connections accept-timeout accept-deadline
-                         on-accept on-error (session-options nil)
+                         on-accept on-error stream-wrapper (session-options nil)
                          (clock-function #'%network-monotonic-time))
     "Serve HTTP/1 sessions accepted from LISTENER.
 
@@ -492,7 +492,8 @@ HANDLER and SESSION-OPTIONS are passed to HTTP-KIT:SERVE-HTTP1-SESSION for
 each accepted connection.  SESSION-OPTIONS may contain any session keyword;
 unless it contains :CLOSE-STREAM, the accepted stream is closed by the
 session boundary.  ON-ACCEPT receives STREAM, PEER-ADDRESS, and PEER-PORT.
-ON-ERROR receives CONDITION, PEER-ADDRESS, and PEER-PORT; session errors are
+STREAM-WRAPPER, when supplied, receives STREAM, :TIMEOUT, and :DEADLINE and
+must return the stream passed to the HTTP session.  ON-ERROR receives CONDITION, PEER-ADDRESS, and PEER-PORT; session errors are
 reported and the listener continues accepting, while accept errors are
 re-signaled after the callback.  ACCEPT-TIMEOUT is applied to each accept.
 
@@ -511,6 +512,8 @@ Returns the number of accepted connections and either :MAX-CONNECTIONS or
       (%network-listener-error :serve (list :on-accept on-accept)))
     (unless (or (null on-error) (functionp on-error))
       (%network-listener-error :serve (list :on-error on-error)))
+    (unless (or (null stream-wrapper) (functionp stream-wrapper))
+      (%network-listener-error :serve (list :stream-wrapper stream-wrapper)))
     (unless (%network-keyword-plist-p session-options)
       (%network-listener-error :serve
                                (list :session-options session-options)))
@@ -539,6 +542,15 @@ Returns the number of accepted connections and either :MAX-CONNECTIONS or
                         (incf count)
                         (handler-case
                             (progn
+                              (when stream-wrapper
+                                (setf stream
+                                      (funcall stream-wrapper
+                                               stream
+                                               :timeout accept-timeout
+                                               :deadline accept-deadline)))
+                              (unless (streamp stream)
+                                (%network-listener-error :serve
+                                                         (list :stream-wrapper stream)))
                               (when on-accept
                                 (funcall on-accept
                                          stream peer-address peer-port))
@@ -583,9 +595,9 @@ TLS, ALPN, and proxy negotiation remain policy callbacks at the client layer."
 #-sbcl
 (defun serve-http1-listener
     (listener handler &key max-connections accept-timeout accept-deadline
-                   on-accept on-error session-options
+                   on-accept on-error stream-wrapper session-options
                    (clock-function #'%network-monotonic-time))
   (declare (ignore listener handler max-connections accept-timeout
-                   accept-deadline on-accept on-error session-options
+                   accept-deadline on-accept on-error stream-wrapper session-options
                    clock-function))
   (%network-unsupported))

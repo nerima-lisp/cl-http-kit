@@ -79,7 +79,7 @@
       (%finish-body-collector body))))
 
 (defun %read-chunked-body
-    (source deadline clock-function max-header-bytes max-body-bytes header-used
+    (source deadline clock-function max-header-bytes max-fields max-body-bytes header-used
      &key on-body-chunk (collect-body-p t))
   (let ((body (%make-body-collector collect-body-p))
         (trailers '())
@@ -89,13 +89,10 @@
       (multiple-value-bind (line updated-bytes)
           (%read-crlf-line source deadline clock-function max-header-bytes bytes)
         (setf bytes updated-bytes)
-        (let* ((separator (position #\; line))
-               (size-text (%trim-ows (if separator (subseq line 0 separator) line))))
-          (unless (and (not (string= size-text ""))
-                       (every (lambda (character) (%hex-character-p character))
-                              size-text))
+        (let ((size-text (%http1-chunk-size-text line)))
+          (unless size-text
             (error 'http-protocol-error
-                   :message "A chunk size is not a valid hexadecimal integer."
+                   :message "A chunk size or extension is malformed."
                    :operation :response-parse
                    :detail line))
           (let ((size (parse-integer size-text :radix 16)))
@@ -103,7 +100,8 @@
                 (progn
                   (multiple-value-bind (parsed-trailers trailer-bytes)
                       (%read-response-headers source deadline clock-function
-                                              max-header-bytes bytes)
+                                              max-header-bytes max-fields bytes)
+                    (%validate-http1-trailers parsed-trailers :response-parse)
                     (setf trailers parsed-trailers bytes trailer-bytes))
                   (return))
                 (progn
@@ -113,4 +111,4 @@
                                       :chunk-data body on-body-chunk)
                   (%read-framing-crlf source deadline clock-function)
                   (incf bytes (+ size 2))))))))
-    (values (%finish-body-collector body) trailers)))
+    (values (%finish-body-collector body) trailers body-length)))

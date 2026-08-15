@@ -13,7 +13,10 @@
    #:+http3-push-promise-type+
    #:+http3-goaway-type+
    #:+http3-max-push-id-type+
+   #:+http3-priority-update-request-type+
+   #:+http3-priority-update-push-type+
    #:+http3-control-stream-type+
+   #:+http3-push-stream-type+
    #:+http3-qpack-encoder-stream-type+
    #:+http3-qpack-decoder-stream-type+
    #:+http3-setting-qpack-max-table-capacity+
@@ -31,19 +34,26 @@
    #:http3-frame-payload
    #:encode-http3-frame
    #:decode-http3-frames
+   #:make-http3-priority-update-frame
+   #:decode-http3-priority-update
    #:make-http3-settings-frame
    #:decode-http3-settings
    #:http3-control-state
    #:http3-control-state-p
    #:make-http3-control-state
+   #:http3-control-state-peer-role
    #:http3-control-state-settings-received-p
    #:http3-control-state-settings
    #:http3-control-state-goaway-id
    #:http3-control-state-max-push-id
+   #:http3-control-state-promised-push-ids
    #:http3-control-state-cancelled-push-ids
+   #:http3-control-state-priority-updates
    #:process-http3-control-frame
    #:process-http3-control-bytes
    #:http3-control-stream-prefix
+   #:http3-qpack-encoder-stream-prefix
+   #:http3-qpack-decoder-stream-prefix
    #:qpack-dynamic-entry
    #:qpack-dynamic-entry-p
    #:qpack-dynamic-entry-absolute-index
@@ -60,6 +70,30 @@
    #:qpack-dynamic-table-insert-count
    #:qpack-dynamic-table-set-capacity
    #:qpack-dynamic-table-insert
+   #:qpack-blocked-field-section
+   #:qpack-blocked-field-section-required-insert-count
+   #:qpack-blocked-field-section-current-insert-count
+   #:http3-qpack-decoder-context
+   #:http3-qpack-decoder-context-p
+   #:make-http3-qpack-decoder-context
+   #:http3-qpack-decoder-context-dynamic-table
+   #:http3-qpack-decoder-context-blocked-stream-limit
+   #:http3-qpack-blocked-stream
+   #:http3-qpack-blocked-stream-p
+   #:http3-qpack-blocked-stream-stream-id
+   #:http3-qpack-blocked-stream-required-insert-count
+   #:decode-http3-qpack-field-section
+   #:resume-http3-qpack-blocked-stream
+   #:qpack-decoder-stream-state
+   #:qpack-decoder-stream-state-p
+   #:make-qpack-decoder-stream-state
+   #:qpack-decoder-stream-state-dynamic-table
+   #:qpack-decoder-stream-state-sent-insert-count
+   #:qpack-decoder-stream-state-known-received-count
+   #:qpack-decoder-stream-state-blocked-stream-limit
+   #:qpack-decoder-stream-state-outstanding-sections
+   #:qpack-decoder-stream-state-note-insertions-sent
+   #:qpack-decoder-stream-state-register-section
    #:qpack-encode-set-dynamic-table-capacity
    #:qpack-encode-insert-with-name-reference
    #:qpack-encode-insert-with-literal-name
@@ -75,21 +109,61 @@
    #:http3-client-p
    #:make-http3-client
    #:close-http3-client
+   #:http3-connection-manager
+   #:http3-connection-manager-p
+   #:make-http3-connection-manager
+   #:close-http3-connection-manager
+   #:http3-connection-manager-open-p
+   #:http3-connection-manager-max-connections
+   #:http3-connection-manager-idle-timeout
+   #:http3-connection-manager-max-connection-age
+   #:http3-connection-manager-clock-function
+   #:http3-connection-manager-connection-count
+   #:http3-connection-manager-clients
+   #:send-http3-request-over-connection-manager
+   #:make-http3-connection-manager-transport
+   #:cancel-http3-stream
+   #:cancel-http3-push
+   #:advertise-http3-max-push-id
+   #:send-http3-priority-update
    #:http3-client-open-p
    #:http3-client-open-stream
    #:http3-client-read-stream
    #:http3-client-write-stream
    #:http3-client-close-stream
+   #:http3-client-cancel-stream
+   #:http3-client-qpack-encoder-stream
+   #:http3-client-qpack-decoder-stream
    #:http3-client-peer-control-stream
    #:http3-client-peer-control-state
    #:http3-client-peer-control-prefix-seen-p
    #:http3-client-peer-control-fin-p
+   #:http3-client-peer-qpack-encoder-stream
+   #:http3-client-peer-qpack-decoder-stream
+   #:http3-client-qpack-encoder-table
+   #:http3-client-qpack-decoder-table
+   #:http3-client-qpack-decoder-context
+   #:http3-client-qpack-decoder-state
    #:http3-client-max-frame-size
    #:http3-client-max-header-bytes
+   #:http3-client-max-fields
+   #:http3-client-max-push-id
+   #:http3-client-promised-push-ids
+   #:http3-client-cancelled-push-ids
+   #:http3-client-consumed-push-ids
    #:http3-client-qpack-settings
+   #:http3-client-set-qpack-capacity
+   #:http3-client-insert-qpack-field
+   #:accept-http3-peer-unidirectional-stream
+   #:process-http3-peer-unidirectional-stream
    #:attach-http3-peer-control-stream
    #:read-http3-control-stream
+   #:attach-http3-peer-qpack-encoder-stream
+   #:attach-http3-peer-qpack-decoder-stream
+   #:read-http3-qpack-encoder-stream
+   #:read-http3-qpack-decoder-stream
    #:serve-http3-control-stream
    #:send-http3-request
-   #:send-http3-request/cps
+   #:send-http3-push
+   #:receive-http3-push
    #:serve-http3-request-stream))

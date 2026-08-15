@@ -58,6 +58,42 @@
    (http-kit/http2::%h2-request-fields
     (make-http-request :method "CONNECT"
                        :uri "https://example.test/")))
+  (ensure-equal
+   "*"
+   (cdr (assoc ":path"
+               (http-kit/http2::%h2-request-fields
+                (make-http-request :method "OPTIONS"
+                                   :uri "https://example.test/"
+                                   :request-target "*"))
+               :test #'string=)))
+  (signals http-invalid-header
+    (http-kit/http2::%h2-request-fields
+     (make-http-request :method "GET"
+                        :uri "https://example.test/"
+                        :request-target "*")))
+  (signals http-invalid-header
+    (http-kit/http2::%h2-request-fields
+     (make-http-request :method "GET"
+                        :uri "https://example.test/"
+                        :request-target "https://example.test/")))
+  (let ((request
+          (make-http-request :method "CONNECT"
+                             :protocol "websocket"
+                             :uri "https://example.test/")))
+    (ensure-equal "websocket" (http-request-protocol request))
+    (ensure-equal
+     (list (cons ":method" "CONNECT")
+           (cons ":protocol" "websocket")
+           (cons ":scheme" "https")
+           (cons ":authority" "example.test")
+           (cons ":path" "/"))
+     (http-kit/http2::%h2-request-fields request)))
+  (signals http-invalid-header
+    (http-kit/http2::%h2-request-fields
+     (make-http-request :method "CONNECT"
+                        :protocol "websocket"
+                        :uri "https://example.test/"
+                        :request-target "*")))
   (signals http-invalid-header
     (http-kit/http2::%h2-request-fields
      (make-http-request
@@ -141,7 +177,13 @@
      (make-http-request :method "POST"
                         :uri "https://example.test/"
                         :body (octets 1 2))
-     16384 1000 1)))
+     16384 1000 1))
+  (signals http-size-limit-exceeded
+    (http-kit/http2::%h2-request-header-wire
+     (make-http-request :method "GET" :uri "https://example.test/")
+     16384 1000 1000
+     :include-session-p nil
+     :peer-max-header-list-size 1)))
 
 (deftest http2-request-wire-huffman
   (let* ((request
@@ -256,19 +298,19 @@
     (ensure-equal :eof (http-kit/http2::%h2-read-frame reader 16384 nil nil)))
   (dolist (trailers
             (list (list (make-http-header "Connection" "close"))
-                  (list (make-http-header "Content-Length" "1"))))
+                  (list (make-http-header "Content-Length" "1"))
+                  (list (make-http-header "Host" "example.test"))
+                  (list (make-http-header "Authorization" "secret"))
+                  (list (make-http-header "If-None-Match" "tag"))
+                  (list (make-http-header "Content-Type" "text/plain"))
+                  (list (make-http-header "Cache-Control" "no-cache"))
+                  (list (make-http-header "Set-Cookie" "a=b"))
+                  (list (make-http-header "TE" "trailers"))
+                  (list (make-http-header "TE" "gzip"))))
     (signals http-invalid-header
       (http-kit/http2::%h2-request-wire
        (make-http-request :method "POST"
                           :uri "https://example.test/"
                           :trailers trailers)
        16384 1000 1000
-       :include-session-p nil)))
-  (signals http-unsupported-feature
-    (http-kit/http2::%h2-request-wire
-     (make-http-request
-      :method "POST"
-      :uri "https://example.test/"
-      :trailers (list (make-http-header "TE" "gzip")))
-     16384 1000 1000
-     :include-session-p nil)))
+       :include-session-p nil))))

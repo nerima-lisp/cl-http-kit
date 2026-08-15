@@ -63,15 +63,64 @@
     (replace result builder)
     result))
 
+(defun %proxy-resolved-address (host resolve-host)
+  (or (%proxy-ipv4-octets host)
+      (%proxy-ipv6-octets host)
+      (when resolve-host
+        (let ((resolved (funcall resolve-host host)))
+          (or (and (stringp resolved)
+                   (or (%proxy-ipv4-octets resolved)
+                       (%proxy-ipv6-octets resolved)))
+              (%proxy-error
+               "The local proxy resolver must return a numeric IPv4 or IPv6 address."
+               resolved))))))
+
+(defun %proxy-socks-address (host remote-dns-p resolve-host)
+  (if remote-dns-p
+      (let ((octets (http-utf8-octets host)))
+        (when (or (zerop (length octets)) (> (length octets) 255))
+          (%proxy-error "A SOCKS5 domain name must fit in one octet length." host))
+        (let ((builder (%proxy-byte-builder)))
+          (%proxy-builder-byte builder 3)
+          (%proxy-builder-byte builder (length octets))
+          (%proxy-builder-octets builder octets)
+          builder))
+      (let ((address (%proxy-resolved-address host resolve-host)))
+        (unless address
+          (%proxy-error
+           "A numeric address or a local resolver is required for SOCKS5."
+           host))
+        (cond
+          ((= (length address) 4)
+           (let ((builder (%proxy-byte-builder)))
+             (%proxy-builder-byte builder 1)
+             (%proxy-builder-octets builder address)
+             builder))
+          ((= (length address) 16)
+           (let ((builder (%proxy-byte-builder)))
+             (%proxy-builder-byte builder 4)
+             (%proxy-builder-octets builder address)
+             builder))
+          (t (%proxy-error "The SOCKS5 address has an unsupported length.
+"                            (length address)))))))
+
 (defun %proxy-socks-negotiate
     (stream proxy-plan deadline clock-function resolve-host)
   (let* ((proxy (getf proxy-plan :proxy))
          (username (http-proxy-username proxy))
          (password (or (http-proxy-password proxy) ""))
          (use-auth-p (not (null username)))
-         (methods (if use-auth-p #(0 2) #(0)))
+         (user-octets (and use-auth-p (http-utf8-octets username)))
+         (password-octets (and use-auth-p (http-utf8-octets password)))
+         (methods (if use-auth-p #(2) #(0)))
          (greeting (make-array (+ 2 (length methods))
                                :element-type '(unsigned-byte 8))))
+    (when (and use-auth-p
+               (or (not (<= 1 (length user-octets) 255))
+                   (not (<= 1 (length password-octets) 255))))
+      (%proxy-error
+       "SOCKS5 username and password must each contain 1 through 255 UTF-8 octets."
+       :authentication))
     (setf (aref greeting 0) 5
           (aref greeting 1) (length methods))
     (replace greeting methods :start1 2)
@@ -84,28 +133,22 @@
          (%proxy-error "The SOCKS5 proxy rejected every authentication method."
                        :authentication))
         ((and use-auth-p (= method 2))
-         (let ((user-octets (cl-codec-kit:string-to-octets username :encoding :utf-8))
-               (password-octets (cl-codec-kit:string-to-octets password :encoding :utf-8)))
-           (when (or (> (length user-octets) 255)
-                     (> (length password-octets) 255))
-             (%proxy-error "SOCKS5 username and password must fit in one octet lengths."
-                           :authentication))
-           (let ((authentication (%proxy-byte-builder)))
-             (%proxy-builder-byte authentication 1)
-             (%proxy-builder-byte authentication (length user-octets))
-             (%proxy-builder-octets authentication user-octets)
-             (%proxy-builder-byte authentication (length password-octets))
-             (%proxy-builder-octets authentication password-octets)
-             (%proxy-write-octets
-              stream
-              (%proxy-builder-vector authentication)
-              deadline clock-function))
-           (unless (= (%proxy-read-byte stream deadline clock-function) 1)
-             (%proxy-error "The SOCKS5 proxy returned an invalid authentication version."
-                           :authentication))
-           (unless (zerop (%proxy-read-byte stream deadline clock-function))
-             (%proxy-error "The SOCKS5 proxy rejected username/password authentication."
-                           :authentication))))
+         (let ((authentication (%proxy-byte-builder)))
+           (%proxy-builder-byte authentication 1)
+           (%proxy-builder-byte authentication (length user-octets))
+           (%proxy-builder-octets authentication user-octets)
+           (%proxy-builder-byte authentication (length password-octets))
+           (%proxy-builder-octets authentication password-octets)
+           (%proxy-write-octets
+            stream
+            (%proxy-builder-vector authentication)
+            deadline clock-function))
+         (unless (= (%proxy-read-byte stream deadline clock-function) 1)
+           (%proxy-error "The SOCKS5 proxy returned an invalid authentication version."
+                         :authentication))
+         (unless (zerop (%proxy-read-byte stream deadline clock-function))
+           (%proxy-error "The SOCKS5 proxy rejected username/password authentication."
+                         :authentication)))
         ((and (not use-auth-p) (zerop method)) nil)
         (t (%proxy-error "The SOCKS5 proxy selected an unsupported authentication method."
                          method))))
@@ -206,59 +249,116 @@
            :request-target authority
            :clock-function clock-function)
         (declare (ignore reusable-p))
-        (unless (<= 200 (http-response-status response) 299)
-          (%proxy-error "The HTTP proxy rejected the CONNECT request."
-                        (list :status (http-response-status response)
-                              :reason (http-response-reason response))))
-        stream))))
+        (if (<= 200 (http-response-status response) 299)
+            (values stream nil)
+            (values nil response))))))
 
-(defun %proxy-open-plan
-    (open-stream request proxy-plan proxy tls-upgrade resolve-host
+(defun %proxy-open-plan-once
+    (open-stream close-stream request proxy-plan proxy tls-upgrade resolve-host
                  timeout deadline clock-function)
   (let* ((mode (or (getf proxy-plan :mode) :direct))
          (proxy (or proxy (getf proxy-plan :proxy)))
          (target (or (getf proxy-plan :target)
                      (http-request-uri request)))
          (stream (%proxy-open-raw open-stream request timeout deadline
-                                  proxy-plan proxy)))
-    (unless (streamp stream)
-      (%proxy-error "The proxy stream opener did not return a stream." stream))
-    (case mode
-      (:direct
-       (if (string= (http-uri-scheme target) "https")
-           (%proxy-upgrade stream tls-upgrade target timeout deadline)
-           stream))
-      (:forward
-       (when (eq (http-proxy-scheme proxy) :https)
-         (setf stream
-               (%proxy-upgrade
-                stream tls-upgrade
-                (%proxy-uri-for :https (http-proxy-host proxy)
-                                (http-proxy-port proxy))
-                timeout deadline)))
-       stream)
-      (:connect
-       (when (eq (http-proxy-scheme proxy) :https)
-         (setf stream
-               (%proxy-upgrade
-                stream tls-upgrade
-                (%proxy-uri-for :https (http-proxy-host proxy)
-                                (http-proxy-port proxy))
-                timeout deadline)))
-       (%proxy-connect stream proxy-plan timeout deadline clock-function)
-       (if (string= (http-uri-scheme target) "https")
-           (%proxy-upgrade stream tls-upgrade target
-                          timeout deadline)
-           stream))
-      (:socks5
-       (%proxy-socks-negotiate stream proxy-plan deadline
-                               clock-function resolve-host)
-       (if (string= (http-uri-scheme target) "https")
-           (%proxy-upgrade stream tls-upgrade target
-                          timeout deadline)
-           stream))
-      (otherwise
-       (%proxy-error "The proxy plan contains an unsupported mode." mode)))))
+                                  proxy-plan proxy))
+         (retained-p nil))
+    (unwind-protect
+         (progn
+           (unless (streamp stream)
+             (%proxy-error "The proxy stream opener did not return a stream." stream))
+           (setf stream
+                 (case mode
+                   (:direct
+                    (if (string= (http-uri-scheme target) "https")
+                        (%proxy-upgrade stream tls-upgrade target timeout deadline)
+                        stream))
+                   (:forward
+                    (when (eq (http-proxy-scheme proxy) :https)
+                      (setf stream
+                            (%proxy-upgrade
+                             stream tls-upgrade
+                             (%proxy-uri-for :https (http-proxy-host proxy)
+                                             (http-proxy-port proxy))
+                             timeout deadline)))
+                    stream)
+                   (:connect
+                    (when (eq (http-proxy-scheme proxy) :https)
+                      (setf stream
+                            (%proxy-upgrade
+                             stream tls-upgrade
+                             (%proxy-uri-for :https (http-proxy-host proxy)
+                                             (http-proxy-port proxy))
+                             timeout deadline)))
+                    (multiple-value-bind (connected response)
+                        (%proxy-connect stream proxy-plan timeout deadline
+                                        clock-function)
+                      (if response
+                          (return-from %proxy-open-plan-once
+                            (values nil response))
+                          (if (string= (http-uri-scheme target) "https")
+                              (%proxy-upgrade connected tls-upgrade target
+                                              timeout deadline)
+                              connected))))
+                   (:socks5
+                    (%proxy-socks-negotiate stream proxy-plan deadline
+                                            clock-function resolve-host)
+                    (if (string= (http-uri-scheme target) "https")
+                        (%proxy-upgrade stream tls-upgrade target
+                                        timeout deadline)
+                        stream))
+                   (otherwise
+                    (%proxy-error "The proxy plan contains an unsupported mode." mode))))
+           (setf retained-p t)
+           stream)
+      (unless retained-p
+        (when (streamp stream)
+          (http-kit::%with-http-cleanup
+            (funcall close-stream stream)))))))
+
+(defun %proxy-auth-provider-value (value)
+  (cond
+    ((null value) nil)
+    ((stringp value) value)
+    ((http-header-p value) (http-header-content value))
+    (t
+     (%proxy-error
+      "A proxy authentication provider must return a string, HTTP-HEADER, or NIL."
+      value))))
+
+(defun %proxy-open-plan
+    (open-stream close-stream request proxy-plan proxy tls-upgrade resolve-host
+                 timeout deadline clock-function)
+  (let ((plan proxy-plan)
+        (challenge-count 0))
+    (loop
+      (multiple-value-bind (stream response)
+          (%proxy-open-plan-once
+           open-stream close-stream request plan proxy tls-upgrade resolve-host
+           timeout deadline clock-function)
+        (when stream
+          (return stream))
+        (let* ((challenge-values
+                 (and (= (http-response-status response) 407)
+                      (http-header-values
+                       (http-response-headers response) "Proxy-Authenticate")))
+               (challenges
+                 (and challenge-values
+                      (http-parse-authentication-challenges challenge-values)))
+               (provider (getf plan :proxy-challenge-auth-provider))
+               (authorization
+                 (and provider
+                      (zerop challenge-count)
+                      challenges
+                      (%proxy-auth-provider-value
+                       (funcall provider request response plan challenges)))))
+          (unless authorization
+            (%proxy-error "The HTTP proxy rejected the CONNECT request."
+                          (list :status (http-response-status response)
+                                :reason (http-response-reason response))))
+          (setf plan (copy-list plan)
+                (getf plan :proxy-authorization) authorization
+                challenge-count 1))))))
 
 (defun make-http-proxy-stream-opener
     (open-stream close-stream &key tls-upgrade resolve-host
@@ -291,7 +391,7 @@ address resolution when a SOCKS5 (rather than SOCKS5H) proxy is selected."
                (progn
                  (setf stream
                        (%proxy-open-plan
-                        open-stream request proxy-plan proxy tls-upgrade
+                        open-stream close-stream request proxy-plan proxy tls-upgrade
                         resolve-host timeout deadline clock-function))
                  (setf retained-p t)
                  stream)

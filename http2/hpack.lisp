@@ -164,11 +164,27 @@
            :reason :value))
   (cons name value))
 
-(defun %hpack-decode-block (octets context &key max-header-bytes)
+(defun %hpack-decode-block (octets context &key max-header-bytes max-fields)
   (let ((position 0)
         (fields '())
         (header-bytes 0)
+        (field-count 0)
         (seen-header nil))
+    (unless (or (null max-fields)
+                (and (integerp max-fields) (plusp max-fields)))
+      (error 'http-protocol-error
+             :message "HPACK field-count limits must be positive integers."
+             :operation :hpack
+             :detail max-fields))
+    (labels ((check-field-count ()
+               (incf field-count)
+               (when (and max-fields (> field-count max-fields))
+                 (error 'http-size-limit-exceeded
+                        :message "HPACK field count exceeds the configured limit."
+                        :operation :hpack
+                        :limit max-fields
+                        :observed field-count
+                        :kind :fields))))
     (loop while (< position (length octets))
           do (let ((first (aref octets position)))
                (cond
@@ -176,6 +192,7 @@
                   (multiple-value-bind (index next-position)
                       (%hpack-read-integer octets position 7)
                     (let ((field (%hpack-indexed-field context index)))
+                      (check-field-count)
                       (push (%hpack-validate-field (car field) (cdr field)) fields)
                       (incf header-bytes (+ (length (car field))
                                             (length (cdr field)) 32))
@@ -189,6 +206,7 @@
                     (multiple-value-bind (value end)
                         (%hpack-decode-string octets next-position)
                       (let ((field (%hpack-validate-field name value)))
+                        (check-field-count)
                         (push field fields)
                         (incf header-bytes (+ (length name) (length value) 32))
                         (http-kit::%check-limit :headers header-bytes max-header-bytes)
@@ -211,11 +229,12 @@
                     (multiple-value-bind (value end)
                         (%hpack-decode-string octets next-position)
                       (let ((field (%hpack-validate-field name value)))
+                        (check-field-count)
                         (push field fields)
                         (incf header-bytes (+ (length name) (length value) 32))
                         (http-kit::%check-limit :headers header-bytes max-header-bytes)
                         (setf position end))))))))
-    (nreverse fields)))
+    (nreverse fields))))
 
 (defun %hpack-encode-name-value (name value &key (huffman-p nil))
   (let ((exact (%hpack-static-index name value))

@@ -64,18 +64,13 @@
   (signals http-invalid-header
     (http-kit/http2::%h2-regular-header-valid-p "te" "gzip"))
   (ensure-true
-   (http-kit/http2::%h2-regular-header-valid-p "te" "trailers"))
-  (multiple-value-bind (status headers)
-      (http-kit/http2::%h2-status-and-headers
-       (list (cons ":status" "200")
-             (cons "x-test" "yes")
-             (cons "te" "trailers")))
-    (ensure-equal 200 status)
-    (ensure-equal '(("x-test" . "yes") ("te" . "trailers"))
-                          (mapcar (lambda (header)
-                            (cons (http-header-name header)
-                                  (http-header-content header)))
-                          headers)))
+   (http-kit/http2::%h2-regular-header-valid-p
+    "te" "trailers" :allow-te-p t))
+  (signals http-invalid-header
+    (http-kit/http2::%h2-status-and-headers
+     (list (cons ":status" "200") (cons "te" "trailers"))))
+  (signals http-invalid-header
+    (http-kit/http2::%h2-trailers (list (cons "te" "trailers"))))
   (signals http-invalid-header
     (http-kit/http2::%h2-status-and-headers
      (list (cons "" "value"))))
@@ -97,7 +92,7 @@
   (signals http-invalid-status
     (http-kit/http2::%h2-status-and-headers
      (list (cons ":status" "200") (cons ":status" "204"))))
-  (signals http-unsupported-feature
+  (signals http-invalid-status
     (http-kit/http2::%h2-status-and-headers
      (list (cons ":status" "101"))))
   (signals http-invalid-header
@@ -109,6 +104,14 @@
   (signals http-invalid-header
     (http-kit/http2::%h2-trailers
      (list (cons "content-length" "1"))))
+  (signals http-invalid-header
+    (http-kit/http2::%h2-trailers
+     (list (cons "host" "example.test"))))
+  (dolist (name '("authorization" "if-none-match" "content-type"
+                  "cache-control" "set-cookie" "via"))
+    (signals http-invalid-header
+      (http-kit/http2::%h2-trailers
+       (list (cons name "forbidden")))))
   (signals http-invalid-header
     (http-kit/http2::%h2-trailers
      (list (cons "X-Trailer" "value"))))

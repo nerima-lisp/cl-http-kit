@@ -121,3 +121,20 @@
 (deftest hpack-name-p-boundaries
   (ensure-true (http-kit/http2::%hpack-name-p "x-header"))
   (ensure-true (not (http-kit/http2::%hpack-name-p 42))))
+
+(deftest hpack-field-count-limit
+  (let ((block
+          (http-kit/http2::%hpack-encode-block
+           (list (cons ":status" "200")
+                 (cons "content-type" "text/plain")))))
+    (ensure-equal
+     2
+     (length
+      (http-kit/http2::%hpack-decode-block
+       block (http-kit/http2::%make-hpack-context) :max-fields 2)))
+    (signals http-size-limit-exceeded
+      (http-kit/http2::%hpack-decode-block
+       block (http-kit/http2::%make-hpack-context) :max-fields 1))
+    (signals http-protocol-error
+      (http-kit/http2::%hpack-decode-block
+       block (http-kit/http2::%make-hpack-context) :max-fields 0))))

@@ -169,6 +169,23 @@
       (%websocket-store-integer digest 16 4 h4)
       digest)))
 
+(defun make-websocket-client-key (random-octets-function)
+  "Return a Base64 WebSocket client key using RANDOM-OCTETS-FUNCTION.
+
+RANDOM-OCTETS-FUNCTION is called with 16 and must return exactly that many
+octets from a cryptographically secure random source."
+  (unless (functionp random-octets-function)
+    (%websocket-protocol-error
+     "The WebSocket random octet source must be a function."
+     random-octets-function))
+  (let ((octets (funcall random-octets-function 16)))
+    (unless (and (%websocket-octet-vector-p octets)
+                 (= (length octets) 16))
+      (%websocket-protocol-error
+       "The WebSocket random octet source must return exactly 16 octets."
+       octets))
+    (%websocket-base64-encode octets)))
+
 (defun websocket-accept-key (sec-websocket-key)
   "Return the RFC 6455 Sec-WebSocket-Accept value for a client key."
   (unless (stringp sec-websocket-key)

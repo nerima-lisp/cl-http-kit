@@ -23,6 +23,7 @@
                                (max-frame-size +http2-default-max-frame-size+)
                                (max-header-bytes
                                 http-kit::*default-max-header-bytes*)
+                               (max-fields 256)
                                (max-body-bytes
                                 http-kit::*default-max-body-bytes*)
                                (clock-function #'http-kit::%monotonic-time))
@@ -49,6 +50,7 @@ persistent HTTP2-CONNECTION created by MAKE-HTTP2-CONNECTION."
            :detail close-stream))
   (%h2-validate-frame-size max-frame-size)
   (%h2-validate-limit :max-header-bytes max-header-bytes)
+  (%h2-validate-limit :max-fields max-fields)
   (%h2-validate-limit :max-body-bytes max-body-bytes :allow-zero t)
   (unless (functionp clock-function)
     (error 'http-kit:http-protocol-error
@@ -62,5 +64,6 @@ persistent HTTP2-CONNECTION created by MAKE-HTTP2-CONNECTION."
    :close-stream (or close-stream #'close)
    :max-frame-size max-frame-size
    :max-header-bytes max-header-bytes
+   :max-fields max-fields
    :max-body-bytes max-body-bytes
    :clock-function clock-function))

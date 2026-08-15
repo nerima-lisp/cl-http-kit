@@ -93,6 +93,7 @@
 (defun %h2-request-fields (request &key body-length (body-length-known-p t))
   (let* ((uri (http-kit:http-request-uri request))
          (method (http-kit:http-request-method request))
+         (protocol (http-kit:http-request-protocol request))
          (headers (http-kit:http-request-headers request))
          (body (http-kit:http-request-body request))
          (effective-body-length
@@ -101,11 +102,20 @@
                     (length body)
                     body-length)))
          (authority (http-kit:http-uri-authority uri))
-         (path (http-kit:http-uri-path uri))
-         (query (http-kit:http-uri-query uri))
-         (path-and-query (if query
-                            (format nil "~A?~A" path query)
-                            path)))
+         (path-and-query (http-kit:http-request-target request)))
+    (when (if (and (string= method "CONNECT") protocol)
+              (or (zerop (length path-and-query))
+                  (not (char= (char path-and-query 0) #\/)))
+              (and (not (string= method "CONNECT"))
+                   (or (and (string= path-and-query "*")
+                            (not (string= method "OPTIONS")))
+                       (and (not (string= path-and-query "*"))
+                            (not (char= (char path-and-query 0) #\/))))))
+      (error 'http-kit:http-invalid-header
+             :message "HTTP/2 :path must be origin-form, or asterisk-form for OPTIONS."
+             :operation :http2-headers
+             :name ":path"
+             :reason :invalid-request-target))
     (multiple-value-bind (regular host-values)
         (%h2-classify-request-headers headers)
       (%h2-validate-host-values host-values authority)
@@ -118,13 +128,18 @@
                 (append regular
                         (list (cons "content-length"
                                     (princ-to-string effective-body-length)))))))
-      (if (string-equal method "CONNECT")
+      (if (string= method "CONNECT")
           ;; RFC 7540 section 8.3.1: a regular CONNECT request carries
           ;; only :method and :authority.  The URI still supplies the
           ;; authority and Host validation above keeps both spellings in
           ;; agreement.
-          (append (list (cons ":method" method)
-                        (cons ":authority" authority))
+          (append (list (cons ":method" method))
+                  (if protocol
+                      (list (cons ":protocol" protocol)
+                            (cons ":scheme" (http-kit:http-uri-scheme uri))
+                            (cons ":authority" authority)
+                            (cons ":path" path-and-query))
+                      (list (cons ":authority" authority)))
                   regular)
           (append (list (cons ":method" method)
                         (cons ":scheme" (http-kit:http-uri-scheme uri))

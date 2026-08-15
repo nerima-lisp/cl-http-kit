@@ -96,6 +96,7 @@
           date = cl-date-kit.packages.${system}.default;
           host = cl-host-kit.packages.${system}.default;
           codec = cl-codec-kit.packages.${system}.default;
+          chipz = pkgs.sbclPackages.chipz;
           paredit = paredit-cli.packages.${system}.default;
         in
         {
@@ -108,6 +109,7 @@
               date
               host
               codec
+              chipz
               paredit
               pkgs.sbcl
               pkgs.coreutils
@@ -144,6 +146,7 @@
           date = cl-date-kit.packages.${system}.default;
           host = cl-host-kit.packages.${system}.default;
           codec = cl-codec-kit.packages.${system}.default;
+          chipz = pkgs.sbclPackages.chipz;
           paredit = paredit-cli.packages.${system}.default;
           sourceRegistry = pkgs.lib.concatStringsSep ":" [
             "${clWeave}/share/common-lisp/source//"
@@ -153,6 +156,7 @@
             "${date}//"
             "${host}//"
             "${codec}//"
+            "${chipz}//"
           ];
           appMeta = {
             description = "Common Lisp HTTP client quality gate";
@@ -173,6 +177,7 @@
               test_home="''${TMPDIR:-/tmp}/cl-http-kit-test-core-$$"
               mkdir -p "$test_home"
               export HOME="$test_home"
+              export XDG_CACHE_HOME="$test_home/.cache"
               export CL_SOURCE_REGISTRY="''${CL_SOURCE_REGISTRY:-$PWD//:${sourceRegistry}}"
               test_timeout_ms="''${CL_WEAVE_TEST_TIMEOUT_MS:-30000}"
               max_workers="''${CL_WEAVE_MAX_WORKERS:-1}"
@@ -194,11 +199,13 @@
               date
               host
               codec
-          ];
+              chipz
+            ];
             text = ''
               test_home="''${TMPDIR:-/tmp}/cl-http-kit-test-$$"
               mkdir -p "$test_home"
               export HOME="$test_home"
+              export XDG_CACHE_HOME="$test_home/.cache"
               export CL_SOURCE_REGISTRY="''${CL_SOURCE_REGISTRY:-$PWD//:${sourceRegistry}}"
               test_timeout_ms="''${CL_WEAVE_TEST_TIMEOUT_MS:-30000}"
               max_workers="''${CL_WEAVE_MAX_WORKERS:-1}"
@@ -219,7 +226,7 @@
               boundary
               date
               host
-              codec
+              chipz
               pkgs.coreutils
               pkgs.findutils
               pkgs.perl
@@ -228,6 +235,7 @@
               coverage_home="''${TMPDIR:-/tmp}/cl-http-kit-coverage-$$"
               mkdir -p "$coverage_home"
               export HOME="$coverage_home"
+              export XDG_CACHE_HOME="$coverage_home/.cache"
               export CL_SOURCE_REGISTRY="''${CL_SOURCE_REGISTRY:-$PWD//:${sourceRegistry}}"
               coverage_root="$(realpath -m -- "$PWD")"
               coverage_report_directory="$(realpath -m -- "''${CL_HTTP_KIT_COVERAGE_DIR:-coverage}")"
@@ -360,6 +368,7 @@
           date = cl-date-kit.packages.${system}.default;
           host = cl-host-kit.packages.${system}.default;
           codec = cl-codec-kit.packages.${system}.default;
+          chipz = pkgs.sbclPackages.chipz;
           paredit = paredit-cli.packages.${system}.default;
           source = pkgs.lib.cleanSource ./.;
           sourceRegistry = pkgs.lib.concatStringsSep ":" [
@@ -370,6 +379,7 @@
             "${date}//"
             "${host}//"
             "${codec}//"
+            "${chipz}//"
           ];
         in
         {
@@ -388,6 +398,7 @@
               }
               ''
                 export HOME="$TMPDIR/home"
+                export XDG_CACHE_HOME="$HOME/.cache"
                 mkdir -p "$HOME"
                 work="$TMPDIR/cl-http-kit"
                 mkdir -p "$work"
@@ -412,11 +423,12 @@
                   boundary
                   date
                   host
-                  codec
+                  chipz
                 ];
               }
               ''
                 export HOME="$TMPDIR/home"
+                export XDG_CACHE_HOME="$HOME/.cache"
                 mkdir -p "$HOME"
                 work="$TMPDIR/cl-http-kit"
                 mkdir -p "$work"

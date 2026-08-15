@@ -43,16 +43,22 @@
     (make-http-header (subseq line 0 colon)
                       (subseq line (1+ colon)))))
 
-(defun %read-response-headers (source deadline clock-function max-header-bytes header-used)
+(defun %read-response-headers
+    (source deadline clock-function max-header-bytes max-fields header-used)
   (let ((headers '())
-        (bytes header-used))
+        (bytes header-used)
+        (field-count 0))
     (loop
       (multiple-value-bind (line updated-bytes)
           (%read-crlf-line source deadline clock-function max-header-bytes bytes)
         (setf bytes updated-bytes)
         (if (string= line "")
             (return (values (nreverse headers) bytes))
-            (push (%parse-response-header-line line) headers))))))
+            (progn
+              (incf field-count)
+              (%check-limit :fields field-count max-fields
+                            :operation :response-parse)
+              (push (%parse-response-header-line line) headers)))))))
 
 (defun %split-comma-values (values)
   (%parse-http1-transfer-codings values :response-parse "transfer-encoding"))

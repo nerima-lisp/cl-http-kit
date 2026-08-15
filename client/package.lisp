@@ -68,6 +68,8 @@
    #:http-percent-encode
    #:http-form-urlencode
    #:http-form-urlencoded-octets
+   #:make-http-content-decoders
+   #:decode-http-response-content
    #:http-multipart-part
    #:http-multipart-part-p
    #:make-http-multipart-part
@@ -101,10 +103,11 @@
    #:http-cookie-secure-p
    #:http-cookie-http-only-p
    #:http-cookie-same-site
+   #:http-cookie-partition-key
    #:http-cookie-host-only-p
    #:http-cookie-creation-time
-   #:http-cookie-partitioned-p
-   #:http-cookie-partition-key
+   #:http-cookie-expiry-time
+   #:http-cookie-last-access-time
    #:http-cookie-jar
    #:make-http-cookie-jar
    #:http-cookie-jar-cookies
@@ -139,13 +142,24 @@
    #:http-retry-policy-statuses
    #:http-retry-policy-base-delay
    #:http-retry-policy-max-delay
+   #:http-retry-policy-jitter-ratio
    #:http-retry-policy-respect-retry-after-p
    #:http-retry-policy-retry-on-timeout-p
    #:http-retry-policy-retry-on-connection-error-p
    ;; Date and authorization helpers
    #:http-parse-date
+   #:http-authentication-challenge
+   #:http-authentication-challenge-p
+   #:http-authentication-challenge-scheme
+   #:http-authentication-challenge-token68
+   #:http-authentication-challenge-parameters
+   #:http-authentication-challenge-parameter
+   #:http-parse-authentication-challenges
    #:http-basic-authorization
    #:http-bearer-authorization
+   #:http-digest-authorization
+   #:http-content-digest
+   #:http-content-digest-valid-p
    ;; Cache
    #:http-cache
    #:make-http-cache
@@ -165,11 +179,43 @@
    #:http-cache-entry-accessed-at
    #:http-cache-max-entries
    #:http-cache-clock-function
+   #:http-cache-status-identifier
    #:http-cache-key
    #:http-cache-lookup
    #:http-cache-store
    #:http-cache-invalidate
    #:http-cache-clear
+   ;; Strict transport security
+   #:http-strict-transport-policy
+   #:http-strict-transport-policy-p
+   #:http-strict-transport-policy-host
+   #:http-strict-transport-policy-expires-at
+   #:http-strict-transport-policy-include-subdomains-p
+   #:http-strict-transport-store
+   #:http-strict-transport-store-p
+   #:make-http-strict-transport-store
+   #:http-strict-transport-store-policies
+   #:http-strict-transport-store-known-host-p
+   #:http-strict-transport-store-note-response
+   #:http-strict-transport-store-upgrade-uri
+   #:http-strict-transport-store-clear
+   ;; Alternative services
+   #:http-alternative-service
+   #:http-alternative-service-p
+   #:http-alternative-service-origin
+   #:http-alternative-service-protocol-id
+   #:http-alternative-service-host
+   #:http-alternative-service-port
+   #:http-alternative-service-expires-at
+   #:http-alternative-service-persist-p
+   #:http-alternative-service-store
+   #:http-alternative-service-store-p
+   #:make-http-alternative-service-store
+   #:http-alternative-service-store-services
+   #:http-alternative-service-store-note-response
+   #:http-alternative-service-store-remove
+   #:http-alternative-service-store-network-changed
+   #:http-alternative-service-store-clear
    ;; Proxy planning
    #:http-proxy
    #:make-http-proxy
@@ -189,6 +235,7 @@
    #:make-http-connection-pool
    #:http-connection-pool-max-idle
    #:http-connection-pool-idle-timeout
+   #:http-connection-pool-max-connection-age
    #:http-connection-pool-clock-function
    #:http-connection-pool-tls-upgrade
    #:http-connection-pool-resolve-host
@@ -206,16 +253,24 @@
    #:http-client-cookie-partition-key
    #:http-client-cookie-same-site-context
    #:http-client-cache
+   #:http-client-strict-transport-store
+   #:http-client-alternative-service-store
    #:http-client-redirect-policy
    #:http-client-retry-policy
    #:http-client-proxy
    #:http-client-tls-upgrade
    #:http-client-resolve-host
    #:http-client-auth-provider
+   #:http-client-challenge-auth-provider
+   #:http-client-proxy-challenge-auth-provider
+   #:http-client-stale-while-revalidate-scheduler
    #:http-client-clock-function
    #:http-client-wall-clock-function
+   #:http-client-content-decoders
    #:http-client-sleep-function
+   #:http-client-random-function
    #:http-client-max-header-bytes
+   #:http-client-max-fields
    #:http-client-max-body-bytes
    #:http-client-on-request
    #:http-client-on-response
@@ -248,6 +303,7 @@
    #:websocket-frame
    #:websocket-frame-p
    #:websocket-frame-fin-p
+   #:websocket-frame-rsv1-p
    #:websocket-frame-opcode
    #:websocket-frame-mask-p
    #:websocket-frame-masking-key
@@ -263,7 +319,13 @@
    #:websocket-pong
    #:websocket-close
    #:serve-websocket-session
+   #:make-websocket-client-key
    #:websocket-accept-key
+   #:websocket-extension
+   #:websocket-extension-p
+   #:websocket-extension-name
+   #:websocket-extension-parameters
+   #:parse-websocket-extensions
    #:websocket-upgrade-request-p
    #:websocket-upgrade-response
    #:make-websocket-upgrade-request

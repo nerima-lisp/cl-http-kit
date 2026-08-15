@@ -17,6 +17,7 @@
   resolve-host
   (max-idle 16)
   idle-timeout
+  max-connection-age
   clock-function
   (entries nil))
 
@@ -57,13 +58,18 @@
   nil)
 
 (defun %pool-expired-p (pool entry now)
-  (let ((timeout (%http-connection-pool-idle-timeout pool)))
-    (and timeout
-         (>= (- now (%http-pooled-connection-last-used entry))
-             timeout))))
+  (let ((idle-timeout (%http-connection-pool-idle-timeout pool))
+        (max-age (%http-connection-pool-max-connection-age pool)))
+    (or (and idle-timeout
+             (>= (- now (%http-pooled-connection-last-used entry))
+                 idle-timeout))
+        (and max-age
+             (>= (- now (%http-pooled-connection-opened-at entry))
+                 max-age)))))
 
 (defun %pool-purge-expired (pool &optional now)
-  (when (%http-connection-pool-idle-timeout pool)
+  (when (or (%http-connection-pool-idle-timeout pool)
+            (%http-connection-pool-max-connection-age pool))
     (let ((now (if now now (%pool-now pool)))
           (retained nil))
       (dolist (entry (%http-connection-pool-entries pool))
@@ -79,6 +85,7 @@
           resolve-host
           (max-idle 16)
           idle-timeout
+          max-connection-age
           (clock-function #'%pool-monotonic-time))
   "Construct a reusable, owner-thread HTTP connection pool.
 
@@ -106,6 +113,11 @@ serialize access when they share one pool between threads."
     (%pool-protocol-error
      "The connection pool idle timeout must be a non-negative real or NIL."
      idle-timeout))
+  (when (and max-connection-age
+             (or (not (realp max-connection-age)) (< max-connection-age 0)))
+    (%pool-protocol-error
+     "The connection pool maximum connection age must be a non-negative real or NIL."
+     max-connection-age))
   (%pool-ensure-function clock-function
                          "The connection pool clock must be a function.")
   (let ((close-stream (or close-stream #'close)))
@@ -120,6 +132,7 @@ serialize access when they share one pool between threads."
      :resolve-host resolve-host
      :max-idle max-idle
      :idle-timeout idle-timeout
+     :max-connection-age max-connection-age
      :clock-function clock-function)))
 
 (defun http-connection-pool-max-idle (pool)
@@ -129,6 +142,10 @@ serialize access when they share one pool between threads."
 (defun http-connection-pool-idle-timeout (pool)
   "Return POOL's idle-stream expiry interval, or NIL when disabled."
   (%http-connection-pool-idle-timeout (%pool-ensure-pool pool)))
+
+(defun http-connection-pool-max-connection-age (pool)
+  "Return POOL's maximum connection lifetime, or NIL when disabled."
+  (%http-connection-pool-max-connection-age (%pool-ensure-pool pool)))
 
 (defun http-connection-pool-clock-function (pool)
   "Return the clock function used by POOL."
@@ -207,14 +224,14 @@ serialize access when they share one pool between threads."
              :cause condition))))
 
 (defun http-connection-pool-stats (pool)
-  "Return current idle connection counts and keys for POOL."
+  "Return non-sensitive idle connection statistics for POOL."
   (%pool-ensure-pool pool)
   (%pool-purge-expired pool)
   (list :idle-count (length (%http-connection-pool-entries pool))
         :max-idle (%http-connection-pool-max-idle pool)
         :idle-timeout (%http-connection-pool-idle-timeout pool)
-        :keys (mapcar #'%http-pooled-connection-key
-                      (%http-connection-pool-entries pool))))
+        :max-connection-age
+        (%http-connection-pool-max-connection-age pool)))
 
 (defun http-connection-pool-clear (pool)
   "Close and remove every idle connection in POOL, returning its count."
@@ -226,7 +243,7 @@ serialize access when they share one pool between threads."
     (length entries)))
 
 (defun http-connection-pool-send
-    (pool request &key key timeout deadline max-header-bytes max-body-bytes
+    (pool request &key key timeout deadline max-header-bytes max-fields max-body-bytes
                      proxy-plan proxy request-target request-body-function
                      request-body-length on-body-chunk on-information
                      (collect-body-p t))
@@ -267,6 +284,7 @@ self-delimited and neither side requested connection closure."
                  stream
                  :deadline absolute-deadline
                  :max-header-bytes max-header-bytes
+                 :max-fields max-fields
                  :max-body-bytes max-body-bytes
                  :request-target
                  (or request-target

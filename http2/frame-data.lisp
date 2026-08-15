@@ -17,6 +17,7 @@
 (defconstant +http2-goaway-type+ 7)
 (defconstant +http2-window-update-type+ 8)
 (defconstant +http2-continuation-type+ 9)
+(defconstant +http2-priority-update-type+ #x10)
 
 (defconstant +http2-end-stream-flag+ #x1)
 (defconstant +http2-end-headers-flag+ #x4)
@@ -25,3 +26,9 @@
 (defconstant +http2-ack-flag+ #x1)
 (defconstant +http2-default-max-frame-size+ 16384)
 (defconstant +http2-default-window-size+ 65535)
+
+(defun %h2-priority-field-value-p (octets &optional (start 0))
+  (loop for position from start below (length octets)
+        for octet = (aref octets position)
+        always (or (= octet #x09)
+                   (<= #x20 octet #x7e))))
