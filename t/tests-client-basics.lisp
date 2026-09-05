@@ -307,7 +307,7 @@
           (ensure-equal 200 (http-response-status response))
           (ensure-equal request effective))
         (ensure-equal 2 calls)
-        (ensure-equal '("cached") seen-bodies))))
+        (ensure-equal '("cached") seen-bodies)))))
 
 (deftest client-proxy-plans
   (let ((proxy (make-http-proxy :scheme :http
