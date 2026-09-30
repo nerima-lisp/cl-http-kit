@@ -25,6 +25,9 @@
 (defun http-uri-path (uri)
   (copy-seq (%http-uri-path uri)))
 
+(defsetf http-uri-path (uri) (value)
+  `(setf (%http-uri-path ,uri) ,value))
+
 (defun http-uri-query (uri)
   (let ((query (%http-uri-query uri)))
     (and query (copy-seq query))))

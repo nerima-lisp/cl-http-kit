@@ -170,7 +170,8 @@ BODY-FUNCTION is called with no arguments until it returns NIL.  Each
 non-NIL value must be a one-dimensional octet vector.  BODY-LENGTH, when
 supplied, is the exact representation length and allows the HTTP/1 server to
 use Content-Length; otherwise HTTP/1.1 uses chunked transfer coding."
-  (unless (functionp body-function)
+  (unless (or (null body-function)
+              (functionp body-function))
     (error 'http-protocol-error
            :message "HTTP response stream body-function must be a function."
            :operation :response

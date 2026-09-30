@@ -4,7 +4,7 @@
   :description "A portable, binary-safe HTTP client substrate."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.2.0"
+  :version "0.3.0"
   :depends-on ()
   :pathname "src"
   :serial t
@@ -15,14 +15,20 @@
                (:file "defaults")
                (:file "utilities")
                (:file "control-macros")
+               (:file "model-summary-support")
+               (:file "utilities-number")
                (:file "uri")
                (:file "header-data")
                (:file "headers")
                (:file "model")
+               (:file "model-request-summary")
+               (:file "model-response-summary")
+               (:file "http1-serialize-support")
                (:file "http1-serialize")
                (:file "http1-source")
                (:file "http1-response-headers")
                (:file "http1-response-body")
+               (:file "http1-response-parse")
                (:file "http1-parse")
                (:file "http1-server")
                (:file "transport-declarations")
@@ -35,7 +41,7 @@
   :description "Optional cl-observability-kit metrics for cl-http-kit."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.2.0"
+  :version "0.3.0"
   :depends-on ("cl-http-kit" "cl-observability-kit")
   :pathname "src"
   :serial t
@@ -47,7 +53,7 @@
   :description "The optional HTTP/2 transport for cl-http-kit."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.2.0"
+  :version "0.3.0"
   :depends-on ("cl-http-kit")
   :pathname "http2"
   :serial t
@@ -77,7 +83,7 @@
   :description "The high-level HTTP client policies and request orchestration layer."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.2.0"
+  :version "0.3.0"
   :depends-on ("cl-http-kit" "cl-codec-kit" "chipz")
   :pathname "client"
   :serial t
@@ -109,7 +115,7 @@
   :description "Optional native TCP and DNS boundary for cl-http-kit."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.2.0"
+  :version "0.3.0"
   :depends-on ("cl-http-kit")
   :pathname "network"
   :serial t
@@ -120,7 +126,7 @@
   :description "Optional cl+ssl TLS integration for cl-http-kit network streams."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.2.0"
+  :version "0.3.0"
   :depends-on ("cl-http-kit/network" "cl+ssl")
   :pathname "network"
   :serial t
@@ -130,7 +136,7 @@
   :description "Optional HTTP/3 framing, QPACK, and injected QUIC transport boundary."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.2.0"
+  :version "0.3.0"
   :depends-on ("cl-http-kit" "cl-http-kit/http2")
   :pathname "http3"
   :serial t
@@ -169,7 +175,8 @@
 
 (asdf:defsystem "cl-http-kit/test"
   :description "Tests for cl-http-kit and its optional HTTP/2 transport."
-  :depends-on ("cl-http-kit/client"
+  :depends-on ("cl-http-kit/test-core"
+               "cl-http-kit/client"
                "cl-http-kit/http2"
                "cl-http-kit/http3"
                "cl-http-kit/network"

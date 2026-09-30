@@ -45,11 +45,6 @@
      partition-key))
   partition-key)
 
-(defun %cookie-prefix-p (name prefix)
-  (and (stringp name)
-       (>= (length name) (length prefix))
-       (string= prefix name :end2 (length prefix))))
-
 (defun %copy-cookie (cookie)
   (%make-http-cookie
    :name (copy-seq (http-cookie-name cookie))
@@ -263,8 +258,7 @@
                                        (if (char= (char attribute-value 0) #\.)
                                            (subseq attribute-value 1)
                                            attribute-value))
-                               host-only-p nil
-                               domain-attribute-p t)))
+                               host-only-p nil)))
                       ((string= attribute-name "path")
                        (setf path-attribute-p t)
                        (when (and attribute-value

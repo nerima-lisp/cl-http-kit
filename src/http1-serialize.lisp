@@ -94,6 +94,7 @@
 
 (defun %http1-ensure-trailer-declaration
     (headers trailers transfer-mode operation)
+  (%validate-http1-trailers trailers operation)
   (let* ((declared-values (http-header-values headers "trailer"))
          (declared-names (and declared-values
                               (%parse-http1-trailer-declaration

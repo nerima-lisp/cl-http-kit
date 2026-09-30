@@ -47,6 +47,7 @@
    #:http-response-headers
    #:http-response-trailers
    #:http-response-body
+   #:http-response-summary
    #:format-http-priority-field-value
    #:http-response-stream
    #:http-response-stream-p

@@ -130,7 +130,7 @@ Content-Length without rescanning a non-collecting response body."
             :operation :http2-read
             :detail arguments))))
 
-(defun %h2-append-data-frame
+(defun %h2-append-data-frame*
     (frame status body body-length request-method max-body-bytes
      on-body-chunk collect-body-p expected-stream-id)
   (%h2-validate-response-stream-id (%h2-frame-stream-id frame)
