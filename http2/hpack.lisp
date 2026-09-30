@@ -179,7 +179,7 @@
     (labels ((check-field-count ()
                (incf field-count)
                (when (and max-fields (> field-count max-fields))
-                 (error 'http-size-limit-exceeded
+                 (error 'http-kit:http-size-limit-exceeded
                         :message "HPACK field count exceeds the configured limit."
                         :operation :hpack
                         :limit max-fields
