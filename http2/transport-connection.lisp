@@ -908,6 +908,8 @@ concurrent streams should use SEND-HTTP2-REQUESTS-OVER-CONNECTION."
                      trailer-fields
                      absolute-deadline clock (not session-started-p)
                      huffman-p)
+                  (when read-initial-settings-p
+                    (setf (%http2-connection-session-started-p connection) t))
                   (let ((response
                           (%h2-read-response
                            reader writer
