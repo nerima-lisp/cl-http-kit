@@ -1067,7 +1067,11 @@ values.
            (condition (caught-condition)
              (when on-error
                (funcall on-error caught-condition current-request))
-             (error caught-condition)))
+             (if (and (typep caught-condition
+                              'http-kit:http-size-limit-exceeded)
+                      (null current-request))
+                 (setf termination caught-condition)
+                 (error caught-condition))))
       (when close-stream
         (funcall close-stream stream)))
     (values request-count termination)))
