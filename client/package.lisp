@@ -43,6 +43,7 @@
                 #:http-header-present-p
                 #:make-http-request
                 #:make-http-response
+                #:http-deadline
                 #:send-http-request-over-open-stream
                 #:with-http-deadline
                 #:send-http-request-over-stream)
