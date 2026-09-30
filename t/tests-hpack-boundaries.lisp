@@ -67,9 +67,9 @@
     (signals http-protocol-error
       (http-kit/http2::%hpack-huffman-decode
        (octets #xff #xff #xff #xfc)))
-    (signals http-protocol-error
-      (http-kit/http2::%hpack-huffman-decode
-       (octets #xff #xff #xea)))
+    (ensure-equal (octets 9)
+                  (http-kit/http2::%hpack-huffman-decode
+                   (octets #xff #xff #xea)))
     (ensure-equal (octets)
                   (http-kit/http2::%hpack-huffman-decode (octets)))
     (signals http-invalid-header
