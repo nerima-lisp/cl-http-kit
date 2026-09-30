@@ -160,7 +160,7 @@
     (let* ((input (concatenate-octets
                    (h2-preface)
                    (h2-frame 4 #x20 0 (octets 0 2 0 0 0 1))
-                   (h2-frame 1 #x25 1
+                   (h2-frame 1 #x45 1
                              (h2-header-block
                               (cons ":method" "GET")
                               (cons ":scheme" "https")
