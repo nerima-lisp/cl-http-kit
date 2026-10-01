@@ -1820,7 +1820,10 @@
             :read-stream
             (lambda (stream &key timeout deadline)
               (declare (ignore stream timeout deadline))
-              (values wire t)))))
+              (values wire t))
+            :close-stream
+            (lambda (stream &key condition)
+              (declare (ignore stream condition))))))
     (ensure-equal
      (octets 1 2 3)
     (http-response-body
@@ -1838,7 +1841,10 @@
             :read-stream
             (lambda (stream &key timeout deadline)
               (declare (ignore stream timeout deadline))
-              (values wire t)))))
+              (values wire t))
+            :close-stream
+            (lambda (stream &key condition)
+              (declare (ignore stream condition))))))
     (handler-case
         (progn
           (http-kit/http3::%h3-read-response
@@ -2103,7 +2109,10 @@
             :read-stream
             (lambda (stream &key timeout deadline)
               (declare (ignore stream timeout deadline))
-              (values wire t)))))
+              (values wire t))
+            :close-stream
+            (lambda (stream &key condition)
+              (declare (ignore stream condition))))))
     (multiple-value-bind (push-id response)
         (http-kit/http3:receive-http3-push
          client :push-stream
