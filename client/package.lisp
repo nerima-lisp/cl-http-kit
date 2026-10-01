@@ -4,6 +4,7 @@
                 #:http-error
                 #:http-protocol-error
                 #:http-connection-error
+                #:http-connection-error-cause
                 #:http-timeout
                 #:http-size-limit-exceeded
                 #:http-request
