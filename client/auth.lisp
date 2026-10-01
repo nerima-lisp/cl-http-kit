@@ -665,9 +665,10 @@
       result)))
 
 (defun %digest-hex (octets)
-  (with-output-to-string (stream)
-    (loop for octet across octets
-          do (format stream "~2,'0x" octet))))
+  (string-downcase
+   (with-output-to-string (stream)
+     (loop for octet across octets
+           do (format stream "~2,'0x" octet)))))
 
 (defun %digest-hash-string (algorithm string)
   (%digest-hex
