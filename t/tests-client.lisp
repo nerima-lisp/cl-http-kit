@@ -4068,7 +4068,7 @@
             'binary-test-stream
             :input
             (ascii
-             "HTTP/1.1 200 Connection Established|CRLF|Content-Length: 0|CRLF||CRLF|HTTP/1.1 200 OK|CRLF|Content-Length: 2|CRLF||CRLF|ok")))
+             "HTTP/1.1 200 Connection Established|CRLF||CRLF|HTTP/1.1 200 OK|CRLF|Content-Length: 2|CRLF||CRLF|ok")))
          (streams (list first second))
          (opened 0)
          (closed nil)
