@@ -279,6 +279,7 @@
                         (setf server-error condition))))))
            (let* ((client
                     (make-http-client
+                     :automatic-decompression-p nil
                      :open-stream (make-http-network-stream-opener)
                      :close-stream #'close-http-tcp-stream))
                   (request
