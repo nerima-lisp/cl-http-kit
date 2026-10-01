@@ -3438,19 +3438,21 @@
          (stream (make-http3-test-stream :kind :request))
          (writes '())
          (producer-limits '())
-         (chunks (list #(1 2) #(3) nil)))
+         (chunks (list #(1 2) #(3) nil))
          (client
            (http-kit/http3:make-http3-client
-            :max-frame-size 4
+            :max-frame-size 64
             :open-stream
             (lambda (request &key stream-type timeout deadline)
-              (declare (ignore request stream-type timeout deadline))
-              (values stream 0))
+              (declare (ignore request timeout deadline))
+              (if (eq stream-type :request)
+                  (values stream 0)
+                  (values (make-http3-test-stream :kind stream-type) 0)))
             :write-stream
             (lambda (written-stream octets &key fin-p timeout deadline)
               (declare (ignore timeout deadline))
-              (ensure-true (eq stream written-stream))
-              (push (list (subseq octets 0) fin-p) writes))
+              (when (eq stream written-stream)
+                (push (list (subseq octets 0) fin-p) writes)))
             :read-stream
             (lambda (read-stream &key timeout deadline)
               (declare (ignore timeout deadline))
@@ -3471,7 +3473,7 @@
          (push maximum-size producer-limits)
          (pop chunks))
        :request-body-length 3)))
-    (ensure-equal '(4 4 4) (nreverse producer-limits))
+    (ensure-equal '(64 64 64) (nreverse producer-limits))
     (let* ((ordered-writes (nreverse writes))
            (header-frame
              (first (http-kit/http3:decode-http3-frames
@@ -3499,7 +3501,7 @@
                             'list))
       (ensure-equal 0
                     (length (http-kit/http3:http3-frame-payload final-data)))
-      (ensure-equal '(nil nil nil t) (mapcar #'second ordered-writes))))
+      (ensure-equal '(nil nil nil t) (mapcar #'second ordered-writes)))))
 
 (deftest http3-client-rejects-invalid-streaming-request-bodies
   (let ((opened 0))
