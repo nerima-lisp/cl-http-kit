@@ -757,7 +757,8 @@
            (http-kit/http3:make-qpack-dynamic-table
             :max-capacity 256 :capacity 0))
          (decoder-state
-           (http-kit/http3:make-qpack-decoder-stream-state encoder-table))
+           (http-kit/http3:make-qpack-decoder-stream-state
+            encoder-table :blocked-stream-limit 1))
          (encoder-instructions
            (http3-test-concat-octets
             (http-kit/http3:qpack-encode-set-dynamic-table-capacity 256)
@@ -791,6 +792,8 @@
             :open-p t
             :qpack-encoder-stream local-encoder-stream
             :qpack-decoder-table decoder-table
+            :qpack-decoder-context
+            (http-kit/http3:make-http3-qpack-decoder-context decoder-table)
             :qpack-encoder-table encoder-table
             :qpack-decoder-state decoder-state)))
     (http-kit/http3:attach-http3-peer-qpack-encoder-stream client encoder-stream)
