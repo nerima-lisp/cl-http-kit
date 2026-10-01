@@ -62,7 +62,13 @@
 #+sbcl
 (progn
   (defconstant +network-ipv4-address-type+ 2)
-  (defconstant +network-ipv6-address-type+ 30)
+  (defconstant +network-ipv6-address-type+
+    #+darwin 30
+    #+linux 10
+    #+freebsd 28
+    #+openbsd 24
+    #+netbsd 24
+    #-(or darwin linux freebsd openbsd netbsd) 10)
 
   (defun %network-address-entries (host)
     (unless (and (stringp host) (string/= host ""))
@@ -304,24 +310,14 @@ stream's read timeout after a connection is accepted."
                                     :protocol :tcp))
                (%network-connect-socket socket address port
                                         deadline clock-function)
-               (let ((remaining (%network-remaining deadline
-                                                      clock-function
-                                                      :connect)))
-                 (setf stream
-                       (if remaining
-                           (sb-bsd-sockets:socket-make-stream
-                            socket
-                            :input t
-                            :output t
-                            :element-type '(unsigned-byte 8)
-                            :buffering :full
-                            :timeout remaining)
-                           (sb-bsd-sockets:socket-make-stream
-                            socket
-                            :input t
-                            :output t
-                            :element-type '(unsigned-byte 8)
-                            :buffering :full))))
+               (%network-check-deadline deadline clock-function :connect)
+               (setf stream
+                     (sb-bsd-sockets:socket-make-stream
+                      socket
+                      :input t
+                      :output t
+                      :element-type '(unsigned-byte 8)
+                      :buffering :full))
                (setf retained-p t)
                stream)
           (unless retained-p

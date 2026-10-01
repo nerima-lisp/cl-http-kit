@@ -135,6 +135,43 @@
          :deadline 0
          :clock-function (lambda () 1)))))
 
+  (deftest native-network-read-deadline
+    (multiple-value-bind (listener port)
+        (%network-test-listener)
+      (let ((server-thread nil)
+            (accepted-socket nil)
+            (server-stream nil))
+        (unwind-protect
+             (progn
+               (setf server-thread
+                     (sb-thread:make-thread
+                      (lambda ()
+                        (setf accepted-socket
+                              (sb-bsd-sockets:socket-accept listener))
+                        (setf server-stream
+                              (sb-bsd-sockets:socket-make-stream
+                               accepted-socket
+                               :input t
+                               :output t
+                               :element-type '(unsigned-byte 8)
+                               :buffering :full))
+                        (sleep 1))))
+               (let ((stream
+                       (open-http-tcp-stream
+                        (make-http-request
+                         :method "GET"
+                         :uri (format nil "http://127.0.0.1:~D/" port)))))
+                 (unwind-protect
+                      (signals http-timeout
+                        (parse-http-response stream :timeout 0.01))
+                   (close-http-tcp-stream stream))))
+          (when server-thread
+            (%network-test-close-stream server-stream)
+            (%network-test-close-socket accepted-socket)
+            (http-kit::%with-http-cleanup
+              (sb-thread:join-thread server-thread)))
+          (%network-test-close-socket listener)))))
+
   (deftest native-network-listener-accept
     (let ((listener (open-http-tcp-listener
                      :host "127.0.0.1"
