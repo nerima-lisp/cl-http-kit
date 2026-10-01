@@ -4148,7 +4148,7 @@
             (lambda (closed-stream)
               (ensure-equal stream closed-stream)
               (incf closed)))))
-    (signals http-protocol-error
+    (signals http-proxy-error
       (http-client-send
        client
        (http-client-request client "GET" "https://example.test/path")))
@@ -4171,7 +4171,7 @@
             (lambda (closed-stream)
               (ensure-equal stream closed-stream)
               (incf closed)))))
-    (signals http-protocol-error
+    (signals http-proxy-error
       (http-client-send
        client
        (http-client-request client "GET" "https://example.test/path")))
