@@ -3887,6 +3887,7 @@
          (client
            (make-http-client
             :cache nil
+            :automatic-decompression-p nil
             :open-stream
             (lambda (request &key timeout deadline &allow-other-keys)
               (declare (ignore request timeout deadline))
