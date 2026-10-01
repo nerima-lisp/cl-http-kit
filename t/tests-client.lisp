@@ -1413,6 +1413,7 @@
     (let* ((client
              (make-http-client
               :cache cache
+              :automatic-decompression-p nil
               :transport-function
               (lambda (request &key proxy-plan &allow-other-keys)
                 (declare (ignore request proxy-plan))
