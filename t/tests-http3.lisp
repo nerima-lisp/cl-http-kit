@@ -397,13 +397,17 @@
          (wire
            (http3-test-concat-octets
             (http-kit/http3:http3-control-stream-prefix)
-            settings-wire goaway-wire max-push-id-wire cancel-push-wire)))
-    (labels ((chunks ()
-               (list (list (subseq wire 0 2) nil)
-                     (list (subseq wire 2) t))))
+            settings-wire goaway-wire max-push-id-wire cancel-push-wire))
+         (peer-wire
+           (http3-test-concat-octets
+            (http-kit/http3:http3-control-stream-prefix)
+            settings-wire goaway-wire)))
+    (labels ((chunks (source)
+               (list (list (subseq source 0 2) nil)
+                     (list (subseq source 2) t))))
       (let ((stream (make-http3-test-stream
                      :kind :control
-                     :reads (chunks)))
+                     :reads (chunks wire)))
             (settings-seen nil)
             (goaways nil)
             (max-push-ids nil)
@@ -451,7 +455,7 @@
           (ensure-true (http3-test-stream-closed-p stream))))
       (let* ((peer-stream (make-http3-test-stream
                            :kind :peer-control
-                           :reads (chunks)))
+                           :reads (chunks peer-wire)))
              (opened-streams nil)
              (closed-streams nil))
         (labels ((open-stream (ignored-request &key stream-type timeout deadline)
