@@ -7,9 +7,17 @@
   (declare (ignore control arguments))
   `(expect ,condition))
 
+(defmacro ensure-false (condition &optional control &rest arguments)
+  (declare (ignore control arguments))
+  `(expect (not ,condition)))
+
 (defmacro ensure-equal (expected actual &optional description)
   (declare (ignore description))
   `(expect ,actual :to-equalp ,expected)) ; paredit:ignore macro-parameter-reordering -- cl-weave EXPECT takes the actual expression before the expected matcher value.
+
+(defmacro ensure-octets-equal (expected actual &optional description)
+  (declare (ignore description))
+  `(ensure-equal ,expected ,actual))
 
 (defmacro ensure-summary= (expected form)
   "Assert that FORM produces exactly the human-facing summary EXPECTED."
