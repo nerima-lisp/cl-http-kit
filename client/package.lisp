@@ -67,6 +67,7 @@
    #:http-uri-origin
    #:http-same-origin-p
    ;; Encoding and entity construction
+   #:http-utf8-octets
    #:http-percent-encode
    #:http-form-urlencode
    #:http-form-urlencoded-octets
@@ -282,6 +283,7 @@
 (defpackage #:http-kit/websocket
   (:use #:cl)
   (:import-from #:http-kit
+                #:http-error-operation
                 #:http-protocol-error
                 #:http-size-limit-exceeded
                 #:http-request
@@ -301,6 +303,8 @@
                 #:make-http-request
                 #:send-http-request-over-open-stream
                 #:%monotonic-time)
+  (:import-from #:http-kit/client
+                #:http-utf8-octets)
   (:export
    #:websocket-frame
    #:websocket-frame-p
