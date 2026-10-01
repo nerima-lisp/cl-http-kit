@@ -1479,9 +1479,20 @@
             (http-kit/http3:qpack-encode-field-section
              fields :dynamic-table encoder-table
              :decoder-stream-state state :stream-id 0)))
-      (signals http-kit/http3:qpack-blocked-field-section
-        (http-kit/http3:qpack-decode-field-section
-         section :dynamic-table decoder-table))
+      (handler-case
+          (progn
+            (http-kit/http3:qpack-decode-field-section
+             section :dynamic-table decoder-table)
+            (error "Expected a blocked QPACK field section."))
+        (http-kit/http3:qpack-blocked-field-section (condition)
+          (ensure-equal
+           1
+           (http-kit/http3:qpack-blocked-field-section-required-insert-count
+            condition))
+          (ensure-equal
+           0
+           (http-kit/http3:qpack-blocked-field-section-current-insert-count
+            condition))))
       (ensure-equal
        1
        (hash-table-count
