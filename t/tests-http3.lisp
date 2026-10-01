@@ -2063,7 +2063,10 @@
               :read-stream
               (lambda (stream &key timeout deadline)
                 (declare (ignore stream timeout deadline))
-                (values wire t))))))
+                (values wire t))
+              :close-stream
+              (lambda (stream &key condition)
+                (declare (ignore stream condition)))))))
     (signals http-size-limit-exceeded
       (http-kit/http3:receive-http3-push
        (funcall make-client) :push-stream :max-fields 1))
