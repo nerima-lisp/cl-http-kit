@@ -90,7 +90,8 @@
                         (%network-test-close-stream server-stream)
                         (%network-test-close-socket accepted-socket))))
                (let* ((client
-                        (make-http-client
+                       (make-http-client
+                         :automatic-decompression-p nil
                          :open-stream (make-http-network-stream-opener)
                          :close-stream #'close-http-tcp-stream))
                       (request
