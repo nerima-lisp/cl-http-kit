@@ -2162,7 +2162,7 @@
             (ensure-equal (fourth case)
                           (http-protocol-error-detail condition))))
         (ensure-equal 1 (length closed))
-        (ensure (typep (first closed) 'http-protocol-error))))))
+        (ensure-true (typep (first closed) 'http-protocol-error))))))
 
 (deftest http3-client-cancels-promised-push-atomically
   (let ((writes '())
