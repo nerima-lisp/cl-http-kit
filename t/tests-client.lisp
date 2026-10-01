@@ -5051,7 +5051,7 @@
                   (http-select-content-coding
                    ""
                    (list "gzip" adapter)))
-    (ensure-equal nil
+    (ensure-equal "identity"
                   (http-select-content-coding
                    "gzip;q=0.5"
                    (list "br" adapter)))))
