@@ -1075,7 +1075,8 @@
             :max-capacity 256
             :capacity 256))
          (state
-           (http-kit/http3:make-qpack-decoder-stream-state table)))
+           (http-kit/http3:make-qpack-decoder-stream-state
+            table :blocked-stream-limit 3)))
     (http-kit/http3:qpack-dynamic-table-insert table "x-first" "one")
     (signals http-protocol-error
       (http-kit/http3:qpack-encode-field-section
@@ -1133,7 +1134,8 @@
             :max-capacity 128
             :capacity 128))
          (state
-           (http-kit/http3:make-qpack-decoder-stream-state table)))
+           (http-kit/http3:make-qpack-decoder-stream-state
+            table :blocked-stream-limit 1)))
     (http-kit/http3:qpack-dynamic-table-insert table "x" "y")
     (http-kit/http3:qpack-decoder-stream-state-note-insertions-sent state 1)
     (http-kit/http3:qpack-process-decoder-stream
@@ -1151,7 +1153,8 @@
             :max-capacity 90
             :capacity 90))
          (state
-           (http-kit/http3:make-qpack-decoder-stream-state table)))
+           (http-kit/http3:make-qpack-decoder-stream-state
+            table :blocked-stream-limit 1)))
     (http-kit/http3:qpack-dynamic-table-insert table "x-first" "one")
     (http-kit/http3:qpack-dynamic-table-insert table "x-second" "two")
     (http-kit/http3:qpack-decoder-stream-state-note-insertions-sent state 2)
