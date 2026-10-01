@@ -358,8 +358,8 @@
               (http-cookie-creation-time right)))))
 
 (defun %cookie-evict-oldest (cookies candidates)
-  (let ((oldest (first (sort (copy-list candidates)
-                             #'%cookie-eviction-older-p))))
+  (let ((oldest (first (stable-sort (reverse (copy-list candidates))
+                                    #'%cookie-eviction-older-p))))
     (delete oldest cookies :count 1 :test #'eq)))
 
 (defun %cookie-string-octet-length (value)
