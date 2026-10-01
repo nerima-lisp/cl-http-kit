@@ -1216,7 +1216,11 @@ eligible stale cache entry may be returned through the configured scheduler."
               (return-from http-client-send
                 (values stale-response current-request)))
             (setf stale-entry entry
-                  current-request revalidation-request)))))
+                  current-request revalidation-request)))
+        (when (and (eq state :miss)
+                   entry
+                   (eq forward-reason :request))
+          (setf stale-entry entry))))
     (loop
       (block next-attempt
         (let* ((redirect-p (plusp redirect-count))
