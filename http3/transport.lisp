@@ -1701,6 +1701,38 @@ receives each validated informational response in wire order."
       (funcall (http3-client-close-stream client)
                stream :condition failure))))
 
+(defun send-http3-request/cps
+    (client request on-success
+     &key on-error on-body-chunk on-information (collect-body-p t)
+       max-header-bytes max-fields max-body-bytes request-body-function
+       request-body-length qpack-encoder-table qpack-decoder-table
+       qpack-decoder-context await-qpack (huffman-p nil) on-stream-open
+       on-push-promise timeout deadline)
+  "Send REQUEST and deliver its response to ON-SUCCESS."
+  (http-kit::%call-http-operation/cps
+   (lambda ()
+     (send-http3-request
+      client request
+      :on-body-chunk on-body-chunk
+      :on-information on-information
+      :collect-body-p collect-body-p
+      :max-header-bytes max-header-bytes
+      :max-fields max-fields
+      :max-body-bytes max-body-bytes
+      :request-body-function request-body-function
+      :request-body-length request-body-length
+      :qpack-encoder-table qpack-encoder-table
+      :qpack-decoder-table qpack-decoder-table
+      :qpack-decoder-context qpack-decoder-context
+      :await-qpack await-qpack
+      :huffman-p huffman-p
+      :on-stream-open on-stream-open
+      :on-push-promise on-push-promise
+      :timeout timeout
+      :deadline deadline))
+   on-success
+   :on-error on-error))
+
 (defun %h3-server-pseudo-field-p (name)
   (and (plusp (length name))
        (char= (char name 0) #\:)))

@@ -4982,3 +4982,218 @@
   (signals http-protocol-error
     (parse-http-sse-events
      (octets #x64 #x61 #x74 #x61 #x3a #xc3 #x28 #x0a #x0a))))
+(deftest client-cookie-jar-enforces-partitioning-and-prefixes
+  (let* ((jar (make-http-cookie-jar :clock-function (lambda () 1000)))
+         (partition-key "https://top.example")
+         (response (client-test-response
+                    200
+                    :headers
+                    (list (make-http-header
+                           "Set-Cookie"
+                           "__Host-sid=abc; Secure; Path=/; SameSite=None; Partitioned")
+                          (make-http-header
+                           "Set-Cookie"
+                           "__Host-bad=def; Path=/")
+                          (make-http-header
+                           "Set-Cookie"
+                           "insecure=ghi; Path=/; SameSite=None")))))
+    (http-cookie-jar-accept-response
+     jar "https://example.test/login" response
+     :now 1000
+     :partition-key partition-key)
+    (ensure-equal "__Host-sid=abc"
+                  (http-cookie-jar-cookie-header
+                   jar "https://example.test/dashboard"
+                   :now 1001
+                   :partition-key partition-key
+                   :same-site-context :same-site
+                   :method "GET"))
+    (ensure-equal nil
+                  (http-cookie-jar-cookie-header
+                   jar "https://example.test/dashboard"
+                   :now 1001
+                   :partition-key "https://other.example"
+                   :same-site-context :same-site
+                   :method "GET"))
+    (ensure-equal nil
+                  (http-cookie-jar-cookie-header
+                   jar "https://example.test/dashboard"
+                   :now 1001
+                   :same-site-context :same-site
+                   :method "GET"))))
+
+(deftest client-content-coding-selection
+  (let* ((adapter (make-http-content-coding
+                   :name "br"
+                   :decoder #'identity))
+         (parsed (parse-http-accept-encoding "gzip;q=0.1, br;q=0.8, identity;q=0")))
+    (ensure-equal '(("gzip" . 0.1) ("br" . 0.8) ("identity" . 0))
+                  parsed)
+    (ensure-true (eq adapter
+                     (http-select-content-coding
+                      "gzip;q=0.1, br;q=0.8, identity;q=0"
+                      (list "gzip" adapter))))
+    (ensure-equal nil
+                  (http-select-content-coding
+                   "gzip;q=0, *;q=0, identity;q=0"
+                   (list "gzip" adapter)))
+    (ensure-equal "identity"
+                  (http-select-content-coding
+                   ""
+                   (list "gzip" adapter)))
+    (ensure-equal nil
+                  (http-select-content-coding
+                   "gzip;q=0.5"
+                   (list "br" adapter)))))
+
+(deftest client-protocol-alpn-selection
+  (ensure-equal "http/1.1" (http-alpn-protocol-name :http1))
+  (ensure-equal "h2" (http-alpn-protocol-name "HTTP2"))
+  (ensure-equal "h3" (http-alpn-protocol-name "http-3"))
+  (ensure-equal nil (http-alpn-protocol-name "spdy"))
+  (ensure-equal "h2"
+                (http-select-protocol
+                 '("spdy/3" "h2" "http/1.1")
+                 '(:http1 :http2))))
+
+(deftest client-cache-request-directives
+  (let* ((cache (make-http-cache :clock-function (lambda () 1000)))
+         (request (make-http-request
+                   :method "GET"
+                   :uri "http://example.test/cache"))
+         (response (client-test-response
+                    200
+                    :headers (list (make-http-header
+                                    "Cache-Control" "max-age=1"))
+                    :body (ascii "cached"))))
+    (http-cache-store cache request response :now 1000)
+    (multiple-value-bind (cached-response state entry)
+        (http-cache-lookup
+         cache
+         (make-http-request
+          :method "GET"
+          :uri "http://example.test/cache"
+          :headers (list (make-http-header "Cache-Control" "max-stale=10")))
+         :now 1005)
+      (declare (ignore entry))
+      (ensure-equal :stale-allowed state)
+      (ensure-equal "cached"
+                    (octets-as-string (http-response-body cached-response))))
+    (multiple-value-bind (cached-response state entry)
+        (http-cache-lookup
+         cache
+         (make-http-request
+          :method "GET"
+          :uri "http://example.test/cache"
+          :headers (list (make-http-header "Cache-Control" "no-store")))
+         :now 1001)
+      (declare (ignore cached-response entry))
+      (ensure-equal :miss state))))
+
+(deftest client-cache-revalidation-refreshes-stored-response
+  (let ((calls 0)
+        (seen-if-none-match nil)
+        (seen-bodies nil)
+        (now 1000))
+    (with-test-client (client
+                       (lambda (request &key proxy-plan &allow-other-keys)
+                         (declare (ignore proxy-plan))
+                         (incf calls)
+                         (setf seen-if-none-match
+                               (http-header-value
+                                (http-request-headers request)
+                                "If-None-Match"))
+                         (if (= calls 1)
+                             (client-test-response
+                              200
+                              :headers (list (make-http-header "ETag" "\"v1\"")
+                                             (make-http-header
+                                              "Cache-Control" "max-age=0"))
+                              :body (ascii "cached"))
+                             (client-test-response
+                              304
+                              :headers (list (make-http-header
+                                              "Cache-Control" "max-age=60")))))
+                       :cache (make-http-cache :clock-function (lambda () now)))
+      (let ((request (http-client-request client "GET"
+                                          "http://example.test/resource")))
+        (multiple-value-bind (response effective)
+            (http-client-send client request)
+          (ensure-equal 200 (http-response-status response))
+          (ensure-equal request effective))
+        (setf now 1001)
+        (multiple-value-bind (response effective)
+            (http-client-send client request)
+          (ensure-equal 200 (http-response-status response))
+          (ensure-equal request effective)
+          (ensure-equal "cached" (octets-as-string (http-response-body response))))
+        (ensure-equal "\"v1\"" seen-if-none-match)
+        (setf now 1002)
+        (multiple-value-bind (response effective)
+            (http-client-send
+             client request
+             :on-body-chunk (lambda (chunk)
+                              (push (octets-as-string chunk) seen-bodies)))
+          (ensure-equal 200 (http-response-status response))
+          (ensure-equal request effective))
+        (ensure-equal 2 calls)
+        (ensure-equal '("cached") seen-bodies)))))
+
+(deftest client-proxy-ipv4-address-boundaries
+  (ensure-equal
+   (octets 192 0 2 10)
+   (http-kit/client::%proxy-ipv4-octets "192.0.2.10"))
+  (ensure-equal nil
+                (http-kit/client::%proxy-ipv4-octets "192.0.2"))
+  (ensure-equal nil
+                (http-kit/client::%proxy-ipv4-octets "192.0.2.999"))
+  (ensure-equal nil
+                (http-kit/client::%proxy-ipv4-octets "192.0..10")))
+
+(deftest client-proxy-ipv6-address-boundaries
+  (ensure-equal
+   (octets 32 1 13 184 0 0 0 0 0 0 0 0 0 0 0 1)
+   (http-kit/client::%proxy-ipv6-octets "2001:db8::1"))
+  (ensure-equal
+   (octets 0 0 0 0 0 0 0 0 0 0 255 255 192 0 2 1)
+   (http-kit/client::%proxy-ipv6-octets "::ffff:192.0.2.1"))
+  (ensure-equal nil
+                (http-kit/client::%proxy-ipv6-octets "2001::db8::1"))
+  (ensure-equal nil
+                (http-kit/client::%proxy-ipv6-octets "[2001:db8::1]")))
+
+(deftest client-proxy-resolved-address-boundaries
+  (ensure-equal
+   (octets 203 0 113 7)
+   (http-kit/client::%proxy-resolved-address
+    "service.example"
+    (lambda (host)
+      (ensure-equal "service.example" host)
+      "203.0.113.7")))
+  (signals http-proxy-error
+    (http-kit/client::%proxy-resolved-address
+     "service.example"
+     (lambda (host)
+       (declare (ignore host))
+       "not-an-ip"))))
+
+(deftest client-proxy-socks-address-boundaries
+  (ensure-equal
+   (octets 3 12 101 120 97 109 112 108 101 46 116 101 115 116)
+   (http-kit/client::%proxy-builder-vector
+    (http-kit/client::%proxy-socks-address "example.test" t nil)))
+  (ensure-equal
+   (octets 1 192 0 2 1)
+   (http-kit/client::%proxy-builder-vector
+    (http-kit/client::%proxy-socks-address "192.0.2.1" nil nil)))
+  (ensure-equal
+   (octets 4 32 1 13 184 0 0 0 0 0 0 0 0 0 0 0 9)
+   (http-kit/client::%proxy-builder-vector
+    (http-kit/client::%proxy-socks-address "2001:db8::9" nil nil)))
+  (signals http-proxy-error
+    (http-kit/client::%proxy-socks-address "service.example" nil nil))
+  (signals http-proxy-error
+    (http-kit/client::%proxy-socks-address
+     ""
+     t
+     nil)))

@@ -214,6 +214,40 @@
         directives
         (list (cons "no-cache" nil)))))
 
+(defun %cache-nonnegative-seconds (value)
+  (let ((number (%client-parse-integer value :allow-sign-p nil)))
+    (and number (>= number 0) number)))
+
+(defun %cache-request-no-store-p (request)
+  (%cache-directive-present-p
+   (%cache-request-directives (http-request-headers request))
+   "no-store"))
+
+(defun %cache-request-no-cache-p (request)
+  (let ((directives (%cache-request-directives (http-request-headers request))))
+    (or (%cache-directive-present-p directives "no-cache")
+        (let ((max-age (%cache-nonnegative-seconds
+                        (%cache-directive directives "max-age"))))
+          (and max-age (zerop max-age))))))
+
+(defun %cache-request-min-fresh (request)
+  (%cache-nonnegative-seconds
+   (%cache-directive
+    (%cache-request-directives (http-request-headers request))
+    "min-fresh")))
+
+(defun %cache-request-max-stale (request)
+  (let* ((directives (%cache-request-directives (http-request-headers request)))
+         (name "max-stale"))
+    (when (%cache-directive-present-p directives name)
+      (let ((value (%cache-directive directives name)))
+        (if value (%cache-nonnegative-seconds value) :unbounded)))))
+
+(defun %cache-response-must-revalidate-p (headers)
+  (let ((directives (%cache-control-directives headers)))
+    (or (%cache-directive-present-p directives "must-revalidate")
+        (%cache-directive-present-p directives "proxy-revalidate"))))
+
 (defun %cache-directive (directives name)
   (cdr (assoc name directives :test #'string=)))
 
@@ -563,7 +597,7 @@ RFC 9211 reason token when the request must be forwarded."
                  (%cache-copy-entry entry)))
         (stale-allowed-p
          (values (%cache-entry-response-for-request entry request current-age)
-                 :stale
+                 :stale-allowed
                  (%cache-copy-entry entry)))
         (t
          (values nil :stale (%cache-copy-entry entry)

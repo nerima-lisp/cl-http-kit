@@ -487,7 +487,7 @@ interoperable browser behavior rather than making a response unusable."
 (defun http-cookie-jar-cookie-header
     (jar request-uri
      &key now (same-site-p t) (top-level-navigation-p nil) (method "GET")
-       partition-key)
+       partition-key same-site-context)
   "Return the Cookie request-header value applicable to REQUEST-URI, or NIL.
 
 SAME-SITE-P states whether the request is same-site with its initiating
@@ -495,6 +495,8 @@ context.  Cross-site Lax cookies are sent only for safe top-level navigations."
   (unless (http-cookie-jar-p jar)
     (%client-protocol-error "Expected an HTTP-COOKIE-JAR value." jar))
   (%cookie-partition-key partition-key)
+  (when same-site-context
+    (setf same-site-p (eq same-site-context :same-site)))
   (let* ((request-uri (%client-uri request-uri))
          (now (or now (funcall (%http-cookie-jar-clock-function jar))))
          (stored-cookies (delete-if (lambda (cookie)

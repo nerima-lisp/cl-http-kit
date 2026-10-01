@@ -164,6 +164,7 @@
    #:read-http3-qpack-decoder-stream
    #:serve-http3-control-stream
    #:send-http3-request
+   #:send-http3-request/cps
    #:send-http3-push
    #:receive-http3-push
    #:serve-http3-request-stream))
