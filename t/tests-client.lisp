@@ -2206,7 +2206,7 @@
                              (http-cache-lookup cache min-fresh :now 1006)))
     (multiple-value-bind (response state)
         (http-cache-lookup cache max-stale-five :now 1015)
-      (ensure-equal :stale state)
+      (ensure-equal :stale-allowed state)
       (ensure-true response)
       (ensure-equal "15" (http-header-value
                            (http-response-headers response) "Age")))
@@ -2216,7 +2216,7 @@
       (ensure-true (null response)))
     (multiple-value-bind (response state)
         (http-cache-lookup cache max-stale-any :now 1100)
-      (ensure-equal :stale state)
+      (ensure-equal :stale-allowed state)
       (ensure-true response)
       (ensure-equal "100" (http-header-value
                             (http-response-headers response) "Age")))
