@@ -901,15 +901,18 @@
            (lambda (read-stream &key timeout deadline)
              (declare (ignore read-stream timeout deadline))
              (push (list :read inside-p) events)
-             (values wire nil))
+           (values wire nil))
            :open-p t
-           :qpack-decoder-table table))
+           :qpack-decoder-table table
+           :qpack-decoder-context
+           (http-kit/http3:make-http3-qpack-decoder-context table)))
     (http-kit/http3:attach-http3-peer-qpack-encoder-stream client stream)
     (multiple-value-bind (application-events ended-p)
         (http-kit/http3:read-http3-qpack-encoder-stream client)
       (ensure-equal 2 (length application-events))
       (ensure-equal nil ended-p))
-    (ensure-equal '((:read nil) (:enter 0) (:leave 1 t 0))
+    (ensure-equal '((:enter 0) (:leave 0 nil 0)
+                   (:read nil) (:enter 0) (:leave 1 t 0))
                   (nreverse events))
     (ensure-equal 1
                   (http-kit/http3:qpack-dynamic-table-insert-count table))))
