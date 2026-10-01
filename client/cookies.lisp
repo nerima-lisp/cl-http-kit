@@ -9,8 +9,9 @@
        (every (lambda (character)
                 (let ((code (char-code character)))
                   (and (<= #x21 code #x7e)
-                       (not (find character "()<>@,;:\\\"/[]?={} \t"
-                                   :test #'char=)))))
+                       (not (or (find character "()<>@,;:\\\"/[]?={} "
+                                         :test #'char=)
+                                (char= character #\Tab))))))
               name)))
 
 (defun %cookie-octets-p (value &key (start 0) (end (length value)))
@@ -240,11 +241,12 @@
             (setf invalid t))
           (dolist (attribute (when (not (string= attribute-string ""))
                                (loop with start = 1
-                                     for separator = (position #\; set-cookie
+                                     for separator = (position #\; attribute-string
                                                               :start start)
                                      collect (%cookie-trim
-                                              (subseq set-cookie start
-                                                      (or separator (length set-cookie))))
+                                              (subseq attribute-string start
+                                                      (or separator
+                                                          (length attribute-string))))
                                      while separator
                                      do (setf start (1+ separator)))))
             (multiple-value-bind (attribute-name attribute-value)
