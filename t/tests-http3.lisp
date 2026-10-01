@@ -1030,8 +1030,7 @@
                  (funcall thunk)))
              :open-stream
              (lambda (request &key stream-type timeout deadline)
-               (declare (ignore request stream-type timeout deadline)
-                        (special inside-p))
+               (declare (ignore request stream-type timeout deadline))
                (setf open-outside-p (not inside-p))
                (values request-stream 4))
              :write-stream
@@ -1042,12 +1041,14 @@
                (error "HEADERS write failed"))
              :close-stream
              (lambda (stream &key condition)
-               (declare (ignore stream condition) (special inside-p))
+               (declare (ignore stream condition))
                (setf close-outside-p (not inside-p)))
              :open-p t
              :qpack-encoder-table table
              :qpack-decoder-table
              (http-kit/http3:make-qpack-dynamic-table)
+             :peer-control-state
+             (http-kit/http3:make-http3-control-state :peer-role :server)
              :qpack-decoder-state state)))
       (declare (special inside-p))
       (signals simple-error
