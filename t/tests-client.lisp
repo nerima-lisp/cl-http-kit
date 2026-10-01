@@ -227,15 +227,15 @@
       (ensure-equal 1 provider-calls))))
 
 (deftest client-forwards-response-field-limit
-  (let ((observed-limit nil)
-        (client
-          (make-http-client
-           :max-fields 17
-           :transport-function
-           (lambda (request &key max-fields &allow-other-keys)
-             (declare (ignore request))
-             (setf observed-limit max-fields)
-             (client-test-response 200)))))
+  (let* ((observed-limit nil)
+         (client
+           (make-http-client
+            :max-fields 17
+            :transport-function
+            (lambda (request &key max-fields &allow-other-keys)
+              (declare (ignore request))
+              (setf observed-limit max-fields)
+              (client-test-response 200)))))
     (http-client-send
      client
      (http-client-request client "GET" "http://example.test/"))
