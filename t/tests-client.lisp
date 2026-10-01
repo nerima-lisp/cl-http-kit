@@ -3455,10 +3455,11 @@
       (ensure-equal 443 (getf plan :connect-port)))
     (ensure-true (http-proxy-no-proxy-p
                  proxy "http://bypass.example/path")))
-  (let* ((proxy (make-http-proxy :scheme :socks5
-                                 :host "proxy.example"
-                                 :username "user:name"
-                                 :password "pass"))
+    (let* ((proxy (make-http-proxy :scheme :socks5
+                                   :host "proxy.example"
+                                   :port 1080
+                                   :username "user:name"
+                                   :password "pass"))
          (plan (http-proxy-plan proxy "http://example.test/path")))
     (ensure-equal :socks5 (getf plan :mode))
     (ensure-false (getf plan :proxy-authorization))))
