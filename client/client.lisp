@@ -1131,6 +1131,7 @@ eligible stale cache entry may be returned through the configured scheduler."
          (retry-policy (or retry-policy
                            (http-client-retry-policy client)))
          (initial-uri (http-request-uri request))
+         (cache-request request)
          (current-request request)
          (only-if-cached-p (%client-only-if-cached-p request))
          (redirect-count 0)
@@ -1422,5 +1423,9 @@ eligible stale cache entry may be returned through the configured scheduler."
                                           (http-response-status response))
                                       forwarded-status)
                                  :stored-p (not (null stored-entry)))))))
-                  (return (values response prepared))))))))
+                  (return
+                    (values response
+                            (if (and stale-entry (= forwarded-status 304))
+                                cache-request
+                                prepared)))))))))
       ))))

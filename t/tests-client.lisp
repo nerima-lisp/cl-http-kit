@@ -5123,8 +5123,11 @@
                              (client-test-response
                               304
                               :headers (list (make-http-header
-                                              "Cache-Control" "max-age=60")))))
-                       :cache (make-http-cache :clock-function (lambda () now)))
+                                              "Cache-Control" "max-age=60")
+                                             (make-http-header
+                                              "ETag" "\"v1\"")))))
+                       :cache (make-http-cache :clock-function (lambda () now))
+                       :automatic-decompression-p nil)
       (let ((request (http-client-request client "GET"
                                           "http://example.test/resource")))
         (multiple-value-bind (response effective)
