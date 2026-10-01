@@ -17,6 +17,8 @@
            #:deftest
            #:ensure-conversion-cases
            #:ensure-equal
+           #:ensure-false
+           #:ensure-octets-equal
            #:ensure-printed-contains
            #:ensure-printed=
            #:ensure-serialization-cases
