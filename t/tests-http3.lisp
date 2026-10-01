@@ -1594,6 +1594,8 @@
              (http-kit/http3::%make-http3-client
               :qpack-decoder-table decoder-table
               :qpack-decoder-context context
+              :peer-control-state
+              (http-kit/http3:make-http3-control-state :peer-role :server)
               :open-stream
               (lambda (request &key stream-type timeout deadline)
                 (declare (ignore request stream-type timeout deadline))
