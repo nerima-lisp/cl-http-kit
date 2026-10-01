@@ -3531,7 +3531,9 @@
             (lambda (closed-stream)
               (ensure-equal stream closed-stream)
               (incf closed))))
-         (client (make-http-client :cache nil :connection-pool pool)))
+         (client (make-http-client :cache nil
+                                   :automatic-decompression-p nil
+                                   :connection-pool pool)))
     (multiple-value-bind (response effective)
         (http-client-send
          client
