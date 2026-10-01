@@ -1543,7 +1543,8 @@
          client :stream :collect-body-p t
          :qpack-decoder-table
          (http-kit/http3::http3-client-qpack-decoder-table client)))
-      (ensure-equal '((:read nil) :serialize-enter (:decode-condition t))
+      (ensure-equal '(:serialize-enter (:read nil)
+                      :serialize-enter (:decode-condition t))
                     (nreverse events)))
     (let* ((inside-p nil)
            (events '())
@@ -1560,11 +1561,11 @@
                 (declare (ignore stream timeout deadline))
                 (push (list :read inside-p) events)
                 (values (malformed-headers-wire) t)))))
-      (signals http-protocol-error
+      (signals simple-error
         (http-kit/http3::%h3-read-response
          client :stream :collect-body-p t
          :qpack-decoder-table caller-table))
-      (ensure-equal '((:read nil)) (nreverse events)))))
+      (ensure-equal '(:unexpected-serialize) (nreverse events)))))
 
 (deftest http3-client-blocked-response-pauses-same-chunk
   (multiple-value-bind (decoder-table section instruction)
