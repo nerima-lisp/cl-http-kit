@@ -4270,6 +4270,7 @@
            (proxy
              (make-http-proxy :scheme :socks5
                               :host "proxy.example"
+                              :port 1080
                               :username (first credentials)
                               :password (second credentials)))
            (client
