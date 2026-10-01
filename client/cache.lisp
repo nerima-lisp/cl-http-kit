@@ -301,7 +301,7 @@
       (%cache-directive-present-p directives "private")))
 
 (defun %cache-understands-status-p (status)
-  (not (null (assoc status *http-status-reasons*))))
+  (not (null (assoc status http-kit::*http-status-reasons*))))
 
 (defun %cache-response-no-store-p (status directives)
   (and (%cache-directive-present-p directives "no-store")
