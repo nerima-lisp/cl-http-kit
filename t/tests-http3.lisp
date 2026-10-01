@@ -2292,7 +2292,7 @@
       (ensure-equal (list (list :push-stream #x10c)) cancelled)
       (ensure-equal 1 (length closed))
       (ensure-equal :push-stream (first (first closed)))
-      (ensure (typep (second (first closed)) 'http-protocol-error)))))
+      (ensure-true (typep (second (first closed)) 'http-protocol-error)))))
 
 (deftest http3-injected-quic-request-response
   (let* ((request-table
