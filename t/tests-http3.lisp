@@ -3506,8 +3506,9 @@
 (deftest http3-client-rejects-invalid-streaming-request-bodies
   (let ((opened 0))
     (labels ((open-stream (request &key stream-type timeout deadline)
-               (declare (ignore request stream-type timeout deadline))
-               (incf opened)
+             (declare (ignore request stream-type timeout deadline))
+               (when (eq stream-type :request)
+                 (incf opened))
                (values (make-http3-test-stream :kind :request) 0))
              (write-stream (stream octets &key fin-p timeout deadline)
                (declare (ignore stream octets fin-p timeout deadline)))
