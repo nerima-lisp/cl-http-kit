@@ -3469,6 +3469,7 @@
            (http-proxy-no-proxy-p
             (make-http-proxy :scheme :http
                              :host "proxy.example"
+                             :port 8080
                              :no-proxy rules)
             uri)))
     (ensure-true (matches-p "example.com" "http://example.com/"))
