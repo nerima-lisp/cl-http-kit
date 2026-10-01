@@ -3168,7 +3168,7 @@
            (incf serialized)
            (funcall thunk)))
       (ensure-equal 0 push-id)
-      (ensure (eq response returned-response)))
+      (ensure-true (eq response returned-response)))
     (ensure-equal 1 serialized)
     (ensure-equal '(0)
                   (http-kit/http3:http3-control-state-promised-push-ids
@@ -3189,9 +3189,9 @@
             (http-kit/http3:http3-varint-decode
              (http-kit/http3:http3-frame-payload (first frames)))
           (ensure-equal 0 push-id)
-          (ensure (< position
-                     (length (http-kit/http3:http3-frame-payload
-                              (first frames)))))))
+          (ensure-true (< position
+                          (length (http-kit/http3:http3-frame-payload
+                                   (first frames)))))))
       (ensure-equal :push-stream (first prefix-write))
       (ensure-equal
        (http3-test-concat-octets
