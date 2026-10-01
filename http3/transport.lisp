@@ -2012,7 +2012,7 @@ can be consumed only once."
                                     :h3-id-error))
                                  (push push-id
                                        (http3-client-consumed-push-ids client))
-                                 (copy-tree (cdr entry)))))))))
+                                 (copy-tree (cdr entry))))))))
                  (let ((promise (claim-promise)))
                    (unless promise
                      (when await-push-promise
@@ -2057,7 +2057,7 @@ can be consumed only once."
                      :await-qpack await-qpack
                      :request-method (cdr (assoc ":method" promise :test #'string=))
                      :timeout timeout
-                     :deadline deadline)))))
+                     :deadline deadline))))))
            (error (condition)
              (setf failure condition)
              (error condition)))
