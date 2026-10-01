@@ -311,16 +311,12 @@
          state
          (frame http-kit/http3:+http3-goaway-type+
                 (http-kit/http3:http3-varint-encode 7))))
-      (handler-case
-          (progn
-            (http-kit/http3:process-http3-control-frame
-             state
-             (frame http-kit/http3:+http3-cancel-push-type+
-                    (http-kit/http3:http3-varint-encode 0)))
-            (error "Expected server CANCEL_PUSH to fail."))
-        (http-protocol-error (condition)
-          (ensure-equal :h3-id-error
-                        (http-protocol-error-detail condition))))
+      (ensure-equal
+       :cancel-push
+       (http-kit/http3:process-http3-control-frame
+        state
+        (frame http-kit/http3:+http3-cancel-push-type+
+               (http-kit/http3:http3-varint-encode 0))))
       (ensure-equal
        :goaway
        (http-kit/http3:process-http3-control-frame
@@ -401,7 +397,7 @@
          (peer-wire
            (http3-test-concat-octets
             (http-kit/http3:http3-control-stream-prefix)
-            settings-wire goaway-wire)))
+            settings-wire goaway-wire cancel-push-wire)))
     (labels ((chunks (source)
                (list (list (subseq source 0 2) nil)
                      (list (subseq source 2) t))))
@@ -487,6 +483,12 @@
                    :write-stream #'write-stream
                    :read-stream #'read-stream
                    :close-stream #'close-stream)))
+            (setf (http-kit/http3:http3-control-state-max-push-id
+                   (http-kit/http3:http3-client-peer-control-state client))
+                  3
+                  (http-kit/http3:http3-control-state-promised-push-ids
+                   (http-kit/http3:http3-client-peer-control-state client))
+                  '(2))
             (ensure-equal client
                           (http-kit/http3:attach-http3-peer-control-stream
                            client peer-stream))
@@ -503,8 +505,10 @@
             (let ((state (http-kit/http3:http3-client-peer-control-state client)))
               (ensure-equal 4
                             (http-kit/http3:http3-control-state-goaway-id state))
-              (ensure-equal nil
+              (ensure-equal 3
                             (http-kit/http3:http3-control-state-max-push-id state))
+              (ensure-equal '(2)
+                            (http-kit/http3:http3-control-state-cancelled-push-ids state))
               (ensure-true
                (http-kit/http3:http3-control-state-settings-received-p state)))
             (ensure-true (http-kit/http3:http3-client-peer-control-fin-p client))
@@ -515,6 +519,48 @@
             (ensure-true (http-kit/http3:close-http3-client client))
             (ensure-true (every #'http3-test-stream-closed-p
                                 (append opened-streams (list peer-stream))))))))))
+
+(deftest http3-client-rejects-server-max-push-id
+  (let* ((settings-wire
+           (http-kit/http3:encode-http3-frame
+            (http-kit/http3:make-http3-settings-frame)))
+         (wire
+           (http3-test-concat-octets
+            (http-kit/http3:http3-control-stream-prefix)
+            settings-wire
+            (http-kit/http3:encode-http3-frame
+             (http-kit/http3:make-http3-frame
+              :type http-kit/http3:+http3-max-push-id-type+
+              :payload (http-kit/http3:http3-varint-encode 1)))))
+         (stream (make-http3-test-stream
+                  :kind :peer-control
+                  :reads (list (list (subseq wire 0 2) nil)
+                                (list (subseq wire 2) nil))))
+         (client
+           (http-kit/http3:make-http3-client
+            :open-stream
+            (lambda (ignored-request &key stream-type timeout deadline)
+              (declare (ignore ignored-request stream-type timeout deadline))
+              (make-http3-test-stream :kind :local))
+            :write-stream
+            (lambda (ignored-stream ignored-octets &key fin-p timeout deadline)
+              (declare (ignore ignored-stream ignored-octets fin-p timeout deadline)))
+            :read-stream
+            (lambda (read-stream &key timeout deadline)
+              (declare (ignore timeout deadline))
+              (let ((entry (pop (http3-test-stream-reads read-stream))))
+                (if entry
+                    (values (first entry) (second entry))
+                    (values nil t)))))))
+    (http-kit/http3:attach-http3-peer-control-stream client stream)
+    (http-kit/http3:read-http3-control-stream client)
+    (handler-case
+        (progn
+          (http-kit/http3:read-http3-control-stream client)
+          (error "Expected server MAX_PUSH_ID to fail."))
+      (http-protocol-error (condition)
+        (ensure-equal :h3-frame-unexpected
+                      (http-protocol-error-detail condition))))))
 
 (deftest http3-qpack-static-field-sections
   (let* ((fields (list (cons ":method" "GET")
@@ -580,13 +626,22 @@
       (ensure-equal fields
                     (http-kit/http3:qpack-decode-field-section
                      encoded :dynamic-table decoder-table))
-      (signals http-protocol-error
-        (http-kit/http3:qpack-decode-field-section
-         encoded
-         :dynamic-table
-         (http-kit/http3:make-qpack-dynamic-table
-          :max-capacity 256
-          :capacity 256)))))
+      (handler-case
+          (progn
+            (http-kit/http3:qpack-decode-field-section
+             encoded
+             :dynamic-table
+             (http-kit/http3:make-qpack-dynamic-table
+              :max-capacity 256
+              :capacity 256))
+            (error "Expected a blocked QPACK field section."))
+        (http-kit/http3:qpack-blocked-field-section (condition)
+          (ensure-equal 4
+                        (http-kit/http3:qpack-blocked-field-section-required-insert-count
+                         condition))
+          (ensure-equal 0
+                        (http-kit/http3:qpack-blocked-field-section-current-insert-count
+                         condition))))))
   (let ((table
           (http-kit/http3:make-qpack-dynamic-table
            :max-capacity 64)))

@@ -387,7 +387,8 @@ are ignored and return :EXTENSION, as required by HTTP/3 extensibility rules."
       ((= type +http3-max-push-id-type+)
        (when (eq (http3-control-state-peer-role state) :server)
          (%http3-control-error
-          "An HTTP/3 server cannot send MAX_PUSH_ID."))
+          "An HTTP/3 server cannot send MAX_PUSH_ID."
+          :h3-frame-unexpected))
        (let ((id (%http3-control-payload-varint frame "MAX_PUSH_ID")))
          (when (and (http3-control-state-max-push-id state)
                     (< id (http3-control-state-max-push-id state)))
@@ -398,18 +399,15 @@ are ignored and return :EXTENSION, as required by HTTP/3 extensibility rules."
          :max-push-id))
       ((= type +http3-cancel-push-type+)
        (let ((id (%http3-control-payload-varint frame "CANCEL_PUSH")))
-         (when (eq (http3-control-state-peer-role state) :server)
-           (%http3-control-error
-            "An HTTP/3 server cannot send CANCEL_PUSH."
-            :h3-id-error))
-         (unless (and (http3-control-state-max-push-id state)
-                      (<= id (http3-control-state-max-push-id state))
-                      (member id
-                              (http3-control-state-promised-push-ids state)
-                              :test #'eql))
-           (%http3-control-error
-            "HTTP/3 CANCEL_PUSH must identify a promised push within MAX_PUSH_ID."
-            :h3-id-error))
+         (unless (eq (http3-control-state-peer-role state) :server)
+           (unless (and (http3-control-state-max-push-id state)
+                        (<= id (http3-control-state-max-push-id state))
+                        (member id
+                                (http3-control-state-promised-push-ids state)
+                                :test #'eql))
+             (%http3-control-error
+              "HTTP/3 CANCEL_PUSH must identify a promised push within MAX_PUSH_ID."
+              :h3-id-error)))
          (pushnew id (http3-control-state-cancelled-push-ids state) :test #'eql)
          :cancel-push))
       ((member type (list +http3-priority-update-request-type+
