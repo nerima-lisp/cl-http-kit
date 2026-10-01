@@ -521,11 +521,7 @@ RFC 9211 reason token when the request must be forwarded."
   (when (http-header-present-p (http-request-headers request) "Range")
     (return-from http-cache-lookup (values nil :miss nil :partial)))
   (when (%cache-conditional-request-p (http-request-headers request))
-    (return-from http-cache-lookup
-      (values nil :miss
-              (let ((entry (%cache-find-entry cache request)))
-                (and entry (%cache-copy-entry entry)))
-              :request)))
+    (return-from http-cache-lookup (values nil :miss nil :request)))
   (let* ((request-directives
            (%cache-request-directives (http-request-headers request)))
          (now (or now (funcall (%http-cache-clock-function cache))))

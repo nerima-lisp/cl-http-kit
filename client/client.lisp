@@ -1069,6 +1069,7 @@ headers replace client default headers with the same case-insensitive name."
                          (cookie-same-site-p t)
                          (cookie-top-level-navigation-p nil)
                          cookie-partition-key
+                         cache-revalidation-entry
                          (allow-stale-while-revalidate-p t))
   "Execute REQUEST with redirects, retries, cookies, cache, auth, and proxy policy.
 
@@ -1143,7 +1144,7 @@ eligible stale cache entry may be returned through the configured scheduler."
                 (lambda (chunk)
                   (setf response-body-observed-p t)
                   (funcall on-body-chunk chunk))))
-         (stale-entry nil))
+         (stale-entry cache-revalidation-entry))
     (unless (http-redirect-policy-p redirect-policy)
       (%client-protocol-error "The redirect policy must be an HTTP-REDIRECT-POLICY."
                               redirect-policy))
@@ -1206,6 +1207,7 @@ eligible stale cache entry may be returned through the configured scheduler."
                            :cookie-top-level-navigation-p
                            cookie-top-level-navigation-p
                            :cookie-partition-key cookie-partition-key
+                           :cache-revalidation-entry entry
                            :allow-stale-while-revalidate-p nil))))
               (setf stale-response
                     (%cache-status-hit-response
@@ -1217,10 +1219,7 @@ eligible stale cache entry may be returned through the configured scheduler."
                 (values stale-response current-request)))
             (setf stale-entry entry
                   current-request revalidation-request)))
-        (when (and (eq state :miss)
-                   entry
-                   (eq forward-reason :request))
-          (setf stale-entry entry))))
+        ))
     (loop
       (block next-attempt
         (let* ((redirect-p (plusp redirect-count))
