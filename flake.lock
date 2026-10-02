@@ -290,6 +290,23 @@
         "type": "github"
       }
     },
+    "cl-crypto-kit": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1790920154,
+        "narHash": "sha256-3EZACudiOvkThjXTV9WUKMRDBK1Sd7QK1JSAvHodJls=",
+        "owner": "nerima-lisp",
+        "repo": "cl-crypto-kit",
+        "rev": "5be434a17f8756ffd921313fc198407726ede3a8",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nerima-lisp",
+        "ref": "takeokunn-crypto-integration",
+        "repo": "cl-crypto-kit",
+        "type": "github"
+      }
+    },
     "cl-date-kit": {
       "inputs": {
         "cl-nix-forge": "cl-nix-forge_6",
@@ -342,6 +359,30 @@
         "owner": "nerima-lisp",
         "ref": "v1.0.0",
         "repo": "cl-date-kit",
+        "type": "github"
+      }
+    },
+    "cl-deflate-kit": {
+      "inputs": {
+        "cl-weave": [
+          "cl-weave"
+        ],
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1790938998,
+        "narHash": "sha256-FVZMzy0gmYDGIeyVAvObaw8kwZ5liDPuqbSnIiHnMlY=",
+        "owner": "nerima-lisp",
+        "repo": "cl-deflate-kit",
+        "rev": "c346e1468e8ffea98ee2e844f755d5debe8ab47e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nerima-lisp",
+        "ref": "takeokunn-deflate-core",
+        "repo": "cl-deflate-kit",
         "type": "github"
       }
     },
@@ -1250,6 +1291,33 @@
         "owner": "nerima-lisp",
         "ref": "v1.0.1",
         "repo": "cl-prolog",
+        "type": "github"
+      }
+    },
+    "cl-tls-kit": {
+      "inputs": {
+        "cl-crypto-kit": [
+          "cl-crypto-kit"
+        ],
+        "cl-weave": [
+          "cl-weave"
+        ],
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1790943415,
+        "narHash": "sha256-AGx8wE3RolGEwXbhKVAlBmlgW7D9kp2SFM0z4MXcrOM=",
+        "owner": "nerima-lisp",
+        "repo": "cl-tls-kit",
+        "rev": "f670518cca12b57a9cde5f61d35d055a7df3a540",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nerima-lisp",
+        "ref": "takeokunn-tls13-handshake",
+        "repo": "cl-tls-kit",
         "type": "github"
       }
     },
@@ -2333,9 +2401,12 @@
         "cl-boundary-kit": "cl-boundary-kit",
         "cl-codec-kit": "cl-codec-kit",
         "cl-concurrent-kit": "cl-concurrent-kit",
+        "cl-crypto-kit": "cl-crypto-kit",
         "cl-date-kit": "cl-date-kit",
+        "cl-deflate-kit": "cl-deflate-kit",
         "cl-host-kit": "cl-host-kit_3",
         "cl-observability-kit": "cl-observability-kit",
+        "cl-tls-kit": "cl-tls-kit",
         "cl-weave": "cl-weave_14",
         "nixpkgs": "nixpkgs_4",
         "paredit-cli": "paredit-cli_16",

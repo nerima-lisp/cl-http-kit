@@ -4,7 +4,7 @@
   :description "A portable, binary-safe HTTP client substrate."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.3.0"
+  :version "0.4.0"
   :depends-on ()
   :pathname "src"
   :serial t
@@ -41,7 +41,7 @@
   :description "Optional cl-observability-kit metrics for cl-http-kit."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.3.0"
+  :version "0.4.0"
   :depends-on ("cl-http-kit" "cl-observability-kit")
   :pathname "src"
   :serial t
@@ -53,7 +53,7 @@
   :description "The optional HTTP/2 transport for cl-http-kit."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.3.0"
+  :version "0.4.0"
   :depends-on ("cl-http-kit")
   :pathname "http2"
   :serial t
@@ -83,8 +83,8 @@
   :description "The high-level HTTP client policies and request orchestration layer."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.3.0"
-  :depends-on ("cl-http-kit" "cl-codec-kit" "chipz")
+  :version "0.4.0"
+  :depends-on ("cl-http-kit" "cl-codec-kit" "cl-deflate-kit")
   :pathname "client"
   :serial t
   :components ((:file "package")
@@ -115,7 +115,7 @@
   :description "Optional native TCP and DNS boundary for cl-http-kit."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.3.0"
+  :version "0.4.0"
   :depends-on ("cl-http-kit")
   :pathname "network"
   :serial t
@@ -123,11 +123,11 @@
                (:file "socket")))
 
 (asdf:defsystem "cl-http-kit/tls"
-  :description "Optional cl+ssl TLS integration for cl-http-kit network streams."
+  :description "Optional cl-tls-kit TLS integration for cl-http-kit network streams."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.3.0"
-  :depends-on ("cl-http-kit/network" "cl+ssl")
+  :version "0.4.0"
+  :depends-on ("cl-http-kit/network" "cl-tls-kit" "cl-crypto-kit")
   :pathname "network"
   :serial t
   :components ((:file "tls")))
@@ -136,7 +136,7 @@
   :description "Optional HTTP/3 framing, QPACK, and injected QUIC transport boundary."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.3.0"
+  :version "0.4.0"
   :depends-on ("cl-http-kit" "cl-http-kit/http2")
   :pathname "http3"
   :serial t
@@ -214,6 +214,8 @@
                (:file "tests-http3")
                (:file "tests-properties")
                (:file "tests-client")
+               (:file "tests-client-content-coding")
+               (:file "tests-client-p6")
                (:file "tests-network")
                (:file "runner"))
   :perform (asdf:test-op (op c)

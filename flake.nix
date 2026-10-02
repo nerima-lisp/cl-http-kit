@@ -43,6 +43,24 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
+    cl-crypto-kit = {
+      url = "github:nerima-lisp/cl-crypto-kit/takeokunn-crypto-integration";
+      flake = false;
+    };
+
+    cl-deflate-kit = {
+      url = "github:nerima-lisp/cl-deflate-kit/takeokunn-deflate-core";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.cl-weave.follows = "cl-weave";
+    };
+
+    cl-tls-kit = {
+      url = "github:nerima-lisp/cl-tls-kit/takeokunn-tls13-handshake";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.cl-weave.follows = "cl-weave";
+      inputs.cl-crypto-kit.follows = "cl-crypto-kit";
+    };
+
     paredit-cli = {
       url = "github:takeokunn/paredit-cli/v1.6.0";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -64,6 +82,9 @@
       cl-date-kit,
       cl-host-kit,
       cl-codec-kit,
+      cl-crypto-kit,
+      cl-deflate-kit,
+      cl-tls-kit,
       paredit-cli,
       treefmt-nix,
       ...
@@ -96,7 +117,9 @@
           date = cl-date-kit.packages.${system}.default;
           host = cl-host-kit.packages.${system}.default;
           codec = cl-codec-kit.packages.${system}.default;
-          chipz = pkgs.sbclPackages.chipz;
+          deflate = cl-deflate-kit.packages.${system}.default;
+          tls = cl-tls-kit.packages.${system}.default;
+          crypto = cl-crypto-kit;
           paredit = paredit-cli.packages.${system}.default;
         in
         {
@@ -109,7 +132,8 @@
               date
               host
               codec
-              chipz
+              deflate
+              tls
               paredit
               pkgs.sbcl
               pkgs.coreutils
@@ -129,6 +153,9 @@
                   "${date}//"
                   "${host}//"
                   "${codec}//"
+                  "${deflate}//"
+                  "${tls}//"
+                  "${crypto}//"
                 ]
               }}"
             '';
@@ -146,7 +173,9 @@
           date = cl-date-kit.packages.${system}.default;
           host = cl-host-kit.packages.${system}.default;
           codec = cl-codec-kit.packages.${system}.default;
-          chipz = pkgs.sbclPackages.chipz;
+          deflate = cl-deflate-kit.packages.${system}.default;
+          tls = cl-tls-kit.packages.${system}.default;
+          crypto = cl-crypto-kit;
           paredit = paredit-cli.packages.${system}.default;
           sourceRegistry = pkgs.lib.concatStringsSep ":" [
             "${clWeave}/share/common-lisp/source//"
@@ -156,7 +185,9 @@
             "${date}//"
             "${host}//"
             "${codec}//"
-            "${chipz}//"
+            "${deflate}//"
+            "${tls}//"
+            "${crypto}//"
           ];
           appMeta = {
             description = "Common Lisp HTTP client quality gate";
@@ -199,7 +230,8 @@
               date
               host
               codec
-              chipz
+              deflate
+              tls
             ];
             text = ''
               test_home="''${TMPDIR:-/tmp}/cl-http-kit-test-$$"
@@ -226,7 +258,8 @@
               boundary
               date
               host
-              chipz
+              deflate
+              tls
               pkgs.coreutils
               pkgs.findutils
               pkgs.perl
@@ -368,7 +401,9 @@
           date = cl-date-kit.packages.${system}.default;
           host = cl-host-kit.packages.${system}.default;
           codec = cl-codec-kit.packages.${system}.default;
-          chipz = pkgs.sbclPackages.chipz;
+          deflate = cl-deflate-kit.packages.${system}.default;
+          tls = cl-tls-kit.packages.${system}.default;
+          crypto = cl-crypto-kit;
           paredit = paredit-cli.packages.${system}.default;
           source = pkgs.lib.cleanSource ./.;
           sourceRegistry = pkgs.lib.concatStringsSep ":" [
@@ -379,7 +414,9 @@
             "${date}//"
             "${host}//"
             "${codec}//"
-            "${chipz}//"
+            "${deflate}//"
+            "${tls}//"
+            "${crypto}//"
           ];
         in
         {
@@ -423,7 +460,8 @@
                   boundary
                   date
                   host
-                  chipz
+                  deflate
+                  tls
                 ];
               }
               ''
