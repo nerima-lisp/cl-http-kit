@@ -353,6 +353,64 @@
      :on-information on-information
      :collect-body-p collect-body-p)))
 
+(defun %client-runtime-function (package-name function-name)
+  (let* ((package (find-package package-name))
+         (symbol (and package (find-symbol function-name package))))
+    (and symbol
+         (fboundp symbol)
+         (symbol-function symbol))))
+
+(defun %client-missing-native-feature (feature package-name)
+  (error 'http-unsupported-feature
+         :message (format nil
+                          "The default HTTP client requires ~A from ~A."
+                          feature package-name)
+         :operation :client
+         :detail package-name
+         :feature feature))
+
+(defun %client-native-open-stream-function ()
+  (let ((factory (%client-runtime-function
+                  "HTTP-KIT/NETWORK" "MAKE-HTTP-NETWORK-STREAM-OPENER")))
+    (unless factory
+      (%client-missing-native-feature :native-tcp "HTTP-KIT/NETWORK"))
+    (let ((opener (funcall factory)))
+      (unless (functionp opener)
+        (%client-protocol-error
+         "The native network stream opener factory must return a function."
+         opener))
+      opener)))
+
+(defun %client-native-open-stream ()
+  (let ((opener nil))
+    (lambda (request &key timeout deadline proxy-plan proxy &allow-other-keys)
+      (unless opener
+        (setf opener (%client-native-open-stream-function)))
+      (funcall opener request
+               :timeout timeout
+               :deadline deadline
+               :proxy-plan proxy-plan
+               :proxy proxy))))
+
+(defun %client-native-resolve-host (host &key timeout deadline)
+  (let ((resolver (%client-runtime-function
+                   "HTTP-KIT/NETWORK" "HTTP-NETWORK-RESOLVE-HOST")))
+    (unless resolver
+      (%client-missing-native-feature :native-dns "HTTP-KIT/NETWORK"))
+    (funcall resolver host :timeout timeout :deadline deadline)))
+
+(defun %client-native-tls-upgrade ()
+  (let ((upgrader nil))
+    (lambda (stream uri &key timeout deadline &allow-other-keys)
+      (unless upgrader
+        (let ((factory (%client-runtime-function
+                        "HTTP-KIT/TLS" "MAKE-HTTP-TLS-UPGRADER")))
+          (unless factory
+            (%client-missing-native-feature :tls "HTTP-KIT/TLS"))
+          (setf upgrader
+                (funcall factory :alpn-protocols '("h2" "http/1.1")))))
+      (funcall upgrader stream uri :timeout timeout :deadline deadline))))
+
 (defun make-http-client
     (&key transport-function open-stream close-stream connection-pool
           (default-headers nil)
@@ -374,7 +432,7 @@
           (automatic-decompression-p t)
           (content-decoders (make-http-content-decoders))
           on-request on-response)
-  "Construct a policy-driven HTTP client around an injected transport.
+  "Construct a policy-driven HTTP client around an injected or native transport.
 
 TRANSPORT-FUNCTION is called with REQUEST and keyword arguments including
 :TIMEOUT, :DEADLINE, :MAX-HEADER-BYTES, :MAX-FIELDS, :MAX-BODY-BYTES, :PROXY, and
@@ -384,8 +442,9 @@ stream boundary and owns opening and closing pooled streams.  TLS-UPGRADE and
 RESOLVE-HOST customize the injected stream boundary when OPEN-STREAM is used.
 When STRICT-TRANSPORT-STORE is omitted, the client creates an RFC 6797 store
 and upgrades known hosts before sending.  When ALTERNATIVE-SERVICE-STORE is
-omitted, the client creates an RFC 7838 discovery store.  Pass NIL explicitly
-to disable either store."
+omitted, the client creates an RFC 7838 discovery store.  When no transport
+boundary is supplied, a native TCP/TLS connection pool is created lazily.
+Pass NIL explicitly to disable either store."
   (when (or (and transport-function open-stream)
             (and transport-function connection-pool)
             (and open-stream connection-pool)
@@ -393,9 +452,13 @@ to disable either store."
     (%client-protocol-error
      "Specify only one of :TRANSPORT-FUNCTION, :OPEN-STREAM, or :CONNECTION-POOL."
      (list transport-function open-stream connection-pool close-stream)))
-  (unless (or transport-function open-stream connection-pool)
+  (unless (or transport-function open-stream connection-pool
+              (and (null transport-function)
+                   (null open-stream)
+                   (null connection-pool)
+                   (null close-stream)))
     (%client-protocol-error
-     "An HTTP client requires :TRANSPORT-FUNCTION, :OPEN-STREAM, or :CONNECTION-POOL."
+     "An HTTP client requires a transport boundary or the native default boundary."
      nil))
   (when transport-function
     (%ensure-function transport-function
@@ -490,7 +553,21 @@ to disable either store."
     (%client-protocol-error
      "The client content decoders must be an association list of names and functions."
      content-decoders))
-  (let* ((strict-transport-store
+  (let* ((native-default-p
+           (and (null transport-function)
+                (null open-stream)
+                (null connection-pool)
+                (null close-stream)))
+         (native-open-stream
+           (and native-default-p (%client-native-open-stream)))
+         (native-tls-upgrade
+           (and native-default-p (%client-native-tls-upgrade)))
+         (native-resolve-host
+           (and native-default-p #'%client-native-resolve-host))
+         (effective-open-stream (or open-stream native-open-stream))
+         (effective-tls-upgrade (or tls-upgrade native-tls-upgrade))
+         (effective-resolve-host (or resolve-host native-resolve-host))
+         (strict-transport-store
            (if strict-transport-store-supplied-p
                strict-transport-store
                (make-http-strict-transport-store
@@ -501,20 +578,28 @@ to disable either store."
                (make-http-alternative-service-store
                 :clock-function clock-function)))
          (effective-close-stream (or close-stream #'close))
+         (effective-connection-pool
+           (or connection-pool
+               (and native-default-p
+                    (make-http-connection-pool
+                     :open-stream effective-open-stream
+                     :close-stream effective-close-stream
+                     :tls-upgrade effective-tls-upgrade
+                     :resolve-host effective-resolve-host))))
          (transport (or transport-function
-                        (and connection-pool
+                        (and effective-connection-pool
                              (%client-transport-from-connection-pool
-                              connection-pool))
+                              effective-connection-pool))
                         (%client-transport-from-stream-boundary
                          (make-http-proxy-stream-opener
-                          open-stream effective-close-stream
-                          :tls-upgrade tls-upgrade
-                          :resolve-host resolve-host
+                          effective-open-stream effective-close-stream
+                          :tls-upgrade effective-tls-upgrade
+                          :resolve-host effective-resolve-host
                           :clock-function #'%client-monotonic-time)
                          effective-close-stream))))
     (%make-http-client
      :transport-function transport
-     :connection-pool connection-pool
+     :connection-pool effective-connection-pool
      :default-headers (%client-normalize-headers default-headers)
      :cookie-jar cookie-jar
      :cache cache
@@ -523,8 +608,8 @@ to disable either store."
      :redirect-policy redirect-policy
      :retry-policy retry-policy
      :proxy proxy
-     :tls-upgrade tls-upgrade
-     :resolve-host resolve-host
+     :tls-upgrade effective-tls-upgrade
+     :resolve-host effective-resolve-host
      :auth-provider auth-provider
      :challenge-auth-provider challenge-auth-provider
      :proxy-challenge-auth-provider proxy-challenge-auth-provider
@@ -1061,7 +1146,7 @@ headers replace client default headers with the same case-insensitive name."
                      (http-cache-entry-last-modified entry))))
     (%client-request-with request :headers headers)))
 
-(defun http-client-send
+(defun %http-client-send-request
     (client request &key timeout deadline redirect-policy retry-policy
                          request-body-function request-body-factory
                          request-body-length
@@ -1429,3 +1514,67 @@ eligible stale cache entry may be returned through the configured scheduler."
                                 cache-request
                                 prepared)))))))))
       ))))
+
+(defun %client-send-keyword-plist-p (arguments)
+  (and (evenp (length arguments))
+       (loop for (key value) on arguments by #'cddr
+             declare (ignore value)
+             always (keywordp key))))
+
+(defun %client-convenience-request
+    (client method uri arguments strip-method-p)
+  (unless (%client-send-keyword-plist-p arguments)
+    (%client-protocol-error
+     "The URL client arguments must be a keyword plist."
+     arguments))
+  (unless (or (stringp method) (symbolp method))
+    (%client-protocol-error
+     "The URL client method must be a string or symbol."
+     method))
+  (let ((request-options nil)
+        (send-options nil))
+    (loop for (key value) on arguments by #'cddr
+          do (cond
+               ((member key '(:headers :trailers :body) :test #'eq)
+                (setf request-options
+                      (append request-options (list key value))))
+               ((and strip-method-p (eq key :method)) nil)
+               (t
+                (setf send-options
+                      (append send-options (list key value))))))
+    (values
+     (apply #'http-client-request
+            client
+            (string-upcase (string method))
+            uri
+            request-options)
+     send-options)))
+
+(defun %client-parse-send-arguments (client request-or-method arguments)
+  (if (http-request-p request-or-method)
+      (values request-or-method arguments)
+      (let ((first (first arguments)))
+        (cond
+          ((and arguments
+                (or (stringp first) (http-uri-p first)))
+           (%client-convenience-request
+            client request-or-method first (rest arguments) nil))
+          (t
+           (%client-convenience-request
+            client
+            (or (getf arguments :method) "GET")
+            request-or-method
+            arguments
+            t))))))
+
+(defun http-client-send (client request-or-method &rest arguments)
+  "Send a request through CLIENT.
+
+The compatible form accepts an HTTP-REQUEST followed by the existing keyword
+arguments.  The convenience form accepts METHOD and URI positionally, or URI
+with an optional :METHOD keyword, and builds the request with CLIENT defaults.
+Convenience-only :HEADERS, :TRAILERS, and :BODY options are consumed while
+all other keywords retain the HTTP-CLIENT-SEND contract."
+  (multiple-value-bind (request send-options)
+      (%client-parse-send-arguments client request-or-method arguments)
+    (apply #'%http-client-send-request client request send-options)))

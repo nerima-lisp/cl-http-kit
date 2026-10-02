@@ -725,10 +725,12 @@
                              "Digest"))
     (%client-protocol-error "Digest authentication requires a Digest challenge."
                             challenge))
-  (dolist (value (list method request-target username password cnonce))
-    (unless (%auth-value-p value)
-      (%client-protocol-error "Digest authentication requires valid string inputs."
-                              value)))
+  (loop for value in (list method request-target username password cnonce)
+        for label in '(:method :request-target :username :password :cnonce)
+        do (unless (%auth-value-p value)
+             (%client-protocol-error
+              "Digest authentication requires valid string inputs."
+              label)))
   (unless (and (integerp nonce-count) (<= 1 nonce-count #xffffffff))
     (%client-protocol-error "Digest nonce-count must be between 1 and 2^32-1."
                             nonce-count))

@@ -1,5 +1,149 @@
 (in-package #:http-kit/client)
 
+(defparameter *proxy-environment-function*
+  (lambda (name)
+    (uiop:getenv name)))
+
+(defun %proxy-environment-value (&rest names)
+  (loop for name in names
+        for value = (funcall *proxy-environment-function* name)
+        when value do
+          (unless (stringp value)
+            (%client-protocol-error
+             "A proxy environment variable must contain a string."
+             name))
+          (return value)))
+
+(defun %proxy-environment-scheme (scheme)
+  (intern (string-upcase scheme) :keyword))
+
+(defun %proxy-environment-hex-value (character)
+  (position character "0123456789abcdefABCDEF" :test #'char=))
+
+(defun %proxy-environment-unescape (value variable)
+  (with-output-to-string (stream)
+    (loop for index from 0 below (length value)
+          for character = (char value index)
+          do (if (char= character #\%)
+                 (if (<= (+ index 2) (1- (length value)))
+                     (let ((high (%proxy-environment-hex-value
+                                  (char value (1+ index))))
+                           (low (%proxy-environment-hex-value
+                                 (char value (+ index 2)))))
+                       (unless (and high low)
+                         (%client-protocol-error
+                          "A proxy environment URL contains an invalid escape."
+                          variable))
+                       (write-char (code-char (+ (* 16 high) low)) stream)
+                       (incf index 2))
+                     (%client-protocol-error
+                      "A proxy environment URL contains an incomplete escape."
+                      variable))
+                 (write-char character stream)))))
+
+(defun %proxy-environment-port (value variable)
+  (let ((port (%client-parse-integer value :allow-sign-p nil)))
+    (unless (and port (<= 1 port 65535))
+      (%client-protocol-error
+       "A proxy environment URL contains an invalid port."
+       variable))
+    port))
+
+(defun %proxy-environment-proxy (value variable)
+  (let* ((value (%cache-trim value))
+         (scheme-position (search "://" value))
+         (scheme (if scheme-position
+                     (subseq value 0 scheme-position)
+                     "http"))
+         (scheme-keyword (%proxy-environment-scheme scheme))
+         (authority-start (if scheme-position (+ scheme-position 3) 0))
+         (authority-end (position-if
+                         (lambda (character)
+                           (find character "/?#" :test #'char=))
+                         value :start authority-start))
+         (authority (subseq value authority-start authority-end)))
+    (unless (and (member scheme-keyword '(:http :https :socks5 :socks5h))
+                 (plusp (length authority))
+                 (or (null authority-end)
+                     (string= (subseq value authority-end) "/")))
+      (%client-protocol-error
+       "A proxy environment URL has an unsupported scheme or path."
+       variable))
+    (let* ((at (position #\@ authority :from-end t))
+           (userinfo (and at (subseq authority 0 at)))
+           (hostport (if at (subseq authority (1+ at)) authority))
+           (username nil)
+           (password nil))
+      (when userinfo
+        (let ((separator (position #\: userinfo)))
+          (if separator
+              (setf username
+                    (%proxy-environment-unescape
+                     (subseq userinfo 0 separator) variable)
+                    password
+                    (%proxy-environment-unescape
+                     (subseq userinfo (1+ separator)) variable))
+              (setf username
+                    (%proxy-environment-unescape userinfo variable)))))
+      (multiple-value-bind (host port)
+          (cond
+            ((and (plusp (length hostport))
+                  (char= (char hostport 0) #\[))
+             (let ((close (position #\] hostport)))
+               (unless close
+                 (%client-protocol-error
+                  "A proxy environment URL contains an invalid host."
+                  variable))
+               (let ((rest (subseq hostport (1+ close))))
+                 (values (subseq hostport 1 close)
+                         (if (string= rest "")
+                             nil
+                             (if (and (plusp (length rest))
+                                      (char= (char rest 0) #\:))
+                                 (%proxy-environment-port
+                                  (subseq rest 1) variable)
+                                 (%client-protocol-error
+                                  "A proxy environment URL contains an invalid port."
+                                  variable))))))
+            (t
+             (let ((colon (position #\: hostport :from-end t)))
+               (if (and colon
+                        (= colon (position #\: hostport))
+                        (< (1+ colon) (length hostport)))
+                   (values (subseq hostport 0 colon)
+                           (%proxy-environment-port
+                            (subseq hostport (1+ colon)) variable))
+                   (values hostport nil)))))
+        (unless (plusp (length host))
+          (%client-protocol-error
+           "A proxy environment URL requires a host."
+           variable))
+        (make-http-proxy
+         :scheme scheme-keyword
+         :host host
+         :port (or port (case scheme-keyword
+                          ((:http) 80)
+                          ((:https) 443)
+                          (otherwise 1080)))
+         :username username
+         :password password))))))
+
+(defun %proxy-environment-proxy-for-uri (uri)
+  (let* ((scheme (http-uri-scheme uri))
+         (proxy-value
+           (if (string= scheme "https")
+               (or (%proxy-environment-value "https_proxy" "HTTPS_PROXY")
+                   (%proxy-environment-value "http_proxy" "HTTP_PROXY"))
+               (%proxy-environment-value "http_proxy" "HTTP_PROXY"))))
+    (when (and proxy-value (plusp (length (%cache-trim proxy-value))))
+      (let ((proxy (%proxy-environment-proxy proxy-value
+                                             (if (string= scheme "https")
+                                                 :https-proxy
+                                                 :http-proxy))))
+        (setf (http-proxy-no-proxy proxy)
+              (%proxy-environment-value "no_proxy" "NO_PROXY"))
+        proxy))))
+
 (defun %proxy-no-proxy-tokens (value)
   (cond ((null value) nil)
         ((stringp value) (%cache-split-comma value))
@@ -178,13 +322,18 @@
     (cond
       ((and (> length 2) (char= (char token 0) #\[))
        (let ((close (position #\] token)))
-         (when (and close
-                    (< (1+ close) length)
-                    (char= (char token (1+ close)) #\:))
-           (values (subseq token 1 close)
-                   (%client-parse-integer token
-                                          :start (+ close 2)
-                                          :allow-sign-p nil)))))
+         (when close
+           (let ((rest (subseq token (1+ close))))
+             (cond
+               ((string= rest "")
+                (values (subseq token 1 close) nil))
+               ((and (char= (char rest 0) #\:)
+                     (> (length rest) 1))
+                (values (subseq token 1 close)
+                        (%client-parse-integer rest
+                                               :start 1
+                                               :allow-sign-p nil)))
+               (t (values nil nil)))))))
       (t
        (let ((colon (position #\: token :from-end t)))
          (if (and colon
@@ -231,7 +380,7 @@ PROXY may be an HTTP-PROXY object, a function of one URI argument, or a list
 of proxy objects/functions.  The first applicable result is returned."
   (let ((uri (%client-uri uri)))
     (cond
-      ((null proxy) nil)
+      ((null proxy) (%proxy-environment-proxy-for-uri uri))
       ((http-proxy-p proxy)
        (and (not (http-proxy-no-proxy-p proxy uri)) proxy))
       ((functionp proxy)

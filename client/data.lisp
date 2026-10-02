@@ -5,6 +5,22 @@
   '("GET" "HEAD" "OPTIONS" "PUT" "DELETE" "TRACE"))
 (defparameter *default-retry-statuses* '(408 425 429 500 502 503 504))
 
+#+sbcl
+(defun %make-client-lock (name)
+  (sb-thread:make-mutex :name name))
+
+#-sbcl
+(defun %make-client-lock (name)
+  (declare (ignore name))
+  nil)
+
+(defmacro %with-client-lock ((lock) &body body)
+  #+sbcl
+  `(sb-thread:with-mutex (,lock)
+     ,@body)
+  #-sbcl
+  `(progn ,@body))
+
 (defun %client-protocol-error (message detail)
   (error 'http-protocol-error
          :message message
@@ -219,6 +235,7 @@ character in that range is a decimal digit, apart from an optional sign when
              (:constructor %make-http-cookie-jar)
              (:conc-name %http-cookie-jar-))
   (cookies nil)
+  lock
   (clock-function #'get-universal-time)
   public-suffix-p-function
   (max-cookies 3000)

@@ -149,6 +149,7 @@
    "A cookie jar byte maximum must be a positive integer.")
   (%make-http-cookie-jar
    :cookies nil
+   :lock (%make-client-lock "http-cookie-jar")
    :clock-function clock-function
    :public-suffix-p-function public-suffix-p-function
    :max-cookies max-cookies
@@ -159,12 +160,14 @@
 (defun http-cookie-jar-cookies (jar)
   (unless (http-cookie-jar-p jar)
     (%client-protocol-error "Expected an HTTP-COOKIE-JAR value." jar))
-  (mapcar #'%copy-cookie (%http-cookie-jar-cookies jar)))
+  (%with-client-lock ((%http-cookie-jar-lock jar))
+    (mapcar #'%copy-cookie (%http-cookie-jar-cookies jar))))
 
 (defun http-cookie-jar-clear (jar)
   (unless (http-cookie-jar-p jar)
     (%client-protocol-error "Expected an HTTP-COOKIE-JAR value." jar))
-  (setf (%http-cookie-jar-cookies jar) nil)
+  (%with-client-lock ((%http-cookie-jar-lock jar))
+    (setf (%http-cookie-jar-cookies jar) nil))
   jar)
 
 (defun %cookie-ipv4-address-p (host)
@@ -422,39 +425,40 @@ interoperable browser behavior rather than making a response unusable."
   (unless (http-cookie-jar-p jar)
     (%client-protocol-error "Expected an HTTP-COOKIE-JAR value." jar))
   (%cookie-partition-key partition-key)
-  (let* ((request-uri (%client-uri request-uri))
-         (now (or now (funcall (%http-cookie-jar-clock-function jar))))
-         (cookies (%http-cookie-jar-cookies jar)))
-    (dolist (set-cookie (http-header-values
-                         (http-response-headers response)
-                         "Set-Cookie"))
-      (let ((cookie (and (<= (%cookie-string-octet-length set-cookie)
-                             (%http-cookie-jar-max-cookie-bytes jar))
-                         (%cookie-parse-set-cookie
-                          set-cookie request-uri now partition-key))))
-        (when (and cookie
-                   (or same-site-p
-                       top-level-navigation-p
-                       (not (member (http-cookie-same-site cookie)
-                                    '(:strict :lax))))
-                   (%cookie-public-suffix-acceptable-p
-                    cookie request-uri
-                    (%http-cookie-jar-public-suffix-p-function jar))
-                   (not (%cookie-secure-overlay-p cookie request-uri cookies)))
-          (let ((existing (find-if (lambda (existing)
-                                     (%cookie-identity-p existing cookie))
-                                   cookies)))
-            (when existing
-              (setf (http-cookie-creation-time cookie)
-                    (http-cookie-creation-time existing))))
-          (setf cookies (delete-if (lambda (existing)
-                                    (%cookie-identity-p existing cookie))
-                                  cookies))
-          (unless (%cookie-expired-p cookie now)
-            (push cookie cookies)))))
-    (setf (%http-cookie-jar-cookies jar)
-          (%cookie-enforce-limits cookies jar now))
-    jar))
+  (%with-client-lock ((%http-cookie-jar-lock jar))
+    (let* ((request-uri (%client-uri request-uri))
+           (now (or now (funcall (%http-cookie-jar-clock-function jar))))
+           (cookies (%http-cookie-jar-cookies jar)))
+      (dolist (set-cookie (http-header-values
+                           (http-response-headers response)
+                           "Set-Cookie"))
+        (let ((cookie (and (<= (%cookie-string-octet-length set-cookie)
+                               (%http-cookie-jar-max-cookie-bytes jar))
+                           (%cookie-parse-set-cookie
+                            set-cookie request-uri now partition-key))))
+          (when (and cookie
+                     (or same-site-p
+                         top-level-navigation-p
+                         (not (member (http-cookie-same-site cookie)
+                                      '(:strict :lax))))
+                     (%cookie-public-suffix-acceptable-p
+                      cookie request-uri
+                      (%http-cookie-jar-public-suffix-p-function jar))
+                     (not (%cookie-secure-overlay-p cookie request-uri cookies)))
+            (let ((existing (find-if (lambda (existing)
+                                       (%cookie-identity-p existing cookie))
+                                     cookies)))
+              (when existing
+                (setf (http-cookie-creation-time cookie)
+                      (http-cookie-creation-time existing))))
+            (setf cookies (delete-if (lambda (existing)
+                                      (%cookie-identity-p existing cookie))
+                                    cookies))
+            (unless (%cookie-expired-p cookie now)
+              (push cookie cookies)))))
+      (setf (%http-cookie-jar-cookies jar)
+            (%cookie-enforce-limits cookies jar now))
+      jar)))
 
 (defun %cookie-safe-method-p (method)
   (member (string method)
@@ -499,33 +503,34 @@ context.  Cross-site Lax cookies are sent only for safe top-level navigations."
   (%cookie-partition-key partition-key)
   (when same-site-context
     (setf same-site-p (eq same-site-context :same-site)))
-  (let* ((request-uri (%client-uri request-uri))
-         (now (or now (funcall (%http-cookie-jar-clock-function jar))))
-         (stored-cookies (delete-if (lambda (cookie)
-                                      (%cookie-expired-p cookie now))
-                                    (%http-cookie-jar-cookies jar)))
-         (cookies (remove-if-not
-                   (lambda (cookie)
-                     (%cookie-request-applicable-p
-                      cookie request-uri now same-site-p
-                      top-level-navigation-p method partition-key))
-                   stored-cookies)))
-    (setf (%http-cookie-jar-cookies jar) stored-cookies)
-    (dolist (cookie cookies)
-      (setf (http-cookie-last-access-time cookie) now))
-    (setf cookies
-          (sort cookies
-                (lambda (left right)
-                  (or (> (length (http-cookie-path left))
-                         (length (http-cookie-path right)))
-                      (and (= (length (http-cookie-path left))
-                              (length (http-cookie-path right)))
-                               (< (http-cookie-creation-time left)
-                               (http-cookie-creation-time right)))))))
-    (when cookies
-      (format nil "~{~A~^; ~}"
-              (mapcar (lambda (cookie)
-                        (format nil "~A=~A"
-                                (http-cookie-name cookie)
-                                (http-cookie-value cookie)))
-                      cookies)))))
+  (%with-client-lock ((%http-cookie-jar-lock jar))
+    (let* ((request-uri (%client-uri request-uri))
+           (now (or now (funcall (%http-cookie-jar-clock-function jar))))
+           (stored-cookies (delete-if (lambda (cookie)
+                                        (%cookie-expired-p cookie now))
+                                      (%http-cookie-jar-cookies jar)))
+           (cookies (remove-if-not
+                     (lambda (cookie)
+                       (%cookie-request-applicable-p
+                        cookie request-uri now same-site-p
+                        top-level-navigation-p method partition-key))
+                     stored-cookies)))
+      (setf (%http-cookie-jar-cookies jar) stored-cookies)
+      (dolist (cookie cookies)
+        (setf (http-cookie-last-access-time cookie) now))
+      (setf cookies
+            (sort cookies
+                  (lambda (left right)
+                    (or (> (length (http-cookie-path left))
+                           (length (http-cookie-path right)))
+                        (and (= (length (http-cookie-path left))
+                                (length (http-cookie-path right)))
+                             (< (http-cookie-creation-time left)
+                                (http-cookie-creation-time right)))))))
+      (when cookies
+        (format nil "~{~A~^; ~}"
+                (mapcar (lambda (cookie)
+                          (format nil "~A=~A"
+                                  (http-cookie-name cookie)
+                                  (http-cookie-value cookie)))
+                        cookies))))))

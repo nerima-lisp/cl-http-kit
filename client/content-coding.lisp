@@ -95,34 +95,33 @@
               while comma
               do (setf start (1+ comma)))))))
 
-(defun %decompress-content-with-limit (coding-format body max-body-bytes)
+(defun %deflate-kit-call (function body keyword max-body-bytes)
   (if (null max-body-bytes)
-      (chipz:decompress nil coding-format body)
-      (let* ((capacity (1+ max-body-bytes))
-             (output (make-array capacity :element-type '(unsigned-byte 8)))
-             (state (chipz:make-dstate coding-format)))
-        (multiple-value-bind (consumed produced)
-            (chipz:decompress output state body)
-          (declare (ignore consumed))
-          (when (= produced capacity)
-            (error 'http-size-limit-exceeded
-                   :message "The decoded HTTP body limit was exceeded."
-                   :operation :content-decoding
-                   :limit max-body-bytes
-                   :observed produced
-                   :kind :body))
-          (chipz:finish-dstate state)
-          (subseq output 0 produced)))))
+      (funcall function body)
+      (funcall function body keyword max-body-bytes)))
 
-(defun %chipz-content-decoder (format)
+(defun %deflate-kit-raw-or-zlib (body max-body-bytes)
+  (handler-case
+      (%deflate-kit-call #'deflate-kit:zlib-decompress
+                         body :max-output max-body-bytes)
+    (deflate-kit:invalid-container-error ()
+      (%deflate-kit-call #'deflate-kit:inflate
+                         body :max-output-bytes max-body-bytes))))
+
+(defun %deflate-kit-content-decoder (format)
   (lambda (body max-body-bytes)
-    (%decompress-content-with-limit format body max-body-bytes)))
+    (ecase format
+      (:gzip
+       (%deflate-kit-call #'deflate-kit:gzip-decompress
+                          body :max-output max-body-bytes))
+      (:deflate
+       (%deflate-kit-raw-or-zlib body max-body-bytes)))))
 
 (defun make-http-content-decoders (&rest decoders)
   "Return a validated Content-Encoding decoder association list."
   (let ((result
-          (list (cons "gzip" (%chipz-content-decoder 'chipz:gzip))
-                (cons "deflate" (%chipz-content-decoder 'chipz:zlib)))))
+          (list (cons "gzip" (%deflate-kit-content-decoder :gzip))
+                (cons "deflate" (%deflate-kit-content-decoder :deflate)))))
     (dolist (decoder decoders)
       (unless (and (consp decoder)
                    (stringp (car decoder))
@@ -150,6 +149,9 @@
   (unless (http-response-p response)
     (%client-protocol-error "The response to decode must be an HTTP-RESPONSE."
                             response))
+  (%client-validate-limit
+   max-body-bytes
+   "The decoded HTTP body size limit must be a non-negative integer or NIL.")
   (let* ((headers (http-response-headers response))
          (codings (%content-coding-tokens headers))
          (decoders (mapcar (lambda (coding)
@@ -173,7 +175,14 @@
                          headers)
                :trailers (http-response-trailers response)
                :body body))
-          (chipz:chipz-error (condition)
+          (deflate-kit:inflate-size-limit-exceeded (condition)
+            (error 'http-size-limit-exceeded
+                   :message "The decoded HTTP body limit was exceeded."
+                   :operation :content-decoding
+                   :limit (deflate-kit:deflate-output-limit-limit condition)
+                   :observed (deflate-kit:inflate-error-observed condition)
+                   :kind :body))
+          (deflate-kit:deflate-error (condition)
             (%client-protocol-error
              "The encoded HTTP response body could not be decompressed."
              condition))))))

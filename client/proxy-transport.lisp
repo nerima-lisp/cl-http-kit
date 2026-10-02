@@ -10,6 +10,12 @@
                  :detail (list :detail detail :cause cause)
                  :operation :proxy))
 
+(defun %proxy-public-plan (plan)
+  (loop for (key value) on plan by #'cddr
+        unless (member key '(:proxy :proxy-authorization
+                             :proxy-challenge-auth-provider))
+          append (list key value)))
+
 (defun %proxy-check-deadline (deadline clock-function &optional (kind :proxy))
   (when (and deadline (>= (funcall clock-function) deadline))
     (error 'http-timeout
@@ -403,4 +409,5 @@ address resolution when a SOCKS5 (rather than SOCKS5H) proxy is selected."
           (error condition))
         (error (condition)
           (%proxy-error "Proxy negotiation signaled an error."
-                        proxy-plan condition))))))
+                        (%proxy-public-plan proxy-plan)
+                        condition))))))
