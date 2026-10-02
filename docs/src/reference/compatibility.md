@@ -6,6 +6,14 @@ WebSocket sessions, and native TCP/DNS integration. This page describes the
 behavior implemented by the registered systems; it is not a claim of complete
 RFC coverage.
 
+The registered systems in this checkout are version 0.4.0. The current
+integration source already has native default client wiring, proxy-environment
+parsing, lock-backed pool/cookie state, and four-kit dependency declarations.
+The URL-and-method convenience form is available through `http-client-send`.
+The TLS wrapper uses cl-tls-kit for the native TLS 1.3 client path; server
+wrapping remains an explicit unsupported boundary because the kit does not
+expose a server driver.
+
 ## HTTP/1.1
 
 The core serializer returns an octet vector containing HTTP/1.1 request lines
@@ -103,15 +111,11 @@ unsupported-feature conditions.
 
 The optional `cl-http-kit/client` system supplies reusable URI, authentication,
 cookie, cache, content-coding selection, ALPN protocol-name, proxy, redirect,
-retry, and HTTP/1.1 connection-pool policies around core messages. The pool is
-an owner-thread, callback-driven boundary;
-applications still provide the transport function or stream callbacks. The
-optional network system can provide native TCP and DNS setup on SBCL. The
-separate `cl-http-kit/tls` system provides cl+ssl client and server wrappers;
-server-certificate verification in the client wrapper defaults to required
-and the request host is passed as cl+ssl's hostname, while trust-root setup,
-alternate certificate policy, and ALPN-based protocol dispatch remain
-application-owned.
+retry, and thread-safe HTTP/1.1 connection-pool policies around core messages.
+The client creates native TCP, TLS 1.3, and pooling boundaries when no custom
+transport is supplied. The `cl-http-kit/tls` system uses cl-tls-kit for client
+certificate verification, trust-store loading, and handshake deadlines.
+Server-side TLS wrapping is explicitly unsupported by the current kit boundary.
 Origin 401 and proxy 407 challenges are parsed with the RFC 9110
 challenge grammar and can be answered by separate provider callbacks. Each
 provider receives at most one safe replay opportunity; streamed responses and
@@ -172,6 +176,12 @@ client API. Older transports that accept only a subset of these keywords are
 not supported; define the complete boundary or use the provided stream or
 connection-pool constructors.
 
+The current integration keeps these policy objects and compatibility entry
+points, and its native default supplies TCP/TLS, redirects, cookies, content
+coding, proxy environment lookup, and pooling when the optional systems are
+available. HTTP/3 connection selection remains deferred until cl-quic-kit
+supplies the QUIC transport.
+
 ## WebSocket
 
 The `http-kit/websocket` package is loaded by `cl-http-kit/client`. It provides
@@ -210,11 +220,16 @@ an IPv4/IPv6 listening socket boundary: `open-http-tcp-listener` binds and
 listens, `accept-http-tcp-stream` accepts one binary stream and returns peer
 address metadata, and `close-http-tcp-listener` closes the listener. It keeps
 TLS, ALPN, and proxy negotiation outside the socket opener. Applications can
-compose the separate `cl-http-kit/tls` cl+ssl wrappers around accepted or
+compose the separate `cl-http-kit/tls` cl-tls-kit client wrapper around
 connected streams while retaining control of certificate and protocol policy.
+Server-side wrapping is an explicit unsupported boundary.
 
 serve-http1-listener combines accept and serve-http1-session dispatch for a
 caller-owned listener, with connection limits and accept/error callbacks.
+
+The native client path uses cl-tls-kit. Native HTTP/3 connection setup remains
+outside this package until cl-quic-kit supplies the QUIC transport; the current
+HTTP/3 system remains an injected framing boundary.
 
 ## Application-owned behavior
 

@@ -10,6 +10,21 @@ deadline-aware transport callbacks, deterministic recording sessions, and
 optional high-level client, HTTP/2, HTTP/3, native-network, and metrics
 integrations.
 
+## Release status
+
+The checked-in ASDF systems are version 0.4.0. The current integration work
+allows `make-http-client` to create a native TCP/TLS connection pool when no
+transport boundary is supplied, while `http-client-request` and
+`http-client-send` remain the compatibility request path. A separate public
+function accepting only a URL and method is not present. See the
+[changelog](docs/src/project/changelog.md) and [migration guide](docs/src/project/migration.md)
+for the 0.4.0 release candidate and its remaining work.
+
+The worktree contains dependency declarations for cl-deflate-kit and
+cl-tls-kit, plus proxy-environment and lock-backed pool/cookie changes. The
+The 0.4.0 integration keeps native HTTP/3 deferred until cl-quic-kit supplies
+the QUIC transport and keeps server TLS outside the current kit boundary.
+
 ## Quick Start
 
 The recording transport is useful when the network boundary should be supplied
@@ -67,7 +82,7 @@ for the package layout and transport integration boundary.
 | cl-http-kit/http2 | HTTP/2 client and injected-stream server-session boundaries |
 | cl-http-kit/http3 | HTTP/3 frames, SETTINGS, QPACK static/literal/Huffman codecs with caller-owned dynamic tables, and injected-QUIC client/request-stream server-session boundaries |
 | cl-http-kit/network | Optional SBCL TCP/DNS stream opener, IPv4/IPv6 listener, and HTTP/1 listener service |
-| cl-http-kit/tls | Optional cl+ssl client/server TLS stream wrappers with certificate verification and ALPN |
+| cl-http-kit/tls | Native TLS 1.3 client stream wrapper backed by cl-tls-kit; server wrapping remains an explicit unsupported boundary until the kit exposes a server driver |
 | cl-http-kit/observability | Request and error counters backed by cl-observability-kit |
 | cl-http-kit/test-core | Internal core-only test runner without optional subsystems |
 | cl-http-kit/test | Internal test runner for the core and optional systems |
@@ -81,6 +96,8 @@ for the package layout and transport integration boundary.
 - [Architecture](https://nerima-lisp.github.io/cl-http-kit/reference/architecture/)
 - [Conditions](https://nerima-lisp.github.io/cl-http-kit/reference/conditions/)
 - [Compatibility](https://nerima-lisp.github.io/cl-http-kit/reference/compatibility/)
+- [Migration guide](docs/src/project/migration.md)
+- [Changelog](docs/src/project/changelog.md)
 
 ## Development
 
@@ -111,21 +128,21 @@ and response sessions, bounded body handling, high-level request policies, and
 small composition boundaries. The optional client system adds cookie-jar
 partitioning and SameSite request context, content-coding adapter selection,
 cache request-directive handling with 304 metadata refresh, and ALPN protocol
-name helpers while leaving compressor implementations, dialing, and TLS/ALPN
-negotiation to the application. The optional `cl-http-kit/http2` system supplies
-both a client and a server session over caller-provided binary I/O. The
-optional `cl-http-kit/http3` system supplies client and per-request server
-stream framing with static/literal/Huffman QPACK and caller-owned dynamic-table
-references over caller-provided QUIC streams;
-QUIC packets, loss recovery, congestion control, TLS 1.3, ALPN, sockets, and
-native HTTP/3 connection/server acceptance remain outside that boundary. The
-optional `cl-http-kit/network` system supplies native TCP, DNS, and an HTTP/1
- listener service on SBCL; `cl-http-kit/tls` supplies cl+ssl-backed TLS upgrade
- and accepted-stream wrappers (usable with `serve-http1-listener`'s
- `:stream-wrapper`) while keeping TLS optional. ALPN selection remains
- an explicit client option, and application-specific proxy negotiation remains a
- callback policy. The optional client system also supplies
-an owner-thread HTTP/1.1 connection pool and RFC 6455 frame, message,
+name helpers. The current client integration can supply native dialing, TLS,
+proxy selection, content coding, and a locked pool when its default boundary is
+used; the TLS source migration is not complete. The optional
+`cl-http-kit/http2` system supplies both a client and a
+server session over caller-provided binary I/O. The optional
+`cl-http-kit/http3` system supplies client and per-request server stream
+framing with static/literal/Huffman QPACK and caller-owned dynamic-table
+references over caller-provided QUIC streams; QUIC packets, loss recovery,
+congestion control, TLS 1.3, ALPN, sockets, and native HTTP/3
+connection/server acceptance remain outside that boundary. The optional
+`cl-http-kit/network` system supplies native TCP, DNS, and an HTTP/1 listener
+service on SBCL; `cl-http-kit/tls` supplies the TLS upgrade and accepted-stream
+wrappers. ALPN selection remains explicit in the current client path, and the
+optional client system also supplies
+a thread-safe HTTP/1.1 connection pool and RFC 6455 frame, message,
 close-payload, HTTP upgrade, client-side 101 handshake, and upgraded server
 session helpers. WebSocket extension grammar and RFC 7692 negotiation
 parameters are validated, with application-injected compression codecs for
@@ -133,6 +150,12 @@ negotiated message processing. WebSocket key generation, dialing, TLS/ALPN,
 extension selection, codec state, and masking-key generation remain
 application-owned; the server session handles Ping/Pong and the close
 handshake it owns.
+
+The 0.4.0 target completes verification of the native four-kit path and
+retains `make-http-client` and
+`http-client-send` as compatibility entry points. HTTP/3 native connection
+selection remains deferred until cl-quic-kit supplies the QUIC transport; the
+existing HTTP/3 framing boundary remains available in the meantime.
 
 ## Support
 

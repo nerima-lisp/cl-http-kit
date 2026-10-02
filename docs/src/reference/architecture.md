@@ -4,6 +4,11 @@ cl-http-kit is organized around a small protocol core and explicit integration
 boundaries. The registered ASDF systems share the HTTP-KIT message model where
 appropriate, while application-owned I/O remains outside the package.
 
+This describes the checked-in 0.4.0 architecture plus the current integration
+work. The high-level client can now assemble native TCP/TLS and a connection
+pool when no transport is supplied, and `http-client-send` accepts the
+URL-and-method convenience form.
+
 ## Core layers
 
 | Layer | Responsibility |
@@ -92,8 +97,14 @@ composes URI resolution, authentication, cookies, cache, content-coding
 selection, ALPN protocol helpers, proxy, redirect, retry, and HTTP/1.1
 connection-pool policies. Its `http-client-send` operation
 delegates actual I/O to an injected transport function, stream callbacks, or a
-callback-driven connection pool. Socket creation, DNS, TLS, and ALPN remain
-outside this system.
+callback-driven connection pool. When no transport boundary is supplied, the
+current integration creates native TCP/TLS and a pool lazily; custom callers
+can still keep socket creation, DNS, TLS, and ALPN at the application boundary.
+
+The URL-and-method convenience path runs over these layers. `make-http-client`
+and `http-client-send` stay as compatibility entry points. HTTP/3 connection
+selection is deferred until cl-quic-kit is complete;
+the current HTTP/3 layer remains an injected QUIC stream boundary.
 
 ## Optional native network system
 
@@ -107,6 +118,10 @@ serve-http1-listener combines accept, HTTP/1 session dispatch, connection
 limits, and error callbacks for a caller-owned listener. TLS, ALPN, proxy
 negotiation, and HTTP/2 or HTTP/3 protocol selection remain explicit policies
 supplied by the surrounding application.
+
+The native TLS implementation is cl-tls-kit. The client wrapper adapts its
+TLS 1.3 driver to the binary stream boundary; server-side TLS remains an
+explicit unsupported feature until the kit exposes a server driver.
 
 ## Optional observability system
 

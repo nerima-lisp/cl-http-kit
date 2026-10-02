@@ -2,6 +2,9 @@
 
 cl-http-kit is loaded through ASDF. The core system has no built-in socket
 dependency: an application supplies the binary stream or exchange boundary.
+The instructions on this page describe the checked-in 0.4.0 API. The
+migration notes are documented in the
+[migration guide](project/migration.md).
 
 ## Load the core system
 
@@ -66,8 +69,8 @@ The parser and transport accept optional :max-header-bytes and
 stable or different policy; the current values are documented with the core
 parsing and transport APIs.
 
-For an SBCL-native TCP and DNS boundary, load the optional network system and
-connect it to the client pool:
+For the checked-in API, an SBCL-native TCP and DNS boundary is supplied
+by the optional network system and can be connected to the client pool:
 
 ```lisp
 (asdf:load-system "cl-http-kit/network")
@@ -102,15 +105,15 @@ HTTP/1 session dispatch for the requested number of connections; applications
 that need HTTP/2 or protocol selection can keep using
 `accept-http-tcp-stream` and dispatch to `serve-http2-session` themselves.
 
-The socket boundary itself does not negotiate TLS, ALPN, or proxies. To wrap
-its binary streams with cl+ssl, load `cl-http-kit/tls` and compose
-`http-kit/tls:make-http-tls-upgrader` with the client opener or
-`http-kit/tls:make-http-tls-server-wrapper` with accepted server streams. The
-client wrapper defaults to `:verify :required` and passes the request host as
-cl+ssl's `:hostname` argument. Applications still own trust-root setup,
-client-certificate policy, the advertised ALPN protocol list, and dispatch
-after ALPN selection. The server wrapper requires both a certificate and its
-private key.
+The socket boundary itself does not negotiate TLS, ALPN, or proxies. Load
+`cl-http-kit/tls` and compose `http-kit/tls:make-http-tls-upgrader` with the
+client opener. The wrapper defaults to `:verify :required`, passes the request
+host as TLS SNI, loads the platform trust store, and accepts an ALPN offer
+list. Server TLS wrapping signals an explicit unsupported-feature condition
+until cl-tls-kit exposes a server driver.
+
+The high-level client creates this native TCP/TLS path automatically when no
+custom transport is supplied.
 
 ## Optional systems
 
@@ -152,4 +155,6 @@ Load metrics integration when cl-observability-kit is available:
 ```
 
 Continue with [Core Concepts](guide/core-concepts.md) for the value model, or
-the [API Reference](reference/api.md) for the primary exported symbols.
+the [API Reference](reference/api.md) for the primary exported symbols. The
+[migration guide](project/migration.md) lists the planned URL-and-method,
+proxy/authentication, compression, pool/cookie, and HTTP/3 changes.

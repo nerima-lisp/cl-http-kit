@@ -6,6 +6,11 @@ auxiliary exports not described here. Common arguments such as timeout,
 deadline, byte limits, and clock-function are accepted by the direct and CPS
 transport APIs where shown.
 
+The registered systems in this checkout are version 0.4.0. The current
+integration includes native default client wiring and the URL-and-method
+convenience form. The signatures below describe the current callback and
+stream API.
+
 ## Core package
 
 The core package name is HTTP-KIT.
@@ -573,17 +578,21 @@ caller-owned listener, with connection limits and accept/error callbacks.
 
 The optional package name is HTTP-KIT/TLS and is provided by the
 `cl-http-kit/tls` system. MAKE-HTTP-TLS-UPGRADER returns a client upgrade
-callback backed by cl+ssl. Its VERIFY argument accepts NIL, :OPTIONAL, or
-:REQUIRED and defaults to :REQUIRED; the callback passes the request host to
-cl+ssl as its HOSTNAME argument and accepts optional ALPN-PROTOCOLS,
-CERTIFICATE, KEY, PASSWORD, TIMEOUT, and DEADLINE values. Each ALPN protocol
-name must contain 1 to 255 ASCII characters; client CERTIFICATE and KEY must
-be supplied together. MAKE-HTTP-TLS-SERVER-WRAPPER returns a server
-stream wrapper and requires both CERTIFICATE and KEY. Both wrappers preserve
-the binary-stream boundary and apply handshake deadlines.
+callback backed by cl-tls-kit. Its VERIFY argument accepts NIL, :OPTIONAL, or
+:REQUIRED and defaults to :REQUIRED; the callback passes the request host as
+TLS SNI and accepts optional ALPN-PROTOCOLS, CERTIFICATE, KEY, PASSWORD,
+TIMEOUT, and DEADLINE values. Each ALPN protocol name must contain 1 to 255
+ASCII characters; client CERTIFICATE and KEY must be supplied together. The
+client wrapper preserves the binary-stream boundary and applies handshake
+deadlines. MAKE-HTTP-TLS-SERVER-WRAPPER validates its certificate arguments
+then signals an explicit unsupported-feature condition because the current kit
+does not expose a server driver.
 HTTP-TLS-SELECTED-ALPN-PROTOCOL returns the protocol selected for an upgraded
 client stream, or NIL when none was negotiated. Trust-root setup, certificate
 selection, and dispatch based on that value remain application policy.
+
+The TLS package is TLS 1.3 only through cl-tls-kit. TLS 1.2, OCSP/CRL, and
+server-side wrapping are outside the current boundary.
 
 ## Observability package
 
@@ -1286,7 +1295,7 @@ Construct the proxy plan for a URI.
 
 ### HTTP/1.1 connection pools
 
-`MAKE-HTTP-CONNECTION-POOL` constructs an owner-thread pool around an
+`MAKE-HTTP-CONNECTION-POOL` constructs a thread-safe pool around an
 `OPEN-STREAM` function. `IDLE-TIMEOUT` optionally expires unused streams, while
 `MAX-CONNECTION-AGE` optionally limits total stream lifetime so continuously
 used connections still refresh DNS, certificates, and routes.
@@ -1300,8 +1309,7 @@ proxy route, DNS mode, and proxy credentials.
 include `HTTP-CONNECTION-POOL-IDLE-TIMEOUT` and
 `HTTP-CONNECTION-POOL-MAX-CONNECTION-AGE`. It deliberately omits internal route keys because they can
 contain authentication material. `HTTP-CONNECTION-POOL-CLEAR` closes all idle
-streams. Pools are synchronization-free; callers sharing a pool between
-threads must serialize access.
+streams. Pool operations may be used concurrently from multiple SBCL threads.
 
 ### `http-client`
 
@@ -1334,6 +1342,11 @@ The injected transport-function must accept the complete keyword boundary used
 by the client, including timeout, deadline, limits, proxy context, request-body
 callbacks, response callbacks, and collect-body-p. Partial legacy keyword
 signatures are intentionally unsupported.
+
+The current integration also permits all three transport arguments to be
+omitted. In that case the client lazily creates a native TCP/TLS connection
+pool and retains the same policy defaults. `HTTP-CLIENT-SEND` also accepts a
+method and URL convenience form while retaining its request-object form.
 
 ### `http-client-transport-function`
 

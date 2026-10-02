@@ -4,6 +4,13 @@ cl-http-kit is a portable, binary-safe Common Lisp HTTP substrate. It
 separates HTTP message semantics and wire processing from the application-owned
 network boundary.
 
+The checked-in systems are version 0.4.0. The current integration includes
+native default client wiring and the four-kit dependency declarations, while
+the separate URL-and-method-only entry point and complete TLS source migration
+remain deferred until the corresponding transport boundaries are available. Read the
+[migration guide](project/migration.md) for the compatibility boundary and the
+[changelog](project/changelog.md) for the candidate scope.
+
 ## Start here
 
 - [Getting Started](getting-started.md) introduces loading, recording
