@@ -21,13 +21,13 @@
 (deftest client-p6-proxy-environment-resolution
   (let ((values '(("https_proxy" . "http://user:secret@proxy.test:8080")
                   ("NO_PROXY" . "example.test"))))
-    (let ((http-kit/client::*proxy-environment-function*
+      (let ((http-kit/client::*proxy-environment-function*
             (lambda (name)
               (cdr (assoc name values :test #'string=)))))
-      (let ((proxy (http-proxy-for-uri nil "https://example.test/resource")))
+      (ensure-false (http-proxy-for-uri nil "https://example.test/resource"))
+      (let ((proxy (http-proxy-for-uri nil "https://other.test/resource")))
         (ensure-equal :http (http-proxy-scheme proxy))
         (ensure-equal "proxy.test" (http-proxy-host proxy))
-        (ensure-true (http-proxy-no-proxy-p proxy "https://example.test/resource"))
         (ensure-false (http-proxy-no-proxy-p proxy "https://other.test/resource"))))))
 
 #+sbcl

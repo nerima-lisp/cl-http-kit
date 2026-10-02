@@ -142,7 +142,8 @@
                                                  :http-proxy))))
         (setf (http-proxy-no-proxy proxy)
               (%proxy-environment-value "no_proxy" "NO_PROXY"))
-        proxy))))
+        (unless (http-proxy-no-proxy-p proxy uri)
+          proxy)))))
 
 (defun %proxy-no-proxy-tokens (value)
   (cond ((null value) nil)
