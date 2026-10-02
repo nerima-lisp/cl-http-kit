@@ -424,6 +424,7 @@
             pkgs.runCommand "cl-http-kit-test-core"
               {
                 nativeBuildInputs = [
+                  pkgs.sbcl
                   clWeave
                   observability
                   concurrent
@@ -454,6 +455,7 @@
             pkgs.runCommand "cl-http-kit-test"
               {
                 nativeBuildInputs = [
+                  pkgs.sbcl
                   clWeave
                   observability
                   concurrent
