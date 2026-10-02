@@ -116,6 +116,10 @@ The client creates native TCP, TLS 1.3, and pooling boundaries when no custom
 transport is supplied. The `cl-http-kit/tls` system uses cl-tls-kit for client
 certificate verification, trust-store loading, and handshake deadlines.
 Server-side TLS wrapping is explicitly unsupported by the current kit boundary.
+For an HTTPS server, terminate TLS in a reverse proxy or load balancer and
+forward plain HTTP to `cl-http-kit/network`. Configure the proxy to preserve
+the original host and scheme according to the application's trusted-forwarding
+policy; cl-http-kit does not validate forwarded headers automatically.
 Origin 401 and proxy 407 challenges are parsed with the RFC 9110
 challenge grammar and can be answered by separate provider callbacks. Each
 provider receives at most one safe replay opportunity; streamed responses and
@@ -236,8 +240,10 @@ HTTP/3 system remains an injected framing boundary.
 The portable core does not choose a socket library, DNS resolver, or TLS
 implementation. Applications can adapt those concerns to their deployment,
 including the optional SBCL network boundary, and can supply callbacks to the
-library's pool without changing the message and wire layers. Proxy negotiation,
-character encoding, and logging policy remain application-owned.
+library's pool without changing the message and wire layers. The optional
+high-level client supplies native TCP/TLS when its default boundary is used;
+custom transports retain ownership of their network and TLS setup. Proxy
+negotiation, character encoding, and logging policy remain application-owned.
 
 ## Portability
 

@@ -12,17 +12,16 @@ integrations.
 
 ## Release status
 
-The checked-in ASDF systems are version 0.4.0. The current integration work
-allows `make-http-client` to create a native TCP/TLS connection pool when no
-transport boundary is supplied, while `http-client-request` and
-`http-client-send` remain the compatibility request path. A separate public
-function accepting only a URL and method is not present. See the
+The checked-in ASDF systems are version 0.4.0. `make-http-client` creates a
+native TCP/TLS connection pool when no transport boundary is supplied, while
+`http-client-request` and `http-client-send` remain supported request paths.
+`http-client-send` also accepts a method and URL convenience form. See the
 [changelog](docs/src/project/changelog.md) and [migration guide](docs/src/project/migration.md)
-for the 0.4.0 release candidate and its remaining work.
+for the 0.4.0 compatibility boundary.
 
 The worktree contains dependency declarations for cl-deflate-kit and
 cl-tls-kit, plus proxy-environment and lock-backed pool/cookie changes. The
-The 0.4.0 integration keeps native HTTP/3 deferred until cl-quic-kit supplies
+0.4.0 integration keeps native HTTP/3 deferred until cl-quic-kit supplies
 the QUIC transport and keeps server TLS outside the current kit boundary.
 
 ## Quick Start
@@ -130,7 +129,7 @@ partitioning and SameSite request context, content-coding adapter selection,
 cache request-directive handling with 304 metadata refresh, and ALPN protocol
 name helpers. The current client integration can supply native dialing, TLS,
 proxy selection, content coding, and a locked pool when its default boundary is
-used; the TLS source migration is not complete. The optional
+used. The optional
 `cl-http-kit/http2` system supplies both a client and a
 server session over caller-provided binary I/O. The optional
 `cl-http-kit/http3` system supplies client and per-request server stream
@@ -140,7 +139,12 @@ congestion control, TLS 1.3, ALPN, sockets, and native HTTP/3
 connection/server acceptance remain outside that boundary. The optional
 `cl-http-kit/network` system supplies native TCP, DNS, and an HTTP/1 listener
 service on SBCL; `cl-http-kit/tls` supplies the TLS upgrade and accepted-stream
-wrappers. ALPN selection remains explicit in the current client path, and the
+wrappers. Server-side TLS wrapping is unsupported because the current
+cl-tls-kit integration has no server driver. To expose HTTPS for a server,
+terminate TLS in a reverse proxy or load balancer and forward plain HTTP to
+`cl-http-kit/network`; preserve the original host and scheme using the proxy's
+trusted forwarding policy. ALPN selection remains explicit in the current
+client path, and the
 optional client system also supplies
 a thread-safe HTTP/1.1 connection pool and RFC 6455 frame, message,
 close-payload, HTTP upgrade, client-side 101 handshake, and upgraded server

@@ -110,7 +110,11 @@ The socket boundary itself does not negotiate TLS, ALPN, or proxies. Load
 client opener. The wrapper defaults to `:verify :required`, passes the request
 host as TLS SNI, loads the platform trust store, and accepts an ALPN offer
 list. Server TLS wrapping signals an explicit unsupported-feature condition
-until cl-tls-kit exposes a server driver.
+because cl-tls-kit does not expose a server driver. For an HTTPS server,
+terminate TLS in a reverse proxy or load balancer and forward HTTP to the
+listener above. Configure that proxy to preserve the original host and scheme
+according to the application's trusted-forwarding policy; cl-http-kit does not
+validate proxy headers automatically.
 
 The high-level client creates this native TCP/TLS path automatically when no
 custom transport is supplied.
@@ -156,5 +160,5 @@ Load metrics integration when cl-observability-kit is available:
 
 Continue with [Core Concepts](guide/core-concepts.md) for the value model, or
 the [API Reference](reference/api.md) for the primary exported symbols. The
-[migration guide](project/migration.md) lists the planned URL-and-method,
-proxy/authentication, compression, pool/cookie, and HTTP/3 changes.
+[migration guide](project/migration.md) records the 0.4.0 compatibility
+boundary and the still-deferred native HTTP/3 connection layer.

@@ -32,7 +32,9 @@ The repository currently documents these ASDF systems:
 | cl-http-kit/http2 | HTTP/2 client and injected-stream server-session boundaries |
 | cl-http-kit/http3 | HTTP/3 request-stream framing, static/literal/Huffman QPACK codecs with caller-owned dynamic tables, and injected-QUIC client/server-session boundaries |
 | cl-http-kit/network | Optional native SBCL TCP, DNS, and HTTP/1 listener service |
+| cl-http-kit/tls | Native TLS 1.3 client stream wrapper; server wrapping is unsupported because cl-tls-kit has no server driver |
 | cl-http-kit/observability | Request and error counters |
+| cl-http-kit/test-core | Internal core-only test runner without optional subsystems |
 | cl-http-kit/test | Internal test runner for the core and optional systems |
 
 ## Scope
@@ -47,8 +49,12 @@ message, close-payload, HTTP upgrade, and upgraded server-session helpers in
 the `http-kit/websocket` package. The optional HTTP/2 system adds client and
 server sessions over injected I/O. The optional HTTP/3 system adds client and
 per-request server sessions over injected QUIC streams. The optional network
-system supplies native SBCL TCP, DNS, and HTTP/1 listener service; QUIC, TLS,
-ALPN, and proxy negotiation remain application-owned.
+system supplies native SBCL TCP, DNS, and HTTP/1 listener service. The
+optional TLS system supplies the native TLS 1.3 client wrapper; server-side TLS
+is not supported because the current cl-tls-kit integration does not expose a
+server driver. For HTTPS servers, terminate TLS in a reverse proxy or load
+balancer and forward HTTP to the listener. QUIC, HTTP/3 TLS and ALPN, and proxy
+negotiation remain application-owned at their respective boundaries.
 
 See [Architecture](reference/architecture.md) for the layer boundaries and
 [Compatibility](reference/compatibility.md) for protocol behavior.

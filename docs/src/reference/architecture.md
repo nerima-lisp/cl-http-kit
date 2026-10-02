@@ -121,7 +121,9 @@ supplied by the surrounding application.
 
 The native TLS implementation is cl-tls-kit. The client wrapper adapts its
 TLS 1.3 driver to the binary stream boundary; server-side TLS remains an
-explicit unsupported feature until the kit exposes a server driver.
+explicit unsupported feature because the kit exposes no server driver. An
+HTTPS deployment can terminate TLS in a reverse proxy or load balancer and
+forward plain HTTP to the listener.
 
 ## Optional observability system
 
@@ -134,6 +136,7 @@ operation wrapper rather than coupled to the HTTP/1.1 parser.
 
 The library owns protocol values, wire correctness, and the policies explicitly
 provided by the optional client system. The optional network system can own
-native TCP and DNS setup on SBCL; applications still own TLS, ALPN, pool
+native TCP and DNS setup on SBCL, and the default client path composes it with
+the native TLS wrapper and pool. Custom transports still own TLS, ALPN, pool
 synchronization, and policy about sensitive logging. This boundary keeps the
 core portable and makes deterministic testing possible.

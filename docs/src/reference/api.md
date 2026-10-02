@@ -580,16 +580,19 @@ The optional package name is HTTP-KIT/TLS and is provided by the
 `cl-http-kit/tls` system. MAKE-HTTP-TLS-UPGRADER returns a client upgrade
 callback backed by cl-tls-kit. Its VERIFY argument accepts NIL, :OPTIONAL, or
 :REQUIRED and defaults to :REQUIRED; the callback passes the request host as
-TLS SNI and accepts optional ALPN-PROTOCOLS, CERTIFICATE, KEY, PASSWORD,
-TIMEOUT, and DEADLINE values. Each ALPN protocol name must contain 1 to 255
-ASCII characters; client CERTIFICATE and KEY must be supplied together. The
-client wrapper preserves the binary-stream boundary and applies handshake
-deadlines. MAKE-HTTP-TLS-SERVER-WRAPPER validates its certificate arguments
-then signals an explicit unsupported-feature condition because the current kit
-does not expose a server driver.
-HTTP-TLS-SELECTED-ALPN-PROTOCOL returns the protocol selected for an upgraded
-client stream, or NIL when none was negotiated. Trust-root setup, certificate
-selection, and dispatch based on that value remain application policy.
+TLS SNI and accepts ALPN-PROTOCOLS, TIMEOUT, and DEADLINE values. Each ALPN
+protocol name must contain 1 to 255 ASCII characters. CERTIFICATE, KEY, and
+PASSWORD are reserved for a future client-certificate integration and currently
+signal an unsupported-feature condition when supplied. The client wrapper
+preserves the binary-stream boundary and applies handshake deadlines.
+MAKE-HTTP-TLS-SERVER-WRAPPER validates its certificate arguments then signals
+an explicit unsupported-feature condition because the current kit does not
+expose a server driver. For an HTTPS server, terminate TLS in a reverse proxy
+or load balancer and forward HTTP to `cl-http-kit/network`.
+HTTP-TLS-SELECTED-ALPN-PROTOCOL returns the protocol negotiated by the
+cl-tls-kit client driver for an upgraded client stream, or NIL when no protocol
+was negotiated. Applications can use that result to dispatch HTTP/2 or
+HTTP/1.1 handling.
 
 The TLS package is TLS 1.3 only through cl-tls-kit. TLS 1.2, OCSP/CRL, and
 server-side wrapping are outside the current boundary.
@@ -1330,8 +1333,9 @@ retry-policy proxy tls-upgrade resolve-host auth-provider
 challenge-auth-provider proxy-challenge-auth-provider
 stale-while-revalidate-scheduler clock-function
 wall-clock-function sleep-function random-function max-header-bytes max-fields max-body-bytes
-automatic-decompression-p content-decoders on-request on-response). Exactly one
-of transport-function, open-stream, or connection-pool must be supplied.
+automatic-decompression-p content-decoders on-request on-response). At most one
+of transport-function, open-stream, or connection-pool may be supplied;
+omitting all three selects the native TCP/TLS connection pool.
 The connection pool owns pooled stream opening and closing; close-stream is
 optional for the direct stream transport boundary. Omitting
 strict-transport-store creates a new RFC 6797 store; explicitly passing nil
@@ -1343,10 +1347,8 @@ by the client, including timeout, deadline, limits, proxy context, request-body
 callbacks, response callbacks, and collect-body-p. Partial legacy keyword
 signatures are intentionally unsupported.
 
-The current integration also permits all three transport arguments to be
-omitted. In that case the client lazily creates a native TCP/TLS connection
-pool and retains the same policy defaults. `HTTP-CLIENT-SEND` also accepts a
-method and URL convenience form while retaining its request-object form.
+`HTTP-CLIENT-SEND` also accepts a method and URL convenience form while
+retaining its request-object form.
 
 ### `http-client-transport-function`
 
@@ -1481,7 +1483,11 @@ ON-BODY-CHUNK and ON-INFORMATION receive response body and informational
 responses, and COLLECT-BODY-P controls whether the response body is retained.
 COOKIE-SAME-SITE-P and COOKIE-TOP-LEVEL-NAVIGATION-P supply the request context
 for SameSite cookie selection. COOKIE-PARTITION-KEY supplies the canonical
-top-level-site identifier for Partitioned cookie acceptance and selection.
+top-level-site identifier for Partitioned cookie acceptance and selection. The
+convenience forms are http-client-send (client method uri &rest arguments) and
+http-client-send (client uri &key method ...); request options such as HEADERS,
+TRAILERS, and BODY are consumed while the remaining keywords use the
+request-object send contract.
 
 ## WebSocket package
 

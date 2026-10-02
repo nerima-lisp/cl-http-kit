@@ -19,14 +19,15 @@ Pool and cookie state now has lock-backed access in the current integration.
 Native TCP and DNS are available through `cl-http-kit/network`. The separate
 `cl-http-kit/tls` source now adapts cl-tls-kit and cl-crypto-kit for the TLS 1.3
 client driver. The client system uses cl-deflate-kit for gzip and deflate.
-Server-side TLS remains an explicit unsupported boundary until the kit exposes
-a server driver.
+Server-side TLS remains an explicit unsupported boundary because the kit does
+not expose a server driver. For HTTPS servers, terminate TLS in a reverse
+proxy or load balancer and forward plain HTTP to `cl-http-kit/network`.
 HTTP/2 and HTTP/3 use injected stream or exchange boundaries; HTTP/3 does not
 open QUIC connections.
 
 ## 0.4.0 changes
 
-The target client path accepts a URL and method as its essential inputs and
+The 0.4.0 client path accepts a URL and method as its essential inputs and
 keeps native TCP/TLS, pooling, redirects, cookies, and content coding enabled
 by default. Existing callers that need custom transports can continue to use
 `make-http-client` and `http-client-send`.

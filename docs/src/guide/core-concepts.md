@@ -95,6 +95,9 @@ The client can return a response together with the effective request after a
 redirect or retry. Applications that need stricter behavior can pass explicit
 redirect, retry, cache, body, and header policies when constructing the client.
 
-The 0.4.0 integration adds the URL-and-method convenience entry point and
-completes the native TLS migration. HTTP/3 remains a framing boundary until
-cl-quic-kit provides the QUIC connection layer.
+The 0.4.0 integration provides the URL-and-method convenience form through
+`http-client-send` and the native TLS 1.3 client wrapper. Server-side TLS is
+outside the current boundary because cl-tls-kit does not expose a server
+driver. Deploy an HTTPS reverse proxy or load balancer in front of the native
+HTTP listener when the server must accept TLS connections. HTTP/3 remains a
+framing boundary until cl-quic-kit provides the QUIC connection layer.
