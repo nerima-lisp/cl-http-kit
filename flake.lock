@@ -1307,11 +1307,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1790943415,
-        "narHash": "sha256-AGx8wE3RolGEwXbhKVAlBmlgW7D9kp2SFM0z4MXcrOM=",
+        "lastModified": 1790952427,
+        "narHash": "sha256-gqehLhGTWMFycKoXt/2c/TTrijASJFdS8cXy3n5vpRw=",
         "owner": "nerima-lisp",
         "repo": "cl-tls-kit",
-        "rev": "f670518cca12b57a9cde5f61d35d055a7df3a540",
+        "rev": "148f68dd7ffbd14efa5b7dc0d465e70a6d95791b",
         "type": "github"
       },
       "original": {

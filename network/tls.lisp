@@ -76,13 +76,15 @@
      (list :role role :required required))))
 
 (defun http-tls-selected-alpn-protocol (stream)
-  "Signal when the negotiated ALPN result cannot be read from the public API.
-
-The cl-tls-kit client driver accepts ALPN offers but does not export a
-negotiated-ALPN accessor.  Returning an unobserved value here would make HTTP
-protocol selection unsafe, so callers receive an explicit boundary error."
+  "Return the ALPN protocol negotiated by the cl-tls-kit client driver."
   (unless (streamp stream)
     (%tls-protocol-error "TLS ALPN lookup requires a Lisp stream." stream))
+  #+sbcl
+  (if (typep stream 'http-tls-stream)
+      (cl-tls-kit:tls13-client-driver-negotiated-alpn
+       (%tls-stream-driver stream))
+      (%tls-unsupported :tls-alpn-result))
+  #-sbcl
   (%tls-unsupported :tls-alpn-result))
 
 (defun %tls-read-exact (stream buffer)
