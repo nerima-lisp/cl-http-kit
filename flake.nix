@@ -134,6 +134,7 @@
               codec
               deflate
               tls
+              pkgs.openssl
               paredit
               pkgs.sbcl
               pkgs.coreutils
@@ -465,6 +466,7 @@
                   host
                   deflate
                   tls
+                  pkgs.openssl
                 ];
               }
               ''

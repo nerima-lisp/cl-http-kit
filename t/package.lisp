@@ -1,5 +1,5 @@
 (defpackage #:http-kit/test
-  (:use #:cl #:http-kit #:http-kit/client #:http-kit/websocket
+  (:use #:cl #:http-kit #:http-kit/client #:http-kit/tls #:http-kit/websocket
         #:http-kit/network #:http-kit/observability)
   (:shadowing-import-from #:cl-weave
                           #:describe)

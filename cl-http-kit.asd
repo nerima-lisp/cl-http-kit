@@ -181,6 +181,7 @@
                "cl-http-kit/http2"
                "cl-http-kit/http3"
                "cl-http-kit/network"
+               "cl-http-kit/tls"
                "cl-http-kit/observability"
                "cl-weave")
   :pathname "t"
@@ -217,6 +218,7 @@
                (:file "tests-properties")
                (:file "tests-client")
                (:file "tests-client-content-coding")
+               (:file "tests-e2e-https")
                (:file "tests-client-p6")
                (:file "tests-network")
                (:file "runner"))

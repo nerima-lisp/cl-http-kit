@@ -161,7 +161,9 @@
             while line
             do (write-line line text)))))
 
-(defun %tls-load-trust-anchors (verify)
+(defun %tls-load-trust-anchors (verify explicit-trust-anchors)
+  (when explicit-trust-anchors
+    (return-from %tls-load-trust-anchors explicit-trust-anchors))
   (unless (member verify '(:optional :required))
     (return-from %tls-load-trust-anchors nil))
   (let ((path (cl-tls-kit:default-trust-store-path)))
@@ -274,7 +276,7 @@
     (declare (ignore stream))
     nil)
 
-  (defmethod sb-gray:open-stream-p ((stream http-tls-stream))
+  (defmethod open-stream-p ((stream http-tls-stream))
     (not (%tls-stream-closed-p stream)))
 
   (defmethod close ((stream http-tls-stream) &key abort)
@@ -296,7 +298,7 @@
   (declare (ignore driver stream)))
 
 (defun make-http-tls-upgrader
-    (&key (verify :required) alpn-protocols certificate key password
+    (&key (verify :required) alpn-protocols trust-anchors certificate key password
           (unwrap-stream-p nil) (clock-function #'%tls-monotonic-time))
   "Return a CLIENT TLS-UPGRADE callback backed by cl-tls-kit.
 
@@ -326,7 +328,7 @@ driver's transport callbacks."
       (%tls-protocol-error "TLS upgrade requires a Lisp stream." stream))
     #+sbcl
     (let* ((provider (cl-tls-kit:make-cl-crypto-kit-provider))
-           (trust-anchors (%tls-load-trust-anchors verify))
+           (trust-anchors (%tls-load-trust-anchors verify trust-anchors))
            (driver
              (cl-tls-kit:make-tls13-client-driver
               :provider provider
