@@ -135,6 +135,7 @@
               deflate
               tls
               pkgs.openssl
+              pkgs.nghttp2
               paredit
               pkgs.sbcl
               pkgs.coreutils
@@ -233,6 +234,7 @@
               codec
               deflate
               tls
+              pkgs.nghttp2
             ];
             text = ''
               test_home="''${TMPDIR:-/tmp}/cl-http-kit-test-$$"
@@ -467,6 +469,7 @@
                   deflate
                   tls
                   pkgs.openssl
+                  pkgs.nghttp2
                 ];
               }
               ''

@@ -55,7 +55,7 @@
              (sb-thread:make-thread
               (lambda ()
                 (handler-case
-                    (loop repeat 5
+                    (loop repeat 10
                           for request = (%https-e2e-read-headers output)
                           for request-text = (octets-as-string request)
                           for path = (second (uiop:split-string
@@ -153,7 +153,9 @@
                       (format nil "https://127.0.0.1:~D/redirect" port)
                       :timeout 5)
                    (declare (ignore ignored))
-                   (ensure-equal 200 (http-response-status response)))
+                   (ensure-equal 200 (http-response-status response))
+                   (ensure-equal "https-ok"
+                                 (octets-as-string (http-response-body response))))
                  (multiple-value-bind (response ignored)
                      (http-client-send
                       client "GET"
@@ -170,7 +172,50 @@
                    (declare (ignore ignored))
                    (ensure-equal 200 (http-response-status response))
                    (ensure-equal "cookie-ok"
-                                 (octets-as-string (http-response-body response))))))
+                                 (octets-as-string (http-response-body response))))
+                 (let ((previous-certificate-file (uiop:getenv "SSL_CERT_FILE")))
+                   (sb-posix:setenv "SSL_CERT_FILE" certificate 1)
+                   (unwind-protect
+                        (let ((default-client (make-http-client)))
+                          (multiple-value-bind (response ignored)
+                              (http-client-send
+                               default-client "GET"
+                               (format nil "https://127.0.0.1:~D/ok" port))
+                            (declare (ignore ignored))
+                            (ensure-equal 200 (http-response-status response))
+                            (ensure-equal "https-ok"
+                                          (octets-as-string
+                                           (http-response-body response))))
+                          (multiple-value-bind (response ignored)
+                              (http-client-send
+                               default-client "GET"
+                               (format nil "https://127.0.0.1:~D/redirect" port))
+                            (declare (ignore ignored))
+                            (ensure-equal 200 (http-response-status response))
+                            (ensure-equal "https-ok"
+                                          (octets-as-string
+                                           (http-response-body response))))
+                          (multiple-value-bind (response ignored)
+                              (http-client-send
+                               default-client "GET"
+                               (format nil "https://127.0.0.1:~D/gzip" port))
+                            (declare (ignore ignored))
+                            (ensure-equal "gzip-ok"
+                                          (octets-as-string
+                                           (http-response-body response))))
+                          (multiple-value-bind (response ignored)
+                              (http-client-send
+                               default-client "GET"
+                               (format nil "https://127.0.0.1:~D/cookie" port))
+                            (declare (ignore ignored))
+                            (ensure-equal 200 (http-response-status response))
+                            (ensure-equal "cookie-ok"
+                                          (octets-as-string
+                                           (http-response-body response)))))
+                     (if previous-certificate-file
+                         (sb-posix:setenv "SSL_CERT_FILE"
+                                         previous-certificate-file 1)
+                         (sb-posix:unsetenv "SSL_CERT_FILE"))))))
           (when input
             (ignore-errors (close input :abort t)))
           (when output

@@ -219,6 +219,7 @@
                (:file "tests-client")
                (:file "tests-client-content-coding")
                (:file "tests-e2e-https")
+               (:file "tests-e2e-http2")
                (:file "tests-client-p6")
                (:file "tests-network")
                (:file "runner"))
