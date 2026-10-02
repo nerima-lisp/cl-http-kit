@@ -442,6 +442,7 @@
                 mkdir -p "$work"
                 cp -R ${source}/. "$work/"
                 cd "$work"
+                export SBCL_HOME="${pkgs.sbcl}/lib/sbcl"
                 export CL_SOURCE_REGISTRY="$PWD//:${sourceRegistry}"
                 cl-weave run cl-http-kit/test-core \
                   --test-timeout-ms "''${CL_WEAVE_TEST_TIMEOUT_MS:-30000}" \
@@ -474,6 +475,7 @@
                 mkdir -p "$work"
                 cp -R ${source}/. "$work/"
                 cd "$work"
+                export SBCL_HOME="${pkgs.sbcl}/lib/sbcl"
                 export CL_SOURCE_REGISTRY="$PWD//:${sourceRegistry}"
                 cl-weave run cl-http-kit/test \
                   --test-timeout-ms "''${CL_WEAVE_TEST_TIMEOUT_MS:-30000}" \
