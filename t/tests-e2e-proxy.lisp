@@ -124,6 +124,7 @@
                            while byte
                            do (write-byte byte destination)
                               (finish-output destination))
+                   (stream-error () nil)
                    (error (condition) (push condition errors)))))
         (let ((thread (sb-thread:make-thread
                        (lambda () (copy right left)))))
