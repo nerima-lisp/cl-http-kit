@@ -104,7 +104,7 @@
                                   (subseq rest 1) variable)
                                  (%client-protocol-error
                                   "A proxy environment URL contains an invalid port."
-                                  variable))))))
+                                  variable)))))))
             (t
              (let ((colon (position #\: hostport :from-end t)))
                (if (and colon
@@ -126,7 +126,7 @@
                           ((:https) 443)
                           (otherwise 1080)))
          :username username
-         :password password))))))
+         :password password)))))
 
 (defun %proxy-environment-proxy-for-uri (uri)
   (let* ((scheme (http-uri-scheme uri))

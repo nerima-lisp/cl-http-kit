@@ -1,17 +1,17 @@
 (in-package #:http-kit/test)
 
 (deftest client-p6-convenience-url-method
-  (let ((seen-request nil)
-        (client
-          (make-http-client
-           :transport-function
-           (lambda (request &rest arguments)
-             (declare (ignore arguments))
-             (setf seen-request request)
-             (make-http-response
-              :status 204
-              :headers nil
-              :body (make-array 0 :element-type '(unsigned-byte 8)))))))
+  (let* ((seen-request nil)
+         (client
+           (make-http-client
+            :transport-function
+            (lambda (request &rest arguments)
+              (declare (ignore arguments))
+              (setf seen-request request)
+              (make-http-response
+               :status 204
+               :headers nil
+               :body (make-array 0 :element-type '(unsigned-byte 8)))))))
     (multiple-value-bind (response request)
         (http-client-send client "GET" "http://example.test/resource")
       (ensure-equal 204 (http-response-status response))
@@ -51,7 +51,7 @@
                            (make-http-header
                             "Set-Cookie"
                             (format nil "~A=value; Path=/" name)))
-                          :body nil))))))))))
+                          :body nil)))))))))
     (dolist (thread threads)
       (sb-thread:join-thread thread))
     (ensure-equal 8 (length (http-cookie-jar-cookies jar)))))

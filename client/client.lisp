@@ -1246,7 +1246,7 @@ eligible stale cache entry may be returned through the configured scheduler."
     (when (and only-if-cached-p
                (or (null (http-client-cache client))
                    (not (%client-cacheable-method-p current-request))))
-      (return-from http-client-send
+      (return-from %http-client-send-request
         (%client-only-if-cached-response client current-request on-body-chunk)))
     (when (and (http-client-cache client)
                (%client-cacheable-method-p current-request))
@@ -1262,9 +1262,10 @@ eligible stale cache entry may be returned through the configured scheduler."
           (%client-deliver-body-chunk response on-body-chunk)
           (when (http-client-on-response client)
             (funcall (http-client-on-response client) response current-request 0))
-          (return-from http-client-send (values response current-request)))
+          (return-from %http-client-send-request
+            (values response current-request)))
         (when only-if-cached-p
-          (return-from http-client-send
+          (return-from %http-client-send-request
             (%client-only-if-cached-response
              client current-request on-body-chunk)))
         (when (eq state :stale)
@@ -1301,7 +1302,7 @@ eligible stale cache entry may be returned through the configured scheduler."
               (when (http-client-on-response client)
                 (funcall (http-client-on-response client)
                          stale-response current-request 0))
-              (return-from http-client-send
+              (return-from %http-client-send-request
                 (values stale-response current-request)))
             (setf stale-entry entry
                   current-request revalidation-request)))
@@ -1517,9 +1518,8 @@ eligible stale cache entry may be returned through the configured scheduler."
 
 (defun %client-send-keyword-plist-p (arguments)
   (and (evenp (length arguments))
-       (loop for (key value) on arguments by #'cddr
-             declare (ignore value)
-             always (keywordp key))))
+       (loop for tail on arguments by #'cddr
+             always (keywordp (first tail)))))
 
 (defun %client-convenience-request
     (client method uri arguments strip-method-p)
