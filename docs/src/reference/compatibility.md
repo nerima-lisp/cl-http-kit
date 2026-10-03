@@ -137,9 +137,11 @@ default. It learns valid `Alt-Svc` response fields, accounts for `Age`, applies
 the default `ma`, handles `clear`, expiry, and `persist=1`, and can discard
 non-persistent alternatives when the network changes. Applications select from
 the discovered services and remove a rejected service after a 421 response.
-The client does not automatically reroute requests: the transport boundary must
+When `:http3-transport-function` is supplied, an advertised `h3` alternative is
+attempted before TCP; a failed QUIC attempt removes that alternative for the
+request and falls back to HTTP/2 or HTTP/1.1. The transport boundary must
 authenticate the certificate for the origin, send the origin as TLS SNI, and
-preserve proxy policy before an alternative can be used safely. Pass
+preserve proxy policy. An explicit HTTP/3 request does not fall back. Pass
 `:alternative-service-store nil` to disable discovery.
 Collected client responses automatically decode `gzip` and `deflate`
 `Content-Encoding` values, including stacked codings, and remove stale
@@ -183,8 +185,8 @@ connection-pool constructors.
 The current integration keeps these policy objects and compatibility entry
 points, and its native default supplies TCP/TLS, redirects, cookies, content
 coding, proxy environment lookup, and pooling when the optional systems are
-available. HTTP/3 connection selection remains deferred until cl-quic-kit
-supplies the QUIC transport.
+available. HTTP/3 connection selection is enabled by the injected cl-quic-kit
+adapter.
 
 ## WebSocket
 
@@ -231,9 +233,10 @@ Server-side wrapping is an explicit unsupported boundary.
 serve-http1-listener combines accept and serve-http1-session dispatch for a
 caller-owned listener, with connection limits and accept/error callbacks.
 
-The native client path uses cl-tls-kit. Native HTTP/3 connection setup remains
-outside this package until cl-quic-kit supplies the QUIC transport; the current
-HTTP/3 system remains an injected framing boundary.
+The native client path uses cl-tls-kit. Client-side HTTP/3 connection setup is
+available through the cl-quic-kit adapter, while the HTTP/3 framing system
+remains an injected QUIC stream boundary and applications retain socket and
+certificate policy.
 
 ## Application-owned behavior
 

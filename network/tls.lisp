@@ -193,9 +193,10 @@
          :invalid-trust-store)))))
 
 (defun %tls-driver-error (condition)
-  (%tls-protocol-error
-   "The TLS 1.3 client driver rejected the handshake."
-   (cl-tls-kit:tls13-client-driver-error-reason condition)))
+  (let ((reason (cl-tls-kit:tls13-client-driver-error-reason condition)))
+    (%tls-protocol-error
+     (format nil "The TLS 1.3 client driver rejected the handshake: ~S." reason)
+     reason)))
 
 #+sbcl
 (progn

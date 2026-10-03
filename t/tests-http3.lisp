@@ -2376,7 +2376,8 @@
                  (make-http-request
                   :method "POST"
                   :uri "https://example.test/resource?q=1"
-                  :headers (list (make-http-header "x-test" "yes"))
+                  :headers (list (make-http-header "Accept-Encoding" "gzip")
+                                 (make-http-header "x-test" "yes"))
                   :body (octets 65 66))
                  :collect-body-p nil
                  :qpack-encoder-table request-table
@@ -2433,6 +2434,7 @@
                    (cons ":authority" "example.test")
                    (cons ":path" "/resource?q=1")
                    (cons "content-length" "2")
+                   (cons "accept-encoding" "gzip")
                    (cons "x-test" "yes"))
              (http-kit/http3:qpack-decode-field-section
               (http-kit/http3:http3-frame-payload (first frames))
@@ -2449,6 +2451,8 @@
 (deftest http3-quic-adapter-validates-poll-interval
   (signals http-protocol-error
     (http-kit/http3:make-http3-quic-adapter :poll-interval -1))
+  (signals http-protocol-error
+    (http-kit/http3:make-http3-quic-adapter))
   (signals http-protocol-error
     (http-kit/http3:http3-quic-adapter-poll :not-an-adapter)))
 

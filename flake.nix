@@ -500,7 +500,26 @@
                   --max-workers "''${CL_WEAVE_MAX_WORKERS:-1}" \
                   --bail true \
                   --fail-with-no-tests
-                caddy_port="$(${pkgs.python3}/bin/python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+                read -r caddy_port receiver_port < <(
+                  sbcl --non-interactive \
+                    --eval '(require :sb-bsd-sockets)' \
+                    --eval "(let ((caddy (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)) \
+                                  (receiver (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp))) \
+                              (unwind-protect \
+                                   (progn \
+                                     (sb-bsd-sockets:socket-bind caddy #(127 0 0 1) 0) \
+                                     (sb-bsd-sockets:socket-bind receiver #(127 0 0 1) 0) \
+                                     (multiple-value-bind (caddy-address caddy-port) \
+                                         (sb-bsd-sockets:socket-name caddy) \
+                                       (declare (ignore caddy-address)) \
+                                       (multiple-value-bind (receiver-address receiver-port) \
+                                           (sb-bsd-sockets:socket-name receiver) \
+                                         (declare (ignore receiver-address)) \
+                                         (format t \"~D ~D~%\" caddy-port receiver-port)))) \
+                                (sb-bsd-sockets:socket-close caddy) \
+                                (sb-bsd-sockets:socket-close receiver)))" \
+                    | tail -n 1
+                )
                 openssl_bin="${pkgs.openssl}/bin/openssl"
                 "$openssl_bin" ecparam -name prime256v1 -genkey -noout -out "$TMPDIR/self.key"
                 "$openssl_bin" req -x509 -new -sha256 -key "$TMPDIR/self.key" \
@@ -514,6 +533,9 @@
                   "localhost:$caddy_port {" '  bind 127.0.0.1' \
                   "  tls $TMPDIR/self.crt $TMPDIR/self.key" \
                   "  header Alt-Svc \"h3=\\\":$caddy_port\\\"; ma=60\"" \
+                  '  handle /upload {' \
+                  '    reverse_proxy 127.0.0.1:'"$receiver_port" \
+                  '  }' \
                   '  respond "ok"' '}' > "$TMPDIR/Caddyfile"
                 "${pkgs.caddy}/bin/caddy" run --config "$TMPDIR/Caddyfile" \
                   --adapter caddyfile > "$TMPDIR/caddy.log" 2>&1 &
@@ -527,6 +549,7 @@
                 grep -q 'serving initial configuration' "$TMPDIR/caddy.log"
                 for mode in alt-svc fallback explicit; do
                   HTTP3_LOOPBACK_MODE="$mode" CADDY_PORT="$caddy_port" \
+                    RECEIVER_PORT="$receiver_port" \
                     CADDY_ROOT="$TMPDIR/self.crt" \
                     sbcl --non-interactive --load t/http3-loopback.lisp
                 done

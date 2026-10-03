@@ -86,7 +86,8 @@
     (&key open-stream write-stream read-stream close-stream cancel-stream
           (serialize (lambda (thunk) (funcall thunk)))
           (max-frame-size #x4000) (max-header-bytes 65536) (max-fields 256)
-          (qpack-settings '()) max-push-id peer-control-stream timeout deadline)
+          (qpack-settings '()) max-push-id peer-control-stream timeout deadline
+          on-control-stream-ready)
   "Open an HTTP/3 client over caller-supplied QUIC stream callbacks.
 
 OPEN-STREAM is called as (REQUEST &KEY STREAM-TYPE TIMEOUT DEADLINE) and
@@ -108,6 +109,11 @@ only supplies the HTTP/3 stream and codec layer."
   (unless (or (null cancel-stream) (functionp cancel-stream))
     (%h3-transport-error "HTTP/3 cancel-stream must be a function or NIL."
                          (type-of cancel-stream)))
+  (unless (or (null on-control-stream-ready)
+              (functionp on-control-stream-ready))
+    (%h3-transport-error
+     "HTTP/3 on-control-stream-ready must be a function or NIL."
+     (type-of on-control-stream-ready)))
   (unless (functionp serialize)
     (%h3-transport-error "HTTP/3 serialize must be a function."
                          (type-of serialize)))
@@ -177,7 +183,7 @@ only supplies the HTTP/3 stream and codec layer."
                               (list +http3-setting-qpack-max-table-capacity+
                                     +http3-setting-qpack-blocked-streams+)))
                     settings))))
-            (funcall write-stream control-stream
+          (funcall write-stream control-stream
                      (apply #'%http3-concatenate-octets
                             (append
                              (list (http3-control-stream-prefix)
@@ -191,6 +197,8 @@ only supplies the HTTP/3 stream and codec layer."
                      :fin-p nil
                      :timeout timeout
                      :deadline deadline))
+          (when on-control-stream-ready
+            (funcall on-control-stream-ready :timeout timeout :deadline deadline))
           (funcall write-stream qpack-encoder-stream
                    (http3-qpack-encoder-stream-prefix)
                    :fin-p nil :timeout timeout :deadline deadline)
@@ -963,9 +971,7 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
              :deadline deadline)))
 
 (defun %h3-header-name (header)
-  (let ((name (http-kit:http-header-name header)))
-    (unless (string= name (string-downcase name))
-      (%h3-invalid-header name "HTTP/3 field names must be lowercase."))
+  (let ((name (string-downcase (http-kit:http-header-name header))))
     (unless (http-kit::%header-name-p name)
       (%h3-invalid-header name "the field name is not a token."))
     name))

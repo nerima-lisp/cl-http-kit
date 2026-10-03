@@ -21,8 +21,8 @@ for the 0.4.0 compatibility boundary.
 
 The worktree contains dependency declarations for cl-deflate-kit and
 cl-tls-kit, plus proxy-environment and lock-backed pool/cookie changes. The
-0.4.0 integration keeps native HTTP/3 deferred until cl-quic-kit supplies
-the QUIC transport and keeps server TLS outside the current kit boundary.
+0.4.0 integration supplies an HTTP/3 client adapter for cl-quic-kit and keeps
+server TLS outside the current kit boundary.
 
 ## Quick Start
 
@@ -136,7 +136,9 @@ server session over caller-provided binary I/O. The optional
 framing with static/literal/Huffman QPACK and caller-owned dynamic-table
 references over caller-provided QUIC streams; QUIC packets, loss recovery,
 congestion control, TLS 1.3, ALPN, sockets, and native HTTP/3
-connection/server acceptance remain outside that boundary. The optional
+connection/server acceptance remain outside that boundary. The HTTP/3 system
+also supplies a cl-quic-kit adapter for the client connection and stream
+lifecycle. The optional
 `cl-http-kit/network` system supplies native TCP, DNS, and an HTTP/1 listener
 service on SBCL; `cl-http-kit/tls` supplies the TLS upgrade and accepted-stream
 wrappers. Server-side TLS wrapping is unsupported because the current
@@ -156,10 +158,11 @@ application-owned; the server session handles Ping/Pong and the close
 handshake it owns.
 
 The 0.4.0 target completes verification of the native four-kit path and
-retains `make-http-client` and
-`http-client-send` as compatibility entry points. HTTP/3 native connection
-selection remains deferred until cl-quic-kit supplies the QUIC transport; the
-existing HTTP/3 framing boundary remains available in the meantime.
+retains `make-http-client` and `http-client-send` as compatibility entry
+points. When a client supplies `:http3-transport-function`, an advertised
+Alt-Svc `h3` alternative is attempted before TCP and a failed QUIC attempt
+falls back to HTTP/2 or HTTP/1.1. An explicit HTTP/3 request is a hard
+requirement and does not fall back.
 
 ## Support
 
