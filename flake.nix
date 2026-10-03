@@ -500,7 +500,7 @@
                   --max-workers "''${CL_WEAVE_MAX_WORKERS:-1}" \
                   --bail true \
                   --fail-with-no-tests
-                caddy_port="$(${pkgs.python3}/bin/python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+                caddy_port=18443
                 openssl_bin="${pkgs.openssl}/bin/openssl"
                 "$openssl_bin" ecparam -name prime256v1 -genkey -noout -out "$TMPDIR/self.key"
                 "$openssl_bin" req -x509 -new -sha256 -key "$TMPDIR/self.key" \
