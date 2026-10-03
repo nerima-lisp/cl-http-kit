@@ -2,6 +2,18 @@
 (push (truename "./") asdf:*central-registry*)
 (asdf:load-system "cl-http-kit/test")
 
+(let ((protection (find-package "CL-QUIC-KIT.PROTECTION"))
+      (crypto (find-package "CRYPTO-KIT")))
+  (funcall (find-symbol "CONFIGURE-CRYPTO-BACKEND" protection)
+           :hkdf-extract (symbol-function (find-symbol "HKDF-EXTRACT" crypto))
+           :hkdf-expand (symbol-function (find-symbol "HKDF-EXPAND" crypto))
+           :aead-seal (symbol-function (find-symbol "AEAD-SEAL" crypto))
+           :aead-open (symbol-function (find-symbol "AEAD-OPEN" crypto))
+           :aes-ecb (symbol-function (find-symbol "AES-ENCRYPT-BLOCK" crypto))
+           :chacha20 (symbol-function (find-symbol "CHACHA20-KEYSTREAM" crypto))
+           :constant-time-equal
+           (symbol-function (find-symbol "CONSTANT-TIME-EQUAL" crypto))))
+
 (defun %env (name &optional default)
   (or (sb-ext:posix-getenv name) default))
 
