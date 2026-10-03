@@ -1297,11 +1297,11 @@
     "cl-quic-kit": {
       "flake": false,
       "locked": {
-        "lastModified": 1791057883,
-        "narHash": "sha256-SI4V1Hf1ed5KYDwfJU33/hLus7wp5qxt2O1LwiWMctc=",
+        "lastModified": 1791066828,
+        "narHash": "sha256-EtodRU9rkpoEBbaKTU/6baafzoToPGVSm8E8YUqJ5xg=",
         "owner": "nerima-lisp",
         "repo": "cl-quic-kit",
-        "rev": "57c5a596e12c5361a4b5532b1fcc02e4b4db7f58",
+        "rev": "c556160a829c9affa52d8407e05ad75a54be18b5",
         "type": "github"
       },
       "original": {
