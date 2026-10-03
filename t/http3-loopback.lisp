@@ -47,7 +47,10 @@
              :tls-trust-anchors (list trust-anchor)
              :tls-verify-signature #'crypto-kit:verify-signature
              :tls-signature-algorithms #(1027)
-             :idle-timeout 10)))
+             :now-fn (lambda ()
+                       (/ (get-internal-real-time)
+                          internal-time-units-per-second))
+             :idle-timeout 30)))
       (unwind-protect
            (http-kit/http3:send-http3-request
             (http-kit/http3:http3-quic-adapter-http3-client adapter)

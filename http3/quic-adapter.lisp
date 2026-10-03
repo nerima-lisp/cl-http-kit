@@ -16,7 +16,7 @@
          :detail detail))
 
 (defun %http3-quic-adapter-now ()
-  (/ (get-internal-real-time) (float internal-time-units-per-second)))
+  (/ (get-internal-real-time) internal-time-units-per-second))
 
 (defun %http3-quic-adapter-deadline (timeout deadline)
   (let ((timeout-deadline
