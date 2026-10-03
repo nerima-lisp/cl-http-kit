@@ -548,10 +548,14 @@
                 done
                 grep -q 'serving initial configuration' "$TMPDIR/caddy.log"
                 for mode in alt-svc fallback explicit; do
-                  HTTP3_LOOPBACK_MODE="$mode" CADDY_PORT="$caddy_port" \
+                  HTTP3_LOOPBACK_DIAGNOSTICS=1 HTTP3_LOOPBACK_MODE="$mode" \
+                    CADDY_LOG="$TMPDIR/caddy.log" CADDY_PORT="$caddy_port" \
                     RECEIVER_PORT="$receiver_port" \
                     CADDY_ROOT="$TMPDIR/self.crt" \
-                    sbcl --non-interactive --load t/http3-loopback.lisp
+                    sbcl --non-interactive --load t/http3-loopback.lisp || {
+                      cat "$TMPDIR/caddy.log"
+                      exit 1
+                    }
                 done
                 touch "$out"
               '';

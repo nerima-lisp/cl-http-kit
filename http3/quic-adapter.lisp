@@ -18,6 +18,11 @@
 (defun %http3-quic-adapter-now ()
   (/ (get-internal-real-time) internal-time-units-per-second))
 
+(defun %http3-quic-adapter-diagnostic (stage)
+  (when (string= "1" (sb-ext:posix-getenv "HTTP3_LOOPBACK_DIAGNOSTICS"))
+    (format *error-output* "HTTP3-DIAG ~A~%" stage)
+    (finish-output *error-output*)))
+
 (defun %http3-quic-adapter-configure-protection ()
   (let* ((protection (find-package "CL-QUIC-KIT.PROTECTION"))
          (crypto (find-package "CRYPTO-KIT"))
@@ -228,10 +233,14 @@ to be selected without exposing QUIC implementation details."
                    :poll-interval poll-interval)))
     (unwind-protect
          (progn
+           (%http3-quic-adapter-diagnostic "client-start")
            (cl-quic-kit:client-start quic-client)
            (setf (http3-quic-adapter-started-p adapter) t)
+           (%http3-quic-adapter-diagnostic "await-handshake-start")
            (%http3-quic-adapter-await-established
             quic-client :timeout timeout :deadline deadline)
+           (%http3-quic-adapter-diagnostic "await-handshake-complete")
+           (%http3-quic-adapter-diagnostic "make-http3-client-start")
            (setf (http3-quic-adapter-http3-client adapter)
                  (apply #'make-http3-client
                         :open-stream
@@ -269,9 +278,12 @@ to be selected without exposing QUIC implementation details."
                         :timeout timeout
                         :deadline deadline
                         http3-options))
+           (%http3-quic-adapter-diagnostic "make-http3-client-complete")
+           (%http3-quic-adapter-diagnostic "await-settings-start")
            (%http3-quic-adapter-await-peer-settings
             quic-client (http3-quic-adapter-http3-client adapter)
             :timeout timeout :deadline deadline)
+           (%http3-quic-adapter-diagnostic "await-settings-complete")
            adapter)
       (unless (http3-quic-adapter-http3-client adapter)
         (ignore-errors (cl-quic-kit:client-close quic-client))))))
