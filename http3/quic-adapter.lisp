@@ -105,7 +105,7 @@ to be selected without exposing QUIC implementation details."
             :tls-provider tls-provider
             :tls-trust-anchors tls-trust-anchors
             :tls-verify-signature tls-verify-signature
-            :now-fn now-fn
+            :now-fn (or now-fn #'%http3-quic-adapter-now)
             :tls-signature-algorithms tls-signature-algorithms
             :idle-timeout idle-timeout
             :io-write io-write

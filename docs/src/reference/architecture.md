@@ -80,8 +80,9 @@ peer tables synchronized before using dynamic references.
 
 The HTTP/3 system does not implement QUIC packet handling, TLS, ALPN, native
 socket setup, peer unidirectional-stream acceptance, connection-level stream
-dispatch, or a native HTTP/3 listener. The surrounding QUIC implementation
-must provide those boundaries.
+dispatch, or a native HTTP/3 listener. The cl-quic-kit adapter supplies the
+client connection and bidirectional stream lifecycle at this boundary; the
+surrounding application still supplies socket and certificate policy.
 
 The implementation is split by responsibility: `transport.lisp` owns shared
 control-stream, frame, settings, and header helpers; `transport-client.lisp`
@@ -102,9 +103,12 @@ current integration creates native TCP/TLS and a pool lazily; custom callers
 can still keep socket creation, DNS, TLS, and ALPN at the application boundary.
 
 The URL-and-method convenience path runs over these layers. `make-http-client`
-and `http-client-send` stay as compatibility entry points. HTTP/3 connection
-selection is deferred until cl-quic-kit is complete;
-the current HTTP/3 layer remains an injected QUIC stream boundary.
+and `http-client-send` stay as compatibility entry points. If the client
+receives an Alt-Svc `h3` alternative and the caller supplies
+`:http3-transport-function`, it attempts HTTP/3 and falls back to TCP when the
+QUIC attempt fails. Explicit HTTP/3 requests do not fall back. The HTTP/3
+layer remains an injected QUIC stream boundary so applications retain socket,
+TLS, and certificate policy.
 
 ## Optional native network system
 
