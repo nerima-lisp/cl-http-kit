@@ -1,7 +1,8 @@
 (in-package #:http-kit/test)
 
-(defun client-test-response (status &key headers body)
+(defun client-test-response (status &key headers body protocol-version)
   (make-http-response :status status
+                      :protocol-version (or protocol-version "HTTP/1.1")
                       :headers headers
                       :body (or body (octets))))
 
@@ -1488,7 +1489,7 @@
                (ensure-true (http-request-http3-p request))
                (error 'http-connection-error
                       :message "synthetic explicit HTTP/3 failure."
-                      :operation :http3))))
+                      :operation :http3)))))
       (signals http-connection-error
         (http-client-send
          client
