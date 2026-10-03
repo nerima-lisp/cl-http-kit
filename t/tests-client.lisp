@@ -1,7 +1,8 @@
 (in-package #:http-kit/test)
 
-(defun client-test-response (status &key headers body)
+(defun client-test-response (status &key headers body protocol-version)
   (make-http-response :status status
+                      :protocol-version (or protocol-version "HTTP/1.1")
                       :headers headers
                       :body (or body (octets))))
 
@@ -1406,6 +1407,96 @@
       (ensure-equal "h3"
                     (http-alternative-service-protocol-id
                      (first services))))))
+
+(deftest client-alt-svc-selects-http3-and-falls-back-to-tcp
+  (let ((tcp-calls 0)
+        (http3-calls 0)
+        (http3-failure t)
+        (client nil))
+    (setf client
+          (make-http-client
+           :cache nil
+           :clock-function (lambda () 4000)
+           :transport-function
+           (lambda (request &key &allow-other-keys)
+             (incf tcp-calls)
+             (ensure-false (http-request-http3-p request))
+             (client-test-response 200 :body (ascii "tcp")))
+           :http3-transport-function
+           (lambda (request &key alternative-service &allow-other-keys)
+             (incf http3-calls)
+             (ensure-true (http-request-http3-p request))
+             (ensure-equal "h3"
+                           (http-alternative-service-protocol-id
+                            alternative-service))
+             (if http3-failure
+                 (error 'http-connection-error
+                        :message "synthetic HTTP/3 connection failure."
+                        :operation :http3
+                        :cause :unreachable)
+                 (client-test-response 200
+                                       :protocol-version "HTTP/3"
+                                       :body (ascii "h3"))))))
+    (http-client-send
+     client (http-client-request client "GET" "https://example.test/"))
+    (http-alternative-service-store-note-response
+     (http-client-alternative-service-store client)
+     "https://example.test/"
+     (client-test-response
+      200 :headers (list (make-http-header "Alt-Svc" "h3=\":443\"; ma=60"))))
+    (let ((response (http-client-send
+                     client
+                     (http-client-request client "GET"
+                                          "https://example.test/"))))
+      (ensure-equal 200 (http-response-status response))
+      (ensure-octets-equal (ascii "tcp") (http-response-body response)))
+    (ensure-equal 1 http3-calls)
+    (ensure-equal 2 tcp-calls)
+    (ensure-equal nil
+                  (http-alternative-service-store-services
+                   (http-client-alternative-service-store client)
+                   "https://example.test/"))
+    (setf http3-failure nil)
+    (http-alternative-service-store-note-response
+     (http-client-alternative-service-store client)
+     "https://example.test/"
+     (client-test-response
+      200 :headers (list (make-http-header "Alt-Svc" "h3=\":443\"; ma=60"))))
+    (let ((response (http-client-send
+                     client
+                     (http-client-request client "GET"
+                                          "https://example.test/"))))
+      (ensure-equal "HTTP/3" (http-response-protocol-version response))
+      (ensure-octets-equal (ascii "h3") (http-response-body response)))
+    (ensure-equal 2 http3-calls)
+    (ensure-equal 2 tcp-calls)))
+
+(deftest client-explicit-http3-does-not-fallback
+  (let ((tcp-calls 0)
+        (http3-calls 0))
+    (let ((client
+            (make-http-client
+             :cache nil
+             :transport-function
+             (lambda (request &key &allow-other-keys)
+               (declare (ignore request))
+               (incf tcp-calls)
+               (client-test-response 200 :body (ascii "tcp")))
+             :http3-transport-function
+             (lambda (request &key alternative-service &allow-other-keys)
+               (declare (ignore alternative-service))
+               (incf http3-calls)
+               (ensure-true (http-request-http3-p request))
+               (error 'http-connection-error
+                      :message "synthetic explicit HTTP/3 failure."
+                      :operation :http3)))))
+      (signals http-connection-error
+        (http-client-send
+         client
+         (http-client-request client "GET" "https://example.test/"
+                              :protocol-version "HTTP/3"))))
+    (ensure-equal 1 http3-calls)
+    (ensure-equal 0 tcp-calls))))
 
 (deftest client-cache-integration
   (let ((calls 0)

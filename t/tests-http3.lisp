@@ -2446,6 +2446,12 @@
         (ensure-true (every #'http3-test-stream-closed-p opened-streams))
         (ensure-true (not (http-kit/http3:http3-client-open-p client)))))))
 
+(deftest http3-quic-adapter-validates-poll-interval
+  (signals http-protocol-error
+    (http-kit/http3:make-http3-quic-adapter :poll-interval -1))
+  (signals http-protocol-error
+    (http-kit/http3:http3-quic-adapter-poll :not-an-adapter)))
+
 (deftest http3-server-request-response
   (let* ((request-fields
            (list (cons ":method" "POST")

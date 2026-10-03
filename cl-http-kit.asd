@@ -137,14 +137,15 @@
   :author "nerima-lisp"
   :license "MIT"
   :version "0.4.0"
-  :depends-on ("cl-http-kit" "cl-http-kit/http2")
+  :depends-on ("cl-http-kit" "cl-http-kit/http2" "cl-quic-kit")
   :pathname "http3"
   :serial t
   :components ((:file "package")
                (:file "varint")
                (:file "qpack")
                (:file "frames")
-               (:file "transport")))
+               (:file "transport")
+               (:file "quic-adapter")))
 
 (asdf:defsystem "cl-http-kit/test-core"
   :description "Core tests for cl-http-kit without optional transport or client subsystems."

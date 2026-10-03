@@ -131,6 +131,7 @@
    ;; Protocol negotiation
    #:http-alpn-protocol-name
    #:http-select-protocol
+   #:http-request-http3-p
    ;; Policies
    #:http-redirect-policy
    #:make-http-redirect-policy
@@ -250,6 +251,7 @@
    #:http-client-p
    #:make-http-client
    #:http-client-transport-function
+   #:http-client-http3-transport-function
    #:http-client-connection-pool
    #:http-client-default-headers
    #:http-client-cookie-jar

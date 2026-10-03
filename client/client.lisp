@@ -225,9 +225,11 @@
         uri)))
 
 (defun %client-request-rebuild
-    (request &key method uri headers body (trailers nil trailers-supplied-p))
+    (request &key method uri headers body protocol-version
+                    (trailers nil trailers-supplied-p))
   (make-http-request :method (or method (http-request-method request))
-                     :protocol-version (http-request-protocol-version request)
+                     :protocol-version (or protocol-version
+                                           (http-request-protocol-version request))
                      :uri (or uri (http-request-uri request))
                      :headers (or headers (http-request-headers request))
                      :trailers (if trailers-supplied-p
@@ -413,6 +415,7 @@
 
 (defun make-http-client
     (&key transport-function open-stream close-stream connection-pool
+          http3-transport-function
           (default-headers nil)
           (cookie-jar (make-http-cookie-jar))
           (cache nil)
@@ -463,6 +466,9 @@ Pass NIL explicitly to disable either store."
   (when transport-function
     (%ensure-function transport-function
                       "The client transport must be a function."))
+  (when http3-transport-function
+    (%ensure-function http3-transport-function
+                      "The HTTP/3 transport must be a function."))
   (when open-stream
     (%ensure-function open-stream
                       "The stream opener must be a function."))
@@ -599,6 +605,7 @@ Pass NIL explicitly to disable either store."
                          effective-close-stream))))
     (%make-http-client
      :transport-function transport
+     :http3-transport-function http3-transport-function
      :connection-pool effective-connection-pool
      :default-headers (%client-normalize-headers default-headers)
      :cookie-jar cookie-jar
@@ -627,7 +634,8 @@ Pass NIL explicitly to disable either store."
      :on-response on-response)))
 
 (defun http-client-request
-    (client method uri &key headers trailers body)
+    (client method uri &key headers trailers body
+                              (protocol-version "HTTP/1.1"))
   "Build a validated HTTP-REQUEST using CLIENT defaults.
 
 BODY may be a string, a one-dimensional octet array, or NIL.  TRAILERS is a
@@ -642,17 +650,20 @@ headers replace client default headers with the same case-insensitive name."
          (combined (append (%client-remove-headers defaults names)
                            explicit)))
     (make-http-request :method method
+                       :protocol-version protocol-version
                        :uri (%client-uri uri)
                        :headers combined
                        :trailers trailers
                        :body (%client-body-octets body))))
 
 (defun %client-request-with
-    (request &key headers body method uri (trailers nil trailers-supplied-p))
+    (request &key headers body method uri protocol-version
+                    (trailers nil trailers-supplied-p))
   (%client-request-rebuild
    request
    :method method
    :uri uri
+   :protocol-version protocol-version
    :headers headers
    :trailers (if trailers-supplied-p
                  trailers
@@ -792,15 +803,53 @@ headers replace client default headers with the same case-insensitive name."
     (unless collect-body-p
       (setf arguments
             (append arguments (list :collect-body-p nil))))
-    (let ((response
-            (apply (http-client-transport-function client)
-                   effective-request
-                   arguments)))
-    (unless (http-response-p response)
-      (%client-protocol-error
-       "The client transport must return an HTTP-RESPONSE."
-       response))
-      response)))
+    (let* ((explicit-http3-p (http-request-http3-p request))
+           (alternative
+             (and (not explicit-http3-p)
+                  (http-client-alternative-service-store client)
+                  (find-if
+                   (lambda (service)
+                     (string= (http-alpn-protocol-name
+                               (http-alternative-service-protocol-id service))
+                              "h3"))
+                   (http-alternative-service-store-services
+                    (http-client-alternative-service-store client)
+                    (http-request-uri request)))))
+           (http3-transport (http-client-http3-transport-function client)))
+      (labels ((call-tcp ()
+                 (apply (http-client-transport-function client)
+                        effective-request arguments))
+               (call-http3 (service)
+                 (unless http3-transport
+                   (%client-missing-native-feature :http3-transport
+                                                   "HTTP-KIT/CLIENT"))
+                 (apply http3-transport
+                        (%client-request-with
+                         effective-request :protocol-version "HTTP/3")
+                        (append arguments
+                                (list :alternative-service service)))))
+        (let ((response
+                (cond
+                  (explicit-http3-p
+                   ;; An explicit HTTP/3 request is a hard requirement.
+                   (call-http3 nil))
+                  (alternative
+                   (handler-case
+                       (call-http3 alternative)
+                     (error (condition)
+                       ;; Failed Alt-Svc knowledge is stale.  Retry via TCP.
+                       (declare (ignore condition))
+                       (http-alternative-service-store-remove
+                        (http-client-alternative-service-store client)
+                        (http-request-uri request)
+                        alternative)
+                       (call-tcp))))
+                  (t (call-tcp)))))
+          (unless (http-response-p response)
+            (%client-protocol-error
+             "The client transport must return an HTTP-RESPONSE."
+             response))
+          response)))))
 
 (defun %client-attempt
     (client request proxy-plan policy &key timeout deadline request-body-function
@@ -1535,7 +1584,7 @@ eligible stale cache entry may be returned through the configured scheduler."
         (send-options nil))
     (loop for (key value) on arguments by #'cddr
           do (cond
-               ((member key '(:headers :trailers :body) :test #'eq)
+               ((member key '(:headers :trailers :body :protocol-version) :test #'eq)
                 (setf request-options
                       (append request-options (list key value))))
                ((and strip-method-p (eq key :method)) nil)

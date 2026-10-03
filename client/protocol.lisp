@@ -31,3 +31,8 @@ HTTP/3 ALPN names are recognized; the canonical selected name is returned."
       (let ((name (http-alpn-protocol-name protocol)))
         (when (and name (member name supported-names :test #'string=))
           (return name))))))
+
+(defun http-request-http3-p (request)
+  "Return true when REQUEST explicitly requires HTTP/3."
+  (and (http-request-p request)
+       (string= (http-request-protocol-version request) "HTTP/3")))

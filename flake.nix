@@ -61,6 +61,11 @@
       inputs.cl-crypto-kit.follows = "cl-crypto-kit";
     };
 
+    cl-quic-kit = {
+      url = "github:nerima-lisp/cl-quic-kit/takeokunn-transport-core";
+      flake = false;
+    };
+
     paredit-cli = {
       url = "github:takeokunn/paredit-cli/v1.6.0";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -85,6 +90,7 @@
       cl-crypto-kit,
       cl-deflate-kit,
       cl-tls-kit,
+      cl-quic-kit,
       paredit-cli,
       treefmt-nix,
       ...
@@ -120,6 +126,7 @@
           deflate = cl-deflate-kit.packages.${system}.default;
           tls = cl-tls-kit.packages.${system}.default;
           crypto = cl-crypto-kit;
+          quic = cl-quic-kit;
           paredit = paredit-cli.packages.${system}.default;
         in
         {
@@ -158,6 +165,7 @@
                   "${deflate}//"
                   "${tls}//"
                   "${crypto}//"
+                  "${quic}//"
                 ]
               }}"
             '';
@@ -178,6 +186,7 @@
           deflate = cl-deflate-kit.packages.${system}.default;
           tls = cl-tls-kit.packages.${system}.default;
           crypto = cl-crypto-kit;
+          quic = cl-quic-kit;
           paredit = paredit-cli.packages.${system}.default;
           sourceRegistry = pkgs.lib.concatStringsSep ":" [
             "${clWeave}/share/common-lisp/source//"
@@ -190,6 +199,7 @@
             "${deflate}//"
             "${tls}//"
             "${crypto}//"
+            "${quic}//"
           ];
           appMeta = {
             description = "Common Lisp HTTP client quality gate";
@@ -407,6 +417,7 @@
           deflate = cl-deflate-kit.packages.${system}.default;
           tls = cl-tls-kit.packages.${system}.default;
           crypto = cl-crypto-kit;
+          quic = cl-quic-kit;
           paredit = paredit-cli.packages.${system}.default;
           source = pkgs.lib.cleanSource ./.;
           sourceRegistry = pkgs.lib.concatStringsSep ":" [
@@ -420,6 +431,7 @@
             "${deflate}//"
             "${tls}//"
             "${crypto}//"
+            "${quic}//"
           ];
         in
         {
@@ -470,6 +482,7 @@
                   tls
                   pkgs.openssl
                   pkgs.nghttp2
+                  pkgs.caddy
                 ];
               }
               ''
@@ -487,6 +500,36 @@
                   --max-workers "''${CL_WEAVE_MAX_WORKERS:-1}" \
                   --bail true \
                   --fail-with-no-tests
+                caddy_port="$(${pkgs.python3}/bin/python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+                openssl_bin="${pkgs.openssl}/bin/openssl"
+                "$openssl_bin" ecparam -name prime256v1 -genkey -noout -out "$TMPDIR/self.key"
+                "$openssl_bin" req -x509 -new -sha256 -key "$TMPDIR/self.key" \
+                  -out "$TMPDIR/self.crt" -days 1 -subj '/CN=localhost' \
+                  -addext 'subjectAltName=DNS:localhost' \
+                  -addext 'basicConstraints=critical,CA:TRUE' \
+                  -addext 'keyUsage=critical,keyCertSign,digitalSignature'
+                printf '%s\n' \
+                  '{' '  admin off' '  auto_https off' \
+                  '  servers {' '    protocols h1 h2 h3' '  }' '}' \
+                  "localhost:$caddy_port {" '  bind 127.0.0.1' \
+                  "  tls $TMPDIR/self.crt $TMPDIR/self.key" \
+                  "  header Alt-Svc \"h3=\\\":$caddy_port\\\"; ma=60\"" \
+                  '  respond "ok"' '}' > "$TMPDIR/Caddyfile"
+                "${pkgs.caddy}/bin/caddy" run --config "$TMPDIR/Caddyfile" \
+                  --adapter caddyfile > "$TMPDIR/caddy.log" 2>&1 &
+                caddy_pid=$!
+                trap 'kill "$caddy_pid" 2>/dev/null || true; wait "$caddy_pid" 2>/dev/null || true' EXIT
+                for attempt in $(seq 1 200); do
+                  grep -q 'serving initial configuration' "$TMPDIR/caddy.log" && break
+                  kill -0 "$caddy_pid" 2>/dev/null || { cat "$TMPDIR/caddy.log"; exit 1; }
+                  sleep 0.05
+                done
+                grep -q 'serving initial configuration' "$TMPDIR/caddy.log"
+                for mode in alt-svc fallback explicit; do
+                  HTTP3_LOOPBACK_MODE="$mode" CADDY_PORT="$caddy_port" \
+                    CADDY_ROOT="$TMPDIR/self.crt" \
+                    sbcl --non-interactive --load t/http3-loopback.lisp
+                done
                 touch "$out"
               '';
 
