@@ -8,6 +8,9 @@
 (defun %env-integer (name default)
   (parse-integer (%env name (princ-to-string default))))
 
+(defun %octets-as-string (octets)
+  (map 'string #'code-char octets))
+
 (defun %read-caddy-root ()
   (let* ((blocks (cl-tls-kit:pem-decode
                   (uiop:read-file-string (%env "CADDY_ROOT"))))
@@ -72,7 +75,7 @@
                       (string= "HTTP/3"
                                (http-kit:http-response-protocol-version response))
                       (string= "ok"
-                               (http-kit/test:octets-as-string
+                               (%octets-as-string
                                 (http-kit:http-response-body response))))
            (error "Explicit HTTP/3 loopback did not return an HTTP/3 ok response."))))
       (t
@@ -89,7 +92,7 @@
                           (string= "HTTP/3"
                                    (http-kit:http-response-protocol-version response)))
                       (string= "ok"
-                               (http-kit/test:octets-as-string
+                               (%octets-as-string
                                 (http-kit:http-response-body response))))
            (error "HTTP/3 loopback mode ~A returned an unexpected response." mode))))))
   (format t "Caddy HTTP/3 loopback passed: ~A~%" mode))
