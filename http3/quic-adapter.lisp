@@ -57,7 +57,12 @@
              (%http3-quic-adapter-error
               "The QUIC client closed before the TLS handshake completed."
               state))
-           (cl-quic-kit:client-poll quic-client)
+           (handler-case
+               (cl-quic-kit:client-poll quic-client)
+             (cl-tls-kit:tls13-client-driver-error (condition)
+               (%http3-quic-adapter-error
+                "The TLS 1.3 client driver rejected the QUIC handshake."
+                (cl-tls-kit:tls13-client-driver-error-reason condition))))
            (sleep 0.005)
         finally
            (%http3-quic-adapter-error
