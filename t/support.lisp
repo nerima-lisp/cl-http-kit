@@ -1,5 +1,34 @@
 (in-package #:http-kit/test)
 
+#+sbcl
+(defun %e2e-wait-for-tcp (host port &key (timeout 5) (retry-interval 0.01))
+  "Wait until HOST:PORT accepts a TCP connection.
+
+The five-second bound matches the existing E2E connection timeout; the
+short retry interval avoids making process startup depend on a fixed delay."
+  (let* ((units internal-time-units-per-second)
+         (deadline (+ (get-internal-real-time) (* timeout units)))
+         (last-condition nil))
+    (loop
+      for remaining-units = (- deadline (get-internal-real-time))
+      for remaining = (/ (max 0 remaining-units) units)
+      do (when (<= remaining-units 0)
+           (error "Timed out waiting for TCP listener ~A:~D~@[ (~A)~]"
+                  host port last-condition))
+         (handler-case
+             (let* ((request (make-http-request
+                              :method "GET"
+                              :uri (format nil "http://~A:~D/" host port)))
+                    (stream (open-http-tcp-stream
+                             request :timeout (min remaining 0.25))))
+               (close-http-tcp-stream stream)
+               (return t))
+           (http-connection-error (condition)
+             (setf last-condition condition))
+           (http-timeout (condition)
+             (setf last-condition condition)))
+         (sleep (min retry-interval remaining)))))
+
 (defmacro with-test-client ((client transport-function &rest options) &body body)
   "Bind CLIENT to a client using the in-process transport fake.
 

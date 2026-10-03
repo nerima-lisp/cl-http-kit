@@ -87,7 +87,7 @@
                              (finish-output input))
                   (error (condition)
                     (setf server-error condition)))))))
-      (sleep 1)
+      (%e2e-wait-for-tcp "127.0.0.1" port)
       (values process server-thread input output
               (lambda ()
                 (when server-thread

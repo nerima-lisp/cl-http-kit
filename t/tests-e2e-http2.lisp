@@ -51,7 +51,7 @@
                       :output :stream
                       :error-output :stream
                       :wait nil))
-               (sleep 1)
+               (%e2e-wait-for-tcp "127.0.0.1" port)
                (let* ((request
                         (make-http-request
                          :method "GET"

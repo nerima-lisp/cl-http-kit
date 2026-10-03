@@ -228,7 +228,7 @@
                              input)
                             (finish-output input))
                         (error (condition) (setf error-value condition)))))))
-      (sleep 1)
+      (%e2e-wait-for-tcp "127.0.0.1" port)
       (values process input output thread
               (lambda ()
                 (sb-thread:join-thread thread)
