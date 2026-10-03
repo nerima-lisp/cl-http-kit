@@ -167,4 +167,12 @@
    #:send-http3-request/cps
    #:send-http3-push
    #:receive-http3-push
-   #:serve-http3-request-stream))
+   #:serve-http3-request-stream
+   #:http3-quic-adapter
+   #:http3-quic-adapter-p
+   #:make-http3-quic-adapter
+   #:http3-quic-adapter-quic-client
+   #:http3-quic-adapter-http3-client
+   #:http3-quic-adapter-start
+   #:http3-quic-adapter-poll
+   #:close-http3-quic-adapter))

@@ -324,6 +324,9 @@ character in that range is a decimal digit, apart from an optional sign when
              (:constructor %make-http-client)
              (:conc-name http-client-))
   transport-function
+  ;; Optional HTTP/3 boundary. It receives the normal transport keywords
+  ;; plus :ALTERNATIVE-SERVICE.
+  http3-transport-function
   connection-pool
   (default-headers nil)
   cookie-jar

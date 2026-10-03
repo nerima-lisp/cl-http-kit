@@ -1294,6 +1294,23 @@
         "type": "github"
       }
     },
+    "cl-quic-kit": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1790970393,
+        "narHash": "sha256-jttYJfsZUmAfXJFjabyhHVkxMzRvD78a4xiL855ZPMc=",
+        "owner": "nerima-lisp",
+        "repo": "cl-quic-kit",
+        "rev": "1341bb9411a8abf754d93710c3a9b4cddad0da2e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nerima-lisp",
+        "ref": "takeokunn-transport-core",
+        "repo": "cl-quic-kit",
+        "type": "github"
+      }
+    },
     "cl-tls-kit": {
       "inputs": {
         "cl-crypto-kit": [
@@ -2406,6 +2423,7 @@
         "cl-deflate-kit": "cl-deflate-kit",
         "cl-host-kit": "cl-host-kit_3",
         "cl-observability-kit": "cl-observability-kit",
+        "cl-quic-kit": "cl-quic-kit",
         "cl-tls-kit": "cl-tls-kit",
         "cl-weave": "cl-weave_14",
         "nixpkgs": "nixpkgs_4",
