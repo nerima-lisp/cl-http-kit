@@ -4,7 +4,7 @@
   :description "A portable, binary-safe HTTP client substrate."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.2.0"
+  :version "0.4.0"
   :depends-on ()
   :pathname "src"
   :serial t
@@ -15,14 +15,20 @@
                (:file "defaults")
                (:file "utilities")
                (:file "control-macros")
+               (:file "model-summary-support")
+               (:file "utilities-number")
                (:file "uri")
                (:file "header-data")
                (:file "headers")
                (:file "model")
+               (:file "model-request-summary")
+               (:file "model-response-summary")
+               (:file "http1-serialize-support")
                (:file "http1-serialize")
                (:file "http1-source")
                (:file "http1-response-headers")
                (:file "http1-response-body")
+               (:file "http1-response-parse")
                (:file "http1-parse")
                (:file "http1-server")
                (:file "transport-declarations")
@@ -35,7 +41,7 @@
   :description "Optional cl-observability-kit metrics for cl-http-kit."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.2.0"
+  :version "0.4.0"
   :depends-on ("cl-http-kit" "cl-observability-kit")
   :pathname "src"
   :serial t
@@ -47,7 +53,7 @@
   :description "The optional HTTP/2 transport for cl-http-kit."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.2.0"
+  :version "0.4.0"
   :depends-on ("cl-http-kit")
   :pathname "http2"
   :serial t
@@ -77,13 +83,15 @@
   :description "The high-level HTTP client policies and request orchestration layer."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.2.0"
-  :depends-on ("cl-http-kit")
+  :version "0.4.0"
+  :depends-on ("cl-http-kit" "cl-codec-kit" "cl-deflate-kit")
   :pathname "client"
   :serial t
   :components ((:file "package")
                (:file "conditions")
                (:file "data")
+               (:file "protocol")
+               (:file "form")
                (:file "multipart")
                (:file "websocket-frame")
                (:file "websocket-crypto")
@@ -100,39 +108,81 @@
                (:file "proxy")
                (:file "proxy-transport")
                (:file "connection")
+               (:file "content-coding")
                (:file "client")))
 
 (asdf:defsystem "cl-http-kit/network"
   :description "Optional native TCP and DNS boundary for cl-http-kit."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.2.0"
+  :version "0.4.0"
   :depends-on ("cl-http-kit")
   :pathname "network"
   :serial t
   :components ((:file "package")
                (:file "socket")))
 
+(asdf:defsystem "cl-http-kit/tls"
+  :description "Optional cl-tls-kit TLS integration for cl-http-kit network streams."
+  :author "nerima-lisp"
+  :license "MIT"
+  :version "0.4.0"
+  :depends-on ("cl-http-kit/network" "cl-tls-kit" "cl-crypto-kit")
+  :pathname "network"
+  :serial t
+  :components ((:file "tls")))
+
 (asdf:defsystem "cl-http-kit/http3"
   :description "Optional HTTP/3 framing, QPACK, and injected QUIC transport boundary."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.2.0"
-  :depends-on ("cl-http-kit" "cl-http-kit/http2")
+  :version "0.4.0"
+  :depends-on ("cl-http-kit" "cl-http-kit/http2" "cl-quic-kit")
   :pathname "http3"
   :serial t
   :components ((:file "package")
                (:file "varint")
                (:file "qpack")
                (:file "frames")
-               (:file "transport")))
+               (:file "transport")
+               (:file "quic-adapter")))
+
+(asdf:defsystem "cl-http-kit/test-core"
+  :description "Core tests for cl-http-kit without optional transport or client subsystems."
+  :depends-on ("cl-http-kit"
+               "cl-weave")
+  :pathname "t"
+  :serial t
+  :components ((:file "package-core")
+               (:file "support-core")
+               (:file "tests-utilities-boundaries")
+               (:file "tests-model-header-boundaries")
+               (:file "tests-model-contracts")
+               (:file "tests-stream-transport")
+               (:file "tests-transport-cps-core")
+               (:file "tests-core")
+               (:file "tests-uri-boundaries")
+               (:file "tests-http1-boundaries")
+               (:file "tests-http1-parse-boundaries")
+               (:file "tests-http1-server-support")
+               (:file "tests-http1-server-request-boundaries")
+               (:file "tests-http1-server-response-boundaries")
+               (:file "tests-http1-server-session-boundaries")
+               (:file "tests-http1-server-stream-boundaries")
+               (:file "tests-properties")
+               (:file "runner-core"))
+  :perform (asdf:test-op (op c)
+             (declare (ignore op c))
+             (uiop:symbol-call "HTTP-KIT/TEST-CORE" "RUN-TESTS")))
 
 (asdf:defsystem "cl-http-kit/test"
   :description "Tests for cl-http-kit and its optional HTTP/2 transport."
-  :depends-on ("cl-http-kit/client"
+  :depends-on ("cl-http-kit/test-core"
+               "cl-http-kit/client"
                "cl-http-kit/http2"
                "cl-http-kit/http3"
                "cl-http-kit/network"
+               "cl-http-kit/tls"
                "cl-http-kit/observability"
                "cl-weave")
   :pathname "t"
@@ -141,6 +191,7 @@
                (:file "support")
                (:file "tests-utilities-boundaries")
                (:file "tests-model-header-boundaries")
+               (:file "tests-model-contracts")
                (:file "tests-stream-transport")
                (:file "tests-transport-cps")
                (:file "tests-observability")
@@ -167,6 +218,12 @@
                (:file "tests-http3")
                (:file "tests-properties")
                (:file "tests-client")
+               (:file "tests-client-content-coding")
+               (:file "tests-e2e-https")
+               (:file "tests-e2e-http2")
+               (:file "tests-e2e-auth")
+               (:file "tests-e2e-proxy")
+               (:file "tests-client-p6")
                (:file "tests-network")
                (:file "runner"))
   :perform (asdf:test-op (op c)

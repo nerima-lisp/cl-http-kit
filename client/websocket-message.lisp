@@ -2,16 +2,23 @@
 
 (defun websocket-valid-close-code-p (code)
   (and (integerp code)
-       (or (member code '(1000 1001 1002 1003 1007 1008 1009 1010 1011)
+       (or (member code '(1000 1001 1002 1003 1007 1008 1009 1010 1011
+                          1012 1013 1014)
                    :test #'=)
            (<= 3000 code 4999))))
 
 (defun %websocket-utf8-continuation-p (byte)
   (<= #x80 byte #xbf))
 
+(defun %websocket-utf8-error (message &optional detail)
+  (error 'http-protocol-error
+         :message message
+         :operation :websocket-utf8
+         :detail detail))
+
 (defun %websocket-utf8-string (octets)
   (unless (%websocket-octet-vector-p octets)
-    (%websocket-protocol-error "A WebSocket reason must be UTF-8 octets." octets))
+    (%websocket-utf8-error "A WebSocket UTF-8 payload must be octets." octets))
   (with-output-to-string (result)
     (loop with index = 0
           while (< index (length octets))
@@ -21,12 +28,12 @@
                       (incf index))
                      ((<= #xc2 first #xdf)
                       (when (> (1+ index) (1- (length octets)))
-                        (%websocket-protocol-error
-                         "A WebSocket close reason ended in a partial UTF-8 sequence."))
+                        (%websocket-utf8-error
+                         "A WebSocket payload ended in a partial UTF-8 sequence."))
                       (let ((second (aref octets (1+ index))))
                         (unless (%websocket-utf8-continuation-p second)
-                          (%websocket-protocol-error
-                           "A WebSocket close reason contains invalid UTF-8."
+                          (%websocket-utf8-error
+                           "A WebSocket payload contains invalid UTF-8."
                            octets))
                         (write-char
                          (code-char (+ (ash (logand first #x1f) 6)
@@ -35,16 +42,16 @@
                         (incf index 2)))
                      ((<= #xe0 first #xef)
                       (when (> (+ index 2) (1- (length octets)))
-                        (%websocket-protocol-error
-                         "A WebSocket close reason ended in a partial UTF-8 sequence."))
+                        (%websocket-utf8-error
+                         "A WebSocket payload ended in a partial UTF-8 sequence."))
                       (let ((second (aref octets (1+ index)))
                             (third (aref octets (+ index 2))))
                         (unless (and (%websocket-utf8-continuation-p second)
                                      (%websocket-utf8-continuation-p third)
                                      (or (/= first #xe0) (>= second #xa0))
                                      (or (/= first #xed) (<= second #x9f)))
-                          (%websocket-protocol-error
-                           "A WebSocket close reason contains invalid UTF-8."
+                          (%websocket-utf8-error
+                           "A WebSocket payload contains invalid UTF-8."
                            octets))
                         (write-char
                          (code-char (+ (ash (logand first #x0f) 12)
@@ -54,8 +61,8 @@
                         (incf index 3)))
                      ((<= #xf0 first #xf4)
                       (when (> (+ index 3) (1- (length octets)))
-                        (%websocket-protocol-error
-                         "A WebSocket close reason ended in a partial UTF-8 sequence."))
+                        (%websocket-utf8-error
+                         "A WebSocket payload ended in a partial UTF-8 sequence."))
                       (let ((second (aref octets (1+ index)))
                             (third (aref octets (+ index 2)))
                             (fourth (aref octets (+ index 3))))
@@ -64,8 +71,8 @@
                                      (%websocket-utf8-continuation-p fourth)
                                      (or (/= first #xf0) (>= second #x90))
                                      (or (/= first #xf4) (<= second #x8f)))
-                          (%websocket-protocol-error
-                           "A WebSocket close reason contains invalid UTF-8."
+                          (%websocket-utf8-error
+                           "A WebSocket payload contains invalid UTF-8."
                            octets))
                         (write-char
                          (code-char (+ (ash (logand first #x07) 18)
@@ -75,8 +82,8 @@
                          result)
                         (incf index 4)))
                      (t
-                      (%websocket-protocol-error
-                       "A WebSocket close reason contains invalid UTF-8."
+                      (%websocket-utf8-error
+                       "A WebSocket payload contains invalid UTF-8."
                        octets)))))))
 
 (defun make-websocket-close-payload (&key (code 1000) (reason ""))
@@ -120,10 +127,29 @@
     (replace target source :start1 old-length)
     target))
 
+(defun %websocket-complete-message
+    (message opcode compressed-p decompress-function max-message-bytes)
+  (let* ((wire-payload (subseq message 0 (fill-pointer message)))
+         (payload (if compressed-p
+                      (funcall decompress-function wire-payload)
+                      wire-payload)))
+    (unless (%websocket-octet-vector-p payload)
+      (%websocket-protocol-error
+       "A WebSocket decompressor must return a vector of octets."
+       payload))
+    (when (> (length payload) max-message-bytes)
+      (%websocket-size-error
+       "A decompressed WebSocket message exceeded its size limit."
+       max-message-bytes (length payload)))
+    (when (= opcode 1)
+      (%websocket-utf8-string payload))
+    (values (%websocket-copy-octets payload) opcode)))
+
 (defun read-websocket-message
     (stream &key (max-message-bytes +websocket-default-max-payload-bytes+)
                   (max-payload-bytes +websocket-default-max-payload-bytes+)
-                  (require-mask-p nil) (allow-unmasked-p t) on-control)
+                  (require-mask-p nil) (allow-unmasked-p t) on-control
+                  decompress-function)
   "Read one fragmented WebSocket data message.
 
 Returns the message payload octets and its data opcode (1 for text or 2 for
@@ -133,7 +159,12 @@ otherwise consumed while the data message is assembled."
   (%websocket-validate-limit max-payload-bytes "MAX-PAYLOAD-BYTES")
   (when (and on-control (not (functionp on-control)))
     (%websocket-protocol-error "ON-CONTROL must be a function or NIL." on-control))
+  (when (and decompress-function (not (functionp decompress-function)))
+    (%websocket-protocol-error
+     "DECOMPRESS-FUNCTION must be a function or NIL."
+     decompress-function))
   (let ((message-opcode nil)
+        (compressed-p nil)
         (message (make-array 0
                              :element-type '(unsigned-byte 8)
                              :adjustable t
@@ -143,7 +174,8 @@ otherwise consumed while the data message is assembled."
                     stream
                     :max-payload-bytes max-payload-bytes
                     :require-mask-p require-mask-p
-                    :allow-unmasked-p allow-unmasked-p)))
+                    :allow-unmasked-p allow-unmasked-p
+                    :allow-rsv1-p (not (null decompress-function)))))
         (let ((opcode (websocket-frame-opcode frame))
               (payload (websocket-frame-payload frame)))
           (cond ((%websocket-control-opcode-p opcode)
@@ -162,14 +194,16 @@ otherwise consumed while the data message is assembled."
                  (setf message (%websocket-append-octets message payload))
                  (when (websocket-frame-fin-p frame)
                    (return
-                     (values (subseq message 0 (fill-pointer message))
-                             message-opcode))))
+                     (%websocket-complete-message
+                      message message-opcode compressed-p decompress-function
+                      max-message-bytes))))
                 ((member opcode '(1 2) :test #'=)
                  (when message-opcode
                    (%websocket-protocol-error
                     "A WebSocket data frame arrived before the prior message ended."
                     opcode))
-                 (setf message-opcode opcode)
+                 (setf message-opcode opcode
+                       compressed-p (websocket-frame-rsv1-p frame))
                  (when (> (length payload) max-message-bytes)
                    (%websocket-size-error
                     "A WebSocket message exceeded its size limit."
@@ -177,8 +211,9 @@ otherwise consumed while the data message is assembled."
                  (setf message (%websocket-append-octets message payload))
                  (when (websocket-frame-fin-p frame)
                    (return
-                     (values (subseq message 0 (fill-pointer message))
-                             message-opcode))))
+                     (%websocket-complete-message
+                      message message-opcode compressed-p decompress-function
+                      max-message-bytes))))
                 (t
                  (%websocket-protocol-error
                  "A WebSocket message encountered an invalid data opcode."
@@ -188,7 +223,7 @@ otherwise consumed while the data message is assembled."
   (cond ((%websocket-octet-vector-p payload)
          (%websocket-copy-octets payload))
         ((and (= opcode 1) (stringp payload))
-         (http-utf8-octets payload))
+         (cl-codec-kit:string-to-octets payload :encoding :utf-8))
         (t
          (%websocket-protocol-error
           "A WebSocket data message must be octets, or a text string for opcode 1."
@@ -229,6 +264,7 @@ otherwise consumed while the data message is assembled."
 (defun write-websocket-message
     (stream payload &key (opcode 2) (max-frame-payload-bytes 65535)
                    (mask-p nil) masking-key masking-key-function
+                   compress-function
                    (finish-output-p t))
   "Write one text or binary WebSocket message.
 
@@ -243,39 +279,52 @@ Returns the number of frames and the payload length."
      opcode))
   (%websocket-positive-limit max-frame-payload-bytes
                               "MAX-FRAME-PAYLOAD-BYTES")
-  (let* ((octets (%websocket-message-octets payload opcode))
-         (payload-length (length octets))
-         (frame-count (max 1 (ceiling payload-length
-                                      max-frame-payload-bytes))))
-    (%websocket-masking-options mask-p masking-key masking-key-function)
-    (when (and mask-p (> frame-count 1) masking-key)
+  (when (and compress-function (not (functionp compress-function)))
+    (%websocket-protocol-error
+     "COMPRESS-FUNCTION must be a function or NIL."
+     compress-function))
+  (let* ((source-octets (%websocket-message-octets payload opcode))
+         (payload-length (length source-octets))
+         (octets (if compress-function
+                     (funcall compress-function source-octets)
+                     source-octets)))
+    (unless (%websocket-octet-vector-p octets)
       (%websocket-protocol-error
-       "Fragmented masked output requires a masking-key function so each frame has a fresh key."))
-    (unless (streamp stream)
-      (%websocket-protocol-error "WebSocket message output must be a stream." stream))
-    (let ((position 0)
-          (frame-index 0)
-          (first-p t))
-      (loop while (or first-p (< position payload-length))
-            do (let* ((remaining (- payload-length position))
-                      (chunk-length (min max-frame-payload-bytes remaining))
-                      (last-p (= (+ position chunk-length) payload-length))
-                      (frame (make-websocket-frame
-                              :fin-p last-p
-                              :opcode (if (zerop frame-index) opcode 0)
-                              :mask-p mask-p
-                              :masking-key
-                              (%websocket-next-masking-key
-                               mask-p masking-key masking-key-function)
-                              :payload (subseq octets position
-                                               (+ position chunk-length)))))
-                 (write-websocket-frame stream frame :finish-output-p nil)
-                 (incf frame-index)
-                 (setf position (+ position chunk-length)
-                       first-p nil)))
-      (when finish-output-p
-        (finish-output stream))
-      (values frame-count payload-length))))
+       "A WebSocket compressor must return a vector of octets."
+       octets))
+    (let ((frame-count (max 1 (ceiling (length octets)
+                                      max-frame-payload-bytes))))
+      (%websocket-masking-options mask-p masking-key masking-key-function)
+      (when (and mask-p (> frame-count 1) masking-key)
+        (%websocket-protocol-error
+         "Fragmented masked output requires a masking-key function so each frame has a fresh key."))
+      (unless (streamp stream)
+        (%websocket-protocol-error "WebSocket message output must be a stream." stream))
+      (let ((position 0)
+            (frame-index 0)
+            (first-p t))
+        (loop while (or first-p (< position (length octets)))
+              do (let* ((remaining (- (length octets) position))
+                        (chunk-length (min max-frame-payload-bytes remaining))
+                        (last-p (= (+ position chunk-length) (length octets)))
+                        (frame (make-websocket-frame
+                                :fin-p last-p
+                                :rsv1-p (and compress-function
+                                             (zerop frame-index))
+                                :opcode (if (zerop frame-index) opcode 0)
+                                :mask-p mask-p
+                                :masking-key
+                                (%websocket-next-masking-key
+                                 mask-p masking-key masking-key-function)
+                                :payload (subseq octets position
+                                                 (+ position chunk-length)))))
+                   (write-websocket-frame stream frame :finish-output-p nil)
+                   (incf frame-index)
+                   (setf position (+ position chunk-length)
+                         first-p nil)))
+        (when finish-output-p
+          (finish-output stream))
+        (values frame-count payload-length)))))
 
 (defun %write-websocket-control-frame
     (stream opcode payload &key (mask-p nil) masking-key masking-key-function
@@ -293,7 +342,7 @@ Returns the number of frames and the payload length."
            (cond ((%websocket-octet-vector-p payload)
                   payload)
                  ((stringp payload)
-                  (http-utf8-octets payload))
+                  (cl-codec-kit:string-to-octets payload :encoding :utf-8))
                  (t
                   (%websocket-protocol-error
                    "A WebSocket control payload must be octets or a string."
@@ -336,6 +385,8 @@ the empty string."
   (when (and payload (or code reason))
     (%websocket-protocol-error
      "A raw WebSocket close payload cannot be combined with CODE or REASON."))
+  (when payload
+    (parse-websocket-close-payload payload))
   (%write-websocket-control-frame
    stream 8
    (or payload (make-websocket-close-payload :code (or code 1000)
@@ -347,6 +398,9 @@ the empty string."
 
 (defun %websocket-session-close-code (condition)
   (cond ((typep condition 'http-size-limit-exceeded) 1009)
+        ((and (typep condition 'http-protocol-error)
+              (eq (http-error-operation condition) :websocket-utf8))
+         1007)
         ((typep condition 'http-protocol-error) 1002)
         (t 1011)))
 
@@ -357,6 +411,7 @@ the empty string."
                      (max-messages nil)
                      (require-mask-p t)
                      (allow-unmasked-p nil)
+                     decompress-function
                      on-control
                      on-error
                      (close-on-error-p t)
@@ -390,6 +445,10 @@ useful when the caller owns the upgraded stream lifecycle."
   (when (and on-control (not (functionp on-control)))
     (%websocket-protocol-error
      "ON-CONTROL must be a function or NIL." on-control))
+  (when (and decompress-function (not (functionp decompress-function)))
+    (%websocket-protocol-error
+     "DECOMPRESS-FUNCTION must be a function or NIL."
+     decompress-function))
   (when (and on-error (not (functionp on-error)))
     (%websocket-protocol-error
      "ON-ERROR must be a function or NIL." on-error))
@@ -436,6 +495,7 @@ useful when the caller owns the upgraded stream lifecycle."
                                     :max-payload-bytes max-payload-bytes
                                     :require-mask-p require-mask-p
                                     :allow-unmasked-p allow-unmasked-p
+                                    :decompress-function decompress-function
                                     :on-control #'handle-control)
                                  (incf message-count)
                                  (when (eq :close

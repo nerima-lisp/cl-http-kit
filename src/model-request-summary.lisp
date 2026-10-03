@@ -1,0 +1,13 @@
+(in-package #:http-kit)
+
+(defun http-request-summary (request)
+  (with-output-to-string (stream)
+    (write-string (%request-method request) stream)
+    (write-char #\Space stream)
+    (write-string (http-uri-string (%request-uri request)) stream)
+    (write-string " headers=" stream)
+    (write (length (%request-headers request)) :stream stream :escape nil)
+    (write-string " trailers=" stream)
+    (write (length (%request-trailers request)) :stream stream :escape nil)
+    (write-string " body-bytes=" stream)
+    (write (length (%request-body request)) :stream stream :escape nil)))

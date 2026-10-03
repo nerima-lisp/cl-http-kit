@@ -4,10 +4,16 @@
   (and (http2-client-p client)
        (%http2-connection client)))
 
+(defun %h2-peer-stream-reset-condition-p (condition)
+  (and (typep condition 'http-kit:http-connection-error)
+       (let ((cause (http-kit:http-connection-error-cause condition)))
+         (and (consp cause) (eq (first cause) :rst-stream)))))
+
 (defun make-http2-connection
     (&key stream close-stream
           (max-frame-size +http2-default-max-frame-size+)
           (max-header-bytes http-kit::*default-max-header-bytes*)
+          (max-fields 256)
           (max-body-bytes http-kit::*default-max-body-bytes*)
           (clock-function #'http-kit::%monotonic-time))
   "Create a reusable HTTP/2 connection over an already negotiated stream.
@@ -27,6 +33,7 @@ SETTINGS, stream identifiers, HPACK decoder state, and control frames."
            :detail close-stream))
   (%h2-validate-frame-size max-frame-size)
   (%h2-validate-limit :max-header-bytes max-header-bytes)
+  (%h2-validate-limit :max-fields max-fields)
   (%h2-validate-limit :max-body-bytes max-body-bytes :allow-zero t)
   (unless (functionp clock-function)
     (error 'http-kit:http-protocol-error
@@ -38,6 +45,7 @@ SETTINGS, stream identifiers, HPACK decoder state, and control frames."
    :close-stream (or close-stream #'close)
    :max-frame-size max-frame-size
    :max-header-bytes max-header-bytes
+   :max-fields max-fields
    :max-body-bytes max-body-bytes
    :clock-function clock-function
    :hpack-context
@@ -60,6 +68,14 @@ SETTINGS, stream identifiers, HPACK decoder state, and control frames."
 (defun http2-connection-peer-max-table-size (connection)
   (and (http2-connection-p connection)
        (%http2-connection-peer-max-table-size connection)))
+
+(defun http2-connection-peer-max-concurrent-streams (connection)
+  (and (http2-connection-p connection)
+       (%http2-connection-peer-max-concurrent-streams connection)))
+
+(defun http2-connection-peer-max-header-list-size (connection)
+  (and (http2-connection-p connection)
+       (%http2-connection-peer-max-header-list-size connection)))
 
 (defun http2-connection-peer-initial-window-size (connection)
   (and (http2-connection-p connection)
@@ -156,6 +172,15 @@ are rejected after this function marks the connection draining."
              :message "The HTTP/2 session has not started."
              :operation :http2-client
              :detail :goaway-before-session))
+    (let ((previous-last-stream-id
+            (%http2-connection-local-goaway-last-stream-id connection)))
+      (when (and previous-last-stream-id
+                 (> last-stream-id previous-last-stream-id))
+        (error 'http-kit:http-protocol-error
+               :message "A subsequent HTTP/2 GOAWAY last-stream identifier must not increase."
+               :operation :http2-client
+               :detail (list :previous previous-last-stream-id
+                             :new last-stream-id))))
     (when (> (+ 8 (length debug-data))
              (%http2-connection-max-frame-size connection))
       (error 'http-kit:http-protocol-error
@@ -186,6 +211,77 @@ are rejected after this function marks the connection draining."
           (close-http2-connection connection)
           (error condition)))
       connection)))
+
+(defun %h2-priority-field-value-octets (value)
+  (unless (stringp value)
+    (error 'http-kit:http-protocol-error
+           :message "An HTTP/2 Priority field value must be a string."
+           :operation :http2-client
+           :detail value))
+  (let ((octets (make-array (length value) :element-type '(unsigned-byte 8))))
+    (loop for character across value
+          for code = (char-code character)
+          for position from 0
+          unless (or (= code 9) (<= 32 code 126))
+            do (error 'http-kit:http-protocol-error
+                      :message "An HTTP/2 Priority field value must contain ASCII field-value bytes."
+                      :operation :http2-client
+                      :detail (list position code))
+          do (setf (aref octets position) code))
+    octets))
+
+(defun send-http2-priority-update
+    (connection stream-id
+     &key (priority-field-value nil priority-field-value-p)
+       (urgency 3) incremental timeout deadline clock-function)
+  "Send an RFC 9218 PRIORITY_UPDATE for STREAM-ID."
+  (unless (http2-connection-p connection)
+    (error 'http-kit:http-protocol-error
+           :message "SEND-HTTP2-PRIORITY-UPDATE requires an HTTP2-CONNECTION."
+           :operation :http2-client
+           :detail (type-of connection)))
+  (unless (%http2-connection-session-started-p connection)
+    (error 'http-kit:http-protocol-error
+           :message "The HTTP/2 session has not started."
+           :operation :http2-client
+           :detail :priority-update-before-session))
+  (when (%http2-connection-closed-p connection)
+    (error 'http-kit:http-protocol-error
+           :message "The HTTP/2 connection is already closed."
+           :operation :http2-client
+           :detail :priority-update-after-close))
+  (unless (and (integerp stream-id) (<= 1 stream-id #x7fffffff))
+    (error 'http-kit:http-protocol-error
+           :message "An HTTP/2 PRIORITY_UPDATE target must be a non-zero 31-bit stream ID."
+           :operation :http2-client
+           :detail stream-id))
+  (let* ((value (if priority-field-value-p
+                    priority-field-value
+                    (http-kit:format-http-priority-field-value
+                     :urgency urgency :incremental incremental)))
+         (value-octets (%h2-priority-field-value-octets value))
+         (payload (make-array (+ 4 (length value-octets))
+                              :element-type '(unsigned-byte 8)))
+         (clock (or clock-function
+                    (%http2-connection-clock-function connection))))
+    (when (> (length payload) (%http2-connection-peer-max-frame-size connection))
+      (error 'http-kit:http-protocol-error
+             :message "The HTTP/2 PRIORITY_UPDATE payload is too large for the peer."
+             :operation :http2-client
+             :detail (length payload)))
+    (%h2-put-u32 payload 0 stream-id)
+    (replace payload value-octets :start1 4)
+    (handler-case
+        (http-kit:with-http-deadline (absolute-deadline timeout
+                                       :inherited deadline
+                                       :clock-function clock)
+          (%h2-send-control (%h2-writer (%http2-connection-stream connection)
+                                        absolute-deadline clock)
+                            +http2-priority-update-type+ 0 0 payload))
+      (error (condition)
+        (close-http2-connection connection)
+        (error condition)))
+    connection))
 
 (defun graceful-shutdown-http2-connection
     (connection &key last-stream-id (error-code 0) debug-data timeout deadline
@@ -285,20 +381,38 @@ this operation has no response stream to associate with it."
         (error condition)))))
 
 (defun %h2-connection-note-peer-settings
-    (connection max-frame-size max-table-size initial-window-size)
+    (connection max-frame-size max-table-size initial-window-size
+                enable-connect-protocol &optional max-concurrent-streams
+                  max-header-list-size)
   (when max-frame-size
     (setf (%http2-connection-peer-max-frame-size connection)
           max-frame-size))
   (when max-table-size
     (setf (%http2-connection-peer-max-table-size connection)
           max-table-size))
+  (when max-concurrent-streams
+    (setf (%http2-connection-peer-max-concurrent-streams connection)
+          max-concurrent-streams))
+  (when max-header-list-size
+    (setf (%http2-connection-peer-max-header-list-size connection)
+          max-header-list-size))
   (when initial-window-size
     (let ((delta (- initial-window-size
                     (%http2-connection-peer-initial-window-size connection))))
+      (when (some (lambda (entry)
+                    (> (+ (cdr entry) delta) #x7fffffff))
+                  (%http2-connection-peer-stream-windows connection))
+        (error 'http-kit:http-protocol-error
+               :message "SETTINGS_INITIAL_WINDOW_SIZE overflowed an HTTP/2 stream flow-control window."
+               :operation :http2-settings
+               :detail :flow-control-error))
       (dolist (entry (%http2-connection-peer-stream-windows connection))
         (incf (cdr entry) delta))
       (setf (%http2-connection-peer-initial-window-size connection)
-            initial-window-size))))
+            initial-window-size)))
+  (when enable-connect-protocol
+    (setf (%http2-connection-peer-enable-connect-protocol-p connection)
+          (= enable-connect-protocol 1))))
 
 (defun %h2-connection-stream-window (connection stream-id)
   (let ((entry (assoc stream-id
@@ -492,8 +606,13 @@ this operation has no response stream to associate with it."
                      :detail new-window))
             (setf (%http2-connection-peer-connection-window-size connection)
                   new-window))
-          (when (or (= stream-id expected-stream-id)
-                    (> expected-stream-id 1))
+          (progn
+            (when (> stream-id expected-stream-id)
+              (error 'http-kit:http-protocol-error
+                     :message "An HTTP/2 WINDOW_UPDATE targeted an idle stream."
+                     :operation :http2-control
+                     :detail stream-id))
+            (when (= stream-id expected-stream-id)
             (let* ((windows (%http2-connection-peer-stream-windows connection))
                    (entry (assoc stream-id windows)))
               (if entry
@@ -504,18 +623,56 @@ this operation has no response stream to associate with it."
                              :operation :http2-control
                              :detail new-window))
                     (setf (cdr entry) new-window))
-                  (push (cons stream-id
-                              (+ (%http2-connection-peer-initial-window-size
-                                  connection)
-                                 increment))
-                        (%http2-connection-peer-stream-windows connection)))))))))
+                  (let ((new-window
+                          (+ (%http2-connection-peer-initial-window-size
+                              connection)
+                             increment)))
+                    (when (> new-window #x7fffffff)
+                      (error 'http-kit:http-protocol-error
+                             :message "The HTTP/2 stream flow-control window overflowed."
+                             :operation :http2-control
+                             :detail new-window))
+                    (push (cons stream-id new-window)
+                          (%http2-connection-peer-stream-windows
+                           connection)))))))))))
 
 (defun %h2-connection-note-settings (connection frame writer)
-  (multiple-value-bind (max-frame-size max-table-size initial-window-size)
+  (multiple-value-bind (max-frame-size max-table-size initial-window-size
+                        enable-connect-protocol max-concurrent-streams
+                        max-header-list-size)
       (%h2-settings (%h2-frame-payload frame))
     (%h2-connection-note-peer-settings
-     connection max-frame-size max-table-size initial-window-size))
+     connection max-frame-size max-table-size initial-window-size
+     enable-connect-protocol max-concurrent-streams max-header-list-size))
   (%h2-validate-settings-frame frame writer))
+
+(defun %h2-connection-start-for-extended-connect
+    (connection reader writer deadline clock-function)
+  (%h2-write-wire
+   (%http2-connection-stream connection)
+   (%h2-concat
+    (list +http2-connection-preface+
+          (%h2-settings-wire (%http2-connection-max-frame-size connection))))
+   deadline clock-function)
+  (let ((frame (%h2-read-frame reader
+                               (%http2-connection-max-frame-size connection)
+                               deadline clock-function)))
+    (when (eq frame :eof)
+      (error 'http-kit:http-protocol-error
+             :message "The HTTP/2 peer sent no initial SETTINGS frame."
+             :operation :http2-read
+             :detail :eof))
+    (unless (and (= (%h2-frame-type frame) +http2-settings-type+)
+                 (zerop (%h2-frame-stream-id frame))
+                 (zerop (logand (%h2-frame-flags frame) +http2-ack-flag+)))
+      (error 'http-kit:http-protocol-error
+             :message "The first HTTP/2 peer frame must be a non-ACK SETTINGS frame."
+             :operation :http2-read
+             :detail (list (%h2-frame-type frame)
+                           (%h2-frame-stream-id frame)
+                           (%h2-frame-flags frame))))
+    (%h2-connection-note-settings connection frame writer)
+    (setf (%http2-connection-session-started-p connection) t)))
 
 (defun %h2-connection-control-handler (connection frame writer expected-stream-id)
   (let ((type (%h2-frame-type frame))
@@ -550,6 +707,32 @@ this operation has no response stream to associate with it."
       (t
        (%h2-handle-control-frame frame writer expected-stream-id)))))
 
+(defun %h2-connection-wait-for-stream-capacity
+    (connection reader writer deadline clock-function)
+  (loop while (eql 0
+                   (%http2-connection-peer-max-concurrent-streams connection))
+        do (let ((frame (%h2-read-frame
+                         reader
+                         (%http2-connection-max-frame-size connection)
+                         deadline clock-function)))
+             (when (eq frame :eof)
+               (error 'http-kit:http-connection-error
+                      :message "The HTTP/2 peer closed while new streams were paused."
+                      :operation :http2-read
+                      :cause :eof))
+             (unless (%h2-control-frame-p (%h2-frame-type frame))
+               (error 'http-kit:http-protocol-error
+                      :message "The HTTP/2 peer sent a stream frame while no request stream was active."
+                      :operation :http2-read
+                      :detail (list (%h2-frame-type frame)
+                                    (%h2-frame-stream-id frame))))
+             (%h2-connection-control-handler
+              connection frame writer
+              (%http2-connection-next-stream-id connection))
+             (when (%http2-connection-goaway-last-stream-id connection)
+               (%h2-connection-next-stream-id connection))))
+  (%http2-connection-peer-max-concurrent-streams connection))
+
 (defun %h2-connection-next-stream-id (connection)
   (when (%http2-connection-draining-p connection)
     (error 'http-kit:http-protocol-error
@@ -563,23 +746,61 @@ this operation has no response stream to associate with it."
              :operation :http2-write
              :cause :stream-id-exhausted))
     (let ((last-stream-id (%http2-connection-goaway-last-stream-id connection)))
-      (when (and last-stream-id (> stream-id last-stream-id))
+      (when last-stream-id
         (error 'http-kit:http-connection-error
                :message "The HTTP/2 peer has closed this connection with GOAWAY."
                :operation :http2-write
                :cause (list :goaway last-stream-id stream-id))))
     stream-id))
 
+(defun cancel-http2-stream
+    (connection stream-id
+     &key (error-code 8) timeout deadline clock-function)
+  "Cancel an active client-initiated STREAM-ID with an HTTP/2 RST_STREAM."
+  (unless (http2-connection-p connection)
+    (error 'http-kit:http-protocol-error
+           :message "CANCEL-HTTP2-STREAM requires an HTTP2-CONNECTION."
+           :operation :http2-client
+           :detail (type-of connection)))
+  (unless (http2-connection-open-p connection)
+    (error 'http-kit:http-connection-error
+           :message "The HTTP/2 connection is closed."
+           :operation :http2-client
+           :cause :closed))
+  (unless (and (integerp stream-id)
+               (plusp stream-id)
+               (oddp stream-id)
+               (< stream-id (%http2-connection-next-stream-id connection)))
+    (error 'http-kit:http-protocol-error
+           :message "STREAM-ID must identify an opened client HTTP/2 stream."
+           :operation :http2-write
+           :detail stream-id))
+  (let ((clock (or clock-function
+                   (%http2-connection-clock-function connection)))
+        (error-code (%h2-control-error-code error-code)))
+    (unless (functionp clock)
+      (error 'http-kit:http-protocol-error
+             :message "An HTTP/2 cancellation clock must be callable."
+             :operation :http2-client
+             :detail clock))
+    (http-kit:with-http-deadline (absolute-deadline timeout
+                                   :inherited deadline
+                                   :clock-function clock)
+      (%h2-send-rst-stream
+       (%h2-writer (%http2-connection-stream connection)
+                   absolute-deadline clock)
+       stream-id error-code)))
+  t)
+
 (defun send-http2-request-over-connection
     (connection request
-     &key timeout deadline max-header-bytes max-body-bytes clock-function
+     &key timeout deadline max-header-bytes max-fields max-body-bytes clock-function
        request-body-function request-body-length
-       on-body-chunk (collect-body-p t) (huffman-p nil))
+       on-body-chunk on-stream-open (collect-body-p t) (huffman-p nil))
   "Send REQUEST on CONNECTION and retain the connection for later streams.
 
 Requests on one connection are serialized by this API.  A caller that needs
-concurrent streams should provide its own scheduler and use separate
-HTTP2-CONNECTION objects until a stream multiplexer is installed."
+concurrent streams should use SEND-HTTP2-REQUESTS-OVER-CONNECTION."
   (unless (http2-connection-p connection)
     (error 'http-kit:http-protocol-error
            :message "An HTTP/2 request requires an HTTP2-CONNECTION."
@@ -598,6 +819,11 @@ HTTP2-CONNECTION objects until a stream multiplexer is installed."
            :message "ON-BODY-CHUNK must be a function or NIL."
            :operation :http2-client
            :detail on-body-chunk))
+  (when (and on-stream-open (not (functionp on-stream-open)))
+    (error 'http-kit:http-protocol-error
+           :message "ON-STREAM-OPEN must be a function or NIL."
+           :operation :http2-client
+           :detail on-stream-open))
   (unless (member collect-body-p '(nil t))
     (error 'http-kit:http-protocol-error
            :message "COLLECT-BODY-P must be NIL or T."
@@ -607,6 +833,8 @@ HTTP2-CONNECTION objects until a stream multiplexer is installed."
                     (%http2-connection-clock-function connection)))
          (header-limit (or max-header-bytes
                            (%http2-connection-max-header-bytes connection)))
+         (field-limit (min (or max-fields most-positive-fixnum)
+                           (%http2-connection-max-fields connection)))
          (body-limit (or max-body-bytes
                          (%http2-connection-max-body-bytes connection)))
          (stream-id nil))
@@ -614,6 +842,7 @@ HTTP2-CONNECTION objects until a stream multiplexer is installed."
                                    :inherited deadline
                                    :clock-function clock)
       (%h2-validate-limit :max-header-bytes header-limit)
+      (%h2-validate-limit :max-fields field-limit)
       (%h2-validate-limit :max-body-bytes body-limit :allow-zero t)
       (http-kit::%with-http-error-translation
           ("The HTTP/2 connection request failed." :http2-connection)
@@ -624,6 +853,24 @@ HTTP2-CONNECTION objects until a stream multiplexer is installed."
                             (%http2-connection-stream connection)))
                    (writer (%h2-writer (%http2-connection-stream connection)
                                        absolute-deadline clock)))
+              (when (and (http-kit:http-request-protocol request)
+                         (not session-started-p))
+                (%h2-connection-start-for-extended-connect
+                 connection reader writer absolute-deadline clock)
+                (setf session-started-p t))
+              (when (and (http-kit:http-request-protocol request)
+                         (not (%http2-connection-peer-enable-connect-protocol-p
+                               connection)))
+                (error 'http-kit:http-protocol-error
+                       :message "The HTTP/2 peer did not enable extended CONNECT."
+                       :operation :http2-write
+                       :detail :protocol-error))
+              (when (and session-started-p
+                         (eql 0
+                              (%http2-connection-peer-max-concurrent-streams
+                               connection)))
+                (%h2-connection-wait-for-stream-capacity
+                 connection reader writer absolute-deadline clock))
               (setf stream-id (%h2-connection-next-stream-id connection))
               (multiple-value-bind (header-wire body outgoing-frame-size
                                      expected-body-length trailer-fields)
@@ -635,6 +882,8 @@ HTTP2-CONNECTION objects until a stream multiplexer is installed."
                    :include-session-p (not session-started-p)
                    :peer-max-frame-size
                    (%http2-connection-peer-max-frame-size connection)
+                   :peer-max-header-list-size
+                   (%http2-connection-peer-max-header-list-size connection)
                    :request-body-function request-body-function
                    :request-body-length request-body-length
                    :huffman-p huffman-p)
@@ -642,6 +891,15 @@ HTTP2-CONNECTION objects until a stream multiplexer is installed."
                  (%http2-connection-stream connection)
                  header-wire absolute-deadline clock)
                 (incf (%http2-connection-next-stream-id connection) 2)
+                (when on-stream-open
+                  (funcall on-stream-open
+                           stream-id
+                           (lambda (&key (error-code 8))
+                             (cancel-http2-stream
+                              connection stream-id
+                              :error-code error-code
+                              :deadline absolute-deadline
+                              :clock-function clock))))
                 (multiple-value-bind (pending-frames read-initial-settings-p)
                     (%h2-connection-send-request-body
                      connection reader writer stream-id body
@@ -650,6 +908,8 @@ HTTP2-CONNECTION objects until a stream multiplexer is installed."
                      trailer-fields
                      absolute-deadline clock (not session-started-p)
                      huffman-p)
+                  (when read-initial-settings-p
+                    (setf (%http2-connection-session-started-p connection) t))
                   (let ((response
                           (%h2-read-response
                            reader writer
@@ -660,16 +920,21 @@ HTTP2-CONNECTION objects until a stream multiplexer is installed."
                            :expected-stream-id stream-id
                            :hpack-context
                            (%http2-connection-hpack-context connection)
+                           :max-fields field-limit
                            :read-initial-settings-p read-initial-settings-p
                            :peer-max-frame-size
                            (%http2-connection-peer-max-frame-size connection)
                            :initial-frames pending-frames
                            :on-peer-settings
                            (lambda (peer-frame-size peer-table-size
-                                    peer-window-size)
+                                    peer-window-size peer-enable-connect
+                                    peer-max-concurrent-streams
+                                    peer-max-header-list-size)
                              (%h2-connection-note-peer-settings
                               connection peer-frame-size peer-table-size
-                              peer-window-size))
+                              peer-window-size peer-enable-connect
+                              peer-max-concurrent-streams
+                              peer-max-header-list-size))
                            :control-handler
                            (lambda (frame response-writer expected-id)
                              (%h2-connection-control-handler
@@ -677,14 +942,15 @@ HTTP2-CONNECTION objects until a stream multiplexer is installed."
                     (setf (%http2-connection-session-started-p connection) t)
                     response))))
           (error (condition)
-            (close-http2-connection connection)
+            (unless (%h2-peer-stream-reset-condition-p condition)
+              (close-http2-connection connection))
             (error condition)))))))
 
 (defun send-http2-request-over-connection/cps
     (connection request on-success
-     &key on-error timeout deadline max-header-bytes max-body-bytes
+     &key on-error timeout deadline max-header-bytes max-fields max-body-bytes
        clock-function request-body-function request-body-length
-       on-body-chunk (collect-body-p t) (huffman-p nil))
+       on-body-chunk on-stream-open (collect-body-p t) (huffman-p nil))
   "Send a request on a reusable HTTP/2 connection using CPS continuations."
   (http-kit::%call-http-operation/cps
    (lambda ()
@@ -693,12 +959,14 @@ HTTP2-CONNECTION objects until a stream multiplexer is installed."
       :timeout timeout
       :deadline deadline
       :max-header-bytes max-header-bytes
+      :max-fields max-fields
       :max-body-bytes max-body-bytes
       :clock-function clock-function
       :request-body-function request-body-function
       :request-body-length request-body-length
       :huffman-p huffman-p
       :on-body-chunk on-body-chunk
+      :on-stream-open on-stream-open
       :collect-body-p collect-body-p))
    on-success
    :on-error on-error))
@@ -711,21 +979,23 @@ HTTP2-CONNECTION objects until a stream multiplexer is installed."
            :operation :http2-client
            :detail (type-of connection)))
   (lambda (request
-           &key timeout deadline max-header-bytes max-body-bytes clock-function
+           &key timeout deadline max-header-bytes max-fields max-body-bytes clock-function
              request-body-function request-body-length
-             on-body-chunk (collect-body-p t) (huffman-p nil)
+             on-body-chunk on-stream-open (collect-body-p t) (huffman-p nil)
              &allow-other-keys)
     (send-http2-request-over-connection
      connection request
      :timeout timeout
      :deadline deadline
      :max-header-bytes max-header-bytes
+     :max-fields max-fields
      :max-body-bytes max-body-bytes
      :clock-function clock-function
      :request-body-function request-body-function
      :request-body-length request-body-length
      :huffman-p huffman-p
      :on-body-chunk on-body-chunk
+     :on-stream-open on-stream-open
      :collect-body-p collect-body-p)))
 
 (defstruct (%h2-batch-entry
@@ -808,13 +1078,14 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                             +http2-end-stream-flag+))))))
 
 (defun %h2-batch-process-headers-frame
-    (entry frame next-frame max-frame-size max-header-bytes context
+    (entry frame next-frame max-frame-size max-header-bytes max-fields context
            request-method)
   (multiple-value-bind (block end-stream)
       (%h2-batch-read-header-block frame next-frame max-frame-size
                                    max-header-bytes)
     (let* ((fields (%hpack-decode-block block context
-                                        :max-header-bytes max-header-bytes))
+                                        :max-header-bytes max-header-bytes
+                                        :max-fields max-fields))
            (status (%h2-batch-entry-status entry))
            (headers (%h2-batch-entry-headers entry))
            (body (%h2-batch-entry-body-vector entry))
@@ -834,6 +1105,13 @@ CONTINUATION frames must still be consumed contiguously from that queue."
               (%h2-status-and-headers fields)
             (if (< candidate-status 200)
                 (progn
+                  (when (http-kit:http-header-values
+                         candidate-headers "content-length")
+                    (error 'http-kit:http-invalid-header
+                           :message "An informational HTTP/2 response cannot contain Content-Length."
+                           :operation :http2-response
+                           :name "content-length"
+                           :reason :forbidden))
                   (when end-stream
                     (error 'http-kit:http-protocol-error
                            :message "An informational HTTP/2 response cannot end the stream."
@@ -864,7 +1142,7 @@ CONTINUATION frames must still be consumed contiguously from that queue."
 
 (defun send-http2-requests-over-connection
     (connection requests
-     &key timeout deadline max-header-bytes max-body-bytes clock-function
+     &key timeout deadline max-header-bytes max-fields max-body-bytes clock-function
        request-body-functions request-body-lengths
        on-body-chunk (collect-body-p t) (huffman-p nil))
   "Send REQUESTS as multiplexed HTTP/2 streams.
@@ -877,7 +1155,8 @@ use each request's in-memory body.  Responses may arrive in any order and are
 returned in the same order as REQUESTS.  ON-BODY-CHUNK, when supplied,
 receives a payload and the corresponding request.  This API is cooperative
 rather than thread-safe: one caller owns a connection while this operation is
-active."
+active.  A batch larger than the peer's advertised concurrent-stream limit is
+sent in successive multiplexed waves under the same deadline."
   (unless (http2-connection-p connection)
     (error 'http-kit:http-protocol-error
            :message "An HTTP/2 batch request requires an HTTP2-CONNECTION."
@@ -921,12 +1200,15 @@ active."
                       (%http2-connection-clock-function connection)))
            (header-limit (or max-header-bytes
                              (%http2-connection-max-header-bytes connection)))
+           (field-limit (min (or max-fields most-positive-fixnum)
+                             (%http2-connection-max-fields connection)))
            (body-limit (or max-body-bytes
                            (%http2-connection-max-body-bytes connection))))
       (http-kit:with-http-deadline (absolute-deadline timeout
                                      :inherited deadline
                                      :clock-function clock)
         (%h2-validate-limit :max-header-bytes header-limit)
+        (%h2-validate-limit :max-fields field-limit)
         (%h2-validate-limit :max-body-bytes body-limit :allow-zero t)
         (http-kit::%with-http-error-translation
             ("The HTTP/2 batch request failed." :http2-connection)
@@ -939,6 +1221,49 @@ active."
                                        absolute-deadline clock))
                    (entries nil)
                    (header-writes nil))
+              (when (and (find-if #'http-kit:http-request-protocol requests)
+                         (not session-started-p))
+                (%h2-connection-start-for-extended-connect
+                 connection reader writer absolute-deadline clock)
+                (setf session-started-p t))
+              (when (and (find-if #'http-kit:http-request-protocol requests)
+                         (not (%http2-connection-peer-enable-connect-protocol-p
+                               connection)))
+                (error 'http-kit:http-protocol-error
+                       :message "The HTTP/2 peer did not enable extended CONNECT."
+                       :operation :http2-write
+                       :detail :protocol-error))
+              (let ((concurrent-limit
+                      (and session-started-p
+                           (%http2-connection-peer-max-concurrent-streams
+                            connection))))
+                (when (eql concurrent-limit 0)
+                  (setf concurrent-limit
+                        (%h2-connection-wait-for-stream-capacity
+                         connection reader writer absolute-deadline clock)))
+                (when (and concurrent-limit
+                           (> (length requests) concurrent-limit))
+                  (return-from send-http2-requests-over-connection
+                    (loop with request-count = (length requests)
+                          for start from 0 below request-count
+                            by concurrent-limit
+                          for end = (min request-count
+                                         (+ start concurrent-limit))
+                          append
+                          (send-http2-requests-over-connection
+                           connection (subseq requests start end)
+                           :deadline absolute-deadline
+                           :max-header-bytes header-limit
+                           :max-fields field-limit
+                           :max-body-bytes body-limit
+                           :clock-function clock
+                           :request-body-functions
+                           (subseq body-functions start end)
+                           :request-body-lengths
+                           (subseq body-lengths start end)
+                           :on-body-chunk on-body-chunk
+                           :collect-body-p collect-body-p
+                           :huffman-p huffman-p)))))
               ;; Build every header block before writing any bytes.  A bad
               ;; request therefore cannot leave a half-emitted batch on the
               ;; connection.
@@ -960,6 +1285,9 @@ active."
                                    (null entries))
                               :peer-max-frame-size
                               (%http2-connection-peer-max-frame-size
+                               connection)
+                              :peer-max-header-list-size
+                              (%http2-connection-peer-max-header-list-size
                                connection)
                               :request-body-function body-function
                               :request-body-length body-length
@@ -1148,6 +1476,7 @@ active."
                                        (%http2-connection-max-frame-size
                                         connection)
                                        header-limit
+                                       field-limit
                                        (%http2-connection-hpack-context
                                         connection)
                                        (http-kit:http-request-method
@@ -1217,20 +1546,21 @@ active."
                                        :detail (%h2-frame-stream-id frame)))
                                ((= (%h2-frame-type frame)
                                    +http2-push-promise-type+)
-                                (error 'http-kit:http-unsupported-feature
-                                       :message "HTTP/2 server push is not supported by the batch client."
+                                (error 'http-kit:http-protocol-error
+                                       :message "The peer sent HTTP/2 PUSH_PROMISE after server push was disabled."
                                        :operation :http2-read
-                                       :feature :http2-server-push))
+                                       :detail :protocol-error))
                                (t nil)))))
                   (setf (%http2-connection-session-started-p connection) t)
                   (mapcar #'%h2-batch-entry-response entries)))
             (error (condition)
-            (close-http2-connection connection)
-            (error condition))))))))
+              (unless (%h2-peer-stream-reset-condition-p condition)
+                (close-http2-connection connection))
+              (error condition))))))))
 
 (defun send-http2-requests-over-connection/cps
     (connection requests on-success
-     &key on-error timeout deadline max-header-bytes max-body-bytes
+     &key on-error timeout deadline max-header-bytes max-fields max-body-bytes
        clock-function request-body-functions request-body-lengths
        on-body-chunk (collect-body-p t) (huffman-p nil))
   "Send a concurrent HTTP/2 batch using CPS continuations."
@@ -1241,6 +1571,7 @@ active."
       :timeout timeout
       :deadline deadline
       :max-header-bytes max-header-bytes
+      :max-fields max-fields
       :max-body-bytes max-body-bytes
       :clock-function clock-function
       :request-body-functions request-body-functions

@@ -1,4 +1,4 @@
-(in-package #:http-kit/test)
+(in-package #:http-kit/test-core)
 
 #+sbcl
 (progn
@@ -241,6 +241,17 @@
            (declare (ignore maximum-size))
            (octets 97 98 99))
          :request-body-length 5))))
+
+  (deftest public-stream-trace-rejects-body-producer
+    (let ((request (make-http-request :method "TRACE"
+                                      :uri "http://127.0.0.1/")))
+      (signals http-protocol-error
+        (send-http-request-over-open-stream
+         request
+         (make-instance 'binary-test-stream :input (octets))
+         :request-body-function (lambda (maximum-size)
+                                  (declare (ignore maximum-size))
+                                  nil)))))
 
   (deftest public-stream-request-cps-error
     (let ((condition-type nil))

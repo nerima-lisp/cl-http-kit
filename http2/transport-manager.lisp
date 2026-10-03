@@ -2,30 +2,41 @@
 
 (defstruct (%http2-managed-connection
              (:constructor %make-http2-managed-connection
-                 (&key key connection last-used)))
+                 (&key key connection opened-at last-used last-used-at)))
   key
   connection
-  last-used)
+  opened-at
+  last-used
+  last-used-at)
 
 (defstruct (http2-connection-manager
              (:conc-name %http2-connection-manager-)
              (:constructor %make-http2-connection-manager
-                 (&key open-connection max-connections)))
+                 (&key open-connection max-connections idle-timeout max-connection-age
+                       clock-function)))
   open-connection
   max-connections
+  idle-timeout
+  max-connection-age
+  clock-function
   (entries nil)
   (sequence 0)
   (closed-p nil))
 
 (defun make-http2-connection-manager
-    (&key open-connection (max-connections 8))
+    (&key open-connection (max-connections 8) idle-timeout max-connection-age
+          (clock-function #'http-kit::%monotonic-time))
   "Create a cooperative pool of reusable HTTP/2 connections.
 
 OPEN-CONNECTION receives the request being sent and may accept TIMEOUT and
 DEADLINE keyword arguments.  It must return an HTTP2-CONNECTION.  The manager
 selects connections by CONNECTION-KEY (the request's scheme, host, and port
 by default), keeps at most MAX-CONNECTIONS entries, and evicts the least
-recently used idle entry when a new key needs a slot.
+recently used idle entry when a new key needs a slot.  IDLE-TIMEOUT expires
+connections that have not completed a request within the specified number of
+seconds; NIL disables expiry.  MAX-CONNECTION-AGE bounds total connection
+lifetime even while requests remain active.  CLOCK-FUNCTION must return a
+real monotonic time value.
 
 The manager is deliberately owner-thread and non-reentrant, like the
 underlying HTTP/2 connection APIs.  Use SEND-HTTP2-REQUESTS-OVER-CONNECTION
@@ -40,9 +51,29 @@ when a caller needs several concurrent streams on one connection."
            :message "MAX-CONNECTIONS must be a positive integer."
            :operation :http2-manager
            :detail max-connections))
+  (when (and idle-timeout
+             (or (not (realp idle-timeout)) (< idle-timeout 0)))
+    (error 'http-kit:http-protocol-error
+           :message "IDLE-TIMEOUT must be a non-negative real or NIL."
+           :operation :http2-manager
+           :detail idle-timeout))
+  (when (and max-connection-age
+             (or (not (realp max-connection-age)) (< max-connection-age 0)))
+    (error 'http-kit:http-protocol-error
+           :message "MAX-CONNECTION-AGE must be a non-negative real or NIL."
+           :operation :http2-manager
+           :detail max-connection-age))
+  (unless (functionp clock-function)
+    (error 'http-kit:http-protocol-error
+           :message "CLOCK-FUNCTION must be a function."
+           :operation :http2-manager
+           :detail clock-function))
   (%make-http2-connection-manager
    :open-connection open-connection
-   :max-connections max-connections))
+   :max-connections max-connections
+   :idle-timeout idle-timeout
+   :max-connection-age max-connection-age
+   :clock-function clock-function))
 
 (defun http2-connection-manager-open-p (manager)
   (and (http2-connection-manager-p manager)
@@ -51,6 +82,21 @@ when a caller needs several concurrent streams on one connection."
 (defun http2-connection-manager-max-connections (manager)
   (and (http2-connection-manager-p manager)
        (%http2-connection-manager-max-connections manager)))
+
+(defun http2-connection-manager-idle-timeout (manager)
+  "Return MANAGER's idle-connection expiry interval, or NIL when disabled."
+  (and (http2-connection-manager-p manager)
+       (%http2-connection-manager-idle-timeout manager)))
+
+(defun http2-connection-manager-max-connection-age (manager)
+  "Return MANAGER's maximum connection lifetime, or NIL when disabled."
+  (and (http2-connection-manager-p manager)
+       (%http2-connection-manager-max-connection-age manager)))
+
+(defun http2-connection-manager-clock-function (manager)
+  "Return the monotonic clock function used by MANAGER."
+  (and (http2-connection-manager-p manager)
+       (%http2-connection-manager-clock-function manager)))
 
 (defun http2-connection-manager-connection-count (manager)
   (and (http2-connection-manager-p manager)
@@ -78,6 +124,25 @@ when a caller needs several concurrent streams on one connection."
          (not (http2-connection-draining-p connection))
          (null (http2-connection-goaway-last-stream-id connection)))))
 
+(defun %h2-manager-now (manager)
+  (let ((now (funcall (%http2-connection-manager-clock-function manager))))
+    (unless (realp now)
+      (error 'http-kit:http-protocol-error
+             :message "The HTTP/2 manager clock must return a real number."
+             :operation :http2-manager
+             :detail now))
+    now))
+
+(defun %h2-manager-entry-expired-p (manager entry now)
+  (let ((idle-timeout (%http2-connection-manager-idle-timeout manager))
+        (max-age (%http2-connection-manager-max-connection-age manager)))
+    (or (and idle-timeout
+             (>= (- now (%http2-managed-connection-last-used-at entry))
+                 idle-timeout))
+        (and max-age
+             (>= (- now (%http2-managed-connection-opened-at entry))
+                 max-age)))))
+
 (defun %h2-manager-discard-entry (manager entry)
   (setf (%http2-connection-manager-entries manager)
         (delete entry (%http2-connection-manager-entries manager)
@@ -88,10 +153,14 @@ when a caller needs several concurrent streams on one connection."
   entry)
 
 (defun %h2-manager-prune (manager)
-  (dolist (entry (copy-list (%http2-connection-manager-entries manager)))
-    (unless (%h2-manager-entry-usable-p entry)
-      (%h2-manager-discard-entry manager entry)))
-  manager)
+  (let ((now (and (or (%http2-connection-manager-idle-timeout manager)
+                      (%http2-connection-manager-max-connection-age manager))
+                  (%h2-manager-now manager))))
+    (dolist (entry (copy-list (%http2-connection-manager-entries manager)))
+      (unless (and (%h2-manager-entry-usable-p entry)
+                   (not (%h2-manager-entry-expired-p manager entry now)))
+        (%h2-manager-discard-entry manager entry)))
+    manager))
 
 (defun %h2-manager-entry-for-key (manager key)
   (let ((candidate nil))
@@ -116,6 +185,10 @@ when a caller needs several concurrent streams on one connection."
 (defun %h2-manager-touch (manager entry)
   (setf (%http2-managed-connection-last-used entry)
         (incf (%http2-connection-manager-sequence manager)))
+  (when (or (%http2-connection-manager-idle-timeout manager)
+            (%http2-connection-manager-max-connection-age manager))
+    (setf (%http2-managed-connection-last-used-at entry)
+          (%h2-manager-now manager)))
   entry)
 
 (defun %h2-manager-open-entry
@@ -136,10 +209,15 @@ when a caller needs several concurrent streams on one connection."
              :message "The HTTP/2 manager open callback returned a non-connection."
              :operation :http2-manager
              :detail (type-of connection)))
-    (let ((entry (%make-http2-managed-connection
+    (let* ((now (and (or (%http2-connection-manager-idle-timeout manager)
+                         (%http2-connection-manager-max-connection-age manager))
+                     (%h2-manager-now manager)))
+           (entry (%make-http2-managed-connection
                   :key key
                   :connection connection
-                  :last-used 0)))
+                  :opened-at now
+                  :last-used 0
+                  :last-used-at now)))
       (push entry (%http2-connection-manager-entries manager))
       (%h2-manager-touch manager entry)
       entry)))
@@ -174,41 +252,60 @@ when a caller needs several concurrent streams on one connection."
       (%h2-manager-touch manager entry)
       (%h2-manager-discard-entry manager entry)))
 
+(defun %h2-manager-unprocessed-retry-p
+    (condition request-body-function)
+  (and (typep condition 'http-kit:http-connection-error)
+       (let ((cause (http-kit:http-connection-error-cause condition)))
+         (and (consp cause)
+              (or (eq (first cause) :goaway)
+                  (and (eq (first cause) :rst-stream)
+                       (eql (third cause) 7)))))
+       (null request-body-function)))
+
 (defun send-http2-request-over-connection-manager
     (manager request
      &key (connection-key nil connection-key-supplied-p)
-       timeout deadline max-header-bytes max-body-bytes clock-function
+       timeout deadline max-header-bytes max-fields max-body-bytes clock-function
        request-body-function request-body-length
        on-body-chunk (collect-body-p t) (huffman-p nil))
   "Send REQUEST through a reusable HTTP/2 connection manager."
-  (multiple-value-bind (connection entry)
-      (%h2-manager-connection-for
-       manager request connection-key connection-key-supplied-p timeout deadline)
-    (handler-case
-        (let ((response
-                (send-http2-request-over-connection
-                 connection request
-                 :timeout timeout
-                 :deadline deadline
-                 :max-header-bytes max-header-bytes
-                 :max-body-bytes max-body-bytes
-                 :clock-function clock-function
-                 :request-body-function request-body-function
-                 :request-body-length request-body-length
-                 :on-body-chunk on-body-chunk
-                 :collect-body-p collect-body-p
-                 :huffman-p huffman-p)))
-          (%h2-manager-finish-entry manager entry)
-          response)
-      (error (condition)
-        (unless (http2-connection-open-p connection)
-          (%h2-manager-discard-entry manager entry))
-        (error condition)))))
+  (loop
+    with retried-p = nil
+    do
+       (multiple-value-bind (connection entry)
+           (%h2-manager-connection-for
+            manager request connection-key connection-key-supplied-p
+            timeout deadline)
+         (handler-case
+             (let ((response
+                     (send-http2-request-over-connection
+                      connection request
+                      :timeout timeout
+                      :deadline deadline
+                      :max-header-bytes max-header-bytes
+                      :max-fields max-fields
+                      :max-body-bytes max-body-bytes
+                      :clock-function clock-function
+                      :request-body-function request-body-function
+                      :request-body-length request-body-length
+                      :on-body-chunk on-body-chunk
+                      :collect-body-p collect-body-p
+                      :huffman-p huffman-p)))
+               (%h2-manager-finish-entry manager entry)
+               (return response))
+           (error (condition)
+             (unless (http2-connection-open-p connection)
+               (%h2-manager-discard-entry manager entry))
+             (if (and (not retried-p)
+                      (%h2-manager-unprocessed-retry-p
+                       condition request-body-function))
+                 (setf retried-p t)
+                 (error condition)))))))
 
 (defun send-http2-requests-over-connection-manager
     (manager requests
      &key (connection-key nil connection-key-supplied-p)
-       timeout deadline max-header-bytes max-body-bytes clock-function
+       timeout deadline max-header-bytes max-fields max-body-bytes clock-function
        request-body-functions request-body-lengths
        on-body-chunk (collect-body-p t) (huffman-p nil))
   "Send a non-empty batch through one reusable HTTP/2 connection manager."
@@ -228,6 +325,7 @@ when a caller needs several concurrent streams on one connection."
                  :timeout timeout
                  :deadline deadline
                  :max-header-bytes max-header-bytes
+                 :max-fields max-fields
                  :max-body-bytes max-body-bytes
                  :clock-function clock-function
                  :request-body-functions request-body-functions
@@ -250,7 +348,7 @@ when a caller needs several concurrent streams on one connection."
            :operation :http2-manager
            :detail (type-of manager)))
   (lambda (request
-           &key timeout deadline max-header-bytes max-body-bytes clock-function
+           &key timeout deadline max-header-bytes max-fields max-body-bytes clock-function
              request-body-function request-body-length
              on-body-chunk (collect-body-p t) (huffman-p nil)
              (connection-key nil connection-key-supplied-p)
@@ -262,6 +360,7 @@ when a caller needs several concurrent streams on one connection."
          :timeout timeout
          :deadline deadline
          :max-header-bytes max-header-bytes
+         :max-fields max-fields
          :max-body-bytes max-body-bytes
          :clock-function clock-function
          :request-body-function request-body-function
@@ -274,6 +373,7 @@ when a caller needs several concurrent streams on one connection."
          :timeout timeout
          :deadline deadline
          :max-header-bytes max-header-bytes
+         :max-fields max-fields
          :max-body-bytes max-body-bytes
          :clock-function clock-function
          :request-body-function request-body-function

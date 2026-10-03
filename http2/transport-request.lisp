@@ -26,6 +26,12 @@
            :operation :http2-write
            :detail request-body-length))
   (when (and request-body-function
+             (string= (http-kit:http-request-method request) "TRACE"))
+    (error 'http-kit:http-protocol-error
+           :message "TRACE requests must not contain content."
+           :operation :http2-write
+           :detail :trace-content))
+  (when (and request-body-function
              (plusp (length (http-kit:http-request-body request))))
     (error 'http-kit:http-protocol-error
            :message "A request body producer cannot be combined with an in-memory request body."
@@ -41,7 +47,7 @@
            :message "An HTTP/2 request body producer must return a one-dimensional octet array or NIL."
            :operation :http2-write
            :detail (type-of chunk)))
-  (when (zerop (length chunk))
+  (when (zerop (array-total-size chunk))
     (error 'http-kit:http-protocol-error
            :message "An HTTP/2 request body producer returned an empty chunk."
            :operation :http2-write
@@ -87,16 +93,16 @@
    (lambda (header)
      (let* ((name (string-downcase (http-kit:http-header-name header)))
             (value (http-kit:http-header-content header)))
-       (when (or (zerop (length name))
+       (when (or (string= name "")
                  (char= (char name 0) #\:))
          (error 'http-kit:http-invalid-header
                 :message "HTTP/2 request trailers cannot contain pseudo-header fields."
                 :operation :http2-trailers
                 :name name
                 :reason :pseudo-field))
-       (when (string= name "content-length")
+       (when (http-kit::%forbidden-trailer-field-name-p name)
          (error 'http-kit:http-invalid-header
-                :message "HTTP/2 request trailers cannot contain Content-Length."
+                :message "The field definition does not permit this HTTP/2 request trailer."
                 :operation :http2-trailers
                 :name name
                 :reason :forbidden))
@@ -106,13 +112,6 @@
                 :operation :http2-trailers
                 :name name
                 :reason :connection-specific))
-       (when (string= name "te")
-         (unless (every (lambda (item) (string= item "trailers"))
-                        (%h2-comma-items (list value) name))
-           (error 'http-kit:http-unsupported-feature
-                  :message "HTTP/2 only permits TE: trailers in request trailers."
-                  :operation :http2-trailers
-                  :feature :http2-te)))
        (%hpack-validate-field name value)))
    (http-kit:http-request-trailers request)))
 
@@ -120,6 +119,7 @@
                                 max-body-bytes
                                 &key (stream-id 1) (include-session-p t)
                                      peer-max-frame-size
+                                     peer-max-header-list-size
                                      request-body-function request-body-length
                                      (huffman-p nil))
   (let* ((body (http-kit:http-request-body request))
@@ -148,6 +148,9 @@
          (trailer-size (%h2-header-list-size trailer-fields)))
     (http-kit::%check-limit :headers header-size max-header-bytes)
     (http-kit::%check-limit :headers trailer-size max-header-bytes)
+    (when peer-max-header-list-size
+      (http-kit::%check-limit :headers header-size peer-max-header-list-size)
+      (http-kit::%check-limit :headers trailer-size peer-max-header-list-size))
     (http-kit::%check-limit :body (or expected-body-length (length body))
                             max-body-bytes)
     (let* ((block (%hpack-encode-block fields :huffman-p huffman-p))
@@ -159,8 +162,8 @@
            (frames (%h2-header-frames
                    block
                    (and (null request-body-function)
-                         (zerop (length body))
-                         (null trailer-fields))
+                        (zerop (array-total-size body))
+                        (null trailer-fields))
                                       outgoing-frame-size stream-id)))
       (values
        (%h2-concat
@@ -174,8 +177,8 @@
        expected-body-length
        trailer-fields))))
 
-(defun %h2-settings-wire (max-frame-size)
-  (let ((payload (make-array 12
+(defun %h2-settings-wire (max-frame-size &key enable-connect-p)
+  (let ((payload (make-array (if enable-connect-p 18 12)
                              :element-type '(unsigned-byte 8)
                              :initial-element 0)))
     ;; Disable server push and advertise the local maximum frame size.
@@ -183,6 +186,9 @@
     (%h2-put-u32 payload 2 0)
     (%h2-put-u16 payload 6 5)
     (%h2-put-u32 payload 8 max-frame-size)
+    (when enable-connect-p
+      (%h2-put-u16 payload 12 8)
+      (%h2-put-u32 payload 14 1))
     (%h2-frame-wire +http2-settings-type+ 0 0 payload)))
 
 (defun %h2-request-wire (request max-frame-size max-header-bytes max-body-bytes
@@ -208,7 +214,12 @@
                         t outgoing-frame-size stream-id)
                        '()))))))
 
-(defun %h2-settings (payload)
+(defun %h2-settings (payload &key (peer-role :server))
+  (unless (member peer-role '(:client :server))
+    (error 'http-kit:http-protocol-error
+           :message "HTTP/2 SETTINGS peer role must be :client or :server."
+           :operation :http2-settings
+           :detail peer-role))
   (unless (zerop (mod (length payload) 6))
     (error 'http-kit:http-protocol-error
            :message "An HTTP/2 SETTINGS payload must contain six-byte entries."
@@ -216,7 +227,10 @@
            :detail (length payload)))
   (let ((max-frame-size nil)
         (max-table-size nil)
-        (initial-window-size nil))
+        (max-concurrent-streams nil)
+        (max-header-list-size nil)
+        (initial-window-size nil)
+        (enable-connect-protocol nil))
     (loop for position from 0 below (length payload) by 6
           for identifier = (%h2-u16 payload position)
           for value = (%h2-u32 payload (+ position 2))
@@ -229,11 +243,18 @@
                (1
                 (setf max-table-size value))
                (2
-                (unless (zerop value)
+                (unless (<= value 1)
+                  (error 'http-kit:http-protocol-error
+                         :message "SETTINGS_ENABLE_PUSH must be zero or one."
+                         :operation :http2-settings
+                         :detail value))
+                (when (and (eq peer-role :server) (plusp value))
                   (error 'http-kit:http-protocol-error
                          :message "An HTTP/2 server must not enable server push."
                          :operation :http2-settings
                          :detail value)))
+               (3
+                (setf max-concurrent-streams value))
                (4
                 (when (> value #x7fffffff)
                   (error 'http-kit:http-protocol-error
@@ -247,5 +268,16 @@
                          :message "SETTINGS_MAX_FRAME_SIZE is outside the HTTP/2 range."
                          :operation :http2-settings
                          :detail value))
-                (setf max-frame-size value))))
-    (values max-frame-size max-table-size initial-window-size)))
+                (setf max-frame-size value))
+               (6
+                (setf max-header-list-size value))
+               (8
+                (unless (<= value 1)
+                  (error 'http-kit:http-protocol-error
+                         :message "SETTINGS_ENABLE_CONNECT_PROTOCOL must be zero or one."
+                         :operation :http2-settings
+                         :detail value))
+                (setf enable-connect-protocol value))))
+    (values max-frame-size max-table-size initial-window-size
+            enable-connect-protocol max-concurrent-streams
+            max-header-list-size)))

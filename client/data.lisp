@@ -5,6 +5,22 @@
   '("GET" "HEAD" "OPTIONS" "PUT" "DELETE" "TRACE"))
 (defparameter *default-retry-statuses* '(408 425 429 500 502 503 504))
 
+#+sbcl
+(defun %make-client-lock (name)
+  (sb-thread:make-mutex :name name))
+
+#-sbcl
+(defun %make-client-lock (name)
+  (declare (ignore name))
+  nil)
+
+(defmacro %with-client-lock ((lock) &body body)
+  #+sbcl
+  `(sb-thread:with-mutex (,lock)
+     ,@body)
+  #-sbcl
+  `(progn ,@body))
+
 (defun %client-protocol-error (message detail)
   (error 'http-protocol-error
          :message message
@@ -124,6 +140,7 @@ character in that range is a decimal digit, apart from an optional sign when
   (statuses (copy-list *default-retry-statuses*))
   (base-delay 0.25)
   (max-delay 30.0)
+  (jitter-ratio 0.0)
   (respect-retry-after-p t)
   (retry-on-timeout-p t)
   (retry-on-connection-error-p t))
@@ -134,6 +151,7 @@ character in that range is a decimal digit, apart from an optional sign when
           (statuses *default-retry-statuses*)
           (base-delay 0.25)
           (max-delay 30.0)
+          (jitter-ratio 0.0)
           (respect-retry-after-p t)
           (retry-on-timeout-p t)
           (retry-on-connection-error-p t))
@@ -154,12 +172,17 @@ character in that range is a decimal digit, apart from an optional sign when
     (%client-protocol-error
      "The retry maximum delay must be at least the base delay."
      max-delay))
+  (unless (and (realp jitter-ratio) (<= 0 jitter-ratio 1))
+    (%client-protocol-error
+     "The retry jitter ratio must be between zero and one."
+     jitter-ratio))
   (%make-http-retry-policy
    :max-attempts max-attempts
-   :methods (mapcar #'string-upcase (copy-list methods))
+   :methods (copy-list methods)
    :statuses (copy-list statuses)
    :base-delay base-delay
    :max-delay max-delay
+   :jitter-ratio jitter-ratio
    :respect-retry-after-p (not (null respect-retry-after-p))
    :retry-on-timeout-p (not (null retry-on-timeout-p))
    :retry-on-connection-error-p (not (null retry-on-connection-error-p))))
@@ -174,7 +197,7 @@ character in that range is a decimal digit, apart from an optional sign when
 
 (defun make-http-multipart-part
     (&key name value filename content-type)
-  (unless (and (stringp name) (plusp (length name)))
+  (unless (and (stringp name) (not (string= name "")))
     (%client-protocol-error "A multipart part requires a non-empty name." name))
   (unless (or (stringp value)
               (and (arrayp value) (= (array-rank value) 1)))
@@ -199,17 +222,26 @@ character in that range is a decimal digit, apart from an optional sign when
   path
   expires
   max-age
+  expiry-time
   secure-p
   http-only-p
   same-site
+  partition-key
   host-only-p
-  creation-time)
+  creation-time
+  last-access-time)
 
 (defstruct (http-cookie-jar
              (:constructor %make-http-cookie-jar)
              (:conc-name %http-cookie-jar-))
   (cookies nil)
-  (clock-function #'get-universal-time))
+  lock
+  (clock-function #'get-universal-time)
+  public-suffix-p-function
+  (max-cookies 3000)
+  (max-cookies-per-domain 180)
+  (max-cookie-bytes 4096)
+  (max-total-cookie-bytes 12288000))
 
 (defstruct (http-proxy
              (:constructor %make-http-proxy)
@@ -228,7 +260,7 @@ character in that range is a decimal digit, apart from an optional sign when
                           (string= (string left) (string right))))
     (%client-protocol-error "Proxy scheme must be HTTP, HTTPS, SOCKS5, or SOCKS5H."
                             scheme))
-  (unless (and (stringp host) (plusp (length host)))
+  (unless (and (stringp host) (not (string= host "")))
     (%client-protocol-error "A proxy requires a non-empty host." host))
   (%ensure-positive-integer port "A proxy port must be a positive integer.")
   (when (> port 65535)
@@ -249,26 +281,77 @@ character in that range is a decimal digit, apart from an optional sign when
              (:conc-name %http-cache-))
   (entries nil)
   (max-entries 256)
+  (clock-function #'get-universal-time)
+  status-identifier)
+
+(defstruct (http-strict-transport-policy
+             (:constructor %make-http-strict-transport-policy)
+             (:conc-name http-strict-transport-policy-))
+  host
+  expires-at
+  include-subdomains-p)
+
+(defstruct (http-strict-transport-store
+             (:constructor %make-http-strict-transport-store)
+             (:conc-name %http-strict-transport-store-))
+  (policies nil)
   (clock-function #'get-universal-time))
+
+(defstruct (http-alternative-service
+             (:constructor %make-http-alternative-service)
+             (:conc-name http-alternative-service-))
+  origin
+  protocol-id
+  host
+  port
+  expires-at
+  persist-p)
+
+(defstruct (http-alternative-service-store
+             (:constructor %make-http-alternative-service-store)
+             (:conc-name %http-alternative-service-store-))
+  (entries nil)
+  (clock-function #'get-universal-time))
+
+(defstruct (http-authentication-challenge
+             (:constructor %make-http-authentication-challenge)
+             (:conc-name http-authentication-challenge-))
+  scheme
+  token68
+  (parameters nil))
 
 (defstruct (http-client
              (:constructor %make-http-client)
              (:conc-name http-client-))
   transport-function
+  ;; Optional HTTP/3 boundary. It receives the normal transport keywords
+  ;; plus :ALTERNATIVE-SERVICE.
+  http3-transport-function
   connection-pool
   (default-headers nil)
   cookie-jar
+  cookie-partition-key
+  cookie-same-site-context
   cache
+  strict-transport-store
+  alternative-service-store
   redirect-policy
   retry-policy
   proxy
   tls-upgrade
   resolve-host
   auth-provider
+  challenge-auth-provider
+  proxy-challenge-auth-provider
+  stale-while-revalidate-scheduler
   clock-function
   wall-clock-function
   sleep-function
+  random-function
   max-header-bytes
+  max-fields
   max-body-bytes
+  (automatic-decompression-p t)
+  (content-decoders nil)
   on-request
   on-response)

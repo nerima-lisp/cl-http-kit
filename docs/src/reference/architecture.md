@@ -4,6 +4,11 @@ cl-http-kit is organized around a small protocol core and explicit integration
 boundaries. The registered ASDF systems share the HTTP-KIT message model where
 appropriate, while application-owned I/O remains outside the package.
 
+This describes the checked-in 0.4.0 architecture plus the current integration
+work. The high-level client can now assemble native TCP/TLS and a connection
+pool when no transport is supplied, and `http-client-send` accepts the
+URL-and-method convenience form.
+
 ## Core layers
 
 | Layer | Responsibility |
@@ -75,17 +80,35 @@ peer tables synchronized before using dynamic references.
 
 The HTTP/3 system does not implement QUIC packet handling, TLS, ALPN, native
 socket setup, peer unidirectional-stream acceptance, connection-level stream
-dispatch, or a native HTTP/3 listener. The surrounding QUIC implementation
-must provide those boundaries.
+dispatch, or a native HTTP/3 listener. The cl-quic-kit adapter supplies the
+client connection and bidirectional stream lifecycle at this boundary; the
+surrounding application still supplies socket and certificate policy.
+
+The implementation is split by responsibility: `transport.lisp` owns shared
+control-stream, frame, settings, and header helpers; `transport-client.lisp`
+owns response parsing and client request execution; and
+`transport-server.lisp` owns request-stream parsing and response production.
+The client entry points also expose CPS variants so an application can keep
+I/O scheduling and error continuation policy outside the protocol code.
 
 ## Optional high-level client system
 
 The cl-http-kit/client system consumes core request and response values and
-composes URI resolution, authentication, cookies, cache, proxy, redirect,
-retry, and HTTP/1.1 connection-pool policies. Its `http-client-send` operation
+composes URI resolution, authentication, cookies, cache, content-coding
+selection, ALPN protocol helpers, proxy, redirect, retry, and HTTP/1.1
+connection-pool policies. Its `http-client-send` operation
 delegates actual I/O to an injected transport function, stream callbacks, or a
-callback-driven connection pool. Socket creation, DNS, TLS, and ALPN remain
-outside this system.
+callback-driven connection pool. When no transport boundary is supplied, the
+current integration creates native TCP/TLS and a pool lazily; custom callers
+can still keep socket creation, DNS, TLS, and ALPN at the application boundary.
+
+The URL-and-method convenience path runs over these layers. `make-http-client`
+and `http-client-send` stay as compatibility entry points. If the client
+receives an Alt-Svc `h3` alternative and the caller supplies
+`:http3-transport-function`, it attempts HTTP/3 and falls back to TCP when the
+QUIC attempt fails. Explicit HTTP/3 requests do not fall back. The HTTP/3
+layer remains an injected QUIC stream boundary so applications retain socket,
+TLS, and certificate policy.
 
 ## Optional native network system
 
@@ -100,6 +123,12 @@ limits, and error callbacks for a caller-owned listener. TLS, ALPN, proxy
 negotiation, and HTTP/2 or HTTP/3 protocol selection remain explicit policies
 supplied by the surrounding application.
 
+The native TLS implementation is cl-tls-kit. The client wrapper adapts its
+TLS 1.3 driver to the binary stream boundary; server-side TLS remains an
+explicit unsupported feature because the kit exposes no server driver. An
+HTTPS deployment can terminate TLS in a reverse proxy or load balancer and
+forward plain HTTP to the listener.
+
 ## Optional observability system
 
 The cl-http-kit/observability system adapts request completion and errors to
@@ -111,6 +140,7 @@ operation wrapper rather than coupled to the HTTP/1.1 parser.
 
 The library owns protocol values, wire correctness, and the policies explicitly
 provided by the optional client system. The optional network system can own
-native TCP and DNS setup on SBCL; applications still own TLS, ALPN, pool
+native TCP and DNS setup on SBCL, and the default client path composes it with
+the native TLS wrapper and pool. Custom transports still own TLS, ALPN, pool
 synchronization, and policy about sensitive logging. This boundary keeps the
 core portable and makes deterministic testing possible.

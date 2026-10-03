@@ -39,7 +39,7 @@
         (%request-parse-error
          "Only HTTP/1.0 and HTTP/1.1 request versions are supported."
          version))
-      (values (string-upcase method) target version))))
+      (values method target version))))
 
 (defun %parse-request-header-line (line)
   (when (and (plusp (length line))
@@ -64,9 +64,10 @@
                  :reason (http-invalid-header-reason condition)))))))
 
 (defun %read-request-headers
-    (source deadline clock-function max-header-bytes header-used)
+    (source deadline clock-function max-header-bytes max-fields header-used)
   (let ((headers '())
-        (bytes header-used))
+        (bytes header-used)
+        (field-count 0))
     (loop
       (multiple-value-bind (line updated-bytes)
           (%read-crlf-line source deadline clock-function max-header-bytes bytes
@@ -74,7 +75,11 @@
         (setf bytes updated-bytes)
         (if (zerop (length line))
             (return (values (nreverse headers) bytes))
-            (push (%parse-request-header-line line) headers))))))
+            (progn
+              (incf field-count)
+              (%check-limit :fields field-count max-fields
+                            :operation :request-parse)
+              (push (%parse-request-header-line line) headers)))))))
 
 (defun %request-content-length (headers)
   (let ((values (http-header-values headers "content-length")))
@@ -274,13 +279,15 @@
     (source length deadline clock-function max-body-bytes
      &key on-body-chunk (collect-body-p t))
   (%check-limit :body length max-body-bytes :operation :request-parse)
-  (%finish-body-collector
-   (%read-request-body-segment source length deadline clock-function :body
-                               (%make-body-collector collect-body-p)
-                               on-body-chunk)))
+  (values
+   (%finish-body-collector
+    (%read-request-body-segment source length deadline clock-function :body
+                                (%make-body-collector collect-body-p)
+                                on-body-chunk))
+   length))
 
 (defun %read-request-chunked-body
-    (source deadline clock-function max-header-bytes max-body-bytes header-used
+    (source deadline clock-function max-header-bytes max-fields max-body-bytes header-used
      &key on-body-chunk (collect-body-p t))
   (let ((body (%make-body-collector collect-body-p))
         (trailers '())
@@ -291,21 +298,17 @@
           (%read-crlf-line source deadline clock-function max-header-bytes bytes
                            :operation :request-parse)
         (setf bytes updated-bytes)
-        (let* ((separator (position #\; line))
-               (size-text (%trim-ows (if separator
-                                        (subseq line 0 separator)
-                                        line))))
-          (unless (and (plusp (length size-text))
-                       (every #'%hex-character-p size-text))
+        (let ((size-text (%http1-chunk-size-text line)))
+          (unless size-text
             (%request-parse-error
-             "A chunk size is not a valid hexadecimal integer."
+             "A chunk size or extension is malformed."
              line))
           (let ((size (parse-integer size-text :radix 16)))
             (if (zerop size)
                 (progn
                   (multiple-value-bind (parsed-trailers trailer-bytes)
                       (%read-request-headers source deadline clock-function
-                                              max-header-bytes bytes)
+                                              max-header-bytes max-fields bytes)
                     (setf trailers parsed-trailers
                           bytes trailer-bytes))
                   (%validate-http1-trailers trailers :request-parse)
@@ -323,10 +326,10 @@
                   (incf bytes 2)
                   (%check-limit :headers bytes max-header-bytes
                                 :operation :request-parse)))))))
-    (values (%finish-body-collector body) trailers)))
+    (values (%finish-body-collector body) trailers body-length)))
 
 (defun parse-http-request
-    (input &key timeout deadline max-header-bytes max-body-bytes
+    (input &key timeout deadline max-header-bytes max-fields max-body-bytes
              default-authority on-body-chunk (collect-body-p t)
              on-expect-continue (clock-function #'%monotonic-time)
              allow-eof-p)
@@ -342,11 +345,16 @@ read."
          (absolute-deadline (http-deadline timeout :deadline deadline
                                            :clock-function clock-function))
          (header-limit (or max-header-bytes *default-max-header-bytes*))
+         (field-limit (or max-fields *default-max-fields*))
          (body-limit (or max-body-bytes *default-max-body-bytes*)))
     (unless (and (integerp header-limit) (plusp header-limit))
       (%request-parse-error
        "The request header limit must be a positive integer."
        header-limit))
+    (unless (and (integerp field-limit) (plusp field-limit))
+      (%request-parse-error
+       "The request field limit must be a positive integer."
+       field-limit))
     (unless (and (integerp body-limit) (>= body-limit 0))
       (%request-parse-error
        "The request body limit must be a non-negative integer."
@@ -377,7 +385,7 @@ read."
               (%parse-request-line request-line)
             (multiple-value-bind (headers final-header-bytes)
                 (%read-request-headers source absolute-deadline clock-function
-                                       header-limit header-used)
+                                       header-limit field-limit header-used)
               (let* ((host-values (http-header-values headers "host"))
                      (uri (%request-target-uri method version target host-values
                                                default-authority))
@@ -407,31 +415,40 @@ read."
                             :headers headers
                             :trailers '()
                             :body (%empty-octets))))
-                (let (body trailers)
+                (let ((wire-body-length 0))
+                  (let (body trailers)
                   (cond
                     ((eq transfer-mode :chunked)
-                     (multiple-value-setq (body trailers)
+                     (multiple-value-setq (body trailers wire-body-length)
                        (%read-request-chunked-body
-                        source absolute-deadline clock-function header-limit body-limit
+                        source absolute-deadline clock-function header-limit field-limit
+                        body-limit
                         final-header-bytes
                         :on-body-chunk on-body-chunk
                         :collect-body-p collect-body-p)))
                     (content-length
-                     (setf body (%read-request-exact-body
-                                 source content-length absolute-deadline clock-function
-                                 body-limit :on-body-chunk on-body-chunk
-                                 :collect-body-p collect-body-p)
-                           trailers '()))
+                     (multiple-value-setq (body wire-body-length)
+                       (%read-request-exact-body
+                        source content-length absolute-deadline clock-function
+                        body-limit :on-body-chunk on-body-chunk
+                        :collect-body-p collect-body-p))
+                     (setf trailers '()))
                     (t
                      (setf body (%empty-octets)
                            trailers '())))
+                  (when (and (string= method "TRACE")
+                             (plusp wire-body-length))
+                    (error 'http-protocol-error
+                           :message "TRACE requests must not contain content."
+                           :operation :request-parse
+                           :detail :trace-content))
                   (make-http-request :method method
                                      :protocol-version version
                                      :uri uri
                                      :request-target target
                                      :headers headers
                                      :trailers trailers
-                                     :body body)))))))))
+                                     :body body))))))))))
 
 (defun %serialize-response-content-length (headers)
   (let ((values (http-header-values headers "content-length")))
@@ -534,9 +551,9 @@ body is never written to the wire."
          (body (http-response-body response))
          (head-response-p (or head-p
                               (and request-method
-                                   (string-equal request-method "HEAD"))))
+                                   (string= request-method "HEAD"))))
          (connect-response-p (and request-method
-                                  (string-equal request-method "CONNECT")))
+                                  (string= request-method "CONNECT")))
          (status-bodyless-p (%response-bodyless-status-p status))
          (connect-bodyless-p (and connect-response-p
                                   (<= 200 status 299)))
@@ -556,11 +573,22 @@ body is never written to the wire."
              :name "content-length"
              :reason :ambiguous-framing))
     (when (and transfer-mode
-               (or status-bodyless-p connect-bodyless-p))
+               (or (< status 200)
+                   (= status 204)
+                   connect-bodyless-p))
       (error 'http-invalid-header
              :message "A bodyless HTTP response cannot declare Transfer-Encoding."
              :operation :serialization
              :name "transfer-encoding"
+             :reason :forbidden))
+    (when (and content-length
+               (or (< status 200)
+                   (= status 204)
+                   connect-bodyless-p))
+      (error 'http-invalid-header
+             :message "This bodyless HTTP response cannot declare Content-Length."
+             :operation :serialization
+             :name "content-length"
              :reason :forbidden))
     (when (and (or status-bodyless-p connect-bodyless-p)
                (plusp (length body)))
@@ -638,19 +666,24 @@ body is never written to the wire."
       (%builder-crlf builder)
       (%write-http1-headers builder headers)
       (%builder-crlf builder)
-      (unless (or head-response-p status-bodyless-p connect-bodyless-p)
-        (if (eq transfer-mode :chunked)
-            (progn
-              (unless (zerop (length body))
-                (%builder-write-string builder (format nil "~X" (length body)))
-                (%builder-crlf builder)
-                (%builder-write-octets builder body)
-                (%builder-crlf builder))
-              (%builder-write-string builder "0")
-              (%builder-crlf builder)
-              (%write-http1-trailers builder trailers)
-              (%builder-crlf builder))
-            (%builder-write-octets builder body)))
+      (cond
+        ((and (= status 205) (eq transfer-mode :chunked))
+         (%builder-write-string builder "0")
+         (%builder-crlf builder)
+         (%builder-crlf builder))
+        ((not (or head-response-p status-bodyless-p connect-bodyless-p))
+         (if (eq transfer-mode :chunked)
+             (progn
+               (unless (zerop (length body))
+                 (%builder-write-string builder (format nil "~X" (length body)))
+                 (%builder-crlf builder)
+                 (%builder-write-octets builder body)
+                 (%builder-crlf builder))
+               (%builder-write-string builder "0")
+               (%builder-crlf builder)
+               (%write-http1-trailers builder trailers)
+               (%builder-crlf builder))
+             (%builder-write-octets builder body))))
       (let ((result (make-array (length builder)
                                 :element-type '(unsigned-byte 8))))
         (replace result builder)
@@ -685,6 +718,66 @@ body is never written to the wire."
                         (setf start (1+ comma))))))
     (some #'value-has-token-p (http-header-values headers name))))
 
+(defun %http1-session-upgrade-protocols (headers)
+  (let ((protocols '()))
+    (dolist (value (http-header-values headers "Upgrade"))
+      (loop with start = 0
+            do (let* ((comma (position #\, value :start start))
+                      (end (or comma (length value)))
+                      (protocol (%trim-ows (subseq value start end)))
+                      (slash (position #\/ protocol)))
+                 (unless (and (plusp (length protocol))
+                              (if slash
+                                  (and (plusp slash)
+                                       (< slash (1- (length protocol)))
+                                       (null (position #\/ protocol :start (1+ slash)))
+                                       (%token-p (subseq protocol 0 slash))
+                                       (%token-p (subseq protocol (1+ slash))))
+                                  (%token-p protocol)))
+                   (%http1-session-error
+                    "HTTP/1 Upgrade header contains an invalid protocol."
+                    protocol))
+                 (push protocol protocols)
+                 (unless comma
+                   (return))
+                 (setf start (1+ comma)))))
+    (nreverse protocols)))
+
+(defun %http1-session-validate-upgrade-response (request status response-headers)
+  (when (= status 101)
+    (let* ((request-headers (http-request-headers request))
+           (offered (%http1-session-upgrade-protocols request-headers))
+           (selected (%http1-session-upgrade-protocols response-headers)))
+      (unless (string= (http-request-protocol-version request) "HTTP/1.1")
+        (%http1-session-error
+         "HTTP 101 responses require an HTTP/1.1 request."
+         (http-request-protocol-version request)))
+      (unless (%http1-session-header-token-p request-headers
+                                               "Connection"
+                                               "Upgrade")
+        (%http1-session-error
+         "HTTP 101 responses require Connection: Upgrade in the request."
+         :request-connection))
+      (unless (%http1-session-header-token-p response-headers
+                                               "Connection"
+                                               "Upgrade")
+        (%http1-session-error
+         "HTTP 101 responses require Connection: Upgrade in the response."
+         :response-connection))
+      (unless offered
+        (%http1-session-error
+         "HTTP 101 responses require an Upgrade offer in the request."
+         :request-upgrade))
+      (unless selected
+        (%http1-session-error
+         "HTTP 101 responses require an Upgrade selection in the response."
+         :response-upgrade))
+      (dolist (protocol selected)
+        (unless (member protocol offered :test #'string-equal)
+          (%http1-session-error
+           "HTTP 101 response selected a protocol not offered by the request."
+           protocol))))))
+
 (defun %http1-session-response-reusable-p (request response)
   (let* ((request-headers (http-request-headers request))
          (response-headers (http-response-headers response))
@@ -705,7 +798,7 @@ body is never written to the wire."
                                              "Connection"
                                              "keep-alive"))
          (not (= status 101))
-         (not (and (string-equal method "CONNECT")
+         (not (and (string= method "CONNECT")
                    (and (>= status 200) (< status 300)))))))
 
 (defun %http1-session-response-for-request (request response)
@@ -720,6 +813,33 @@ body is never written to the wire."
          :headers (http-response-headers response)
          :trailers (http-response-trailers response)
          :body (http-response-body response)))))
+
+(defun %http1-session-informational-wires (request information)
+  (unless (listp information)
+    (%http1-session-error
+     "HTTP/1 session handler informational responses must be a list."
+     (type-of information)))
+  (when (and information
+             (not (string= (http-request-protocol-version request)
+                           "HTTP/1.1")))
+    (%http1-session-error
+     "HTTP/1 informational responses require an HTTP/1.1 request."
+     (http-request-protocol-version request)))
+  (mapcar
+   (lambda (response)
+     (unless (http-response-p response)
+       (%http1-session-error
+        "HTTP/1 informational responses must be HTTP responses."
+        (type-of response)))
+     (let ((status (http-response-status response)))
+       (unless (and (>= status 100) (< status 200) (/= status 101))
+         (%http1-session-error
+          "HTTP/1 informational response status must be 100-199 except 101."
+          status)))
+     (serialize-http-response
+      (%http1-session-response-for-request request response)
+      :request-method (http-request-method request)))
+   information))
 
 (defun %http1-session-response-stream-for-request (request response)
   (let ((protocol-version (http-request-protocol-version request)))
@@ -793,8 +913,8 @@ body is never written to the wire."
          (body-function (http-response-stream-body-function response))
          (body-length (http-response-stream-body-length response))
          (request-method (http-request-method request))
-         (head-response-p (string-equal request-method "HEAD"))
-         (connect-response-p (string-equal request-method "CONNECT"))
+         (head-response-p (string= request-method "HEAD"))
+         (connect-response-p (string= request-method "CONNECT"))
          (status-bodyless-p (%response-bodyless-status-p status))
          (connect-bodyless-p (and connect-response-p
                                   (<= 200 status 299)))
@@ -814,7 +934,9 @@ body is never written to the wire."
              :name "content-length"
              :reason :ambiguous-framing))
     (when (and transfer-mode
-               (or status-bodyless-p connect-bodyless-p))
+               (or (< status 200)
+                   (= status 204)
+                   connect-bodyless-p))
       (error 'http-invalid-header
              :message "A bodyless HTTP response cannot declare Transfer-Encoding."
              :operation :serialization
@@ -836,6 +958,17 @@ body is never written to the wire."
              :detail status))
     (%validate-http1-trailers trailers :serialization)
     (cond
+      ((and content-length (= status 304))
+       nil)
+      ((and content-length
+            (or (< status 200)
+                (= status 204)
+                connect-bodyless-p))
+       (error 'http-invalid-header
+              :message "This bodyless HTTP response cannot declare Content-Length."
+              :operation :serialization
+              :name "content-length"
+              :reason :forbidden))
       ((or status-bodyless-p connect-bodyless-p)
        (when (and content-length (plusp content-length))
          (error 'http-invalid-header
@@ -843,13 +976,21 @@ body is never written to the wire."
                 :operation :serialization
                 :name "content-length"
                 :reason :forbidden)))
-      ((and content-length body-length (/= status 304)
+      ((and content-length body-length
             (/= content-length body-length))
        (error 'http-invalid-header
               :message "Content-Length does not match the streamed response length."
               :operation :serialization
               :name "content-length"
               :reason :mismatch)))
+    (when (and content-length
+               (null body-length)
+               (not (or head-response-p status-bodyless-p
+                        connect-bodyless-p)))
+      (error 'http-protocol-error
+             :message "A streamed response with Content-Length requires body-length."
+             :operation :serialization
+             :detail content-length))
     (when (and (or trailers
                    (http-header-values headers "trailer"))
                content-length)
@@ -910,45 +1051,108 @@ body is never written to the wire."
            (produced 0))
       (%write-http1-response-stream-head
        stream protocol-version status reason headers)
-      (unless bodyless-p
-        (loop
-          for chunk = (funcall body-function)
-          do (if (null chunk)
-                 (return)
-                 (let ((octets (%copy-octets chunk :allow-list nil)))
-                   (incf produced (length octets))
-                   (when (and body-length (> produced body-length))
-                     (error 'http-protocol-error
-                            :message "The streamed response body exceeded body-length."
-                            :operation :serialization
-                            :detail body-length))
-                   (when (and content-length (> produced content-length))
-                     (error 'http-invalid-header
-                            :message "The streamed response body exceeded Content-Length."
-                            :operation :serialization
-                            :name "content-length"
-                            :reason :mismatch))
-                   (%write-http1-response-stream-chunk
-                    stream octets transfer-mode))))
-        (when (and body-length (/= produced body-length))
-          (error 'http-protocol-error
-                 :message "The streamed response body ended before body-length."
-                 :operation :serialization
-                 :detail (list :expected body-length :observed produced)))
-        (when (and content-length (/= produced content-length))
-          (error 'http-invalid-header
-                 :message "Content-Length does not match the streamed response body."
-                 :operation :serialization
-                 :name "content-length"
-                 :reason :mismatch))
-        (when (eq transfer-mode :chunked)
-          (%write-http1-response-stream-final-chunk stream trailers)))
+      (cond
+        ((and (= status 205) (eq transfer-mode :chunked))
+         (%write-http1-response-stream-final-chunk stream nil))
+        ((not bodyless-p)
+         (loop
+           for chunk = (funcall body-function)
+           do (if (null chunk)
+                  (return)
+                  (let ((octets (%copy-octets chunk :allow-list nil)))
+                    (incf produced (length octets))
+                    (when (and body-length (> produced body-length))
+                      (error 'http-protocol-error
+                             :message "The streamed response body exceeded body-length."
+                             :operation :serialization
+                             :detail body-length))
+                    (when (and content-length (> produced content-length))
+                      (error 'http-invalid-header
+                             :message "The streamed response body exceeded Content-Length."
+                             :operation :serialization
+                             :name "content-length"
+                             :reason :mismatch))
+                    (%write-http1-response-stream-chunk
+                     stream octets transfer-mode))))
+         (when (and body-length (/= produced body-length))
+           (error 'http-protocol-error
+                  :message "The streamed response body ended before body-length."
+                  :operation :serialization
+                  :detail (list :expected body-length :observed produced)))
+         (when (and content-length (/= produced content-length))
+           (error 'http-invalid-header
+                  :message "Content-Length does not match the streamed response body."
+                  :operation :serialization
+                  :name "content-length"
+                  :reason :mismatch))
+         (when (eq transfer-mode :chunked)
+           (%write-http1-response-stream-final-chunk stream trailers))))
       (values wire-response
               (and framed-p
                    (%http1-session-response-reusable-p request wire-response))))))
 
+(defun %http1-session-upgrade-response-p (request response)
+  (let ((status (http-response-status response)))
+    (or (= status 101)
+        (and (string= (http-request-method request) "CONNECT")
+             (>= status 200)
+             (< status 300)))))
+
+(defun %http1-session-write-handler-response
+    (stream request response information on-upgrade)
+  (let ((stream-response-p (http-response-stream-p response)))
+    (unless (or (http-response-p response) stream-response-p)
+      (%http1-session-error
+       "HTTP/1 session handler must return an HTTP response or response stream."
+       (type-of response)))
+    (let ((status (if stream-response-p
+                      (http-response-stream-status response)
+                      (http-response-status response))))
+      (when (and (>= status 100) (< status 200) (/= status 101))
+        (%http1-session-error
+         "HTTP/1 session handler final response cannot be informational."
+         status))
+      (%http1-session-validate-upgrade-response
+       request
+       status
+       (if stream-response-p
+           (http-response-stream-headers response)
+           (http-response-headers response))))
+    (let* ((information-wires
+             (%http1-session-informational-wires request information))
+           (wire-response
+             (unless stream-response-p
+               (%http1-session-response-for-request request response)))
+           (wire
+             (unless stream-response-p
+               (serialize-http-response
+                wire-response
+                :request-method (http-request-method request)))))
+      (dolist (information-wire information-wires)
+        (write-sequence information-wire stream))
+      (multiple-value-bind (written-response reusable-p)
+          (if stream-response-p
+              (%write-http1-response-stream
+               stream
+               request
+               (%http1-session-response-stream-for-request request response))
+              (progn
+                (write-sequence wire stream)
+                (values wire-response
+                        (%http1-session-response-reusable-p
+                         request wire-response))))
+        (finish-output stream)
+        (if (%http1-session-upgrade-response-p request written-response)
+            (values :upgrade
+                    (and on-upgrade
+                         (not (null (funcall on-upgrade
+                                            stream
+                                            request
+                                            written-response)))))
+            (values (if reusable-p :running :close) nil))))))
+
 (defun serve-http1-session
-    (stream handler &key timeout deadline max-header-bytes max-body-bytes
+    (stream handler &key timeout deadline max-header-bytes max-fields max-body-bytes
              default-authority on-body-chunk (collect-body-p t)
              (on-expect-continue :automatic)
              max-requests on-error on-upgrade (close-stream #'close)
@@ -1021,6 +1225,7 @@ response."
                                        stream
                                        :deadline absolute-deadline
                                        :max-header-bytes max-header-bytes
+                                       :max-fields max-fields
                                        :max-body-bytes max-body-bytes
                                        :default-authority default-authority
                                        :on-body-chunk on-body-chunk
@@ -1032,88 +1237,15 @@ response."
                                     (setf termination :eof)
                                     (progn
                                       (setf request parsed)
-                                      (let* ((response (funcall handler request))
-                                             (stream-response-p
-                                               (http-response-stream-p response)))
-                                        (unless (or (http-response-p response)
-                                                    stream-response-p)
-                                          (%http1-session-error
-                                           "HTTP/1 session handler must return an HTTP response or response stream."
-                                           (type-of response)))
-                                        (let ((status (if stream-response-p
-                                                          (http-response-stream-status response)
-                                                          (http-response-status response))))
-                                          (when (and (>= status 100)
-                                                     (< status 200)
-                                                     (/= status 101))
-                                            (%http1-session-error
-                                             "HTTP/1 session handlers cannot return interim responses."
-                                             status))
-                                          (if stream-response-p
-                                              (multiple-value-bind (wire-response reusable-p)
-                                                  (%write-http1-response-stream
-                                                   stream
-                                                   request
-                                                   (%http1-session-response-stream-for-request
-                                                    request response))
-                                                (finish-output stream)
-                                                (incf count)
-                                                (if (or (= (http-response-status wire-response)
-                                                           101)
-                                                        (and (string-equal
-                                                              (http-request-method request)
-                                                              "CONNECT")
-                                                             (>= (http-response-status
-                                                                  wire-response)
-                                                                 200)
-                                                             (< (http-response-status
-                                                                 wire-response)
-                                                                300)))
-                                                    (progn
-                                                      (when on-upgrade
-                                                        (setf handed-off-p
-                                                              (not (null
-                                                                    (funcall on-upgrade
-                                                                             stream
-                                                                             request
-                                                                             wire-response)))))
-                                                      (setf termination :upgrade))
-                                                    (unless reusable-p
-                                                      (setf termination :close))))
-                                              (let* ((wire-response
-                                                       (%http1-session-response-for-request
-                                                        request response))
-                                                     (wire
-                                                       (serialize-http-response
-                                                        wire-response
-                                                        :request-method
-                                                        (http-request-method request))))
-                                                (write-sequence wire stream)
-                                                (finish-output stream)
-                                                (incf count)
-                                                (if (or (= (http-response-status wire-response)
-                                                           101)
-                                                        (and (string-equal
-                                                              (http-request-method request)
-                                                              "CONNECT")
-                                                             (>= (http-response-status
-                                                                  wire-response)
-                                                                 200)
-                                                             (< (http-response-status
-                                                                 wire-response)
-                                                                300)))
-                                                    (progn
-                                                      (when on-upgrade
-                                                        (setf handed-off-p
-                                                              (not (null
-                                                                    (funcall on-upgrade
-                                                                             stream
-                                                                             request
-                                                                             wire-response)))))
-                                                      (setf termination :upgrade))
-                                                    (unless (%http1-session-response-reusable-p
-                                                             request wire-response)
-                                                      (setf termination :close))))))))))
+                                      (multiple-value-bind (response information)
+                                          (funcall handler request)
+                                        (multiple-value-bind (next-termination
+                                                              next-handed-off-p)
+                                            (%http1-session-write-handler-response
+                                             stream request response information on-upgrade)
+                                          (incf count)
+                                          (setf termination next-termination
+                                                handed-off-p next-handed-off-p))))))
                             (error (caught-condition)
                               (when on-error
                                 (funcall on-error caught-condition request))

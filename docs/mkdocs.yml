@@ -63,3 +63,5 @@ nav:
       - Compatibility: reference/compatibility.md
   - Project:
       - Development: project/development.md
+      - Changelog: project/changelog.md
+      - Migration guide: project/migration.md

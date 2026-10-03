@@ -7,8 +7,11 @@
 (defconstant +http3-push-promise-type+ 5)
 (defconstant +http3-goaway-type+ 7)
 (defconstant +http3-max-push-id-type+ 13)
+(defconstant +http3-priority-update-request-type+ #xf0700)
+(defconstant +http3-priority-update-push-type+ #xf0701)
 
 (defconstant +http3-control-stream-type+ 0)
+(defconstant +http3-push-stream-type+ 1)
 (defconstant +http3-qpack-encoder-stream-type+ 2)
 (defconstant +http3-qpack-decoder-stream-type+ 3)
 
@@ -66,6 +69,64 @@
      (http3-varint-encode (http3-frame-type frame))
      (http3-varint-encode (length payload))
      payload)))
+
+(defun %http3-priority-field-value-octets (value)
+  (unless (stringp value)
+    (%http3-frame-error "An HTTP Priority Field Value must be a string."
+                        (type-of value)))
+  (let ((octets (make-array (length value) :element-type '(unsigned-byte 8))))
+    (loop for character across value
+          for code = (char-code character)
+          for position from 0
+          unless (or (= code 9) (<= 32 code 126))
+            do (%http3-frame-error
+                "An HTTP Priority Field Value must contain only ASCII field-value characters."
+                (list position code))
+          do (setf (aref octets position) code))
+    octets))
+
+(defun make-http3-priority-update-frame
+    (&key element-id priority-field-value (kind :request))
+  "Construct an RFC 9218 PRIORITY_UPDATE frame for a request or push."
+  (unless (and (integerp element-id) (<= 0 element-id +http3-max-varint+))
+    (%http3-frame-error "An HTTP/3 prioritized element identifier is invalid."
+                        element-id))
+  (let ((type (ecase kind
+                (:request +http3-priority-update-request-type+)
+                (:push +http3-priority-update-push-type+))))
+    (make-http3-frame
+     :type type
+     :payload (%http3-concatenate-octets
+               (http3-varint-encode element-id)
+               (%http3-priority-field-value-octets priority-field-value)))))
+
+(defun decode-http3-priority-update (frame)
+  "Return the element identifier, Priority Field Value, and kind of FRAME."
+  (unless (and (http3-frame-p frame)
+               (member (http3-frame-type frame)
+                       (list +http3-priority-update-request-type+
+                             +http3-priority-update-push-type+)
+                       :test #'=))
+    (%http3-frame-error "The frame is not an HTTP/3 PRIORITY_UPDATE frame."
+                        (and (http3-frame-p frame) (http3-frame-type frame))))
+  (let ((payload (http3-frame-payload frame)))
+    (multiple-value-bind (element-id position)
+        (http3-varint-decode payload)
+      (let ((value
+              (coerce
+               (loop for index from position below (length payload)
+                     for code = (aref payload index)
+                     unless (or (= code 9) (<= 32 code 126))
+                       do (%http3-frame-error
+                           "An HTTP/3 PRIORITY_UPDATE value contains a non-ASCII field-value octet."
+                           (list index code))
+                     collect (code-char code))
+               'string)))
+        (values element-id value
+                (if (= (http3-frame-type frame)
+                       +http3-priority-update-request-type+)
+                    :request
+                    :push))))))
 
 (defun %http3-decode-one-frame (octets position allow-incomplete-p max-frame-size)
   (multiple-value-bind (type after-type)
@@ -131,6 +192,20 @@ second value; otherwise it signals a protocol error."
                         (list name value)))
   value)
 
+(defun %http3-validate-setting (identifier value)
+  (when (<= +http3-setting-enable-push+ identifier 5)
+    (%http3-frame-error
+     "HTTP/2-specific settings are prohibited in HTTP/3."
+     identifier))
+  (when (and (member identifier
+                     (list +http3-setting-enable-connect+
+                           +http3-setting-h3-datagram+)
+                     :test #'=)
+             (> value 1))
+    (%http3-frame-error "HTTP/3 boolean settings must be either 0 or 1."
+                        (cons identifier value)))
+  value)
+
 (defun %http3-setting-pairs (qpack-max-table-capacity
                              max-field-section-size
                              qpack-blocked-streams
@@ -167,10 +242,7 @@ second value; otherwise it signals a protocol error."
     (setf pairs (nreverse pairs))
     (let ((seen '()))
       (dolist (pair pairs)
-        (when (= (car pair) +http3-setting-enable-push+)
-          (%http3-frame-error
-           "HTTP/3 SETTINGS_ENABLE_PUSH is prohibited by the protocol."
-           (car pair)))
+        (%http3-validate-setting (car pair) (cdr pair))
         (when (member (car pair) seen)
           (%http3-frame-error "An HTTP/3 SETTINGS frame cannot contain duplicate identifiers."
                               (car pair)))
@@ -223,10 +295,7 @@ second value; otherwise it signals a protocol error."
                      (%http3-frame-error
                       "An HTTP/3 SETTINGS payload cannot contain duplicate identifiers."
                       identifier))
-                   (when (= identifier +http3-setting-enable-push+)
-                     (%http3-frame-error
-                      "HTTP/3 SETTINGS_ENABLE_PUSH is prohibited by the protocol."
-                      identifier))
+                   (%http3-validate-setting identifier value)
                    (push (cons identifier value) settings)
                    (setf position next-value))))
       (nreverse settings))))
@@ -234,13 +303,17 @@ second value; otherwise it signals a protocol error."
 (defstruct (http3-control-state
             (:constructor make-http3-control-state
                 (&key (settings-received-p nil) settings goaway-id
-                      max-push-id (cancelled-push-ids '()))))
+                      max-push-id (promised-push-ids '())
+                      (cancelled-push-ids '()) (priority-updates '()) peer-role)))
   "Mutable state for one HTTP/3 control stream."
   (settings-received-p nil :type boolean)
   settings
   goaway-id
   max-push-id
-  (cancelled-push-ids '() :type list))
+  peer-role
+  (promised-push-ids '() :type list)
+  (cancelled-push-ids '() :type list)
+  (priority-updates '() :type list))
 
 (defun %http3-control-error (message &optional detail)
   (error 'http-protocol-error
@@ -279,6 +352,15 @@ are ignored and return :EXTENSION, as required by HTTP/3 extensibility rules."
       (%http3-control-error
        "The first HTTP/3 control-stream frame must be SETTINGS."
        type))
+    (when (and (null (http3-control-state-peer-role state))
+               (member type (list +http3-goaway-type+
+                                  +http3-max-push-id-type+
+                                  +http3-cancel-push-type+
+                                  +http3-priority-update-request-type+
+                                  +http3-priority-update-push-type+)))
+      (%http3-control-error
+       "HTTP/3 role-sensitive control frames require a peer role."
+       type))
     (cond
       ((= type +http3-settings-type+)
        (when (http3-control-state-settings-received-p state)
@@ -290,6 +372,11 @@ are ignored and return :EXTENSION, as required by HTTP/3 extensibility rules."
        :settings)
       ((= type +http3-goaway-type+)
        (let ((id (%http3-control-payload-varint frame "GOAWAY")))
+         (when (and (eq (http3-control-state-peer-role state) :server)
+                    (not (zerop (mod id 4))))
+           (%http3-control-error
+            "A server HTTP/3 GOAWAY identifier must identify a client-initiated bidirectional stream."
+            id))
          (when (and (http3-control-state-goaway-id state)
                     (> id (http3-control-state-goaway-id state)))
            (%http3-control-error
@@ -298,6 +385,10 @@ are ignored and return :EXTENSION, as required by HTTP/3 extensibility rules."
          (setf (http3-control-state-goaway-id state) id)
          :goaway))
       ((= type +http3-max-push-id-type+)
+       (when (eq (http3-control-state-peer-role state) :server)
+         (%http3-control-error
+          "An HTTP/3 server cannot send MAX_PUSH_ID."
+          :h3-frame-unexpected))
        (let ((id (%http3-control-payload-varint frame "MAX_PUSH_ID")))
          (when (and (http3-control-state-max-push-id state)
                     (< id (http3-control-state-max-push-id state)))
@@ -308,8 +399,49 @@ are ignored and return :EXTENSION, as required by HTTP/3 extensibility rules."
          :max-push-id))
       ((= type +http3-cancel-push-type+)
        (let ((id (%http3-control-payload-varint frame "CANCEL_PUSH")))
+         (unless (eq (http3-control-state-peer-role state) :server)
+           (unless (and (http3-control-state-max-push-id state)
+                        (<= id (http3-control-state-max-push-id state))
+                        (member id
+                                (http3-control-state-promised-push-ids state)
+                                :test #'eql))
+             (%http3-control-error
+              "HTTP/3 CANCEL_PUSH must identify a promised push within MAX_PUSH_ID."
+              :h3-id-error)))
          (pushnew id (http3-control-state-cancelled-push-ids state) :test #'eql)
          :cancel-push))
+      ((member type (list +http3-priority-update-request-type+
+                          +http3-priority-update-push-type+)
+               :test #'=)
+       (when (eq (http3-control-state-peer-role state) :server)
+         (%http3-control-error
+          "An HTTP/3 server cannot send PRIORITY_UPDATE."
+          :h3-frame-unexpected))
+       (multiple-value-bind (element-id value kind)
+           (decode-http3-priority-update frame)
+         (if (eq kind :request)
+             (unless (zerop (mod element-id 4))
+               (%http3-control-error
+                "An HTTP/3 request PRIORITY_UPDATE must identify a client-initiated bidirectional stream."
+                :h3-id-error))
+             (unless (and (http3-control-state-max-push-id state)
+                          (<= element-id
+                              (http3-control-state-max-push-id state))
+                          (member element-id
+                                  (http3-control-state-promised-push-ids state)
+                                  :test #'eql))
+               (%http3-control-error
+                "An HTTP/3 push PRIORITY_UPDATE must identify a promised push within MAX_PUSH_ID."
+                :h3-id-error)))
+         (let* ((key (cons kind element-id))
+                (entry (assoc key
+                              (http3-control-state-priority-updates state)
+                              :test #'equal)))
+           (if entry
+               (setf (cdr entry) value)
+               (push (cons key value)
+                     (http3-control-state-priority-updates state))))
+         :priority-update))
       ((member type (list +http3-data-type+
                          +http3-headers-type+
                          +http3-push-promise-type+)
@@ -342,3 +474,11 @@ caller must reject a non-empty suffix when the stream reaches FIN."
 (defun http3-control-stream-prefix ()
   "Return the unidirectional stream-type prefix for an HTTP/3 control stream."
   (http3-varint-encode +http3-control-stream-type+))
+
+(defun http3-qpack-encoder-stream-prefix ()
+  "Return the unidirectional stream-type prefix for a QPACK encoder stream."
+  (http3-varint-encode +http3-qpack-encoder-stream-type+))
+
+(defun http3-qpack-decoder-stream-prefix ()
+  "Return the unidirectional stream-type prefix for a QPACK decoder stream."
+  (http3-varint-encode +http3-qpack-decoder-stream-type+))

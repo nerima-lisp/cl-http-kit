@@ -62,13 +62,16 @@
             (server-error nil))
         (unwind-protect
              (progn
+               #+sbcl
                (setf server-thread
                      (sb-thread:make-thread
                       (lambda ()
                         (handler-case
                             (progn
+                              #+sbcl
                               (setf accepted-socket
                                     (sb-bsd-sockets:socket-accept listener))
+                              #+sbcl
                               (setf server-stream
                                     (sb-bsd-sockets:socket-make-stream
                                      accepted-socket
@@ -87,7 +90,8 @@
                         (%network-test-close-stream server-stream)
                         (%network-test-close-socket accepted-socket))))
                (let* ((client
-                        (make-http-client
+                       (make-http-client
+                         :automatic-decompression-p nil
                          :open-stream (make-http-network-stream-opener)
                          :close-stream #'close-http-tcp-stream))
                       (request
@@ -100,6 +104,7 @@
                    (ensure-equal "ok"
                                  (octets-as-string (http-response-body response)))
                    (ensure-equal request effective-request)))
+               #+sbcl
                (sb-thread:join-thread server-thread)
                (ensure-true (null server-error))
                (ensure-true request-wire)
@@ -110,8 +115,9 @@
             (%network-test-close-stream server-stream)
             (%network-test-close-socket accepted-socket)
             (%network-test-close-socket listener)
-            (http-kit::%with-http-cleanup
-              (sb-thread:join-thread server-thread)))
+              (http-kit::%with-http-cleanup
+                #+sbcl
+                (sb-thread:join-thread server-thread)))
           (unless server-thread
             (%network-test-close-socket listener))))))
 
@@ -130,6 +136,43 @@
          :deadline 0
          :clock-function (lambda () 1)))))
 
+  (deftest native-network-read-deadline
+    (multiple-value-bind (listener port)
+        (%network-test-listener)
+      (let ((server-thread nil)
+            (accepted-socket nil)
+            (server-stream nil))
+        (unwind-protect
+             (progn
+               (setf server-thread
+                     (sb-thread:make-thread
+                      (lambda ()
+                        (setf accepted-socket
+                              (sb-bsd-sockets:socket-accept listener))
+                        (setf server-stream
+                              (sb-bsd-sockets:socket-make-stream
+                               accepted-socket
+                               :input t
+                               :output t
+                               :element-type '(unsigned-byte 8)
+                               :buffering :full))
+                        (sleep 1))))
+               (let ((stream
+                       (open-http-tcp-stream
+                        (make-http-request
+                         :method "GET"
+                         :uri (format nil "http://127.0.0.1:~D/" port)))))
+                 (unwind-protect
+                      (signals http-timeout
+                        (parse-http-response stream :timeout 0.01))
+                   (close-http-tcp-stream stream))))
+          (when server-thread
+            (%network-test-close-stream server-stream)
+            (%network-test-close-socket accepted-socket)
+            (http-kit::%with-http-cleanup
+              (sb-thread:join-thread server-thread)))
+          (%network-test-close-socket listener)))))
+
   (deftest native-network-listener-accept
     (let ((listener (open-http-tcp-listener
                      :host "127.0.0.1"
@@ -146,28 +189,30 @@
              (ensure-equal "127.0.0.1"
                            (http-network-listener-address listener))
              (ensure-true (plusp (http-network-listener-port listener)))
-             (setf server-thread
-                   (sb-thread:make-thread
-                    (lambda ()
-                      (handler-case
-                          (multiple-value-bind (stream address port)
-                              (accept-http-tcp-stream listener :timeout 5)
-                            (setf peer-address address
-                                  peer-port port)
-                            (let ((request-wire
-                                    (%network-test-read-headers stream)))
-                              (ensure-true
-                               (search "GET / HTTP/1.1"
-                                       (octets-as-string request-wire)))
-                              (write-sequence
-                               (ascii "HTTP/1.1 200 OK|CRLF|Content-Length: 2|CRLF|Connection: close|CRLF||CRLF|ok")
-                               stream)
-                              (finish-output stream)
-                              (%network-test-close-stream stream)))
-                        (error (condition)
-                          (setf server-error condition))))))
+              #+sbcl
+              (setf server-thread
+                    (sb-thread:make-thread
+                     (lambda ()
+                       (handler-case
+                           (multiple-value-bind (stream address port)
+                               (accept-http-tcp-stream listener :timeout 5)
+                             (setf peer-address address
+                                   peer-port port)
+                             (let ((request-wire
+                                     (%network-test-read-headers stream)))
+                               (ensure-true
+                                (search "GET / HTTP/1.1"
+                                        (octets-as-string request-wire)))
+                               (write-sequence
+                                (ascii "HTTP/1.1 200 OK|CRLF|Content-Length: 2|CRLF|Connection: close|CRLF||CRLF|ok")
+                                stream)
+                               (finish-output stream)
+                               (%network-test-close-stream stream)))
+                         (error (condition)
+                           (setf server-error condition))))))
              (let* ((client
                       (make-http-client
+                       :automatic-decompression-p nil
                        :open-stream (make-http-network-stream-opener)
                        :close-stream #'close-http-tcp-stream))
                     (request
@@ -181,12 +226,14 @@
                  (ensure-equal "ok"
                                (octets-as-string (http-response-body response)))
                  (ensure-equal request effective-request)))
+             #+sbcl
              (sb-thread:join-thread server-thread)
              (ensure-true (null server-error))
              (ensure-equal "127.0.0.1" peer-address)
              (ensure-true (plusp peer-port)))
         (when server-thread
           (http-kit::%with-http-cleanup
+            #+sbcl
             (sb-thread:join-thread server-thread)))
         (close-http-tcp-listener listener))))
 
@@ -232,6 +279,7 @@
                         (setf server-error condition))))))
            (let* ((client
                     (make-http-client
+                     :automatic-decompression-p nil
                      :open-stream (make-http-network-stream-opener)
                      :close-stream #'close-http-tcp-stream))
                   (request

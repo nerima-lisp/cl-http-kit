@@ -1,7 +1,7 @@
 (in-package #:http-kit)
 
 (defun parse-http-response (input &key timeout deadline
-                                      max-header-bytes max-body-bytes
+                                      max-header-bytes max-fields max-body-bytes
                                       request-method
                                       on-body-chunk
                                       on-information
@@ -17,17 +17,23 @@ REQUEST-METHOD as \"HEAD\" for the bodyless response semantics of HEAD."
          (absolute-deadline (http-deadline timeout :deadline deadline
                                            :clock-function clock-function))
          (header-limit (or max-header-bytes *default-max-header-bytes*))
+         (field-limit (or max-fields *default-max-fields*))
          (body-limit (or max-body-bytes *default-max-body-bytes*))
          (head-response-p (and (stringp request-method)
-                               (string-equal request-method "HEAD")))
+                               (string= request-method "HEAD")))
          (connect-response-p (and (stringp request-method)
-                                  (string-equal request-method "CONNECT")))
+                                  (string= request-method "CONNECT")))
          (header-used 0))
     (unless (and (integerp header-limit) (plusp header-limit))
       (error 'http-protocol-error
              :message "The response header limit must be a positive integer."
              :operation :response-parse
              :detail header-limit))
+    (unless (and (integerp field-limit) (plusp field-limit))
+      (error 'http-protocol-error
+             :message "The response field limit must be a positive integer."
+             :operation :response-parse
+             :detail field-limit))
     (unless (and (integerp body-limit) (>= body-limit 0))
       (error 'http-protocol-error
              :message "The response body limit must be a non-negative integer."
@@ -56,27 +62,16 @@ REQUEST-METHOD as \"HEAD\" for the bodyless response semantics of HEAD."
             (%parse-status-line status-line)
           (multiple-value-bind (headers final-header-bytes)
               (%read-response-headers source absolute-deadline clock-function
-                                      header-limit header-used)
+                                      header-limit field-limit header-used)
             (setf header-used final-header-bytes)
             (let ((transfer-encoding (%response-transfer-encoding headers))
                   (content-length (%response-content-length headers)))
-              (when (and transfer-encoding content-length)
-                (error 'http-invalid-header
-                       :message "Transfer-Encoding and Content-Length must not be combined."
-                       :operation :response-parse
-                       :name "content-length"
-                       :reason :framing-conflict))
-              (when (and (string= protocol-version "HTTP/1.0")
-                         transfer-encoding)
-                (error 'http-unsupported-feature
-                       :message "HTTP/1.0 transfer codings are unsupported."
-                       :operation :response-parse
-                       :feature :http1-transfer-encoding
-                       :detail transfer-encoding))
+              (%validate-http-response-framing
+               protocol-version status transfer-encoding content-length)
               (when (= status 101)
-                (when (and content-length (plusp content-length))
+                (when content-length
                   (error 'http-invalid-header
-                         :message "A 101 Switching Protocols response cannot declare a non-zero Content-Length."
+                         :message "A 101 Switching Protocols response cannot declare Content-Length."
                          :operation :response-parse
                          :name "content-length"
                          :reason :forbidden))
@@ -87,33 +82,57 @@ REQUEST-METHOD as \"HEAD\" for the bodyless response semantics of HEAD."
                          :name "transfer-encoding"
                          :reason :forbidden))
                 (return
-                  (make-http-response :protocol-version protocol-version
-                                      :status status :reason reason
-                                      :headers headers :trailers '()
-                                      :body (%empty-octets))))
+                  (%make-header-only-http-response
+                   protocol-version status reason headers)))
               ;; Informational responses do not carry a response body;
               ;; notify the caller and continue until the final response.
               ;; The 101 case above is a protocol switch rather than an
               ;; interim response.
               (if (< status 200)
-                  (when on-information
-                    (funcall on-information
-                             (make-http-response
-                              :protocol-version protocol-version
-                              :status status :reason reason
-                              :headers headers :trailers '()
-                              :body (%empty-octets))))
+                  (progn
+                    (when content-length
+                      (error 'http-invalid-header
+                             :message "An informational response cannot declare Content-Length."
+                             :operation :response-parse
+                             :name "content-length"
+                             :reason :forbidden))
+                    (when transfer-encoding
+                      (error 'http-invalid-header
+                             :message "An informational response cannot declare Transfer-Encoding."
+                             :operation :response-parse
+                             :name "transfer-encoding"
+                             :reason :forbidden))
+                    (when on-information
+                      (funcall on-information
+                               (make-http-response
+                                :protocol-version protocol-version
+                                :status status :reason reason
+                                :headers headers :trailers '()
+                                :body (%empty-octets)))))
                   (let ((body (%empty-octets))
                         (trailers '()))
                     (cond
+                      ((and (= status 205) transfer-encoding)
+                       (multiple-value-bind (decoded-body decoded-trailers decoded-length)
+                           (%read-chunked-body source absolute-deadline clock-function
+                                               header-limit field-limit body-limit header-used
+                                               :on-body-chunk on-body-chunk
+                                               :collect-body-p collect-body-p)
+                         (unless (zerop decoded-length)
+                           (error 'http-protocol-error
+                                  :message "A 205 response cannot carry response content."
+                                  :operation :response-parse
+                                  :detail decoded-length))
+                         (setf body decoded-body
+                               trailers decoded-trailers)))
                       ((or head-response-p
                            (and connect-response-p
                                 (<= 200 status 299))
                            (= status 204)
                            (= status 205)
                            (= status 304))
-                       (when (and (or (not head-response-p)
-                                      connect-response-p)
+                       (when (and (or (= status 204)
+                                      (= status 205))
                                   content-length
                                   (plusp content-length))
                          (error 'http-invalid-header
@@ -121,17 +140,28 @@ REQUEST-METHOD as \"HEAD\" for the bodyless response semantics of HEAD."
                                 :operation :response-parse
                                 :name "content-length"
                                 :reason :forbidden))
-                       (when (and connect-response-p transfer-encoding)
+                       (when (and (or (and connect-response-p
+                                           (<= 200 status 299))
+                                      (= status 204))
+                                  transfer-encoding)
                          (error 'http-invalid-header
-                                :message "A successful CONNECT response cannot declare Transfer-Encoding."
+                                :message "This bodyless response cannot declare Transfer-Encoding."
                                 :operation :response-parse
                                 :name "transfer-encoding"
+                                :reason :forbidden))
+                       (when (and connect-response-p
+                                  (<= 200 status 299)
+                                  content-length)
+                         (error 'http-invalid-header
+                                :message "A successful CONNECT response cannot declare Content-Length."
+                                :operation :response-parse
+                                :name "content-length"
                                 :reason :forbidden))
                        (setf body (%empty-octets)))
                       (transfer-encoding
                        (multiple-value-setq (body trailers)
                          (%read-chunked-body source absolute-deadline clock-function
-                                             header-limit body-limit header-used
+                                             header-limit field-limit body-limit header-used
                                              :on-body-chunk on-body-chunk
                                              :collect-body-p collect-body-p)))
                       (content-length

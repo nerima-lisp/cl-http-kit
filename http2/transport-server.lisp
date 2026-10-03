@@ -9,7 +9,7 @@
 
 (defstruct (%h2-server-stream
             (:constructor %make-h2-server-stream
-                (id &key request method scheme authority target headers
+                (id &key request method protocol scheme authority target headers
                     (body (make-array 0 :element-type '(unsigned-byte 8)
                                        :adjustable t :fill-pointer 0))
                     expected-body-length (body-length-seen 0) trailers
@@ -19,6 +19,7 @@
   id
   request
   method
+  protocol
   scheme
   authority
   target
@@ -76,7 +77,8 @@
              :operation :http2-server
              :detail value))))
 
-(defun %h2-server-header-fields (fields default-authority)
+(defun %h2-server-header-fields (fields default-authority
+                                 &key enable-connect-p)
   "Parse a decoded request header block.
 
 Returns METHOD, SCHEME, AUTHORITY, TARGET, and regular HEADERS.  Request
@@ -86,6 +88,7 @@ pseudo-fields are kept separate because they are not ordinary HTTP headers.
         (scheme nil)
         (authority nil)
         (path nil)
+        (protocol nil)
         (regular '())
         (seen-pseudo (make-hash-table :test #'equal))
         (regular-seen-p nil))
@@ -97,7 +100,7 @@ pseudo-fields are kept separate because they are not ordinary HTTP headers.
                           field))
       (let ((name (car field))
             (value (cdr field)))
-        (if (and (plusp (length name))
+        (if (and (string/= name "")
                  (char= (char name 0) #\:))
             (progn
               (when regular-seen-p
@@ -111,66 +114,90 @@ pseudo-fields are kept separate because they are not ordinary HTTP headers.
                 ((string= name ":scheme") (setf scheme value))
                 ((string= name ":authority") (setf authority value))
                 ((string= name ":path") (setf path value))
-                ((string= name ":protocol")
-                 (error 'http-kit:http-unsupported-feature
-                        :feature :http2-extended-connect
-                        :operation :http2-server
-                        :message "Extended CONNECT is not implemented"))
+                ((string= name ":protocol") (setf protocol value))
                 (t (%h2-server-invalid-header name "Unknown request pseudo-field"))))
             (progn
               (setf regular-seen-p t)
-              (unless (%h2-regular-header-valid-p name value)
+              (unless (%h2-regular-header-valid-p name value :allow-te-p t)
                 (%h2-server-invalid-header name "Forbidden HTTP/2 header field"))
               (push (http-kit:make-http-header name value) regular)))))
     (setf regular (nreverse regular))
-    (unless (and method (plusp (length method))
+    (unless (and method (string/= method "")
                  (http-kit::%token-p method))
       (%h2-server-invalid-header ":method" "Missing or invalid method"))
-    (setf authority (or authority default-authority))
+    (when (and protocol
+               (or (not (string= method "CONNECT"))
+                   (not (http-kit::%token-p protocol))))
+      (%h2-server-invalid-header ":protocol"
+                                 "Only CONNECT may carry a valid :protocol"))
+    (when (and protocol (not enable-connect-p))
+      (%h2-server-invalid-header
+       ":protocol" "Extended CONNECT was not enabled by server SETTINGS"))
+    (let ((host-values (http-kit:http-header-values regular "host")))
+      (setf authority (or authority (first host-values) default-authority))
+      (when host-values
+        (%h2-validate-host-values host-values authority)))
     (unless (and (stringp authority) (plusp (length authority)))
       (%h2-server-invalid-header ":authority" "Missing authority"))
-    (let* ((connect-p (string-equal method "CONNECT"))
+    (let* ((connect-p (string= method "CONNECT"))
            (target
              (cond
                (connect-p
-                (when (or scheme path)
-                  (%h2-server-invalid-header ":path"
-                                             "CONNECT must use authority-form"))
-                authority)
+                (if protocol
+                    (progn
+                      (unless (and scheme (plusp (length scheme)))
+                        (%h2-server-invalid-header ":scheme"
+                                                   "Extended CONNECT requires :scheme"))
+                      (unless (and path (plusp (length path))
+                                   (char= (char path 0) #\/))
+                        (%h2-server-invalid-header ":path"
+                                                   "Extended CONNECT requires origin-form :path"))
+                      path)
+                    (progn
+                      (when (or scheme path)
+                        (%h2-server-invalid-header ":path"
+                                                   "CONNECT must use authority-form"))
+                      authority)))
                (t
-                (unless (and scheme (plusp (length scheme)))
+                (unless (and scheme (string/= scheme ""))
                   (%h2-server-invalid-header ":scheme" "Missing scheme"))
-                (unless (and path (plusp (length path)))
+                (unless (and path (string/= path ""))
                   (%h2-server-invalid-header ":path" "Missing path"))
                 (unless (or (string= path "*")
                             (char= (char path 0) #\/))
                   (%h2-server-invalid-header ":path" "Path must be origin-form"))
+                (when (and (string= path "*")
+                           (not (string= method "OPTIONS")))
+                  (%h2-server-invalid-header
+                   ":path" "Asterisk-form is valid only for OPTIONS"))
                 path))))
       (handler-case
           (http-kit::%authority-parts authority authority)
         (http-kit:http-invalid-uri ()
           (%h2-server-invalid-header ":authority" "Invalid authority")))
-      (when (and (not connect-p)
+      (when (and (or (not connect-p) protocol)
                  (not (member (string-downcase scheme)
                               '("http" "https") :test #'string=)))
         (error 'http-kit:http-unsupported-feature
                :feature :http2-scheme
                :operation :http2-server
                :message "Only HTTP and HTTPS URI schemes are supported"))
-      (let ((host-values (http-kit:http-header-values regular "host")))
-        (when host-values
-          (%h2-validate-host-values host-values authority)))
       (values method
-              (if connect-p "http" (string-downcase scheme))
+              (if (and connect-p (null protocol))
+                  "http"
+                  (string-downcase scheme))
               authority
               target
+              protocol
               regular))))
 
 (defun %h2-server-make-request (state collect-body-p)
   (let* ((target (%h2-server-stream-target state))
-         (connect-p (string-equal (%h2-server-stream-method state) "CONNECT"))
-         (path (if connect-p "/" target))
-         (query-start (and (not connect-p) (position #\? path)))
+         (connect-p (string= (%h2-server-stream-method state) "CONNECT"))
+         (authority-connect-p
+           (and connect-p (null (%h2-server-stream-protocol state))))
+         (path (if authority-connect-p "/" target))
+         (query-start (and (not authority-connect-p) (position #\? path)))
          (uri-path (if query-start (subseq path 0 query-start) path))
          (query (and query-start (subseq path (1+ query-start))))
          (uri (http-kit:make-http-uri
@@ -180,6 +207,7 @@ pseudo-fields are kept separate because they are not ordinary HTTP headers.
                :query query)))
     (http-kit:make-http-request
      :method (%h2-server-stream-method state)
+     :protocol (%h2-server-stream-protocol state)
      :uri uri
      :request-target target
      :protocol-version "HTTP/2"
@@ -200,9 +228,11 @@ pseudo-fields are kept separate because they are not ordinary HTTP headers.
     next))
 
 (defun %h2-server-frame-flags-valid-p (frame mask)
-  (= (logand (%h2-frame-flags frame) (lognot mask)) 0))
+  (declare (ignore frame mask))
+  t)
 
-(defun %h2-server-materialize-response (response request)
+(defun %h2-server-materialize-response (response request
+                                        &key informational-p)
   (let ((status nil)
         (headers nil)
         (trailers nil)
@@ -232,19 +262,25 @@ pseudo-fields are kept separate because they are not ordinary HTTP headers.
               :message "HTTP/2 handler must return an HTTP response"
               :operation :http2-server
               :detail response)))
-    (unless (and (integerp status) (<= 100 status 999))
+    (unless (and (integerp status) (<= 100 status 599))
       (error 'http-kit:http-invalid-status
              :code status
              :operation :http2-server
              :message "Invalid HTTP/2 response status"))
-    (when (or (< status 200) (= status 101))
-      (error 'http-kit:http-unsupported-feature
-             :feature :http2-informational-response
-             :operation :http2-server
-             :message "A single HTTP/2 response must be final"))
+    (if informational-p
+        (unless (and (< status 200) (/= status 101))
+          (error 'http-kit:http-protocol-error
+                 :operation :http2-server
+                 :message "An HTTP/2 informational response must have status 100-199 other than 101"
+                 :detail status))
+        (when (< status 200)
+          (error 'http-kit:http-protocol-error
+                 :operation :http2-server
+                 :message "The final HTTP/2 response must have status 200 or greater"
+                 :detail status)))
     (let* ((actual-body-length (length body))
            (method (http-kit:http-request-method request))
-           (no-body (or (string-equal method "HEAD")
+           (no-body (or (string= method "HEAD")
                         (= status 204)
                         (= status 205)
                         (= status 304)
@@ -252,6 +288,7 @@ pseudo-fields are kept separate because they are not ordinary HTTP headers.
       (multiple-value-bind (validated)
           (%h2-finish-response status headers trailers body
                                :no-body no-body
+                               :request-method method
                                :body-length actual-body-length)
         (declare (ignore validated)))
       (when (and body-length (/= body-length actual-body-length))
@@ -263,6 +300,7 @@ pseudo-fields are kept separate because they are not ordinary HTTP headers.
     (stream handler &key timeout deadline
              (max-frame-size +http2-default-max-frame-size+)
              (max-header-bytes http-kit::*default-max-header-bytes*)
+             (max-fields 256)
              (max-body-bytes http-kit::*default-max-body-bytes*)
              default-authority
              (collect-body-p t)
@@ -271,7 +309,8 @@ pseudo-fields are kept separate because they are not ordinary HTTP headers.
              on-error
              (close-stream #'close)
              (clock-function #'http-kit::%monotonic-time)
-             (huffman-p nil))
+             (huffman-p nil)
+             (enable-connect-p nil))
   "Serve one HTTP/2 connection on STREAM.
 
 The caller owns the network transport and supplies HANDLER.  This function
@@ -321,8 +360,14 @@ values.
            :message "HTTP/2 collect-body-p must be boolean"
            :operation :http2-server
            :detail collect-body-p))
+  (unless (member enable-connect-p '(nil t))
+    (error 'http-kit:http-protocol-error
+           :message "HTTP/2 enable-connect-p must be boolean"
+           :operation :http2-server
+           :detail enable-connect-p))
   (%h2-validate-frame-size max-frame-size)
   (%h2-validate-limit :max-header-bytes max-header-bytes)
+  (%h2-validate-limit :max-fields max-fields)
   (%h2-validate-limit :max-body-bytes max-body-bytes :allow-zero t)
   (let ((request-count 0)
         (termination :running)
@@ -344,6 +389,7 @@ values.
                       (last-client-stream-id 0)
                       (goaway-sent-p nil)
                       (peer-max-frame-size +http2-default-max-frame-size+)
+                      (peer-max-header-list-size nil)
                       (peer-initial-window-size +http2-default-window-size+)
                       (peer-connection-window +http2-default-window-size+)
                       (receive-connection-window +http2-default-window-size+)
@@ -375,16 +421,23 @@ values.
                    (unless (and (= (%h2-frame-type first-frame)
                                    +http2-settings-type+)
                                 (zerop (%h2-frame-stream-id first-frame))
-                                (zerop (%h2-frame-flags first-frame)))
+                                (zerop (logand (%h2-frame-flags first-frame)
+                                              +http2-ack-flag+)))
                      (%h2-server-error
                       "HTTP/2 first frame must be a non-ACK SETTINGS frame"
                       first-frame))
                    (multiple-value-bind
                          (new-max-frame-size new-table-size
-                          new-initial-window-size)
-                       (%h2-settings (%h2-frame-payload first-frame))
+                          new-initial-window-size enable-connect-protocol
+                          max-concurrent-streams max-header-list-size)
+                       (%h2-settings (%h2-frame-payload first-frame)
+                                     :peer-role :client)
+                     (declare (ignore enable-connect-protocol
+                                      max-concurrent-streams))
                      (when new-max-frame-size
                        (setf peer-max-frame-size new-max-frame-size))
+                     (when max-header-list-size
+                       (setf peer-max-header-list-size max-header-list-size))
                      (when new-table-size
                        (%hpack-set-maximum-size decoder-context new-table-size))
                      (when new-initial-window-size
@@ -393,7 +446,9 @@ values.
                                    +http2-settings-type+
                                    0
                                    0
-                                   (%h2-settings-wire max-frame-size))
+                                   (%h2-settings-wire
+                                    max-frame-size
+                                    :enable-connect-p enable-connect-p))
                  (%h2-send-control writer
                                    +http2-settings-type+
                                    +http2-ack-flag+
@@ -411,10 +466,16 @@ values.
                      (apply-peer-settings (payload)
                           (multiple-value-bind
                                 (new-max-frame-size new-table-size
-                                 new-initial-window-size)
-                            (%h2-settings payload)
+                                 new-initial-window-size enable-connect-protocol
+                                 max-concurrent-streams max-header-list-size)
+                            (%h2-settings payload :peer-role :client)
+                          (declare (ignore enable-connect-protocol
+                                           max-concurrent-streams))
                           (when new-max-frame-size
                             (setf peer-max-frame-size new-max-frame-size))
+                          (when max-header-list-size
+                            (setf peer-max-header-list-size
+                                  max-header-list-size))
                           (when new-table-size
                             (%hpack-set-maximum-size decoder-context
                                                      new-table-size))
@@ -503,7 +564,7 @@ values.
                                                    0 payload))
                                nil)
                               ((= type +http2-window-update-type+)
-                               (unless (and (zerop flags) (= (length payload) 4))
+                               (unless (= (length payload) 4)
                                  (%h2-server-error
                                   "Invalid HTTP/2 WINDOW_UPDATE frame" frame))
                                (let ((increment
@@ -519,17 +580,22 @@ values.
                                             peer-connection-window increment
                                             :connection))
                                      (let ((state (gethash stream-id streams)))
-                                       (when state
-                                         (setf (%h2-server-stream-send-window state)
-                                               (%h2-server-window-add
-                                                (%h2-server-stream-send-window state)
-                                                increment
-                                                :stream))
-                                         (when (and interested-state
-                                                    (eq state interested-state)
-                                                    (%h2-server-stream-reset-p state))
-                                           (return-from process-control-frame
-                                             :reset)))))
+                                       (cond
+                                         (state
+                                          (setf (%h2-server-stream-send-window state)
+                                                (%h2-server-window-add
+                                                 (%h2-server-stream-send-window state)
+                                                 increment
+                                                 :stream))
+                                          (when (and interested-state
+                                                     (eq state interested-state)
+                                                     (%h2-server-stream-reset-p state))
+                                            (return-from process-control-frame
+                                              :reset)))
+                                         ((> stream-id last-client-stream-id)
+                                          (%h2-server-error
+                                           "HTTP/2 WINDOW_UPDATE targeted an idle stream"
+                                           stream-id)))))
                                nil))
                               ((= type +http2-rst-stream-type+)
                                (unless (and (plusp stream-id)
@@ -572,6 +638,23 @@ values.
                                   "HTTP/2 stream cannot depend on itself"
                                   stream-id))
                                nil)
+                              ((= type +http2-priority-update-type+)
+                               (unless (and (zerop stream-id)
+                                            (zerop flags)
+                                            (>= (length payload) 4))
+                                 (%h2-server-error
+                                  "Invalid HTTP/2 PRIORITY_UPDATE frame" frame))
+                               (let ((element-id (%h2-u32 payload 0)))
+                                 (when (or (logbitp 31 element-id)
+                                           (zerop element-id))
+                                   (%h2-server-error
+                                    "Invalid HTTP/2 PRIORITY_UPDATE element ID"
+                                    element-id)))
+                               (unless (%h2-priority-field-value-p payload 4)
+                                 (%h2-server-error
+                                  "HTTP/2 PRIORITY_UPDATE contains non-ASCII field data"
+                                  frame))
+                               nil)
                               (t nil)))))
                       (await-send-window (state)
                         (loop
@@ -589,7 +672,8 @@ values.
                                               +http2-window-update-type+
                                               +http2-rst-stream-type+
                                               +http2-goaway-type+
-                                              +http2-priority-type+))
+                                              +http2-priority-type+
+                                              +http2-priority-update-type+))
                                 (let ((result
                                         (process-control-frame frame state)))
                                   (when (member result '(:goaway :reset))
@@ -622,6 +706,31 @@ values.
                               (setf fields
                                     (nconc fields (list (cons name value))))))
                           fields))
+                      (send-information (state response)
+                        (multiple-value-bind
+                              (status headers trailers body body-length no-body)
+                            (%h2-server-materialize-response
+                             response current-request :informational-p t)
+                          (declare (ignore body no-body))
+                          (when (or (plusp body-length) trailers)
+                            (%h2-server-error
+                             "An HTTP/2 informational response cannot carry a body or trailers"
+                             status))
+                          (let ((fields (response-fields status headers)))
+                            (when peer-max-header-list-size
+                              (http-kit::%check-limit
+                               :headers
+                               (%h2-header-list-size fields)
+                               peer-max-header-list-size
+                               :operation :http2-server))
+                            (dolist (wire
+                                     (%h2-header-frames
+                                      (%hpack-encode-block fields
+                                                           :huffman-p huffman-p)
+                                      nil
+                                      peer-max-frame-size
+                                      (%h2-server-stream-id state)))
+                              (funcall writer wire)))))
                       (send-response (state response)
                         (block send-response
                           (multiple-value-bind
@@ -646,6 +755,17 @@ values.
                                              (not has-trailers)))
                                     peer-max-frame-size
                                     (%h2-server-stream-id state))))
+                            (when peer-max-header-list-size
+                              (http-kit::%check-limit
+                               :headers
+                               (%h2-header-list-size response-header-fields)
+                               peer-max-header-list-size
+                               :operation :http2-server)
+                              (http-kit::%check-limit
+                               :headers
+                               (%h2-header-list-size response-trailer-fields)
+                               peer-max-header-list-size
+                               :operation :http2-server))
                             (dolist (wire header-frames)
                               (funcall writer wire))
                             (unless no-body
@@ -723,11 +843,24 @@ values.
                            (%h2-server-stream-headers state)
                            (%h2-server-stream-body-length-seen state)
                            :body-length-known-p t)
+                          (when (and
+                                 (string= (%h2-server-stream-method state) "TRACE")
+                                 (plusp (%h2-server-stream-body-length-seen state)))
+                            (%h2-server-error
+                             "TRACE requests must not contain content."
+                             :trace-content))
                           (let ((request
                                   (%h2-server-make-request state collect-body-p)))
                             (setf (%h2-server-stream-request state) request
                                   current-request request)
-                            (let ((response (funcall handler request)))
+                            (multiple-value-bind (response information)
+                                (funcall handler request)
+                              (unless (listp information)
+                                (%h2-server-error
+                                 "HTTP/2 informational responses must be supplied as a list"
+                                 information))
+                              (dolist (informational-response information)
+                                (send-information state informational-response))
                               (let ((send-result (send-response state response)))
                                 (when (eq send-result :goaway)
                                   (return-from finish-request :goaway))
@@ -779,7 +912,8 @@ values.
                                     (let ((fields
                                             (%hpack-decode-block
                                              block decoder-context
-                                             :max-header-bytes max-header-bytes)))
+                                             :max-header-bytes max-header-bytes
+                                             :max-fields max-fields)))
                                       (%h2-trailers fields)
                                       (setf (%h2-server-stream-trailers state)
                                             (mapcar
@@ -805,15 +939,18 @@ values.
                                     (let ((fields
                                             (%hpack-decode-block
                                              block decoder-context
-                                             :max-header-bytes max-header-bytes)))
+                                             :max-header-bytes max-header-bytes
+                                             :max-fields max-fields)))
                                       (multiple-value-bind
-                                            (method scheme authority target headers)
+                                            (method scheme authority target protocol headers)
                                           (%h2-server-header-fields
-                                           fields default-authority)
+                                           fields default-authority
+                                           :enable-connect-p enable-connect-p)
                                         (let ((state
                                                 (%make-h2-server-stream
                                                  stream-id
                                                  :method method
+                                                 :protocol protocol
                                                  :scheme scheme
                                                  :authority authority
                                                  :target target
@@ -895,7 +1032,8 @@ values.
                                 #.+http2-window-update-type+
                                 #.+http2-rst-stream-type+
                                 #.+http2-goaway-type+
-                                #.+http2-priority-type+)
+                                #.+http2-priority-type+
+                                #.+http2-priority-update-type+)
                                (process-control-frame frame))
                               (#.+http2-headers-type+
                                (handle-headers frame))
@@ -929,7 +1067,11 @@ values.
            (condition (caught-condition)
              (when on-error
                (funcall on-error caught-condition current-request))
-             (error caught-condition)))
+             (if (and (typep caught-condition
+                              'http-kit:http-size-limit-exceeded)
+                      (null current-request))
+                 (setf termination caught-condition)
+                 (error caught-condition))))
       (when close-stream
         (funcall close-stream stream)))
     (values request-count termination)))

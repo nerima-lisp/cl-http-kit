@@ -10,6 +10,12 @@
                  :detail (list :detail detail :cause cause)
                  :operation :proxy))
 
+(defun %proxy-public-plan (plan)
+  (loop for (key value) on plan by #'cddr
+        unless (member key '(:proxy :proxy-authorization
+                             :proxy-challenge-auth-provider))
+          append (list key value)))
+
 (defun %proxy-check-deadline (deadline clock-function &optional (kind :proxy))
   (when (and deadline (>= (funcall clock-function) deadline))
     (error 'http-timeout
@@ -63,129 +69,6 @@
     (replace result builder)
     result))
 
-(defun %proxy-ipv4-octets (host)
-  (when (stringp host)
-    (let ((start 0)
-          (values nil)
-          (valid-p t))
-      (loop
-        for separator = (position #\. host :start start)
-        for end = (or separator (length host))
-        for part = (and (< start end) (subseq host start end))
-        do (unless (and part
-                        (let ((value (%client-parse-integer
-                                      part
-                                      :allow-sign-p nil)))
-                          (and value (<= value 255))))
-             (setf valid-p nil))
-           (when valid-p
-             (push (%client-parse-integer
-                    part
-                    :allow-sign-p nil)
-                   values))
-           (if separator
-               (setf start (1+ separator))
-               (return)))
-      (when (and valid-p (= (length values) 4))
-        (let ((result (make-array 4 :element-type '(unsigned-byte 8))))
-          (loop for value in (nreverse values)
-                for index from 0
-                do (setf (aref result index) value))
-          result)))))
-
-(defun %proxy-hex-value (character)
-  (position character "0123456789abcdefABCDEF" :test #'char=))
-
-(defun %proxy-hex-word (token)
-  (when (and (stringp token)
-             (plusp (length token))
-             (<= (length token) 4)
-             (every (lambda (character)
-                     (%proxy-hex-value character))
-                    token))
-    (let ((value 0))
-      (loop for character across token
-            for digit = (%proxy-hex-value character)
-            do (setf value (+ (* value 16)
-                               (if (< digit 16) digit (- digit 6)))))
-      value)))
-
-(defun %proxy-colon-parts (string)
-  (let ((start 0)
-        (parts nil))
-    (loop
-      for separator = (position #\: string :start start)
-      for end = (or separator (length string))
-      do (push (subseq string start end) parts)
-         (if separator
-             (setf start (1+ separator))
-             (return (nreverse parts))))))
-
-(defun %proxy-ipv6-octets (host)
-  (when (and (stringp host)
-             (not (find #\[ host)))
-    (let* ((double (search "::" host))
-           (second-double (and double
-                               (search "::" host
-                                       :start2 (1+ double))))
-           (left-string (if double (subseq host 0 double) host))
-           (right-string (and double (subseq host (+ double 2))))
-           (left (if (zerop (length left-string))
-                     nil
-                     (%proxy-colon-parts left-string)))
-           (right (if (or (null right-string)
-                          (zerop (length right-string)))
-                       nil
-                       (%proxy-colon-parts right-string)))
-           (parts (append left right))
-           (last-index (1- (length parts)))
-           (word-groups nil)
-           (valid-p (null second-double)))
-      (when (and (not double)
-                 (or (some (lambda (part) (zerop (length part))) left)
-                     (some (lambda (part) (zerop (length part))) right)))
-        (setf valid-p nil))
-      (loop for part in parts
-            for index from 0
-            do (cond
-                 ((zerop (length part))
-                  (setf valid-p nil))
-                 ((find #\. part)
-                  (let ((octets (%proxy-ipv4-octets part)))
-                    (if (and octets (= index last-index))
-                        (push (list (+ (ash (aref octets 0) 8)
-                                       (aref octets 1))
-                                    (+ (ash (aref octets 2) 8)
-                                       (aref octets 3)))
-                              word-groups)
-                        (setf valid-p nil))))
-                 (t
-                  (let ((word (%proxy-hex-word part)))
-                    (if word
-                        (push (list word) word-groups)
-                        (setf valid-p nil))))))
-      (setf word-groups (nreverse word-groups))
-      (let* ((words (loop for group in word-groups append group))
-             (left-word-count
-               (loop for part in left
-                     sum (if (find #\. part) 2 1))))
-        (when (and valid-p
-                   (if double
-                       (< (length words) 8)
-                       (= (length words) 8)))
-          (let* ((zeroes (if double (- 8 (length words)) 0))
-                 (expanded (if double
-                               (append (subseq words 0 left-word-count)
-                                       (make-list zeroes :initial-element 0)
-                                       (subseq words left-word-count))
-                               words))
-                 (result (make-array 16 :element-type '(unsigned-byte 8))))
-            (loop for word in expanded
-                  for index from 0 by 2
-                  do (setf (aref result index) (ldb (byte 8 8) word)
-                           (aref result (1+ index)) (ldb (byte 8 0) word)))
-            result))))))
-
 (defun %proxy-resolved-address (host resolve-host)
   (or (%proxy-ipv4-octets host)
       (%proxy-ipv6-octets host)
@@ -233,9 +116,17 @@
          (username (http-proxy-username proxy))
          (password (or (http-proxy-password proxy) ""))
          (use-auth-p (not (null username)))
-         (methods (if use-auth-p #(0 2) #(0)))
+         (user-octets (and use-auth-p (http-utf8-octets username)))
+         (password-octets (and use-auth-p (http-utf8-octets password)))
+         (methods (if use-auth-p #(2) #(0)))
          (greeting (make-array (+ 2 (length methods))
                                :element-type '(unsigned-byte 8))))
+    (when (and use-auth-p
+               (or (not (<= 1 (length user-octets) 255))
+                   (not (<= 1 (length password-octets) 255))))
+      (%proxy-error
+       "SOCKS5 username and password must each contain 1 through 255 UTF-8 octets."
+       :authentication))
     (setf (aref greeting 0) 5
           (aref greeting 1) (length methods))
     (replace greeting methods :start1 2)
@@ -248,28 +139,22 @@
          (%proxy-error "The SOCKS5 proxy rejected every authentication method."
                        :authentication))
         ((and use-auth-p (= method 2))
-         (let ((user-octets (http-utf8-octets username))
-               (password-octets (http-utf8-octets password)))
-           (when (or (> (length user-octets) 255)
-                     (> (length password-octets) 255))
-             (%proxy-error "SOCKS5 username and password must fit in one octet lengths."
-                           :authentication))
-           (let ((authentication (%proxy-byte-builder)))
-             (%proxy-builder-byte authentication 1)
-             (%proxy-builder-byte authentication (length user-octets))
-             (%proxy-builder-octets authentication user-octets)
-             (%proxy-builder-byte authentication (length password-octets))
-             (%proxy-builder-octets authentication password-octets)
-             (%proxy-write-octets
-              stream
-              (%proxy-builder-vector authentication)
-              deadline clock-function))
-           (unless (= (%proxy-read-byte stream deadline clock-function) 1)
-             (%proxy-error "The SOCKS5 proxy returned an invalid authentication version."
-                           :authentication))
-           (unless (zerop (%proxy-read-byte stream deadline clock-function))
-             (%proxy-error "The SOCKS5 proxy rejected username/password authentication."
-                           :authentication))))
+         (let ((authentication (%proxy-byte-builder)))
+           (%proxy-builder-byte authentication 1)
+           (%proxy-builder-byte authentication (length user-octets))
+           (%proxy-builder-octets authentication user-octets)
+           (%proxy-builder-byte authentication (length password-octets))
+           (%proxy-builder-octets authentication password-octets)
+           (%proxy-write-octets
+            stream
+            (%proxy-builder-vector authentication)
+            deadline clock-function))
+         (unless (= (%proxy-read-byte stream deadline clock-function) 1)
+           (%proxy-error "The SOCKS5 proxy returned an invalid authentication version."
+                         :authentication))
+         (unless (zerop (%proxy-read-byte stream deadline clock-function))
+           (%proxy-error "The SOCKS5 proxy rejected username/password authentication."
+                         :authentication)))
         ((and (not use-auth-p) (zerop method)) nil)
         (t (%proxy-error "The SOCKS5 proxy selected an unsupported authentication method."
                          method))))
@@ -370,59 +255,116 @@
            :request-target authority
            :clock-function clock-function)
         (declare (ignore reusable-p))
-        (unless (<= 200 (http-response-status response) 299)
-          (%proxy-error "The HTTP proxy rejected the CONNECT request."
-                        (list :status (http-response-status response)
-                              :reason (http-response-reason response))))
-        stream))))
+        (if (<= 200 (http-response-status response) 299)
+            (values stream nil)
+            (values nil response))))))
 
-(defun %proxy-open-plan
-    (open-stream request proxy-plan proxy tls-upgrade resolve-host
+(defun %proxy-open-plan-once
+    (open-stream close-stream request proxy-plan proxy tls-upgrade resolve-host
                  timeout deadline clock-function)
   (let* ((mode (or (getf proxy-plan :mode) :direct))
          (proxy (or proxy (getf proxy-plan :proxy)))
          (target (or (getf proxy-plan :target)
                      (http-request-uri request)))
          (stream (%proxy-open-raw open-stream request timeout deadline
-                                  proxy-plan proxy)))
-    (unless (streamp stream)
-      (%proxy-error "The proxy stream opener did not return a stream." stream))
-    (case mode
-      (:direct
-       (if (string= (http-uri-scheme target) "https")
-           (%proxy-upgrade stream tls-upgrade target timeout deadline)
-           stream))
-      (:forward
-       (when (eq (http-proxy-scheme proxy) :https)
-         (setf stream
-               (%proxy-upgrade
-                stream tls-upgrade
-                (%proxy-uri-for :https (http-proxy-host proxy)
-                                (http-proxy-port proxy))
-                timeout deadline)))
-       stream)
-      (:connect
-       (when (eq (http-proxy-scheme proxy) :https)
-         (setf stream
-               (%proxy-upgrade
-                stream tls-upgrade
-                (%proxy-uri-for :https (http-proxy-host proxy)
-                                (http-proxy-port proxy))
-                timeout deadline)))
-       (%proxy-connect stream proxy-plan timeout deadline clock-function)
-       (if (string= (http-uri-scheme target) "https")
-           (%proxy-upgrade stream tls-upgrade target
-                          timeout deadline)
-           stream))
-      (:socks5
-       (%proxy-socks-negotiate stream proxy-plan deadline
-                               clock-function resolve-host)
-       (if (string= (http-uri-scheme target) "https")
-           (%proxy-upgrade stream tls-upgrade target
-                          timeout deadline)
-           stream))
-      (otherwise
-       (%proxy-error "The proxy plan contains an unsupported mode." mode)))))
+                                  proxy-plan proxy))
+         (retained-p nil))
+    (unwind-protect
+         (progn
+           (unless (streamp stream)
+             (%proxy-error "The proxy stream opener did not return a stream." stream))
+           (setf stream
+                 (case mode
+                   (:direct
+                    (if (string= (http-uri-scheme target) "https")
+                        (%proxy-upgrade stream tls-upgrade target timeout deadline)
+                        stream))
+                   (:forward
+                    (when (eq (http-proxy-scheme proxy) :https)
+                      (setf stream
+                            (%proxy-upgrade
+                             stream tls-upgrade
+                             (%proxy-uri-for :https (http-proxy-host proxy)
+                                             (http-proxy-port proxy))
+                             timeout deadline)))
+                    stream)
+                   (:connect
+                    (when (eq (http-proxy-scheme proxy) :https)
+                      (setf stream
+                            (%proxy-upgrade
+                             stream tls-upgrade
+                             (%proxy-uri-for :https (http-proxy-host proxy)
+                                             (http-proxy-port proxy))
+                             timeout deadline)))
+                    (multiple-value-bind (connected response)
+                        (%proxy-connect stream proxy-plan timeout deadline
+                                        clock-function)
+                      (if response
+                          (return-from %proxy-open-plan-once
+                            (values nil response))
+                          (if (string= (http-uri-scheme target) "https")
+                              (%proxy-upgrade connected tls-upgrade target
+                                              timeout deadline)
+                              connected))))
+                   (:socks5
+                    (%proxy-socks-negotiate stream proxy-plan deadline
+                                            clock-function resolve-host)
+                    (if (string= (http-uri-scheme target) "https")
+                        (%proxy-upgrade stream tls-upgrade target
+                                        timeout deadline)
+                        stream))
+                   (otherwise
+                    (%proxy-error "The proxy plan contains an unsupported mode." mode))))
+           (setf retained-p t)
+           stream)
+      (unless retained-p
+        (when (streamp stream)
+          (http-kit::%with-http-cleanup
+            (funcall close-stream stream)))))))
+
+(defun %proxy-auth-provider-value (value)
+  (cond
+    ((null value) nil)
+    ((stringp value) value)
+    ((http-header-p value) (http-header-content value))
+    (t
+     (%proxy-error
+      "A proxy authentication provider must return a string, HTTP-HEADER, or NIL."
+      value))))
+
+(defun %proxy-open-plan
+    (open-stream close-stream request proxy-plan proxy tls-upgrade resolve-host
+                 timeout deadline clock-function)
+  (let ((plan proxy-plan)
+        (challenge-count 0))
+    (loop
+      (multiple-value-bind (stream response)
+          (%proxy-open-plan-once
+           open-stream close-stream request plan proxy tls-upgrade resolve-host
+           timeout deadline clock-function)
+        (when stream
+          (return stream))
+        (let* ((challenge-values
+                 (and (= (http-response-status response) 407)
+                      (http-header-values
+                       (http-response-headers response) "Proxy-Authenticate")))
+               (challenges
+                 (and challenge-values
+                      (http-parse-authentication-challenges challenge-values)))
+               (provider (getf plan :proxy-challenge-auth-provider))
+               (authorization
+                 (and provider
+                      (zerop challenge-count)
+                      challenges
+                      (%proxy-auth-provider-value
+                       (funcall provider request response plan challenges)))))
+          (unless authorization
+            (%proxy-error "The HTTP proxy rejected the CONNECT request."
+                          (list :status (http-response-status response)
+                                :reason (http-response-reason response))))
+          (setf plan (copy-list plan)
+                (getf plan :proxy-authorization) authorization
+                challenge-count 1))))))
 
 (defun make-http-proxy-stream-opener
     (open-stream close-stream &key tls-upgrade resolve-host
@@ -455,7 +397,7 @@ address resolution when a SOCKS5 (rather than SOCKS5H) proxy is selected."
                (progn
                  (setf stream
                        (%proxy-open-plan
-                        open-stream request proxy-plan proxy tls-upgrade
+                        open-stream close-stream request proxy-plan proxy tls-upgrade
                         resolve-host timeout deadline clock-function))
                  (setf retained-p t)
                  stream)
@@ -467,4 +409,5 @@ address resolution when a SOCKS5 (rather than SOCKS5H) proxy is selected."
           (error condition))
         (error (condition)
           (%proxy-error "Proxy negotiation signaled an error."
-                        proxy-plan condition))))))
+                        (%proxy-public-plan proxy-plan)
+                        condition))))))

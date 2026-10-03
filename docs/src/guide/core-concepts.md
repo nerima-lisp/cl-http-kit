@@ -4,6 +4,10 @@ cl-http-kit keeps the HTTP protocol model small and explicit. Applications
 construct values, choose a transport boundary, and decide how deadlines and
 limits should be inherited.
 
+The examples and boundaries here describe the checked-in 0.4.0 systems. The
+convenience client path is available without removing
+the compatibility APIs described in the reference pages.
+
 ## Message values
 
 An HTTP URI contains a scheme, authority, path, and optional query. The core
@@ -82,11 +86,18 @@ TLS, ALPN, and native HTTP/3 acceptance remain outside this system.
 
 The optional `cl-http-kit/client` system builds request orchestration on the
 core values. It provides URI resolution, authentication headers, cookies,
-cache entries, proxy planning, redirects, bounded retries, and an optional
-HTTP/1.1 connection pool. Its `http-client` object receives an
-application-provided transport function, stream callbacks, or pool, so policy
-remains separate from TLS, ALPN, and application-specific proxy negotiation.
+cache entries, proxy planning, redirects, bounded retries, and an HTTP/1.1
+connection pool. Its `http-client` object accepts an application-provided
+transport function, stream callbacks, or pool; when none is supplied, the
+current integration constructs a native default boundary.
 
 The client can return a response together with the effective request after a
 redirect or retry. Applications that need stricter behavior can pass explicit
 redirect, retry, cache, body, and header policies when constructing the client.
+
+The 0.4.0 integration provides the URL-and-method convenience form through
+`http-client-send` and the native TLS 1.3 client wrapper. Server-side TLS is
+outside the current boundary because cl-tls-kit does not expose a server
+driver. Deploy an HTTPS reverse proxy or load balancer in front of the native
+HTTP listener when the server must accept TLS connections. HTTP/3 remains a
+framing boundary until cl-quic-kit provides the QUIC connection layer.

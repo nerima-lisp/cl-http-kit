@@ -71,7 +71,11 @@
 ;; interoperability with ordinary HTTP/2 peers.
 (defparameter +hpack-huffman-codes+
   #(#x1ff8 #x7fffd8 #xfffffe2 #xfffffe3 #xfffffe4 #xfffffe5 #xfffffe6
-    #xfffffe7 #xfffffe8 #xfffea #x3ffffffc #xfffffe9 #xfffffea #x3ffffffd
+    ;; Symbol 9 (TAB) is #xffffea, not #xfffea: the shorter value occupies only
+    ;; 20 bits against a declared width of 24, so the encoder emitted four
+    ;; leading zero bits that no decoder could resolve. RFC 7541 Appendix B
+    ;; gives ffffea [24].
+    #xfffffe7 #xfffffe8 #xffffea #x3ffffffc #xfffffe9 #xfffffea #x3ffffffd
     #xfffffeb #xfffffec #xfffffed #xfffffee #xfffffef #xffffff0 #xffffff1
     #xffffff2 #x3ffffffe #xffffff3 #xffffff4 #xffffff5 #xffffff6 #xffffff7
     #xffffff8 #xffffff9 #xffffffa #xffffffb

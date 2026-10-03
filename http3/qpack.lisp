@@ -1,5 +1,156 @@
 (in-package #:http-kit/http3)
 
+(define-condition qpack-blocked-field-section (condition)
+  ((required-insert-count
+    :initarg :required-insert-count
+    :reader qpack-blocked-field-section-required-insert-count)
+   (current-insert-count
+    :initarg :current-insert-count
+    :reader qpack-blocked-field-section-current-insert-count))
+  (:report
+   (lambda (condition stream)
+     (format stream "QPACK field section requires insert count ~D, but only ~D is available."
+             (qpack-blocked-field-section-required-insert-count condition)
+             (qpack-blocked-field-section-current-insert-count condition)))))
+
+(defstruct (http3-qpack-decoder-context
+             (:constructor %make-http3-qpack-decoder-context))
+  (dynamic-table nil)
+  (blocked-stream-limit 0 :type integer)
+  (blocked-streams (make-hash-table :test #'eql) :type hash-table)
+  (latest-streams (make-hash-table :test #'eql) :type hash-table))
+
+(defstruct (http3-qpack-blocked-stream
+             (:constructor %make-http3-qpack-blocked-stream))
+  (stream-id 0 :type integer)
+  (required-insert-count 0 :type integer)
+  (resume-function nil :type function)
+  (serialize (lambda (thunk) (funcall thunk)) :type function)
+  (context nil :type http3-qpack-decoder-context)
+  (state :blocked :type symbol))
+
+(defun make-http3-qpack-decoder-context
+    (dynamic-table &key (blocked-stream-limit 0))
+  (unless (qpack-dynamic-table-p dynamic-table)
+    (%qpack-error "A QPACK dynamic table object is required." dynamic-table))
+  (unless (and (integerp blocked-stream-limit) (>= blocked-stream-limit 0))
+    (%qpack-error "QPACK blocked-stream limits must be non-negative integers."
+                  blocked-stream-limit))
+  (%make-http3-qpack-decoder-context
+   :dynamic-table dynamic-table :blocked-stream-limit blocked-stream-limit))
+
+(defun %http3-qpack-register-blocked-stream
+    (context stream-id required-insert-count resume-function
+     &optional (serialize (lambda (thunk) (funcall thunk))))
+  (unless (and (integerp stream-id) (>= stream-id 0))
+    (%qpack-error "QPACK stream IDs must be non-negative integers." stream-id))
+  (let* ((streams (http3-qpack-decoder-context-blocked-streams context))
+         (latest-streams
+           (http3-qpack-decoder-context-latest-streams context))
+         (existing-blocked (gethash stream-id streams))
+         (existing-latest (gethash stream-id latest-streams)))
+    (unless (or existing-blocked
+                (< (hash-table-count streams)
+                   (http3-qpack-decoder-context-blocked-stream-limit context)))
+      (%qpack-error "QPACK blocked-stream limit exceeded." stream-id))
+    (when existing-latest
+      (setf (http3-qpack-blocked-stream-state existing-latest) :invalid))
+    (let ((blocked (%make-http3-qpack-blocked-stream
+                    :stream-id stream-id
+                    :required-insert-count required-insert-count
+                    :resume-function resume-function
+                    :serialize serialize
+                    :context context)))
+      (setf (gethash stream-id streams) blocked
+            (gethash stream-id latest-streams) blocked)
+      blocked)))
+
+(defun %http3-qpack-detach-ready-streams (context)
+  (let ((current (qpack-dynamic-table-insert-count
+                  (http3-qpack-decoder-context-dynamic-table context)))
+        (ready '()))
+    (maphash
+     (lambda (stream-id blocked)
+       (when (<= (http3-qpack-blocked-stream-required-insert-count blocked)
+                 current)
+         (remhash stream-id
+                  (http3-qpack-decoder-context-blocked-streams context))
+         (setf (http3-qpack-blocked-stream-state blocked) :ready)
+         (push blocked ready)))
+     (http3-qpack-decoder-context-blocked-streams context))
+    (nreverse ready)))
+
+(defun resume-http3-qpack-blocked-stream (blocked-stream)
+  (unless (http3-qpack-blocked-stream-p blocked-stream)
+    (%qpack-error "A QPACK blocked-stream token is required." blocked-stream))
+  (let ((resume-function nil))
+    (funcall
+     (http3-qpack-blocked-stream-serialize blocked-stream)
+     (lambda ()
+       (let* ((context (http3-qpack-blocked-stream-context blocked-stream))
+              (stream-id
+                (http3-qpack-blocked-stream-stream-id blocked-stream))
+              (latest-streams
+                (http3-qpack-decoder-context-latest-streams context)))
+         (unless (and
+                  (eq (http3-qpack-blocked-stream-state blocked-stream) :ready)
+                  (eq blocked-stream (gethash stream-id latest-streams)))
+           (%qpack-error "QPACK blocked-stream token is not resumable."
+                         stream-id))
+         (remhash stream-id latest-streams))
+       (setf (http3-qpack-blocked-stream-state blocked-stream) :consumed
+             resume-function
+             (http3-qpack-blocked-stream-resume-function blocked-stream))))
+    (funcall resume-function)))
+
+(defun decode-http3-qpack-field-section
+    (octets context stream-id
+     &key (serialize (lambda (thunk) (funcall thunk))) on-decoded
+          (max-header-bytes 65536) (max-fields 256))
+  "Decode a field section or return a resumable blocked-stream token."
+  (unless (http3-qpack-decoder-context-p context)
+    (%qpack-error "A QPACK decoder context is required." context))
+  (unless (functionp serialize)
+    (%qpack-error "QPACK serialization must be a function." serialize))
+  (unless (or (null on-decoded) (functionp on-decoded))
+    (%qpack-error "QPACK decode callbacks must be functions or NIL." on-decoded))
+  (let (fields blocked)
+    (handler-case
+        (funcall
+         serialize
+         (lambda ()
+           (handler-case
+               (setf fields
+                     (qpack-decode-field-section
+                      octets
+                      :dynamic-table
+                      (http3-qpack-decoder-context-dynamic-table context)
+                      :max-header-bytes max-header-bytes
+                      :max-fields max-fields))
+             (qpack-blocked-field-section (condition)
+               (setf blocked
+                     (%http3-qpack-register-blocked-stream
+                      context stream-id
+                      (qpack-blocked-field-section-required-insert-count
+                       condition)
+                      (lambda ()
+                        (decode-http3-qpack-field-section
+                         octets context stream-id
+                         :serialize serialize :on-decoded on-decoded
+                         :max-header-bytes max-header-bytes
+                         :max-fields max-fields))
+                      serialize))))))
+      (http-protocol-error (condition)
+        (error 'http-protocol-error
+               :message "QPACK field section decompression failed."
+               :operation :http3-transport
+               :detail (list :qpack-decompression-failed condition))))
+    (if blocked
+        blocked
+        (if on-decoded
+            (funcall on-decoded fields)
+            fields))))
+
 (defparameter +qpack-static-table+
   (vector
    (list ":authority" "")
@@ -134,7 +285,114 @@ present in this table."
   (capacity 0 :type integer)
   (entries '() :type list)
   (size 0 :type integer)
-  (insert-count 0 :type integer))
+  (insert-count 0 :type integer)
+  (protected-indices (make-hash-table) :type hash-table))
+
+(defstruct (qpack-decoder-stream-state
+             (:constructor %make-qpack-decoder-stream-state))
+  (dynamic-table nil :type qpack-dynamic-table)
+  (sent-insert-count 0 :type integer)
+  (known-received-count 0 :type integer)
+  (blocked-stream-limit 0 :type integer)
+  (outstanding-sections (make-hash-table) :type hash-table))
+
+(defun make-qpack-decoder-stream-state
+    (dynamic-table &key (blocked-stream-limit 0))
+  "Create encoder-side state for instructions received on a decoder stream."
+  (unless (qpack-dynamic-table-p dynamic-table)
+    (%qpack-error "A QPACK dynamic table object is required." dynamic-table))
+  (unless (and (integerp blocked-stream-limit) (>= blocked-stream-limit 0))
+    (%qpack-error "QPACK blocked-stream limits must be non-negative integers."
+                  blocked-stream-limit))
+  (%make-qpack-decoder-stream-state
+   :dynamic-table dynamic-table :blocked-stream-limit blocked-stream-limit))
+
+(defun qpack-decoder-stream-state-note-insertions-sent (state insert-count)
+  "Record the cumulative insert count written to the peer's encoder stream."
+  (unless (qpack-decoder-stream-state-p state)
+    (%qpack-error "A QPACK decoder-stream state object is required." state))
+  (unless (and (integerp insert-count)
+               (>= insert-count
+                   (qpack-decoder-stream-state-sent-insert-count state))
+               (<= insert-count
+                   (qpack-dynamic-table-insert-count
+                    (qpack-decoder-stream-state-dynamic-table state))))
+    (%qpack-error "Sent QPACK insert count is invalid." insert-count))
+  (setf (qpack-decoder-stream-state-sent-insert-count state) insert-count)
+  state)
+
+(defun qpack-decoder-stream-state-register-section
+    (state stream-id required-insert-count &optional referenced-indices)
+  "Track a sent field section that references the dynamic table."
+  (unless (qpack-decoder-stream-state-p state)
+    (%qpack-error "A QPACK decoder-stream state object is required." state))
+  (unless (and (integerp stream-id) (>= stream-id 0))
+    (%qpack-error "QPACK stream IDs must be non-negative integers." stream-id))
+  (unless (and (integerp required-insert-count)
+               (plusp required-insert-count)
+               (<= required-insert-count
+                   (qpack-decoder-stream-state-sent-insert-count state)))
+    (%qpack-error "A tracked QPACK section must reference a sent insertion."
+                  required-insert-count))
+  (unless (every (lambda (index)
+                   (and (integerp index)
+                        (<= 0 index)
+                        (< index required-insert-count)))
+                 referenced-indices)
+    (%qpack-error "A QPACK section has an invalid dynamic reference."
+                  referenced-indices))
+  (let* ((sections (qpack-decoder-stream-state-outstanding-sections state))
+         (outstanding (gethash stream-id sections))
+         (references (remove-duplicates referenced-indices))
+         (protected
+           (qpack-dynamic-table-protected-indices
+            (qpack-decoder-stream-state-dynamic-table state))))
+    (dolist (index references)
+      (incf (gethash index protected 0)))
+    (setf (gethash stream-id sections)
+          (append outstanding
+                  (list (cons required-insert-count references)))))
+  state)
+
+(defun %qpack-release-section (state section)
+  (let ((protected
+          (qpack-dynamic-table-protected-indices
+           (qpack-decoder-stream-state-dynamic-table state))))
+    (dolist (index (cdr section))
+      (let ((count (gethash index protected)))
+        (unless (plusp count)
+          (%qpack-error "QPACK dynamic-reference state is invalid." index))
+        (if (= count 1)
+            (remhash index protected)
+            (setf (gethash index protected) (1- count)))))))
+
+(defun %qpack-evict-oldest (table)
+  (let* ((entries (qpack-dynamic-table-entries table))
+         (oldest (car (last entries))))
+    (unless oldest
+      (%qpack-error "QPACK dynamic-table eviction state is invalid."))
+    (when (gethash (qpack-dynamic-entry-absolute-index oldest)
+                   (qpack-dynamic-table-protected-indices table))
+      (%qpack-error "QPACK cannot evict an entry referenced by a field section."
+                    (qpack-dynamic-entry-absolute-index oldest)))
+    (setf (qpack-dynamic-table-entries table) (butlast entries)
+          (qpack-dynamic-table-size table)
+          (- (qpack-dynamic-table-size table)
+             (qpack-dynamic-entry-size oldest)))))
+
+(defun %qpack-ensure-evictable-size (table target-size)
+  (let ((remaining-size (qpack-dynamic-table-size table)))
+    (dolist (entry (reverse (qpack-dynamic-table-entries table)))
+      (when (<= remaining-size target-size)
+        (return))
+      (when (gethash (qpack-dynamic-entry-absolute-index entry)
+                     (qpack-dynamic-table-protected-indices table))
+        (%qpack-error
+         "QPACK cannot evict an entry referenced by a field section."
+         (qpack-dynamic-entry-absolute-index entry)))
+      (decf remaining-size (qpack-dynamic-entry-size entry)))
+    (when (> remaining-size target-size)
+      (%qpack-error "QPACK dynamic-table eviction state is invalid."))))
 
 (defun make-qpack-dynamic-table (&key (max-capacity 0) (capacity max-capacity))
   "Create a QPACK dynamic table with MAX-CAPACITY and current CAPACITY."
@@ -158,17 +416,10 @@ present in this table."
                (<= capacity (qpack-dynamic-table-max-capacity table)))
     (%qpack-error "QPACK table capacity is outside the advertised maximum."
                   capacity))
+  (%qpack-ensure-evictable-size table capacity)
   (setf (qpack-dynamic-table-capacity table) capacity)
   (loop while (> (qpack-dynamic-table-size table) capacity)
-        do (let* ((entries (qpack-dynamic-table-entries table))
-                  (oldest (car (last entries))))
-             (unless oldest
-               (return))
-             (setf (qpack-dynamic-table-entries table)
-                   (butlast entries)
-                   (qpack-dynamic-table-size table)
-                   (- (qpack-dynamic-table-size table)
-                      (qpack-dynamic-entry-size oldest)))))
+        do (%qpack-evict-oldest table))
   table)
 
 (defun %qpack-entry-size (name value)
@@ -190,17 +441,10 @@ current capacity, as required by RFC 9204."
     (when (> entry-size capacity)
       (%qpack-error "A QPACK dynamic-table entry exceeds the table capacity."
                     entry-size))
+    (%qpack-ensure-evictable-size table (- capacity entry-size))
     (loop while (> (+ (qpack-dynamic-table-size table) entry-size)
                    capacity)
-          do (let* ((entries (qpack-dynamic-table-entries table))
-                    (oldest (car (last entries))))
-               (unless oldest
-                 (%qpack-error "QPACK dynamic-table eviction state is invalid."))
-               (setf (qpack-dynamic-table-entries table)
-                     (butlast entries)
-                     (qpack-dynamic-table-size table)
-                     (- (qpack-dynamic-table-size table)
-                        (qpack-dynamic-entry-size oldest)))))
+          do (%qpack-evict-oldest table))
     (let ((entry (%make-qpack-dynamic-entry
                   :absolute-index (qpack-dynamic-table-insert-count table)
                   :name normalized-name
@@ -418,23 +662,31 @@ coding."
   (%qpack-concat
    (http-kit/http2::%hpack-encode-integer increment 6 0)))
 
-(defun %qpack-field-dynamic-entry (table name value)
+(defun %qpack-field-dynamic-entry (table name value &optional max-reference-count)
   (when table
     (let ((static-index (%qpack-static-index name value))
-          (static-name-index (%qpack-static-name-index name)))
-      (cond
-        ((and (null static-index)
-              (not (%qpack-sensitive-name-p name)))
-         (%qpack-dynamic-exact-entry table name value))
-        ((null static-name-index)
-         (%qpack-dynamic-name-entry table name))
-        (t nil)))))
+          (static-name-index (%qpack-static-name-index name))
+          entry)
+      (setf entry
+            (cond
+              ((and (null static-index)
+                    (not (%qpack-sensitive-name-p name)))
+               (%qpack-dynamic-exact-entry table name value))
+              ((null static-name-index)
+               (%qpack-dynamic-name-entry table name))
+              (t nil)))
+      (when (and entry
+                 (or (null max-reference-count)
+                     (<= (1+ (qpack-dynamic-entry-absolute-index entry))
+                         max-reference-count)))
+        entry))))
 
-(defun %qpack-encode-field (name value dynamic-table base huffman-p)
+(defun %qpack-encode-field
+    (name value dynamic-table base huffman-p max-reference-count)
   (let* ((indexed (%qpack-static-index name value))
          (name-index (%qpack-static-name-index name))
          (dynamic-entry (%qpack-field-dynamic-entry
-                         dynamic-table name value))
+                         dynamic-table name value max-reference-count))
          (sensitive (if (%qpack-sensitive-name-p name) #x20 0)))
     (cond
       (indexed
@@ -503,22 +755,66 @@ coding."
       (http-kit/http2::%hpack-encode-integer
        (- required-insert-count base 1) 7 #x80)))
 
-(defun qpack-encode-field-section (fields &key dynamic-table (huffman-p nil))
-  "Encode FIELDS using static and, when supplied, dynamic QPACK entries.
-
-DYNAMIC-TABLE is the encoder's current table.  The function only references
-entries already inserted in that table; callers must send the corresponding
-encoder-stream instructions before a peer can decode a non-zero required
-insert count.  When HUFFMAN-P is true, string literals use HPACK Huffman
-coding."
+(defun %qpack-prepare-field-section
+    (fields &key dynamic-table decoder-stream-state stream-id (huffman-p nil))
   (when (and dynamic-table (not (qpack-dynamic-table-p dynamic-table)))
     (%qpack-error "DYNAMIC-TABLE must be a QPACK dynamic table object."
                   dynamic-table))
+  (when decoder-stream-state
+    (unless (qpack-decoder-stream-state-p decoder-stream-state)
+      (%qpack-error "DECODER-STREAM-STATE must be a QPACK state object."
+                    decoder-stream-state))
+    (unless (eq dynamic-table
+                (qpack-decoder-stream-state-dynamic-table
+                 decoder-stream-state))
+      (%qpack-error "QPACK encoder state and dynamic table must match." nil))
+    (unless (and (integerp stream-id) (>= stream-id 0))
+      (%qpack-error "STREAM-ID is required when tracking a field section."
+                    stream-id)))
   (let* ((normalized (%qpack-fields fields))
-         (required-insert-count
+         (known-received-count
+           (and decoder-stream-state
+                (qpack-decoder-stream-state-known-received-count
+                 decoder-stream-state)))
+         (stream-already-blocked-p
+           (and decoder-stream-state
+                (some (lambda (section)
+                        (> (car section) known-received-count))
+                      (gethash
+                       stream-id
+                       (qpack-decoder-stream-state-outstanding-sections
+                        decoder-stream-state)))))
+         (blocked-stream-count
+           (if decoder-stream-state
+               (let ((count 0))
+                 (maphash
+                  (lambda (outstanding-stream sections)
+                    (declare (ignore outstanding-stream))
+                    (when (some (lambda (section)
+                                  (> (car section) known-received-count))
+                                sections)
+                      (incf count)))
+                  (qpack-decoder-stream-state-outstanding-sections
+                   decoder-stream-state))
+                 count)
+               0))
+         (max-reference-count
+           (if (or (null decoder-stream-state)
+                   stream-already-blocked-p
+                   (< blocked-stream-count
+                      (qpack-decoder-stream-state-blocked-stream-limit
+                       decoder-stream-state)))
+               (and dynamic-table
+                    (qpack-dynamic-table-insert-count dynamic-table))
+               known-received-count))
+         (referenced-entries
            (loop for field in normalized
                  for entry = (%qpack-field-dynamic-entry
-                              dynamic-table (car field) (cdr field))
+                              dynamic-table (car field) (cdr field)
+                              max-reference-count)
+                 when entry collect entry))
+         (required-insert-count
+           (loop for entry in referenced-entries
                  maximize (if entry
                               (1+ (qpack-dynamic-entry-absolute-index entry))
                               0)))
@@ -534,14 +830,41 @@ coding."
                      required-insert-count max-capacity)
                     8 0)
                    (%qpack-encode-base required-insert-count base))))
-    (dolist (field normalized section)
+    (dolist (field normalized)
       (setf section (%qpack-concat
                      section
                      (%qpack-encode-field (car field)
                                           (cdr field)
                                           dynamic-table
                                           base
-                                          huffman-p))))))
+                                          huffman-p
+                                          max-reference-count))))
+    (values section
+            (and decoder-stream-state (plusp required-insert-count)
+                 (list decoder-stream-state stream-id required-insert-count
+                       (mapcar #'qpack-dynamic-entry-absolute-index
+                               referenced-entries))))))
+
+(defun %qpack-commit-field-section (registration)
+  (when registration
+    (apply #'qpack-decoder-stream-state-register-section registration)))
+
+(defun qpack-encode-field-section
+    (fields &key dynamic-table decoder-stream-state stream-id (huffman-p nil))
+  "Encode FIELDS using static and, when supplied, dynamic QPACK entries.
+
+DYNAMIC-TABLE is the encoder's current table.  The function only references
+entries already inserted in that table; callers must send the corresponding
+encoder-stream instructions before a peer can decode a non-zero required
+insert count.  When HUFFMAN-P is true, string literals use HPACK Huffman
+coding."
+  (multiple-value-bind (section registration)
+      (%qpack-prepare-field-section
+       fields :dynamic-table dynamic-table
+       :decoder-stream-state decoder-stream-state
+       :stream-id stream-id :huffman-p huffman-p)
+    (%qpack-commit-field-section registration)
+    section))
 
 (defun %qpack-decode-string (octets position prefix-bits huffman-mask)
   (when (>= position (length octets))
@@ -601,11 +924,14 @@ coding."
       (when (<= required 0)
         (%qpack-error "QPACK encoded required insert count resolves to zero."
                       encoded-count))
-      (when (or (null dynamic-table)
-                (> required total-insert-count))
+      (when (null dynamic-table)
         (%qpack-error
-         "QPACK field section references dynamic entries not yet available."
+         "QPACK field section references a dynamic table that is unavailable."
          required))
+      (when (> required total-insert-count)
+        (error 'qpack-blocked-field-section
+               :required-insert-count required
+               :current-insert-count total-insert-count))
       required)))
 
 (defun %qpack-field-entry (dynamic-table static-p index base required post-base-p)
@@ -637,10 +963,8 @@ coding."
             (max-header-bytes 65536) (max-fields 256))
   "Decode a QPACK field section with optional dynamic-table references.
 
-The decoder is deliberately synchronous: a section that references an entry
-not yet present in DYNAMIC-TABLE signals a protocol error instead of blocking
-the caller.  A transport that supports blocked streams can defer this call
-until its encoder stream has advanced the table."
+A section whose valid required insert count is in the future signals
+QPACK-BLOCKED-FIELD-SECTION."
   (unless (%http3-octet-vector-p octets)
     (%qpack-error "QPACK field sections must be octet vectors." (type-of octets)))
   (when (and dynamic-table (not (qpack-dynamic-table-p dynamic-table)))
@@ -774,7 +1098,7 @@ until its encoder stream has advanced the table."
                  (check-limits)))
     (nreverse fields))))
 
-(defun qpack-process-encoder-stream (table octets)
+(defun %qpack-process-complete-encoder-stream (table octets)
   "Apply complete QPACK encoder-stream instructions to TABLE.
 
 Returns two values: an event list and the consumed position.  The parser is
@@ -841,12 +1165,71 @@ instruction; stream buffering belongs to the HTTP/3 transport."
                       (setf position next)))))))
     (values (nreverse events) position)))
 
+(defun %qpack-encoder-instruction-end (octets position)
+  (let ((first (aref octets position)))
+    (cond
+      ((= (logand first #xe0) #x20)
+       (nth-value 1
+                  (http-kit/http2::%hpack-read-integer octets position 5)))
+      ((/= 0 (logand first #x80))
+       (multiple-value-bind (name-index next)
+           (http-kit/http2::%hpack-read-integer octets position 6)
+         (declare (ignore name-index))
+         (nth-value 1 (%qpack-decode-string octets next 7 #x80))))
+      ((= (logand first #xc0) #x40)
+       (multiple-value-bind (name next)
+           (%qpack-decode-string octets position 5 #x20)
+         (declare (ignore name))
+         (nth-value 1 (%qpack-decode-string octets next 7 #x80))))
+      (t
+       (nth-value 1
+                  (http-kit/http2::%hpack-read-integer octets position 5))))))
+
+(defun %qpack-truncated-error-p (condition)
+  (and (typep condition 'http-protocol-error)
+       (search "truncated" (http-kit:http-error-message condition)
+               :test #'char-equal)))
+
+(defun qpack-process-encoder-stream (table octets &key allow-incomplete-p)
+  "Apply QPACK encoder-stream instructions to TABLE.
+
+Returns the events and consumed position.  With ALLOW-INCOMPLETE-P, a final
+partial instruction is left unconsumed so transports can buffer it."
+  (unless (qpack-dynamic-table-p table)
+    (%qpack-error "A QPACK dynamic table object is required." table))
+  (unless (%http3-octet-vector-p octets)
+    (%qpack-error "QPACK encoder streams must be octet vectors." (type-of octets)))
+  (let ((position 0)
+        (events '()))
+    (loop while (< position (length octets))
+          do (let ((end
+                     (handler-case
+                         (%qpack-encoder-instruction-end octets position)
+                       (http-protocol-error (condition)
+                         (if (and allow-incomplete-p
+                                  (%qpack-truncated-error-p condition))
+                             (return)
+                             (error condition))))))
+               (multiple-value-bind (instruction-events consumed)
+                   (%qpack-process-complete-encoder-stream
+                    table (subseq octets position end))
+                 (unless (= consumed (- end position))
+                   (%qpack-error "QPACK encoder instruction was not fully consumed."
+                                 consumed))
+                 (setf events (nconc events instruction-events)
+                       position end))))
+    (values events position)))
+
 (defun qpack-process-decoder-stream
     (octets &key on-section-acknowledgment on-stream-cancellation
-            on-insert-count-increment)
-  "Decode QPACK decoder-stream instructions and return event records."
+            on-insert-count-increment state allow-incomplete-p)
+  "Decode QPACK decoder-stream instructions and return event records.
+
+With ALLOW-INCOMPLETE-P, a final partial instruction is left unconsumed."
   (unless (%http3-octet-vector-p octets)
     (%qpack-error "QPACK decoder streams must be octet vectors." (type-of octets)))
+  (when (and state (not (qpack-decoder-stream-state-p state)))
+    (%qpack-error "STATE must be a QPACK decoder-stream state object." state))
   (dolist (callback (list on-section-acknowledgment
                           on-stream-cancellation
                           on-insert-count-increment))
@@ -856,30 +1239,85 @@ instruction; stream buffering belongs to the HTTP/3 transport."
         (events '()))
     (loop while (< position (length octets))
           do (let ((first (aref octets position)))
-               (cond
-                 ((/= 0 (logand first #x80))
-                  (multiple-value-bind (stream-id next)
-                      (http-kit/http2::%hpack-read-integer octets position 7)
+               (multiple-value-bind (value next)
+                   (handler-case
+                       (http-kit/http2::%hpack-read-integer
+                        octets position
+                        (cond
+                          ((/= 0 (logand first #x80)) 7)
+                          ((= (logand first #xc0) #x40) 6)
+                          (t 6)))
+                     (http-protocol-error (condition)
+                       (if (and allow-incomplete-p
+                                (%qpack-truncated-error-p condition))
+                           (return)
+                           (error condition))))
+                 (cond
+                   ((/= 0 (logand first #x80))
+                    (let ((stream-id value))
+                    (when state
+                      (let* ((sections
+                               (qpack-decoder-stream-state-outstanding-sections
+                                state))
+                             (outstanding (gethash stream-id sections)))
+                        (unless outstanding
+                          (%qpack-error
+                           "QPACK acknowledged an unknown field section."
+                           stream-id))
+                        (setf (qpack-decoder-stream-state-known-received-count
+                               state)
+                              (max (qpack-decoder-stream-state-known-received-count
+                                    state)
+                                   (caar outstanding)))
+                        (%qpack-release-section state (first outstanding))
+                        (if (rest outstanding)
+                            (setf (gethash stream-id sections)
+                                  (rest outstanding))
+                            (remhash stream-id sections))))
                     (when on-section-acknowledgment
                       (funcall on-section-acknowledgment stream-id))
                     (push (list :section-acknowledgment stream-id) events)
                     (setf position next)))
-                 ((= (logand first #xc0) #x40)
-                  (multiple-value-bind (stream-id next)
-                      (http-kit/http2::%hpack-read-integer octets position 6)
+                   ((= (logand first #xc0) #x40)
+                    (let ((stream-id value))
+                    (when state
+                      (let* ((sections
+                               (qpack-decoder-stream-state-outstanding-sections
+                                state))
+                             (outstanding (gethash stream-id sections)))
+                        (unless outstanding
+                          (%qpack-error
+                           "QPACK cancelled a stream with no outstanding section."
+                           stream-id))
+                        (dolist (section outstanding)
+                          (%qpack-release-section state section))
+                        (remhash stream-id sections)))
                     (when on-stream-cancellation
                       (funcall on-stream-cancellation stream-id))
                     (push (list :stream-cancellation stream-id) events)
                     (setf position next)))
-                 (t
-                  (multiple-value-bind (increment next)
-                      (http-kit/http2::%hpack-read-integer octets position 6)
+                   (t
+                    (let ((increment value))
                     (unless (plusp increment)
                       (%qpack-error
                        "QPACK insert-count increments must be positive."
                        increment))
+                    (when state
+                      (let ((received
+                              (+ (qpack-decoder-stream-state-known-received-count
+                                  state)
+                                 increment)))
+                        (when (> received
+                                 (qpack-decoder-stream-state-sent-insert-count
+                                  state))
+                          (%qpack-error
+                           "QPACK insert-count increment exceeds sent insertions."
+                           received))
+                        (setf (qpack-decoder-stream-state-known-received-count
+                               state)
+                              received)))
                     (when on-insert-count-increment
                       (funcall on-insert-count-increment increment))
                     (push (list :insert-count-increment increment) events)
-                    (setf position next))))))
+                    (setf position next)))))))
     (values (nreverse events) position)))
