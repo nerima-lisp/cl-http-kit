@@ -18,11 +18,6 @@
 (defun %http3-quic-adapter-now ()
   (/ (get-internal-real-time) internal-time-units-per-second))
 
-(defun %http3-quic-adapter-diagnostic (stage)
-  (when (string= "1" (sb-ext:posix-getenv "HTTP3_LOOPBACK_DIAGNOSTICS"))
-    (format *error-output* "HTTP3-DIAG ~A~%" stage)
-    (finish-output *error-output*)))
-
 (defun %http3-quic-adapter-configure-protection ()
   (let* ((protection (find-package "CL-QUIC-KIT.PROTECTION"))
          (crypto (find-package "CRYPTO-KIT"))
@@ -233,48 +228,36 @@ to be selected without exposing QUIC implementation details."
                    :poll-interval poll-interval)))
     (unwind-protect
          (progn
-           (%http3-quic-adapter-diagnostic "client-start")
            (cl-quic-kit:client-start quic-client)
            (setf (http3-quic-adapter-started-p adapter) t)
-           (%http3-quic-adapter-diagnostic "await-handshake-start")
            (%http3-quic-adapter-await-established
             quic-client :timeout timeout :deadline deadline)
-           (%http3-quic-adapter-diagnostic "await-handshake-complete")
-           (%http3-quic-adapter-diagnostic "make-http3-client-start")
            (setf (http3-quic-adapter-http3-client adapter)
                  (apply #'make-http3-client
                         :open-stream
                         (lambda (request &key stream-type timeout deadline)
-                          (%http3-quic-adapter-diagnostic "open-stream-start")
                           (let ((stream
                                   (cl-quic-kit:client-open-stream
                                    quic-client request
                                    :stream-type stream-type
                                    :timeout timeout
                                    :deadline deadline)))
-                            (%http3-quic-adapter-diagnostic "open-stream-complete")
                             (values stream (cl-quic-kit:stream-id stream))))
                         :write-stream
                         (lambda (stream octets &key fin-p timeout deadline)
-                          (%http3-quic-adapter-diagnostic "write-stream-start")
                           (prog1
                               (cl-quic-kit:client-write-stream
                                quic-client stream octets
                                :fin-p fin-p :timeout timeout :deadline deadline)
-                            (cl-quic-kit:client-flush quic-client)
-                            (%http3-quic-adapter-diagnostic "write-stream-complete")))
+                            (cl-quic-kit:client-flush quic-client)))
                         :read-stream
                         (lambda (stream &key timeout deadline)
-                          (%http3-quic-adapter-diagnostic "read-stream-start")
-                          (multiple-value-prog1
-                              (%http3-quic-adapter-read
-                               quic-client
-                               (http3-quic-adapter-http3-client adapter)
-                               stream
-                               :timeout timeout :deadline deadline
-                               :poll-interval poll-interval)
-                            (%http3-quic-adapter-diagnostic
-                             "read-stream-complete")))
+                          (%http3-quic-adapter-read
+                           quic-client
+                           (http3-quic-adapter-http3-client adapter)
+                           stream
+                           :timeout timeout :deadline deadline
+                           :poll-interval poll-interval))
                         :close-stream
                         (lambda (stream &key condition)
                           (cl-quic-kit:client-close-stream
@@ -286,12 +269,9 @@ to be selected without exposing QUIC implementation details."
                         :timeout timeout
                         :deadline deadline
                         http3-options))
-           (%http3-quic-adapter-diagnostic "make-http3-client-complete")
-           (%http3-quic-adapter-diagnostic "await-settings-start")
            (%http3-quic-adapter-await-peer-settings
             quic-client (http3-quic-adapter-http3-client adapter)
             :timeout timeout :deadline deadline)
-           (%http3-quic-adapter-diagnostic "await-settings-complete")
            adapter)
       (unless (http3-quic-adapter-http3-client adapter)
         (ignore-errors (cl-quic-kit:client-close quic-client))))))

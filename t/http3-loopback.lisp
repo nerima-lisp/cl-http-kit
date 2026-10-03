@@ -20,11 +20,6 @@
 (defun %env-integer (name default)
   (parse-integer (%env name (princ-to-string default))))
 
-(defun %diagnostic (stage)
-  (when (string= "1" (%env "HTTP3_LOOPBACK_DIAGNOSTICS"))
-    (format *error-output* "HTTP3-DIAG ~A~%" stage)
-    (finish-output *error-output*)))
-
 (defun %octets-as-string (octets)
   (map 'string #'code-char octets))
 
@@ -102,32 +97,27 @@
 (defun %http3-loopback-transport (port trust-anchor mode)
   (lambda (request &key alternative-service timeout deadline &allow-other-keys)
     (declare (ignore alternative-service))
-  (%diagnostic "request-transport-start")
   (let ((adapter
-            (http-kit/http3:make-http3-quic-adapter
-             :server-host "127.0.0.1"
-             :server-port (if (string= mode "fallback") (1+ port) port)
-             :hostname "localhost"
-             :alpn '("h3")
-             :tls-trust-anchors (list trust-anchor)
-             :tls-verify-signature #'crypto-kit:verify-signature
-             :tls-signature-algorithms #(1027)
-             :timeout timeout
-             :deadline deadline
-             :now-fn (lambda ()
-                       (/ (get-internal-real-time)
-                          internal-time-units-per-second))
-             :idle-timeout 30)))
-        (%diagnostic "adapter-returned")
-        (unwind-protect
-             (progn
-               (%diagnostic "send-http3-request-start")
-           (http-kit/http3:send-http3-request
-            (http-kit/http3:http3-quic-adapter-http3-client adapter)
-            request :timeout timeout :deadline deadline)
-               (%diagnostic "send-http3-request-complete"))
-        (ignore-errors
-          (http-kit/http3:close-http3-quic-adapter adapter))))))
+         (http-kit/http3:make-http3-quic-adapter
+          :server-host "127.0.0.1"
+          :server-port (if (string= mode "fallback") (1+ port) port)
+          :hostname "localhost"
+          :alpn '("h3")
+          :tls-trust-anchors (list trust-anchor)
+          :tls-verify-signature #'crypto-kit:verify-signature
+          :tls-signature-algorithms #(1027)
+          :timeout timeout
+          :deadline deadline
+          :now-fn (lambda ()
+                    (/ (get-internal-real-time)
+                       internal-time-units-per-second))
+          :idle-timeout 30)))
+    (unwind-protect
+        (http-kit/http3:send-http3-request
+         (http-kit/http3:http3-quic-adapter-http3-client adapter)
+         request :timeout timeout :deadline deadline)
+      (ignore-errors
+        (http-kit/http3:close-http3-quic-adapter adapter))))))
 
 (defun %make-loopback-client (port trust-anchor mode)
   (http-kit/client:make-http-client
@@ -154,11 +144,9 @@
          (post-body (make-array post-length :element-type '(unsigned-byte 8)
                                 :initial-element #x5a)))
   (labels ((send (request)
-             (%diagnostic "http-client-send-start")
              (multiple-value-bind (response ignored)
                  (http-kit/client:http-client-send client request :timeout 10)
                (declare (ignore ignored))
-               (%diagnostic "http-client-send-complete")
                response))
            (request (&optional protocol-version)
              (http-kit/client:http-client-request
