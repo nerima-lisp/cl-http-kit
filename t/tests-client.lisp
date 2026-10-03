@@ -1496,7 +1496,7 @@
          (http-client-request client "GET" "https://example.test/"
                               :protocol-version "HTTP/3"))))
     (ensure-equal 1 http3-calls)
-    (ensure-equal 0 tcp-calls))))
+    (ensure-equal 0 tcp-calls)))
 
 (deftest client-cache-integration
   (let ((calls 0)
