@@ -18,6 +18,23 @@
 (defun %http3-quic-adapter-now ()
   (/ (get-internal-real-time) internal-time-units-per-second))
 
+(defun %http3-quic-adapter-configure-protection ()
+  (let* ((protection (find-package "CL-QUIC-KIT.PROTECTION"))
+         (crypto (find-package "CRYPTO-KIT"))
+         (configure (and protection
+                         (find-symbol "CONFIGURE-CRYPTO-BACKEND" protection))))
+    (when (and configure crypto)
+      (flet ((crypto-function (name)
+               (symbol-function (find-symbol name crypto))))
+        (funcall configure
+                 :hkdf-extract (crypto-function "HKDF-EXTRACT")
+                 :hkdf-expand (crypto-function "HKDF-EXPAND")
+                 :aead-seal (crypto-function "AEAD-SEAL")
+                 :aead-open (crypto-function "AEAD-OPEN")
+                 :aes-ecb (crypto-function "AES-ENCRYPT-BLOCK")
+                 :chacha20 (crypto-function "CHACHA20-KEYSTREAM")
+                 :constant-time-equal (crypto-function "CONSTANT-TIME-EQUAL"))))))
+
 (defun %http3-quic-adapter-deadline (timeout deadline)
   (let ((timeout-deadline
           (and (numberp timeout)
@@ -93,6 +110,7 @@ to be selected without exposing QUIC implementation details."
     (%http3-quic-adapter-error
      "HTTP/3 QUIC adapter http3-options must be a property list."
      http3-options))
+  (%http3-quic-adapter-configure-protection)
   (let* ((quic-client
            (cl-quic-kit:make-quic-client
             :connection connection
