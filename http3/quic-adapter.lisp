@@ -47,6 +47,24 @@
       (when (plusp poll-interval)
         (sleep poll-interval)))))
 
+(defun %http3-quic-adapter-await-established (quic-client)
+  (loop repeat 3000
+        for state = (cl-quic-kit:connection-state
+                     (cl-quic-kit:quic-client-connection quic-client))
+        do (when (eq state :established)
+             (return quic-client))
+           (when (cl-quic-kit::quic-client-closed-p quic-client)
+             (%http3-quic-adapter-error
+              "The QUIC client closed before the TLS handshake completed."
+              state))
+           (cl-quic-kit:client-poll quic-client)
+           (sleep 0.005)
+        finally
+           (%http3-quic-adapter-error
+            "The QUIC TLS handshake did not complete."
+            (cl-quic-kit:connection-state
+             (cl-quic-kit:quic-client-connection quic-client)))))
+
 (defun make-http3-quic-adapter
     (&key connection udp-socket tls-boundary tls-driver
           local-connection-id destination-connection-id
@@ -99,6 +117,7 @@ to be selected without exposing QUIC implementation details."
          (progn
            (cl-quic-kit:client-start quic-client)
            (setf (http3-quic-adapter-started-p adapter) t)
+           (%http3-quic-adapter-await-established quic-client)
            (setf (http3-quic-adapter-http3-client adapter)
                  (apply #'make-http3-client
                         :open-stream
