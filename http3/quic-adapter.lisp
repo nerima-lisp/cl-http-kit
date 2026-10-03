@@ -245,28 +245,36 @@ to be selected without exposing QUIC implementation details."
                  (apply #'make-http3-client
                         :open-stream
                         (lambda (request &key stream-type timeout deadline)
+                          (%http3-quic-adapter-diagnostic "open-stream-start")
                           (let ((stream
                                   (cl-quic-kit:client-open-stream
                                    quic-client request
                                    :stream-type stream-type
                                    :timeout timeout
                                    :deadline deadline)))
+                            (%http3-quic-adapter-diagnostic "open-stream-complete")
                             (values stream (cl-quic-kit:stream-id stream))))
                         :write-stream
                         (lambda (stream octets &key fin-p timeout deadline)
+                          (%http3-quic-adapter-diagnostic "write-stream-start")
                           (prog1
                               (cl-quic-kit:client-write-stream
                                quic-client stream octets
                                :fin-p fin-p :timeout timeout :deadline deadline)
-                            (cl-quic-kit:client-flush quic-client)))
+                            (cl-quic-kit:client-flush quic-client)
+                            (%http3-quic-adapter-diagnostic "write-stream-complete")))
                         :read-stream
                         (lambda (stream &key timeout deadline)
-                          (%http3-quic-adapter-read
-                           quic-client
-                           (http3-quic-adapter-http3-client adapter)
-                           stream
-                           :timeout timeout :deadline deadline
-                           :poll-interval poll-interval))
+                          (%http3-quic-adapter-diagnostic "read-stream-start")
+                          (multiple-value-prog1
+                              (%http3-quic-adapter-read
+                               quic-client
+                               (http3-quic-adapter-http3-client adapter)
+                               stream
+                               :timeout timeout :deadline deadline
+                               :poll-interval poll-interval)
+                            (%http3-quic-adapter-diagnostic
+                             "read-stream-complete")))
                         :close-stream
                         (lambda (stream &key condition)
                           (cl-quic-kit:client-close-stream
