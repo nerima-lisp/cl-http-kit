@@ -513,6 +513,12 @@
     (let* ((input (concatenate-octets
                    (h2-preface)
                    (h2-frame 4 0 0 (octets))
+                   (h2-frame 1 5 1
+                             (h2-header-block
+                              (cons ":method" "GET")
+                              (cons ":scheme" "https")
+                              (cons ":authority" "example.com")
+                              (cons ":path" "/")))
                    (h2-frame 3 0 3 (octets 0 0 0 0))))
            (stream (make-instance 'binary-session-stream :input input)))
       (signals http-protocol-error
@@ -529,6 +535,36 @@
         (ensure-true goaway)
         (ensure-equal 0 (http-kit/http2::%h2-frame-stream-id goaway))
         (ensure-equal 1
+                      (http-kit/http2::%h2-u32
+                       (http-kit/http2::%h2-frame-payload goaway) 0))
+        (ensure-equal 1
+                      (http-kit/http2::%h2-u32
+                       (http-kit/http2::%h2-frame-payload goaway) 4)))))
+
+  (deftest http2-server-error-goaway-retains-stream-after-hpack-error
+    (let* ((input (concatenate-octets
+                   (h2-preface)
+                   (h2-frame 4 0 0 (octets))
+                   (h2-frame 1 5 1
+                             (octets #x3f #xff #xff #xe3 #x1d
+                                     #x82 #x87))))
+           (stream (make-instance 'binary-session-stream :input input)))
+      (signals http-protocol-error
+        (http-kit/http2:serve-http2-session
+         stream
+         (lambda (request)
+           (declare (ignore request))
+           (make-http-response :status 204))))
+      (let ((goaway
+              (find-if (lambda (frame)
+                         (= (http-kit/http2::%h2-frame-type frame) 7))
+                       (server-output-frames
+                        (binary-session-output stream)))))
+        (ensure-true goaway)
+        (ensure-equal 1
+                      (http-kit/http2::%h2-u32
+                       (http-kit/http2::%h2-frame-payload goaway) 0))
+        (ensure-equal 9
                       (http-kit/http2::%h2-u32
                        (http-kit/http2::%h2-frame-payload goaway) 4)))))
 
@@ -676,8 +712,7 @@
                    (h2-frame 4 0 0 (octets))
                    (h2-frame 1 4 1 headers)
                    (h2-frame 3 0 1 (octets 0 0 0 0))
-                   (h2-frame 1 4 3 headers)
-                   (h2-frame 3 0 3 (octets 0 0 0 0))))
+                   (h2-frame 3 0 1 (octets 0 0 0 0))))
            (stream (make-instance 'binary-session-stream :input input)))
       (signals http-protocol-error
         (http-kit/http2:serve-http2-session
@@ -692,6 +727,9 @@
                        (server-output-frames
                         (binary-session-output stream)))))
         (ensure-true goaway)
+        (ensure-equal 1
+                      (http-kit/http2::%h2-u32
+                       (http-kit/http2::%h2-frame-payload goaway) 0))
         (ensure-equal 11
                       (http-kit/http2::%h2-u32
                        (http-kit/http2::%h2-frame-payload goaway) 4)))))
@@ -716,6 +754,12 @@
     (let* ((input (concatenate-octets
                    (h2-preface)
                    (h2-frame 4 0 0 (octets))
+                   (h2-frame 1 5 1
+                             (h2-header-block
+                              (cons ":method" "GET")
+                              (cons ":scheme" "https")
+                              (cons ":authority" "example.com")
+                              (cons ":path" "/")))
                    (h2-frame 6 0 0 (octets 1 2 3 4 5 6 7 8))
                    (h2-frame 6 0 0 (octets 9 10 11 12 13 14 15 16))))
            (stream (make-instance 'binary-session-stream :input input)))
@@ -740,6 +784,9 @@
                       frames)))
         (ensure-equal 1 acks)
         (ensure-true goaway)
+        (ensure-equal 1
+                      (http-kit/http2::%h2-u32
+                       (http-kit/http2::%h2-frame-payload goaway) 0))
         (ensure-equal 11
                       (http-kit/http2::%h2-u32
                        (http-kit/http2::%h2-frame-payload goaway) 4)))))

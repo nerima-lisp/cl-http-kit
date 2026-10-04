@@ -424,7 +424,8 @@ values.
                       :allow-zero t)
   (let ((request-count 0)
         (termination :running)
-        (current-request nil))
+        (current-request nil)
+        (last-client-stream-id 0))
     (unwind-protect
          (handler-case
              (http-kit:with-http-deadline
@@ -439,7 +440,6 @@ values.
                                           clock-function)))
                       (streams (make-hash-table :test #'eql))
                       (pending-frames '())
-                      (last-client-stream-id 0)
                       (peer-max-concurrent-streams nil)
                       (reset-stream-count 0)
                       (reset-times '())
@@ -1200,7 +1200,7 @@ values.
                (when error-code
                  (let ((payload (make-array 8
                                             :element-type '(unsigned-byte 8))))
-                   (%h2-put-u32 payload 0 0)
+                   (%h2-put-u32 payload 0 last-client-stream-id)
                    (%h2-put-u32 payload 4 error-code)
                    (%h2-write-wire
                     stream
