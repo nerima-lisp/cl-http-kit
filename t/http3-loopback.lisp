@@ -120,6 +120,8 @@
               (error (condition)
                 (format t "HTTP/3 diagnostic transport error mode=~A condition=~A~%"
                         mode condition)
+                #+sbcl
+                (sb-debug:print-backtrace :count 20 :stream *error-output*)
                 (error condition)))
       (ignore-errors
         (http-kit/http3:close-http3-quic-adapter adapter))))))
