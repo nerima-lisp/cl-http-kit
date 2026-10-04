@@ -233,9 +233,10 @@
                                      :budget-owner client
                                      :control-handler
                                      (lambda (frame response-writer expected-id)
-                                       (declare (ignore expected-id))
                                        (%h2-client-control-budget-check
-                                        client frame response-writer)))))
+                                        client frame response-writer)
+                                       (%h2-handle-control-frame
+                                        frame response-writer expected-id)))))
                (t
                 (setf stream
                       (funcall (%http2-open-stream client)
