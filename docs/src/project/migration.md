@@ -45,8 +45,8 @@ The dependency and policy changes are:
 - Basic and Digest authentication are available for origin and proxy
   challenges, subject to replay safety;
 - pool and cookie-jar state is safe for concurrent use;
-- HTTP/2 is selected through the native client protocol path with ALPN
-  `h2`/`http/1.1` and the documented fallback rules.
+- the native client offers only `http/1.1` through ALPN; HTTP/2 uses the
+  explicit `cl-http-kit/http2` transport boundary until native dispatch exists.
 
 Automatic HTTP/3 selection remains out of this migration. The existing HTTP/3
 framing and injected-QUIC boundary remains the integration seam, and the

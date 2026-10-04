@@ -17,16 +17,17 @@ The 0.4.0 release is a breaking integration release for the 0.x series:
 - support environment-based proxy selection (`HTTP_PROXY`, `HTTPS_PROXY`,
   and `NO_PROXY`, including lowercase names), proxy/origin authentication,
   and thread-safe pool and cookie state;
-- keep HTTP/2 protocol selection in the native client path; HTTP/3 is not
-  selected automatically, while an explicitly supplied cl-quic-kit adapter can
-  drive the client QUIC connection and HTTP/3 stream lifecycle;
+- keep the native client path on HTTP/1.1; HTTP/2 uses its explicit transport
+  boundary, while HTTP/3 is not selected automatically and an explicitly
+  supplied cl-quic-kit adapter can drive the client QUIC connection and HTTP/3
+  stream lifecycle;
 - add HTTP/3 client loopback coverage through the cl-quic-kit adapter for
   Alt-Svc, fallback, and explicit HTTP/3 modes;
 - update the dependency pins for cl-crypto-kit, cl-deflate-kit, cl-tls-kit,
   and cl-quic-kit to their release integration branches;
 - verify the release gate on Ubuntu x86_64 with `nix flake check`, including
-  the test, lint, and coverage checks defined by the flake, and run the
-  separate strict MkDocs build for documentation.
+  the test and lint checks defined by the flake; run the separate strict MkDocs
+  build for documentation when publishing the docs.
 
 The documented runtime verification is limited to Ubuntu x86_64. The HTTP/3
 connection path is verified through the cl-quic-kit adapter; native QUIC

@@ -85,8 +85,8 @@
           tls-upgrade
           resolve-host
           (max-idle 16)
-          idle-timeout
-          max-connection-age
+          (idle-timeout 60.0)
+          (max-connection-age 300.0)
           (clock-function #'%pool-monotonic-time))
   "Construct a reusable, thread-safe HTTP connection pool.
 

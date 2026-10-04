@@ -95,7 +95,8 @@
                    :message "A chunk size or extension is malformed."
                    :operation :response-parse
                    :detail line))
-          (let ((size (parse-integer size-text :radix 16)))
+          (let ((size (%parse-hex-limited size-text max-body-bytes
+                                         :operation :response-parse)))
             (if (zerop size)
                 (progn
                   (multiple-value-bind (parsed-trailers trailer-bytes)

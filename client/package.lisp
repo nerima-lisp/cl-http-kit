@@ -274,6 +274,7 @@
    #:http-client-content-decoders
    #:http-client-sleep-function
    #:http-client-random-function
+   #:http-client-default-timeout
    #:http-client-max-header-bytes
    #:http-client-max-fields
    #:http-client-max-body-bytes

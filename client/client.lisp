@@ -410,7 +410,9 @@
           (unless factory
             (%client-missing-native-feature :tls "HTTP-KIT/TLS"))
           (setf upgrader
-                (funcall factory :alpn-protocols '("h2" "http/1.1")))))
+                ;; HTTP/2 dispatch is not implemented by this client path yet.
+                ;; Offering h2 would route an h2 wire stream into the HTTP/1.1 parser.
+                (funcall factory :alpn-protocols '("http/1.1")))))
       (funcall upgrader stream uri :timeout timeout :deadline deadline))))
 
 (defun make-http-client
@@ -431,7 +433,9 @@
           (wall-clock-function #'%client-monotonic-time)
           (sleep-function #'sleep)
           (random-function #'random)
-          max-header-bytes max-fields max-body-bytes
+          (default-timeout *default-client-timeout*)
+          max-header-bytes max-fields
+          (max-body-bytes http-kit::*default-max-body-bytes*)
           (automatic-decompression-p t)
           (content-decoders (make-http-content-decoders))
           on-request on-response)
@@ -487,6 +491,11 @@ Pass NIL explicitly to disable either store."
                     "The client wall clock must be a function.")
   (%ensure-function sleep-function "The client sleep function must be a function.")
   (%ensure-function random-function "The client random function must be a function.")
+  (unless (or (null default-timeout)
+              (and (realp default-timeout) (>= default-timeout 0)))
+    (%client-protocol-error
+     "The client default timeout must be a non-negative real number or NIL."
+     default-timeout))
   (when close-stream
     (%ensure-function close-stream "The stream close function must be a function."))
   (when auth-provider
@@ -625,6 +634,7 @@ Pass NIL explicitly to disable either store."
      :wall-clock-function wall-clock-function
      :sleep-function sleep-function
      :random-function random-function
+     :default-timeout default-timeout
      :max-header-bytes max-header-bytes
      :max-fields max-fields
      :max-body-bytes max-body-bytes
@@ -1141,8 +1151,9 @@ headers replace client default headers with the same case-insensitive name."
          "The redirect policy rejected an HTTPS to HTTP downgrade."
          :detail target
          :operation :redirect))
-      (unless (or (http-redirect-policy-preserve-authorization-p policy)
-                  (http-same-origin-p initial-uri target))
+      (unless (and (not downgrade)
+                   (or (http-redirect-policy-preserve-authorization-p policy)
+                       (http-same-origin-p initial-uri target)))
         (setf headers (%client-remove-headers headers '("Authorization"))))
       (unless (http-same-origin-p (http-request-uri request) target)
         (setf headers (%client-remove-headers
@@ -1643,4 +1654,8 @@ Convenience-only :HEADERS, :TRAILERS, and :BODY options are consumed while
 all other keywords retain the HTTP-CLIENT-SEND contract."
   (multiple-value-bind (request send-options)
       (%client-parse-send-arguments client request-or-method arguments)
-    (apply #'%http-client-send-request client request send-options)))
+    (apply #'%http-client-send-request client request
+           (if (member :timeout send-options)
+               send-options
+               (append (list :timeout (http-client-default-timeout client))
+                       send-options)))))

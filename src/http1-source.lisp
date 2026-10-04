@@ -8,8 +8,10 @@
 (defun %make-byte-source-for (input &key (operation :response-parse))
   (cond
     ((and (arrayp input) (= (array-rank input) 1)
-          (not (stringp input)))
-     (%make-byte-source :vector (%copy-octets input) :position 0))
+          (not (stringp input))
+          (loop for item across input
+                always (and (integerp item) (<= 0 item 255))))
+     (%make-byte-source :vector input :position 0))
     ((and (listp input)
           (every (lambda (octet) (and (integerp octet) (<= 0 octet 255))) input))
      (%make-byte-source :vector (%copy-octets input) :position 0))

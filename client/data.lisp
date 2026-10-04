@@ -4,6 +4,7 @@
 (defparameter *default-retry-methods*
   '("GET" "HEAD" "OPTIONS" "PUT" "DELETE" "TRACE"))
 (defparameter *default-retry-statuses* '(408 425 429 500 502 503 504))
+(defparameter *default-client-timeout* 30.0)
 
 #+sbcl
 (defun %make-client-lock (name)
@@ -348,6 +349,7 @@ character in that range is a decimal digit, apart from an optional sign when
   wall-clock-function
   sleep-function
   random-function
+  default-timeout
   max-header-bytes
   max-fields
   max-body-bytes

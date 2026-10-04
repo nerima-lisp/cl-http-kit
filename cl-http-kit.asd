@@ -149,6 +149,7 @@
 
 (asdf:defsystem "cl-http-kit/test-core"
   :description "Core tests for cl-http-kit without optional transport or client subsystems."
+  :version "0.4.0"
   :depends-on ("cl-http-kit"
                "cl-weave")
   :pathname "t"
@@ -177,6 +178,7 @@
 
 (asdf:defsystem "cl-http-kit/test"
   :description "Tests for cl-http-kit and its optional protocol and network systems."
+  :version "0.4.0"
   :depends-on ("cl-http-kit/test-core"
                "cl-http-kit/client"
                "cl-http-kit/http2"

@@ -434,6 +434,15 @@ available through `http2-connection-peer-max-frame-size`,
 `http2-connection-peer-initial-window-size`, and
 `http2-connection-peer-connection-window-size`.
 
+HTTP/2 header-block assembly has three configurable implementation caps in
+the `http-kit/http2` package. `*h2-max-header-block-frames*` defaults to 128
+frames per block, `*h2-max-continuation-frames*` defaults to 127 continuation
+frames, and `*h2-max-header-block-parts*` defaults to 128 retained fragments.
+They apply while reading client response headers and batched response headers;
+exceeding a cap raises `HTTP-PROTOCOL-ERROR` before the block is decoded.
+These caps are separate from the per-section `max-header-bytes` and
+`max-fields` limits.
+
 ### HTTP/2 connection manager
 
 `make-http2-connection-manager` constructs an owner-thread connection pool
@@ -1332,7 +1341,7 @@ alternative-service-store redirect-policy
 retry-policy proxy tls-upgrade resolve-host auth-provider
 challenge-auth-provider proxy-challenge-auth-provider
 stale-while-revalidate-scheduler clock-function
-wall-clock-function sleep-function random-function max-header-bytes max-fields max-body-bytes
+wall-clock-function sleep-function random-function default-timeout max-header-bytes max-fields max-body-bytes
 automatic-decompression-p content-decoders on-request on-response). At most one
 of transport-function, open-stream, or connection-pool may be supplied;
 omitting all three selects the native TCP/TLS connection pool.
@@ -1349,6 +1358,24 @@ signatures are intentionally unsupported.
 
 `HTTP-CLIENT-SEND` also accepts a method and URL convenience form while
 retaining its request-object form.
+
+### Client and HTTP/1.1 defaults
+
+| Setting | Default | Scope |
+| --- | ---: | --- |
+| Client request timeout | 30 seconds | One request deadline covering DNS, connect, TLS, write, read, redirects, and retries |
+| Maximum header bytes | 65,536 | HTTP/1.1 headers and trailers |
+| Maximum fields | 256 | Each HTTP/1.1 field section |
+| Maximum wire body bytes | 16 MiB | HTTP/1.1 collected request or response body |
+| Maximum decoded body bytes | 16 MiB | Automatic gzip/deflate response decoding, enforced during expansion |
+| Connection-pool max idle | 16 | Idle streams retained per pool |
+| Connection-pool idle timeout | 60 seconds | Idle stream expiry during pool operations |
+| Connection-pool max connection age | 300 seconds | Absolute stream lifetime during pool operations |
+
+Passing `:timeout NIL`, `:max-body-bytes NIL`, `:idle-timeout NIL`, or
+`:max-connection-age NIL` explicitly opts into an unbounded value. The native
+client offers only `http/1.1` through ALPN; HTTP/2 requires the explicit
+`cl-http-kit/http2` transport boundary until native client dispatch is provided.
 
 ### `http-client-transport-function`
 

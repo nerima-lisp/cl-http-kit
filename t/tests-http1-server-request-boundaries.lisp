@@ -89,6 +89,18 @@
     (parse-http-request
      (ascii "POST / HTTP/1.1|CRLF|Host: example.com|CRLF|Content-Length: 2|CRLF||CRLF|ab")
      :max-body-bytes 1))
+  (signals http-size-limit-exceeded
+    (parse-http-request
+     (ascii (format nil
+                    "POST / HTTP/1.1|CRLF|Host: example.com|CRLF|Content-Length: ~A|CRLF||CRLF|"
+                    (make-string 10000 :initial-element #\9)))
+     :max-body-bytes 0))
+  (signals http-size-limit-exceeded
+    (parse-http-request
+     (ascii (format nil
+                    "POST / HTTP/1.1|CRLF|Host: example.com|CRLF|Transfer-Encoding: chunked|CRLF||CRLF|~A|CRLF|"
+                    (make-string 10000 :initial-element #\f)))
+     :max-body-bytes 0))
   (signals http-protocol-error
     (parse-http-request
      (ascii "GET / HTTP/1.1|CRLF| Host: folded|CRLF||CRLF|")))

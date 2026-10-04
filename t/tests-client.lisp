@@ -2838,6 +2838,39 @@
       (ensure-equal nil redirect-origin)
       (ensure-equal nil redirect-referer))))
 
+(deftest client-downgrade-redirect-drops-authorization-even-when-preserved
+  (let ((calls 0)
+        (seen-authorization :not-observed))
+    (let ((client
+            (make-http-client
+             :cache nil
+             :redirect-policy
+             (make-http-redirect-policy
+              :allow-downgrade-p t
+              :preserve-authorization-p t)
+             :transport-function
+             (lambda (request &key &allow-other-keys)
+               (incf calls)
+               (if (= calls 1)
+                   (client-test-response
+                    302 :headers (list (make-http-header
+                                        "Location" "http://target.test/final")))
+                   (progn
+                     (setf seen-authorization
+                           (http-header-value
+                            (http-request-headers request) "Authorization"))
+                     (client-test-response 200)))))))
+      (let ((response
+              (http-client-send
+               client
+               (http-client-request
+                client "GET" "https://source.test/start"
+                :headers (list (make-http-header
+                                "Authorization" "Basic secret"))))))
+        (ensure-equal 200 (http-response-status response)))
+      (ensure-equal 2 calls)
+      (ensure-equal nil seen-authorization))))
+
 (deftest client-challenge-auth-does-not-cross-origin-on-redirect
   (let ((calls 0)
         (provider-calls 0)
@@ -3332,6 +3365,33 @@
       (ensure-true condition)
       (ensure-equal :deadline (http-timeout-kind condition))
       (ensure-equal 1 calls))))
+
+(deftest client-default-timeout-is-finite-and-explicit-nil-is-unbounded
+  (let ((observed nil))
+    (let ((client
+            (make-http-client
+             :cache nil
+             :wall-clock-function (lambda () 100)
+             :transport-function
+             (lambda (request &key timeout deadline &allow-other-keys)
+               (declare (ignore request deadline))
+               (setf observed timeout)
+               (client-test-response 200)))))
+      (http-client-send client
+                        (http-client-request client "GET" "http://example.test/"))
+      (ensure-equal 30.0 observed))
+    (let ((client
+            (make-http-client
+             :cache nil
+             :transport-function
+             (lambda (request &key timeout &allow-other-keys)
+               (declare (ignore request))
+               (setf observed timeout)
+               (client-test-response 200)))))
+      (http-client-send client
+                        (http-client-request client "GET" "http://example.test/")
+                        :timeout nil)
+      (ensure-equal nil observed))))
 
 (deftest client-does-not-retry-after-streaming-response-bytes
   (let ((calls 0)

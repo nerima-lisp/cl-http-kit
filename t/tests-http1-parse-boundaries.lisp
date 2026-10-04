@@ -72,6 +72,12 @@
   (signals http-protocol-error
     (parse-http-response
      (ascii "HTTP/1.1 200 OK|CRLF|Transfer-Encoding: chunked|CRLF||CRLF|1|CRLF|a")))
+  (signals http-size-limit-exceeded
+    (parse-http-response
+     (ascii (format nil
+                    "HTTP/1.1 200 OK|CRLF|Transfer-Encoding: chunked|CRLF||CRLF|~A|CRLF|"
+                    (make-string 10000 :initial-element #\f)))
+     :max-body-bytes 0))
   (signals http-invalid-header
     (parse-http-response
      (ascii "HTTP/1.1 200 OK|CRLF|Transfer-Encoding: chunked|CRLF||CRLF|0|CRLF|Broken|CRLF||CRLF|")))

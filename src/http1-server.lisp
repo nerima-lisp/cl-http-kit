@@ -81,7 +81,7 @@
                             :operation :request-parse)
               (push (%parse-request-header-line line) headers)))))))
 
-(defun %request-content-length (headers)
+(defun %request-content-length (headers max-body-bytes)
   (let ((values (http-header-values headers "content-length")))
     (cond
       ((null values) nil)
@@ -90,13 +90,16 @@
         "Content-Length must be an ASCII decimal integer."
         "content-length" :value values))
       ((not (every (lambda (value)
-                     (= (%parse-decimal value)
-                        (%parse-decimal (first values))))
+                     (= (%parse-decimal-limited value max-body-bytes
+                                                :operation :request-parse)
+                        (%parse-decimal-limited (first values) max-body-bytes
+                                                :operation :request-parse)))
                    values))
        (%request-header-error
         "Duplicate Content-Length values must agree."
         "content-length" :duplicate values))
-      (t (%parse-decimal (first values))))))
+      (t (%parse-decimal-limited (first values) max-body-bytes
+                                 :operation :request-parse)))))
 
 (defun %request-transfer-mode (headers)
   (let ((values (http-header-values headers "transfer-encoding")))
@@ -303,7 +306,8 @@
             (%request-parse-error
              "A chunk size or extension is malformed."
              line))
-          (let ((size (parse-integer size-text :radix 16)))
+          (let ((size (%parse-hex-limited size-text max-body-bytes
+                                         :operation :request-parse)))
             (if (zerop size)
                 (progn
                   (multiple-value-bind (parsed-trailers trailer-bytes)
@@ -390,7 +394,7 @@ read."
                      (uri (%request-target-uri method version target host-values
                                                default-authority))
                      (transfer-mode (%request-transfer-mode headers))
-                     (content-length (%request-content-length headers))
+                     (content-length (%request-content-length headers body-limit))
                      (expect-continue-p (%request-expectation headers version)))
                 (when (and transfer-mode content-length)
                   (%request-header-error

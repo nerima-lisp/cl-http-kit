@@ -16,6 +16,50 @@
            :detail string))
   (parse-integer string))
 
+(defun %decimal-exceeds-limit-p (string limit)
+  (when limit
+    (let* ((first (or (position-if-not (lambda (character)
+                                        (char= character #\0))
+                                      string)
+                      (length string)))
+           (digits (subseq string first))
+           (limit-text (princ-to-string limit)))
+      (or (> (length digits) (length limit-text))
+          (and (= (length digits) (length limit-text))
+               (string> digits limit-text))))))
+
+(defun %parse-decimal-limited (string limit &key (operation :integer))
+  (when (%decimal-exceeds-limit-p string limit)
+    (error 'http-size-limit-exceeded
+           :message "The HTTP body limit was exceeded."
+           :operation operation
+           :limit limit
+           :observed string
+           :kind :body))
+  (%parse-decimal string))
+
+(defun %hex-string-exceeds-limit-p (string limit)
+  (when limit
+    (let* ((first (or (position-if-not (lambda (character)
+                                        (char= character #\0))
+                                      string)
+                      (length string)))
+           (digits (subseq string first))
+           (limit-text (format nil "~X" limit)))
+      (or (> (length digits) (length limit-text))
+          (and (= (length digits) (length limit-text))
+               (string> (string-upcase digits) limit-text))))))
+
+(defun %parse-hex-limited (string limit &key (operation :chunk-size))
+  (when (%hex-string-exceeds-limit-p string limit)
+    (error 'http-size-limit-exceeded
+           :message "The HTTP body limit was exceeded."
+           :operation operation
+           :limit limit
+           :observed string
+           :kind :body))
+  (parse-integer string :radix 16))
+
 (defun %hex-digit (character)
   (let ((code (char-code character)))
     (cond ((and (<= (char-code #\0) code)
