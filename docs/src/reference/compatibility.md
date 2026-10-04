@@ -104,6 +104,9 @@ The client can advertise `MAX_PUSH_ID`, receive promised responses on injected
 push streams, and cancel pushes. The server boundary can emit a push promise
 and its matching push stream when the surrounding QUIC transport supplies the
 required callbacks.
+The optional cl-quic-kit client adapter drives a caller-selected QUIC client,
+including its TLS handshake and HTTP/3 stream lifecycle; it does not replace
+the caller's QUIC, socket, certificate, or server-accept policy.
 Invalid or deliberately unsupported protocol features raise public protocol or
 unsupported-feature conditions.
 
@@ -185,8 +188,8 @@ connection-pool constructors.
 The current integration keeps these policy objects and compatibility entry
 points, and its native default supplies TCP/TLS, redirects, cookies, content
 coding, proxy environment lookup, and pooling when the optional systems are
-available. HTTP/3 connection selection is enabled by the injected cl-quic-kit
-adapter.
+available. HTTP/3 connection selection is available when the cl-quic-kit
+adapter is explicitly supplied.
 
 ## WebSocket
 

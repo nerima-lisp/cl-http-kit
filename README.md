@@ -134,11 +134,11 @@ used. The optional
 server session over caller-provided binary I/O. The optional
 `cl-http-kit/http3` system supplies client and per-request server stream
 framing with static/literal/Huffman QPACK and caller-owned dynamic-table
-references over caller-provided QUIC streams; QUIC packets, loss recovery,
-congestion control, TLS 1.3, ALPN, sockets, and native HTTP/3
-connection/server acceptance remain outside that boundary. The HTTP/3 system
-also supplies a cl-quic-kit adapter for the client connection and stream
-lifecycle. The optional
+references over caller-provided QUIC streams. Its optional cl-quic-kit adapter
+can drive the client QUIC connection and stream lifecycle when explicitly
+supplied. QUIC packets, loss recovery, congestion control, TLS 1.3, ALPN,
+sockets, certificate policy, and native HTTP/3 server acceptance remain
+outside the framing boundary. The optional
 `cl-http-kit/network` system supplies native TCP, DNS, and an HTTP/1 listener
 service on SBCL; `cl-http-kit/tls` supplies the TLS upgrade and accepted-stream
 wrappers. Server-side TLS wrapping is unsupported because the current

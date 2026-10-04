@@ -99,5 +99,7 @@ The 0.4.0 integration provides the URL-and-method convenience form through
 `http-client-send` and the native TLS 1.3 client wrapper. Server-side TLS is
 outside the current boundary because cl-tls-kit does not expose a server
 driver. Deploy an HTTPS reverse proxy or load balancer in front of the native
-HTTP listener when the server must accept TLS connections. HTTP/3 remains a
-framing boundary until cl-quic-kit provides the QUIC connection layer.
+HTTP listener when the server must accept TLS connections. HTTP/3 framing
+remains an injected QUIC boundary. When explicitly supplied, the optional
+cl-quic-kit client adapter drives the client QUIC connection and HTTP/3 stream
+lifecycle.

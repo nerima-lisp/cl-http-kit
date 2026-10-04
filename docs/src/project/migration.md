@@ -22,8 +22,10 @@ client driver. The client system uses cl-deflate-kit for gzip and deflate.
 Server-side TLS remains an explicit unsupported boundary because the kit does
 not expose a server driver. For HTTPS servers, terminate TLS in a reverse
 proxy or load balancer and forward plain HTTP to `cl-http-kit/network`.
-HTTP/2 and HTTP/3 use injected stream or exchange boundaries; HTTP/3 does not
-open QUIC connections.
+HTTP/2 and the base HTTP/3 APIs use injected stream or exchange boundaries.
+The optional cl-quic-kit client adapter can open and drive a QUIC connection
+when explicitly supplied; QUIC setup and server-side accept remain outside the
+base framing API.
 
 ## 0.4.0 changes
 
@@ -46,10 +48,9 @@ The dependency and policy changes are:
 - HTTP/2 is selected through the native client protocol path with ALPN
   `h2`/`http/1.1` and the documented fallback rules.
 
-Native HTTP/3 is deliberately out of this migration until cl-quic-kit is
-complete. The existing HTTP/3 framing and injected-QUIC boundary remains the
-integration seam; native H3 connection setup will be documented separately
-when that transport is available.
+Automatic HTTP/3 selection remains out of this migration. The existing HTTP/3
+framing and injected-QUIC boundary remains the integration seam, and the
+optional cl-quic-kit adapter provides explicit client connection setup.
 
 ## Migration checklist
 

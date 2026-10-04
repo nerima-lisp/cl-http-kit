@@ -17,13 +17,15 @@ The candidate scope is a breaking integration release for the 0.x series:
 - support environment-based proxy selection (`HTTP_PROXY`, `HTTPS_PROXY`,
   and `NO_PROXY`, including lowercase names), proxy/origin authentication,
   and thread-safe pool and cookie state;
-- keep HTTP/2 protocol selection in the native client path; defer native
-  HTTP/3 connection selection until cl-quic-kit provides the QUIC transport.
+- keep HTTP/2 protocol selection in the native client path; HTTP/3 is not
+  selected automatically, while an explicitly supplied cl-quic-kit adapter can
+  drive the client QUIC connection and HTTP/3 stream lifecycle;
 
 These entries describe the integrated 0.4.0 source.
 
 The current worktree has cl-deflate-kit and cl-tls-kit dependency declarations.
-The missing QUIC connection and server-side TLS driver remain outside the
+The HTTP/3 client adapter uses cl-quic-kit; QUIC implementation details,
+certificate and TLS policy, and the server-side TLS driver remain outside the
 candidate boundary.
 
 ## Earlier 0.3.x source
