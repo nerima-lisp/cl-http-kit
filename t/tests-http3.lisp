@@ -3675,6 +3675,51 @@
                 (+ 32 (length (octets-as-string (octets 120)))
                    (length (octets-as-string (octets 121))))))
 
+(deftest http3-qpack-decoder-transport-limits
+  (flet ((read-decoder-stream (instruction max-instruction-bytes max-buffer-bytes)
+           (let* ((wire
+                    (http3-test-concat-octets
+                     (http-kit/http3:http3-qpack-decoder-stream-prefix)
+                     instruction))
+                  (stream
+                    (make-http3-test-stream
+                     :kind :peer-qpack-decoder
+                     :reads (list (list wire nil))))
+                  (client
+                    (http-kit/http3::%make-http3-client
+                     :open-p t
+                     :qpack-max-instruction-bytes max-instruction-bytes
+                     :qpack-max-buffer-bytes max-buffer-bytes
+                     :read-stream
+                     (lambda (read-stream &key timeout deadline)
+                       (declare (ignore timeout deadline))
+                       (let ((entry (pop (http3-test-stream-reads
+                                          read-stream))))
+                         (values (first entry) (second entry)))))))
+             (http-kit/http3:attach-http3-peer-qpack-decoder-stream
+              client stream)
+             (http-kit/http3:read-http3-qpack-decoder-stream client))))
+    (multiple-value-bind (events ended-p)
+        (read-decoder-stream
+         (http-kit/http3:qpack-encode-section-acknowledgment 0)
+         1 2)
+      (ensure-equal '((:section-acknowledgment 0)) events)
+      (ensure-equal nil ended-p))
+    (signals http-protocol-error
+      (read-decoder-stream
+       (http-kit/http3:qpack-encode-stream-cancellation 128)
+       1 2))
+    (multiple-value-bind (events ended-p)
+        (read-decoder-stream
+         (http-kit/http3:qpack-encode-section-acknowledgment 0)
+         2 1)
+      (ensure-equal '((:section-acknowledgment 0)) events)
+      (ensure-equal nil ended-p))
+    (signals http-protocol-error
+      (read-decoder-stream
+       (http-kit/http3:qpack-encode-stream-cancellation 128)
+       4 1))))
+
 (deftest http3-client-connection-limits-are-configurable
   (let ((client
           (http-kit/http3:make-http3-client

@@ -885,6 +885,10 @@ HTTP3-CLIENT-PEER-CONTROL-STATE."
                    (multiple-value-bind (new-events consumed)
                        (qpack-process-decoder-stream
                         buffer :allow-incomplete-p t
+                        :max-instruction-bytes
+                        (http3-client-qpack-max-instruction-bytes client)
+                        :max-buffer-bytes
+                        (http3-client-qpack-max-buffer-bytes client)
                         :state (http3-client-qpack-decoder-state client))
                      (setf events new-events
                            buffer (subseq buffer consumed)))
