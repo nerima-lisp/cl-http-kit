@@ -772,6 +772,16 @@ headers replace client default headers with the same case-insensitive name."
     (when (plusp delay)
       (funcall (http-client-sleep-function client) delay))))
 
+(defun %client-http3-fallback-deadline (client deadline)
+  (when deadline
+    (let* ((now (funcall (http-client-wall-clock-function client)))
+           (remaining (- deadline now))
+           (fallback-minimum
+             (if (> remaining 1.0)
+                 1.0
+                 (* remaining 0.5))))
+      (max now (- deadline fallback-minimum)))))
+
 (defun %client-call-transport
     (client request proxy-plan &key timeout deadline request-body-function
                                       request-body-length on-body-chunk
@@ -819,14 +829,19 @@ headers replace client default headers with the same case-insensitive name."
       (labels ((call-tcp ()
                  (apply (http-client-transport-function client)
                         effective-request arguments))
-               (call-http3 (service)
+              (call-http3 (service &optional attempt-deadline)
                  (unless http3-transport
                    (%client-missing-native-feature :http3-transport
                                                    "HTTP-KIT/CLIENT"))
                  (apply http3-transport
                         (%client-request-with
                          effective-request :protocol-version "HTTP/3")
-                        (append arguments
+                        (append (if attempt-deadline
+                                    (let ((limited (copy-list arguments)))
+                                      (setf (getf limited :deadline)
+                                            attempt-deadline)
+                                      limited)
+                                    arguments)
                                 (list :alternative-service service)))))
         (let ((response
                 (cond
@@ -835,7 +850,9 @@ headers replace client default headers with the same case-insensitive name."
                    (call-http3 nil))
                   (alternative
                    (handler-case
-                       (call-http3 alternative)
+                       (call-http3
+                        alternative
+                        (%client-http3-fallback-deadline client deadline))
                      (error (condition)
                        ;; Failed Alt-Svc knowledge is stale.  Retry via TCP.
                        (declare (ignore condition))
