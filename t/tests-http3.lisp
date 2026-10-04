@@ -3652,3 +3652,52 @@
           (http-kit/http3::%h3-server-send-information
            :stream #'write-stream response 16384 65536 nil nil nil nil)))
       (ensure-equal 0 writes))))
+
+(deftest http3-qpack-instruction-and-field-accounting-limits
+  (let ((table (http-kit/http3:make-qpack-dynamic-table)))
+    (signals http-protocol-error
+      (http-kit/http3:qpack-process-encoder-stream
+       table (octets #x40 #x00 #x00)
+       :allow-incomplete-p t
+       :max-instruction-bytes 2))
+    (signals http-protocol-error
+      (http-kit/http3:qpack-process-decoder-stream
+       (octets #x40 #x00)
+       :allow-incomplete-p t
+       :max-buffer-bytes 1)))
+  (let ((section
+          (http-kit/http3:qpack-encode-field-section
+           (list (cons "x" "y")))))
+    (signals http-size-limit-exceeded
+      (http-kit/http3:qpack-decode-field-section
+       section :max-header-bytes 32)))
+  (ensure-equal 34
+                (+ 32 (length (octets-as-string (octets 120)))
+                   (length (octets-as-string (octets 121))))))
+
+(deftest http3-client-connection-limits-are-configurable
+  (let ((client
+          (http-kit/http3:make-http3-client
+           :max-request-streams 3
+           :max-peer-unidirectional-streams 4
+           :max-state-bytes 128
+           :qpack-max-instruction-bytes 16
+           :qpack-max-buffer-bytes 32
+           :open-stream (lambda (request &key stream-type timeout deadline)
+                          (declare (ignore request stream-type timeout deadline))
+                          (list :stream))
+           :write-stream (lambda (stream octets &key fin-p timeout deadline)
+                           (declare (ignore stream octets fin-p timeout deadline)))
+           :read-stream (lambda (stream &key timeout deadline)
+                          (declare (ignore stream timeout deadline))
+                          (values nil t)))))
+    (ensure-equal 3 (http-kit/http3:http3-client-max-request-streams client))
+    (ensure-equal 4
+                  (http-kit/http3:http3-client-max-peer-unidirectional-streams
+                   client))
+    (ensure-equal 128 (http-kit/http3:http3-client-max-state-bytes client))
+    (ensure-equal 16
+                  (http-kit/http3:http3-client-qpack-max-instruction-bytes client))
+    (ensure-equal 32
+                  (http-kit/http3:http3-client-qpack-max-buffer-bytes client))
+    (http-kit/http3:close-http3-client client)))

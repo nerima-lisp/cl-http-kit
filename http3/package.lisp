@@ -6,6 +6,11 @@
                 #:http-size-limit-exceeded
                 #:http-unsupported-feature)
   (:export
+   #:+http3-default-qpack-max-instruction-bytes+
+   #:+http3-default-qpack-max-buffer-bytes+
+   #:+http3-default-max-request-streams+
+   #:+http3-default-max-peer-unidirectional-streams+
+   #:+http3-default-max-state-bytes+
    #:+http3-data-type+
    #:+http3-headers-type+
    #:+http3-cancel-push-type+
@@ -147,6 +152,11 @@
    #:http3-client-max-frame-size
    #:http3-client-max-header-bytes
    #:http3-client-max-fields
+   #:http3-client-max-request-streams
+   #:http3-client-max-peer-unidirectional-streams
+   #:http3-client-max-state-bytes
+   #:http3-client-qpack-max-instruction-bytes
+   #:http3-client-qpack-max-buffer-bytes
    #:http3-client-max-push-id
    #:http3-client-promised-push-ids
    #:http3-client-cancelled-push-ids

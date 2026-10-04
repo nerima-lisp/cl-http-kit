@@ -1017,7 +1017,8 @@ QPACK-BLOCKED-FIELD-SECTION."
                      (setf regular-seen-p t))
                  (push (cons normalized-name normalized-value) fields)
                  (incf total-bytes
-                       (+ (length (http-kit::%string-octets normalized-name))
+                       (+ 32
+                          (length (http-kit::%string-octets normalized-name))
                           (length (http-kit::%string-octets normalized-value))))))
              (append-entry (entry)
                (append-field (if (qpack-dynamic-entry-p entry)
@@ -1190,7 +1191,10 @@ instruction; stream buffering belongs to the HTTP/3 transport."
        (search "truncated" (http-kit:http-error-message condition)
                :test #'char-equal)))
 
-(defun qpack-process-encoder-stream (table octets &key allow-incomplete-p)
+(defun qpack-process-encoder-stream
+    (table octets &key allow-incomplete-p
+                          (max-instruction-bytes 65536)
+                          (max-buffer-bytes 262144))
   "Apply QPACK encoder-stream instructions to TABLE.
 
 Returns the events and consumed position.  With ALLOW-INCOMPLETE-P, a final
@@ -1199,6 +1203,14 @@ partial instruction is left unconsumed so transports can buffer it."
     (%qpack-error "A QPACK dynamic table object is required." table))
   (unless (%http3-octet-vector-p octets)
     (%qpack-error "QPACK encoder streams must be octet vectors." (type-of octets)))
+  (unless (and (integerp max-instruction-bytes) (plusp max-instruction-bytes))
+    (%qpack-error "QPACK instruction limits must be positive integers."
+                  max-instruction-bytes))
+  (unless (and (integerp max-buffer-bytes) (plusp max-buffer-bytes))
+    (%qpack-error "QPACK buffer limits must be positive integers." max-buffer-bytes))
+  (when (> (length octets) max-buffer-bytes)
+    (%qpack-error "QPACK encoder instruction buffer exceeds its configured limit."
+                  (length octets)))
   (let ((position 0)
         (events '()))
     (loop while (< position (length octets))
@@ -1210,6 +1222,9 @@ partial instruction is left unconsumed so transports can buffer it."
                                   (%qpack-truncated-error-p condition))
                              (return)
                              (error condition))))))
+               (when (> (- end position) max-instruction-bytes)
+                 (%qpack-error "QPACK encoder instruction exceeds its configured limit."
+                               (- end position)))
                (multiple-value-bind (instruction-events consumed)
                    (%qpack-process-complete-encoder-stream
                     table (subseq octets position end))
@@ -1218,16 +1233,29 @@ partial instruction is left unconsumed so transports can buffer it."
                                  consumed))
                  (setf events (nconc events instruction-events)
                        position end))))
+    (when (and allow-incomplete-p
+               (> (- (length octets) position) max-instruction-bytes))
+      (%qpack-error "QPACK incomplete encoder instruction exceeds its configured limit."
+                    (- (length octets) position)))
     (values events position)))
 
 (defun qpack-process-decoder-stream
     (octets &key on-section-acknowledgment on-stream-cancellation
-            on-insert-count-increment state allow-incomplete-p)
+            on-insert-count-increment state allow-incomplete-p
+            (max-instruction-bytes 65536) (max-buffer-bytes 262144))
   "Decode QPACK decoder-stream instructions and return event records.
 
 With ALLOW-INCOMPLETE-P, a final partial instruction is left unconsumed."
   (unless (%http3-octet-vector-p octets)
     (%qpack-error "QPACK decoder streams must be octet vectors." (type-of octets)))
+  (unless (and (integerp max-instruction-bytes) (plusp max-instruction-bytes))
+    (%qpack-error "QPACK instruction limits must be positive integers."
+                  max-instruction-bytes))
+  (unless (and (integerp max-buffer-bytes) (plusp max-buffer-bytes))
+    (%qpack-error "QPACK buffer limits must be positive integers." max-buffer-bytes))
+  (when (> (length octets) max-buffer-bytes)
+    (%qpack-error "QPACK decoder instruction buffer exceeds its configured limit."
+                  (length octets)))
   (when (and state (not (qpack-decoder-stream-state-p state)))
     (%qpack-error "STATE must be a QPACK decoder-stream state object." state))
   (dolist (callback (list on-section-acknowledgment
@@ -1252,6 +1280,9 @@ With ALLOW-INCOMPLETE-P, a final partial instruction is left unconsumed."
                                 (%qpack-truncated-error-p condition))
                            (return)
                            (error condition))))
+                 (when (> (- next position) max-instruction-bytes)
+                   (%qpack-error "QPACK decoder instruction exceeds its configured limit."
+                                 (- next position)))
                  (cond
                    ((/= 0 (logand first #x80))
                     (let ((stream-id value))
@@ -1320,4 +1351,8 @@ With ALLOW-INCOMPLETE-P, a final partial instruction is left unconsumed."
                       (funcall on-insert-count-increment increment))
                     (push (list :insert-count-increment increment) events)
                     (setf position next)))))))
+    (when (and allow-incomplete-p
+               (> (- (length octets) position) max-instruction-bytes))
+      (%qpack-error "QPACK incomplete decoder instruction exceeds its configured limit."
+                    (- (length octets) position)))
     (values (nreverse events) position)))
