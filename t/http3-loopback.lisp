@@ -113,16 +113,16 @@
                        internal-time-units-per-second))
           :idle-timeout 30)))
         (unwind-protect
-            (handler-case
-                (http-kit/http3:send-http3-request
-                 (http-kit/http3:http3-quic-adapter-http3-client adapter)
-                 request :timeout timeout :deadline deadline)
-              (error (condition)
-                (format t "HTTP/3 diagnostic transport error mode=~A condition=~A~%"
-                        mode condition)
-                #+sbcl
-                (sb-debug:print-backtrace :count 20 :stream *error-output*)
-                (error condition)))
+            (handler-bind
+                ((error
+                   (lambda (condition)
+                     (format t "HTTP/3 diagnostic transport error mode=~A condition=~A~%"
+                             mode condition)
+                     #+sbcl
+                     (sb-debug:print-backtrace :count 40 :stream *error-output*))))
+              (http-kit/http3:send-http3-request
+               (http-kit/http3:http3-quic-adapter-http3-client adapter)
+               request :timeout timeout :deadline deadline))
       (ignore-errors
         (http-kit/http3:close-http3-quic-adapter adapter))))))
 
