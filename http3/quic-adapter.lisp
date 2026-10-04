@@ -244,7 +244,6 @@ to be selected without exposing QUIC implementation details."
             :on-close on-close))
          (stream-prefixes (make-hash-table :test #'eq))
          (stream-prefix-sent (make-hash-table :test #'eq))
-         (stream-buffers (make-hash-table :test #'eq))
          (adapter (%make-http3-quic-adapter
                    :quic-client quic-client
                    :poll-interval poll-interval)))
@@ -283,22 +282,21 @@ to be selected without exposing QUIC implementation details."
                                                                     (length prefix))))
                                        (progn
                                          (setf (gethash stream stream-prefix-sent) t)
-                                         (subseq octets (length prefix)))
-                                       octets))
-                                 (buffered (gethash stream stream-buffers)))
-                            (if (and (null prefix) (not fin-p))
-                                (setf (gethash stream stream-buffers)
-                                      (if buffered
-                                          (%http3-concatenate-octets buffered payload)
-                                          payload))
+                                       (subseq octets (length prefix)))
+                                       octets)))
+                            (if (null prefix)
+                                (progn
+                                  (cl-quic-kit:client-write-stream
+                                   quic-client stream payload
+                                   :fin-p fin-p :timeout timeout :deadline deadline)
+                                  (%http3-quic-adapter-await-stream-write
+                                   quic-client stream
+                                   :timeout timeout :deadline deadline))
                                 (prog1
                                     (cl-quic-kit:client-write-stream
                                      quic-client stream
-                                     (if buffered
-                                         (%http3-concatenate-octets buffered payload)
-                                         payload)
+                                     payload
                                      :fin-p fin-p :timeout timeout :deadline deadline)
-                                  (remhash stream stream-buffers)
                                   (when fin-p
                                     (%http3-quic-adapter-await-stream-write
                                      quic-client stream
