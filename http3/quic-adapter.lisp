@@ -268,18 +268,20 @@ to be selected without exposing QUIC implementation details."
                                        octets))
                                  (buffered (gethash stream stream-buffers)))
                             (if (and (null prefix) (not fin-p))
-                                (setf (gethash stream stream-buffers)
-                                      (if buffered
-                                          (%http3-concatenate-octets buffered payload)
-                                          payload))
-                            (prog1
-                                (cl-quic-kit:client-write-stream
-                                 quic-client stream
-                                 (if buffered
-                                     (%http3-concatenate-octets buffered payload)
-                                     payload)
-                                 :fin-p fin-p :timeout timeout :deadline deadline)
-                              (remhash stream stream-buffers)))))
+                                (progn
+                                  (setf (gethash stream stream-buffers)
+                                        (if buffered
+                                            (%http3-concatenate-octets buffered payload)
+                                            payload))
+                                  nil)
+                                (prog1
+                                    (cl-quic-kit:client-write-stream
+                                     quic-client stream
+                                     (if buffered
+                                         (%http3-concatenate-octets buffered payload)
+                                         payload)
+                                     :fin-p fin-p :timeout timeout :deadline deadline)
+                                  (remhash stream stream-buffers)))))
                         :read-stream
                         (lambda (stream &key timeout deadline)
                           (%http3-quic-adapter-read

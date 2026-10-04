@@ -1665,13 +1665,29 @@ receives each validated informational response in wire order."
                                       :payload (http-kit::%empty-octets))
                                      :fin-p t :timeout timeout :deadline deadline))
                                   (return))))
-                   (unless (zerop (length body))
-                     (%h3-write-frame
-                      client stream
-                      (make-http3-frame
-                       :type +http3-data-type+ :payload body)
-                      :fin-p (null trailer-fields)
-                      :timeout timeout :deadline deadline)))
+                   (progn
+                     (loop with position = 0
+                           with max-frame-size = (http3-client-max-frame-size client)
+                           while (< position (length body))
+                           for end = (min (length body)
+                                         (+ position max-frame-size))
+                           for chunk = (subseq body position end)
+                           do (%h3-write-frame
+                               client stream
+                               (make-http3-frame
+                                :type +http3-data-type+ :payload chunk)
+                               :fin-p (and (= end (length body))
+                                           (null trailer-fields))
+                               :timeout timeout :deadline deadline)
+                              (setf position end))
+                     (when (and (zerop (length body))
+                                (null trailer-fields))
+                       (%h3-write-frame
+                        client stream
+                        (make-http3-frame
+                         :type +http3-data-type+
+                         :payload (http-kit::%empty-octets))
+                        :fin-p t :timeout timeout :deadline deadline))))
                (when trailer-fields
                  (%h3-write-request-field-section
                   client stream trailer-fields encoder-table encoder-state
