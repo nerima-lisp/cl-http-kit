@@ -90,6 +90,15 @@ routing currently raises an explicit unsupported error. Per-request response
 header-byte, field-count, and body limits can be stricter than the retained
 connection defaults.
 
+The HTTP/3 client uses finite defaults of 65,536 bytes for each QPACK
+instruction, 262,144 bytes for each retained QPACK instruction buffer, 100
+request streams, 16 peer unidirectional streams, and 4 MiB for aggregate
+retained connection state. The injected QUIC backend still owns packet
+processing, flow control, and connection shutdown. `max-body-bytes` defaults
+to the core 16 MiB body limit at the client, server-stream, push, and
+connection-manager entry points. Passing `NIL` explicitly disables that body
+limit for that call.
+
 The boundary does not provide QUIC packets, loss recovery, congestion control,
 TLS 1.3, ALPN, native sockets, a connection-level accept loop, or a native
 HTTP/3 server. The injected

@@ -92,6 +92,12 @@ client request execution; and `transport-server.lisp` owns request-stream
 parsing and response production.
 The client entry points also expose CPS variants so an application can keep
 I/O scheduling and error continuation policy outside the protocol code.
+The codec applies finite defaults of 65,536 bytes per QPACK instruction and
+262,144 bytes per retained QPACK instruction buffer, plus limits of 100 local
+request streams, 16 peer unidirectional streams, and 4 MiB aggregate retained
+state per client. Body limits default to the core 16 MiB value; an explicit
+`NIL` disables the body limit for that call. QUIC packet handling, flow
+control, and connection shutdown remain outside this layer.
 
 ## Optional high-level client system
 
