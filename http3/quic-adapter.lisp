@@ -255,10 +255,6 @@ to be selected without exposing QUIC implementation details."
                             (values stream (cl-quic-kit:stream-id stream))))
                         :write-stream
                         (lambda (stream octets &key fin-p timeout deadline)
-                          (format *error-output*
-                                  "HTTP3 DIAG write-start stream=~S len=~D fin=~S~%"
-                                  (cl-quic-kit:stream-id stream)
-                                  (length octets) fin-p)
                           (let* ((prefix (gethash stream stream-prefixes))
                                  (payload
                                    (if (and prefix
@@ -285,11 +281,7 @@ to be selected without exposing QUIC implementation details."
                                          (%http3-concatenate-octets buffered payload)
                                          payload)
                                      :fin-p fin-p :timeout timeout :deadline deadline)
-                                  (remhash stream stream-buffers)))
-                            (format *error-output*
-                                    "HTTP3 DIAG write-done stream=~S len=~D fin=~S~%"
-                                    (cl-quic-kit:stream-id stream)
-                                    (length octets) fin-p)))
+                                  (remhash stream stream-buffers)))))
                         :read-stream
                         (lambda (stream &key timeout deadline)
                           (%http3-quic-adapter-read
@@ -300,14 +292,8 @@ to be selected without exposing QUIC implementation details."
                            :poll-interval poll-interval))
                         :close-stream
                         (lambda (stream &key condition)
-                          (format *error-output*
-                                  "HTTP3 DIAG close-start stream=~S~%"
-                                  (cl-quic-kit:stream-id stream))
                           (cl-quic-kit:client-close-stream
-                           quic-client stream :condition condition)
-                          (format *error-output*
-                                  "HTTP3 DIAG close-done stream=~S~%"
-                                  (cl-quic-kit:stream-id stream)))
+                           quic-client stream :condition condition))
                         :on-control-stream-ready
                         (lambda (&key timeout deadline)
                           (%http3-quic-adapter-await-peer-control-data

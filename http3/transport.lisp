@@ -1626,9 +1626,7 @@ receives each validated informational response in wire order."
                 (%h3-write-request-field-section
                  client stream request-fields encoder-table encoder-state
                  stream-id huffman-p
-                 :fin-p (and (null request-body-function)
-                             (zerop (length body))
-                             (null trailer-fields))
+                 :fin-p nil
                  :timeout timeout :deadline deadline)
                (if request-body-function
                    (loop with sent = 0
