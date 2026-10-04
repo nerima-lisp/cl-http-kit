@@ -3891,6 +3891,8 @@
              (ascii
               "HTTP/1.1 200 OK|CRLF|Content-Length: 2|CRLF||CRLF|ok"))))
          (resolved-hosts nil)
+         (resolved-timeouts nil)
+         (resolved-deadlines nil)
          (upgraded-uris nil)
          (opened-plans nil)
          (closed 0)
@@ -3911,8 +3913,10 @@
               (ensure-equal stream closed-stream)
               (incf closed))
             :resolve-host
-            (lambda (host)
+            (lambda (host &key timeout deadline)
               (push host resolved-hosts)
+              (push timeout resolved-timeouts)
+              (push deadline resolved-deadlines)
               "192.0.2.10")
             :tls-upgrade
             (lambda (received-stream uri &key timeout deadline)
@@ -3931,6 +3935,8 @@
       (ensure-equal 200 (http-response-status response))
       (ensure-equal "ok" (octets-as-string (http-response-body response))))
     (ensure-equal '("example.test") (reverse resolved-hosts))
+    (ensure-equal '(30.0) (reverse resolved-timeouts))
+    (ensure-true (realp (first resolved-deadlines)))
     (ensure-equal 1 (length upgraded-uris))
     (ensure-equal "https" (http-uri-scheme (first upgraded-uris)))
     (ensure-equal :socks5 (getf (first opened-plans) :mode))

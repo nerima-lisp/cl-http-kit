@@ -65,7 +65,7 @@ REQUEST-METHOD as \"HEAD\" for the bodyless response semantics of HEAD."
                                       header-limit field-limit header-used)
             (setf header-used final-header-bytes)
             (let ((transfer-encoding (%response-transfer-encoding headers))
-                  (content-length (%response-content-length headers)))
+                  (content-length (%response-content-length headers body-limit)))
               (%validate-http-response-framing
                protocol-version status transfer-encoding content-length)
               (when (= status 101)

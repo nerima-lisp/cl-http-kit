@@ -63,7 +63,7 @@
 (defun %split-comma-values (values)
   (%parse-http1-transfer-codings values :response-parse "transfer-encoding"))
 
-(defun %response-content-length (headers)
+(defun %response-content-length (headers max-body-bytes)
   (let ((values (http-header-values headers "content-length")))
     (cond
       ((null values) nil)
@@ -74,14 +74,18 @@
               :name "content-length"
               :reason :value))
       ((not (every (lambda (value)
-                     (= (%parse-decimal value) (%parse-decimal (first values))))
+                     (= (%parse-decimal-limited value max-body-bytes
+                                                :operation :response-parse)
+                        (%parse-decimal-limited (first values) max-body-bytes
+                                                :operation :response-parse)))
                    values))
        (error 'http-invalid-header
               :message "Duplicate Content-Length values must agree."
               :operation :response-parse
               :name "content-length"
               :reason :duplicate))
-      (t (%parse-decimal (first values))))))
+      (t (%parse-decimal-limited (first values) max-body-bytes
+                                 :operation :response-parse)))))
 
 (defun %response-transfer-encoding (headers)
   (let ((values (http-header-values headers "transfer-encoding")))

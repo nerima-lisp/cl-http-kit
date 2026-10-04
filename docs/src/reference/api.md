@@ -447,7 +447,19 @@ The HTTP/2 server also accepts `max-concurrent-streams`, `max-reset-streams`,
 and `max-hpack-table-size`. Their defaults are 100, 100, and 4096 bytes.
 The first bounds active request streams per session. The reset budget defaults
 to 100 resets in a one-second window and closes the session with
-`HTTP-PROTOCOL-ERROR` when exceeded. The last
+`HTTP-PROTOCOL-ERROR` when exceeded. Wire-level HTTP/2 connection failures
+send GOAWAY before the session closes; stream admission failures send a
+REFUSED_STREAM RST_STREAM and keep the connection usable. The bounded server
+failure paths use these RFC 9113 error codes:
+
+| Condition | Frame and error code | RFC 9113 |
+| --- | --- | --- |
+| RST_STREAM on an idle stream | GOAWAY / PROTOCOL_ERROR | §5.1, §6.4 |
+| Concurrent stream limit | RST_STREAM / REFUSED_STREAM | §5.1, §6.5.2 |
+| Reset budget | GOAWAY / ENHANCE_YOUR_CALM | §7 |
+| HPACK decoding failure | GOAWAY / COMPRESSION_ERROR | §4.3, §5.4.1 |
+
+The last
 clamps the peer's HPACK dynamic-table capacity. The client connection path
 also clamps peer HPACK table settings to 4096 bytes by default through
 `*h2-max-peer-hpack-table-size*`.
@@ -1389,8 +1401,10 @@ retaining its request-object form.
 | Connection-pool idle timeout | 60 seconds | Idle stream expiry during pool operations |
 | Connection-pool max connection age | 300 seconds | Absolute stream lifetime during pool operations |
 
-Passing `:timeout NIL`, `:max-body-bytes NIL`, `:idle-timeout NIL`, or
-`:max-connection-age NIL` explicitly opts into an unbounded value. The native
+Passing `:timeout NIL`, `:idle-timeout NIL`, or `:max-connection-age NIL`
+explicitly opts into an unbounded value. Passing `:max-body-bytes NIL` returns
+to the corresponding finite default; specify a sufficiently large integer when
+an application needs a larger body limit. The native
 client offers only `http/1.1` through ALPN; HTTP/2 requires the explicit
 `cl-http-kit/http2` transport boundary until native client dispatch is provided.
 

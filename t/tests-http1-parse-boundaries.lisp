@@ -166,6 +166,21 @@
   (signals http-invalid-header
     (parse-http-response
      (ascii "HTTP/1.1 200 OK|CRLF|Content-Length: 1|CRLF|Content-Length: 2|CRLF||CRLF|")))
+  (let ((response
+          (parse-http-response
+           (ascii "HTTP/1.1 200 OK|CRLF|Content-Length: 16|CRLF||CRLF|0123456789abcdef")
+           :max-body-bytes 16)))
+    (ensure-equal 16 (length (http-response-body response))))
+  (signals http-size-limit-exceeded
+    (parse-http-response
+     (ascii "HTTP/1.1 200 OK|CRLF|Content-Length: 17|CRLF||CRLF|")
+     :max-body-bytes 16))
+  (signals http-size-limit-exceeded
+    (parse-http-response
+     (ascii (format nil
+                    "HTTP/1.1 200 OK|CRLF|Content-Length: ~A|CRLF||CRLF|"
+                    (make-string 1000 :initial-element #\9)))
+     :max-body-bytes 16))
   (signals http-protocol-error
     (parse-http-response
      (ascii "HTTP/1.1 200 OK|CRLF||CRLF|")

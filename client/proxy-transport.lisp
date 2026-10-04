@@ -69,11 +69,18 @@
     (replace result builder)
     result))
 
-(defun %proxy-resolved-address (host resolve-host)
+(defun %proxy-resolve-host (resolve-host host timeout deadline)
+  (handler-case
+      (funcall resolve-host host :timeout timeout :deadline deadline)
+    (program-error ()
+      ;; Host-only resolver callbacks predate the timeout-aware contract.
+      (funcall resolve-host host))))
+
+(defun %proxy-resolved-address (host resolve-host &optional timeout deadline)
   (or (%proxy-ipv4-octets host)
       (%proxy-ipv6-octets host)
       (when resolve-host
-        (let ((resolved (funcall resolve-host host)))
+        (let ((resolved (%proxy-resolve-host resolve-host host timeout deadline)))
           (or (and (stringp resolved)
                    (or (%proxy-ipv4-octets resolved)
                        (%proxy-ipv6-octets resolved)))
@@ -81,7 +88,8 @@
                "The local proxy resolver must return a numeric IPv4 or IPv6 address."
                resolved))))))
 
-(defun %proxy-socks-address (host remote-dns-p resolve-host)
+(defun %proxy-socks-address (host remote-dns-p resolve-host
+                             &optional timeout deadline)
   (if remote-dns-p
       (let ((octets (http-utf8-octets host)))
         (when (or (zerop (length octets)) (> (length octets) 255))
@@ -91,7 +99,8 @@
           (%proxy-builder-byte builder (length octets))
           (%proxy-builder-octets builder octets)
           builder))
-      (let ((address (%proxy-resolved-address host resolve-host)))
+      (let ((address (%proxy-resolved-address host resolve-host
+                                              timeout deadline)))
         (unless address
           (%proxy-error
            "A numeric address or a local resolver is required for SOCKS5."
@@ -111,7 +120,7 @@
 "                            (length address)))))))
 
 (defun %proxy-socks-negotiate
-    (stream proxy-plan deadline clock-function resolve-host)
+    (stream proxy-plan timeout deadline clock-function resolve-host)
   (let* ((proxy (getf proxy-plan :proxy))
          (username (http-proxy-username proxy))
          (password (or (http-proxy-password proxy) ""))
@@ -162,7 +171,7 @@
            (port (getf proxy-plan :connect-port))
            (address (%proxy-socks-address host
                                           (getf proxy-plan :remote-dns-p)
-                                          resolve-host))
+                                          resolve-host timeout deadline))
            (request (%proxy-byte-builder)))
       (%proxy-builder-byte request 5)
       (%proxy-builder-byte request 1)
@@ -307,7 +316,7 @@
                                               timeout deadline)
                               connected))))
                    (:socks5
-                    (%proxy-socks-negotiate stream proxy-plan deadline
+                    (%proxy-socks-negotiate stream proxy-plan timeout deadline
                                             clock-function resolve-host)
                     (if (string= (http-uri-scheme target) "https")
                         (%proxy-upgrade stream tls-upgrade target
@@ -375,8 +384,11 @@ The returned function accepts REQUEST and :TIMEOUT, :DEADLINE, :PROXY-PLAN, and
 :PROXY.  OPEN-STREAM is the raw endpoint opener.  For direct requests it is
 called with only :TIMEOUT and :DEADLINE, preserving the original stream
 boundary contract.  TLS-UPGRADE receives STREAM, a target URI, and the same
-timeout keywords and must return a stream.  RESOLVE-HOST is used for numeric
-address resolution when a SOCKS5 (rather than SOCKS5H) proxy is selected."
+timeout keywords and must return a stream.  RESOLVE-HOST receives HOST,
+:TIMEOUT, and :DEADLINE for SOCKS5 local DNS.  Host-only resolver callbacks
+remain supported as a compatibility fallback.  RESOLVE-HOST is used for
+numeric address resolution when a SOCKS5 (rather than SOCKS5H) proxy is
+selected."
   (%ensure-function open-stream
                     "A proxy stream opener requires an :OPEN-STREAM function.")
   (%ensure-function close-stream
