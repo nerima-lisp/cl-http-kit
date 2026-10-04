@@ -663,7 +663,7 @@ values.
                                  (when (and (null state)
                                             (> stream-id last-client-stream-id))
                                    ;; RST_STREAM on an idle stream is a
-                                   ;; connection error (RFC 9113, section 5.4.1).
+                                   ;; connection error (RFC 9113, section 6.4).
                                    (%h2-server-error
                                     "HTTP/2 RST_STREAM targeted an idle stream"
                                     stream-id))
