@@ -293,16 +293,16 @@
     "cl-crypto-kit": {
       "flake": false,
       "locked": {
-        "lastModified": 1791013020,
-        "narHash": "sha256-uRNIw2fQ8itmBZ0oUCc99b+aK7hPQN0IHOSn0RsabXM=",
+        "lastModified": 1791090963,
+        "narHash": "sha256-u/b4pjocz3qVubdoZJ3YKzIjBkDhZ8GT3oY/IJchPfc=",
         "owner": "nerima-lisp",
         "repo": "cl-crypto-kit",
-        "rev": "0adeb48f7d2755a323bfa6906d73f6a78d14d74e",
+        "rev": "761e95926923eba809f3e5deac88e68414aef894",
         "type": "github"
       },
       "original": {
         "owner": "nerima-lisp",
-        "ref": "takeokunn-crypto-integration",
+        "ref": "main",
         "repo": "cl-crypto-kit",
         "type": "github"
       }
@@ -372,16 +372,16 @@
         ]
       },
       "locked": {
-        "lastModified": 1790938998,
-        "narHash": "sha256-FVZMzy0gmYDGIeyVAvObaw8kwZ5liDPuqbSnIiHnMlY=",
+        "lastModified": 1790993481,
+        "narHash": "sha256-rvyTveWs6NdaOKKAxOnBlGQENo7CnYyaAh7H1cjwbrA=",
         "owner": "nerima-lisp",
         "repo": "cl-deflate-kit",
-        "rev": "c346e1468e8ffea98ee2e844f755d5debe8ab47e",
+        "rev": "7eb113733b0b76ee2e32cd88565fb8f2535a4c24",
         "type": "github"
       },
       "original": {
         "owner": "nerima-lisp",
-        "ref": "takeokunn-deflate-core",
+        "ref": "main",
         "repo": "cl-deflate-kit",
         "type": "github"
       }
@@ -1297,16 +1297,16 @@
     "cl-quic-kit": {
       "flake": false,
       "locked": {
-        "lastModified": 1791066828,
+        "lastModified": 1791093341,
         "narHash": "sha256-EtodRU9rkpoEBbaKTU/6baafzoToPGVSm8E8YUqJ5xg=",
         "owner": "nerima-lisp",
         "repo": "cl-quic-kit",
-        "rev": "c556160a829c9affa52d8407e05ad75a54be18b5",
+        "rev": "f560e81e4e41e271803977b68b1d0039e610e224",
         "type": "github"
       },
       "original": {
         "owner": "nerima-lisp",
-        "ref": "takeokunn-transport-core",
+        "ref": "main",
         "repo": "cl-quic-kit",
         "type": "github"
       }
@@ -1324,16 +1324,16 @@
         ]
       },
       "locked": {
-        "lastModified": 1791017550,
-        "narHash": "sha256-M7ozdy9Kg7oN4OD6+NSDZUQBaxD0FM4Xpdhs1NVsk4s=",
+        "lastModified": 1791093330,
+        "narHash": "sha256-lGDfw4dE6EkEjacsWzqpm00RPn8tMi/NPSq2k90BoD4=",
         "owner": "nerima-lisp",
         "repo": "cl-tls-kit",
-        "rev": "db0ee988fd3ba5b218c0ff1a0182df2b2ad01c76",
+        "rev": "101e4e70207befccbae7281969abe25717c85148",
         "type": "github"
       },
       "original": {
         "owner": "nerima-lisp",
-        "ref": "takeokunn-tls13-handshake",
+        "ref": "main",
         "repo": "cl-tls-kit",
         "type": "github"
       }

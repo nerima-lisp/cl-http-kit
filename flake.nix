@@ -44,25 +44,25 @@
     };
 
     cl-crypto-kit = {
-      url = "github:nerima-lisp/cl-crypto-kit/takeokunn-crypto-integration";
+      url = "github:nerima-lisp/cl-crypto-kit/main";
       flake = false;
     };
 
     cl-deflate-kit = {
-      url = "github:nerima-lisp/cl-deflate-kit/takeokunn-deflate-core";
+      url = "github:nerima-lisp/cl-deflate-kit/main";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.cl-weave.follows = "cl-weave";
     };
 
     cl-tls-kit = {
-      url = "github:nerima-lisp/cl-tls-kit/takeokunn-tls13-handshake";
+      url = "github:nerima-lisp/cl-tls-kit/main";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.cl-weave.follows = "cl-weave";
       inputs.cl-crypto-kit.follows = "cl-crypto-kit";
     };
 
     cl-quic-kit = {
-      url = "github:nerima-lisp/cl-quic-kit/takeokunn-transport-core";
+      url = "github:nerima-lisp/cl-quic-kit/main";
       flake = false;
     };
 
