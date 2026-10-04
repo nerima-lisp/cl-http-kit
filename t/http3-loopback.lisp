@@ -92,7 +92,7 @@
                                     #\Return #\Linefeed))
                        stream)
                       (finish-output stream))
-                 (close stream)
+                 (close stream :abort t)
                  (sb-bsd-sockets:socket-close socket)))
           (sb-bsd-sockets:socket-close listener)))
       :name "cl-http-kit-post-receiver")
