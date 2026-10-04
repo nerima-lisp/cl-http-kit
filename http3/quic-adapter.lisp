@@ -22,14 +22,17 @@
   (when (string= "1" (sb-ext:posix-getenv "HTTP3_LOOPBACK_DIAGNOSTICS"))
     (let ((connection (cl-quic-kit:quic-client-connection quic-client)))
       (format *error-output*
-              "HTTP3-DIAG ~A state=~S sent=~D received=~D udp=~S port=~S readable=~S~%"
+              "HTTP3-DIAG ~A state=~S sent=~D received=~D udp=~S port=~S stream=~S readable=~S closed-error=~S closed-reason=~S~%"
               stage
               (cl-quic-kit:connection-state connection)
               (length (cl-quic-kit::quic-client-sent-packets quic-client))
               (length (cl-quic-kit::quic-client-received-packets quic-client))
               (not (null (cl-quic-kit::quic-client-udp-socket quic-client)))
               (cl-quic-kit::quic-client-server-port quic-client)
-              (and stream (cl-quic-kit:stream-readable-bytes stream)))
+              (and stream (cl-quic-kit:stream-id stream))
+              (and stream (cl-quic-kit:stream-readable-bytes stream))
+              (cl-quic-kit::quic-connection-closed-error connection)
+              (cl-quic-kit::quic-connection-closed-reason connection))
       (finish-output *error-output*))))
 
 (defun %http3-quic-adapter-configure-protection ()
