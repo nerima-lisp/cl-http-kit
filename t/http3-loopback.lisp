@@ -85,7 +85,8 @@
                         (error "Receiver got unexpected POST body bytes."))
                       (write-sequence
                        (map '(vector (unsigned-byte 8)) #'char-code
-                            (format nil "HTTP/1.1 200 OK~C~CContent-Length: 8~C~C~C~Cverified"
+                            (format nil "HTTP/1.1 200 OK~C~CContent-Length: 8~C~CConnection: close~C~C~C~Cverified"
+                                    #\Return #\Linefeed
                                     #\Return #\Linefeed
                                     #\Return #\Linefeed
                                     #\Return #\Linefeed))
