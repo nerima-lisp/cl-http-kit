@@ -92,6 +92,7 @@
                                     #\Return #\Linefeed))
                        stream)
                       (finish-output stream))
+                 (finish-output)
                  (close stream :abort t)
                  (sb-bsd-sockets:socket-close socket)))
           (sb-bsd-sockets:socket-close listener)))
