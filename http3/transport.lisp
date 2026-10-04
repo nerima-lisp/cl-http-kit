@@ -1,5 +1,11 @@
 (in-package #:http-kit/http3)
 
+(defparameter +http3-default-qpack-max-instruction-bytes+ 65536)
+(defparameter +http3-default-qpack-max-buffer-bytes+ 262144)
+(defparameter +http3-default-max-request-streams+ 100)
+(defparameter +http3-default-max-peer-unidirectional-streams+ 16)
+(defparameter +http3-default-max-state-bytes+ (* 4 1024 1024))
+
 (defun %h3-transport-error (message &optional detail)
   (error 'http-protocol-error
          :message message
@@ -26,6 +32,20 @@
 
 (defun %h3-non-negative-limit-p (value)
   (and (integerp value) (>= value 0)))
+
+(defun %h3-check-state-bytes (client)
+  (let ((observed (+ (length (http3-client-peer-control-buffer client))
+                     (length (http3-client-peer-qpack-encoder-buffer client))
+                     (length (http3-client-peer-qpack-decoder-buffer client))
+                     (reduce #'+ (http3-client-prefetched-stream-inputs client)
+                             :key (lambda (entry)
+                                    (length (or (first (cdr entry)) #())))
+                             :initial-value 0))))
+    (when (> observed (http3-client-max-state-bytes client))
+      (%h3-transport-error "HTTP/3 aggregate connection state exceeds its limit."
+                           (list :h3-excessive-load
+                                 (http3-client-max-state-bytes client)
+                                 observed)))))
 
 (defun %h3-copy-settings (settings)
   (unless (listp settings)
@@ -66,6 +86,15 @@
   (peer-qpack-decoder-buffer #() :type vector)
   (peer-qpack-decoder-prefix-seen-p nil :type boolean)
   (peer-qpack-decoder-fin-p nil :type boolean)
+  (request-stream-count 0 :type integer)
+  (peer-unidirectional-stream-count 0 :type integer)
+  (max-request-streams +http3-default-max-request-streams+ :type integer)
+  (max-peer-unidirectional-streams
+   +http3-default-max-peer-unidirectional-streams+ :type integer)
+  (max-state-bytes +http3-default-max-state-bytes+ :type integer)
+  (qpack-max-instruction-bytes
+   +http3-default-qpack-max-instruction-bytes+ :type integer)
+  (qpack-max-buffer-bytes +http3-default-qpack-max-buffer-bytes+ :type integer)
   qpack-encoder-table
   qpack-decoder-table
   qpack-decoder-context
@@ -86,6 +115,13 @@
     (&key open-stream write-stream read-stream close-stream cancel-stream
           (serialize (lambda (thunk) (funcall thunk)))
           (max-frame-size #x4000) (max-header-bytes 65536) (max-fields 256)
+          (max-request-streams +http3-default-max-request-streams+)
+          (max-peer-unidirectional-streams
+           +http3-default-max-peer-unidirectional-streams+)
+          (max-state-bytes +http3-default-max-state-bytes+)
+          (qpack-max-instruction-bytes
+           +http3-default-qpack-max-instruction-bytes+)
+          (qpack-max-buffer-bytes +http3-default-qpack-max-buffer-bytes+)
           (qpack-settings '()) max-push-id peer-control-stream timeout deadline
           on-control-stream-ready)
   "Open an HTTP/3 client over caller-supplied QUIC stream callbacks.
@@ -126,6 +162,16 @@ only supplies the HTTP/3 stream and codec layer."
   (unless (%h3-positive-limit-p max-fields)
     (%h3-transport-error "HTTP/3 max-fields must be a positive integer."
                          max-fields))
+  (dolist (entry (list (cons :max-request-streams max-request-streams)
+                       (cons :max-peer-unidirectional-streams
+                             max-peer-unidirectional-streams)
+                       (cons :max-state-bytes max-state-bytes)
+                       (cons :qpack-max-instruction-bytes
+                             qpack-max-instruction-bytes)
+                       (cons :qpack-max-buffer-bytes qpack-max-buffer-bytes)))
+    (unless (%h3-positive-limit-p (cdr entry))
+      (%h3-transport-error "HTTP/3 connection limits must be positive integers."
+                           entry)))
   (unless (or (null max-push-id)
               (and (%h3-non-negative-limit-p max-push-id)
                    (<= max-push-id +http3-max-varint+)))
@@ -245,6 +291,11 @@ only supplies the HTTP/3 stream and codec layer."
            :max-frame-size max-frame-size
            :max-header-bytes max-header-bytes
            :max-fields max-fields
+           :max-request-streams max-request-streams
+           :max-peer-unidirectional-streams max-peer-unidirectional-streams
+           :max-state-bytes max-state-bytes
+           :qpack-max-instruction-bytes qpack-max-instruction-bytes
+           :qpack-max-buffer-bytes qpack-max-buffer-bytes
            :max-push-id max-push-id
            :promised-push-ids '()
            :push-promises '()
@@ -303,6 +354,12 @@ surrounding QUIC transport remains responsible for discarding their contents."
   (unless stream
     (%h3-transport-error
      "ACCEPT-HTTP3-PEER-UNIDIRECTIONAL-STREAM requires a stream."))
+  (when (>= (http3-client-peer-unidirectional-stream-count client)
+            (http3-client-max-peer-unidirectional-streams client))
+    (%h3-transport-error
+     "The HTTP/3 peer unidirectional-stream limit was exceeded."
+     :h3-excessive-load))
+  (incf (http3-client-peer-unidirectional-stream-count client))
   (let ((buffer (make-array 0 :element-type '(unsigned-byte 8)))
         (prefetched-fin-p nil))
     (loop
@@ -334,7 +391,8 @@ surrounding QUIC transport remains responsible for discarding their contents."
             (%h3-transport-error
              "HTTP/3 read-stream must return an octet vector or NIL."
              (type-of chunk)))
-          (setf buffer (%http3-concatenate-octets buffer chunk)))
+          (setf buffer (%http3-concatenate-octets buffer chunk))
+          (%h3-check-state-bytes client))
         (setf prefetched-fin-p fin-p)
         (when (or fin-p (null chunk))
           (multiple-value-bind (stream-type position)
@@ -749,7 +807,8 @@ HTTP3-CLIENT-PEER-CONTROL-STATE."
            (when chunk
              (unless (%http3-octet-vector-p chunk)
                (%h3-transport-error "QPACK stream reads must return octets."))
-             (setf buffer (%http3-concatenate-octets buffer chunk)))
+             (setf buffer (%http3-concatenate-octets buffer chunk))
+             (%h3-check-state-bytes client))
            (multiple-value-bind (seen-p remainder)
                (%h3-consume-stream-prefix
                 buffer
@@ -763,7 +822,11 @@ HTTP3-CLIENT-PEER-CONTROL-STATE."
                    (multiple-value-bind (new-events consumed)
                        (qpack-process-encoder-stream
                         (http3-client-qpack-decoder-table client)
-                        buffer :allow-incomplete-p t)
+                        buffer :allow-incomplete-p t
+                        :max-instruction-bytes
+                        (http3-client-qpack-max-instruction-bytes client)
+                        :max-buffer-bytes
+                        (http3-client-qpack-max-buffer-bytes client))
                      (setf events new-events
                            buffer (subseq buffer consumed)))
                  (http-protocol-error (condition)
@@ -780,6 +843,7 @@ HTTP3-CLIENT-PEER-CONTROL-STATE."
               "The peer closed the QPACK encoder stream."
               :h3-closed-critical-stream))
            (setf (http3-client-peer-qpack-encoder-buffer client) buffer)
+           (%h3-check-state-bytes client)
              (values events ended-p
                      (%http3-qpack-detach-ready-streams
                       (http3-client-qpack-decoder-context client))))))
@@ -838,6 +902,7 @@ HTTP3-CLIENT-PEER-CONTROL-STATE."
               "The peer closed the QPACK decoder stream."
               :h3-closed-critical-stream))
            (setf (http3-client-peer-qpack-decoder-buffer client) buffer)
+           (%h3-check-state-bytes client)
            (values events ended-p)))))))
 
 (defun serve-http3-control-stream
@@ -1287,7 +1352,8 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
               (decode))))))
 
 (defun %h3-read-response
-    (client stream &key on-body-chunk on-information collect-body-p max-body-bytes
+    (client stream &key on-body-chunk on-information collect-body-p
+            (max-body-bytes http-kit::*default-max-body-bytes*)
             max-header-bytes max-fields
             qpack-decoder-table qpack-decoder-context stream-id await-qpack
             request-method on-push-promise timeout deadline)
@@ -1493,7 +1559,8 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
 
 (defun send-http3-request
     (client request &key on-body-chunk on-information (collect-body-p t)
-            max-header-bytes max-fields max-body-bytes
+            max-header-bytes max-fields
+            (max-body-bytes http-kit::*default-max-body-bytes*)
             request-body-function request-body-length
             qpack-encoder-table qpack-decoder-table qpack-decoder-context
             await-qpack (huffman-p nil) on-stream-open on-push-promise
@@ -1579,11 +1646,17 @@ receives each validated informational response in wire order."
           (%h3-request-fields request :body-length (length body))))
     (when (and request-body-function (null known-body-length))
       (setf known-body-length declared-body-length))
+    (when (>= (http3-client-request-stream-count client)
+              (http3-client-max-request-streams client))
+      (%h3-transport-error
+       "The HTTP/3 request-stream limit was exceeded."
+       :h3-excessive-load))
     (multiple-value-setq (stream stream-id)
       (funcall (http3-client-open-stream client)
                request :stream-type :request :timeout timeout :deadline deadline))
     (unless stream
       (%h3-transport-error "The HTTP/3 open-stream callback returned NIL."))
+    (incf (http3-client-request-stream-count client))
     (unwind-protect
          (handler-case
              (progn
@@ -1710,13 +1783,16 @@ receives each validated informational response in wire order."
            (error (condition)
              (setf failure condition)
              (error condition)))
-      (funcall (http3-client-close-stream client)
-               stream :condition failure))))
+      (unwind-protect
+           (funcall (http3-client-close-stream client)
+                    stream :condition failure)
+        (decf (http3-client-request-stream-count client))))))
 
 (defun send-http3-request/cps
     (client request on-success
      &key on-error on-body-chunk on-information (collect-body-p t)
-       max-header-bytes max-fields max-body-bytes request-body-function
+       max-header-bytes max-fields
+       (max-body-bytes http-kit::*default-max-body-bytes*) request-body-function
        request-body-length qpack-encoder-table qpack-decoder-table
        qpack-decoder-context await-qpack (huffman-p nil) on-stream-open
        on-push-promise timeout deadline)
@@ -1949,7 +2025,8 @@ receives each validated informational response in wire order."
 
 (defun receive-http3-push
     (client stream &key stream-id on-body-chunk (collect-body-p t)
-            max-header-bytes max-fields max-body-bytes
+            max-header-bytes max-fields
+            (max-body-bytes http-kit::*default-max-body-bytes*)
             qpack-decoder-table qpack-decoder-context
             await-qpack await-push-promise timeout deadline)
   "Read one server-initiated HTTP/3 push stream and return its push ID and response.
@@ -2529,7 +2606,8 @@ an opened push stream.  Returns the push ID and RESPONSE."
 (defun serve-http3-request-stream
     (stream handler &key read-stream write-stream close-stream
             (max-frame-size +http3-default-max-frame-size+)
-            (max-header-bytes 65536) (max-fields 256) max-body-bytes
+            (max-header-bytes 65536) (max-fields 256)
+            (max-body-bytes http-kit::*default-max-body-bytes*)
             (collect-body-p t) on-body-chunk qpack-decoder-table
             qpack-decoder-context stream-id await-qpack
             (qpack-serialize (lambda (thunk) (funcall thunk)))
@@ -2922,7 +3000,8 @@ owner-thread and non-reentrant."
     (manager request
      &key (connection-key nil connection-key-supplied-p)
        on-body-chunk on-information (collect-body-p t)
-       max-header-bytes max-fields max-body-bytes
+       max-header-bytes max-fields
+       (max-body-bytes http-kit::*default-max-body-bytes*)
        request-body-function request-body-length proxy proxy-plan
        qpack-encoder-table qpack-decoder-table qpack-decoder-context
        await-qpack (huffman-p nil) on-stream-open on-push-promise
@@ -2974,7 +3053,8 @@ owner-thread and non-reentrant."
      "MAKE-HTTP3-CONNECTION-MANAGER-TRANSPORT requires a manager."
      (type-of manager)))
   (lambda (request
-           &key timeout deadline max-header-bytes max-fields max-body-bytes
+           &key timeout deadline max-header-bytes max-fields
+             (max-body-bytes http-kit::*default-max-body-bytes*)
              request-body-function request-body-length
              on-body-chunk on-information (collect-body-p t)
              proxy proxy-plan

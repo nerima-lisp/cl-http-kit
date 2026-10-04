@@ -373,7 +373,8 @@
 (defun serve-http3-request-stream
     (stream handler &key read-stream write-stream close-stream
             (max-frame-size +http3-default-max-frame-size+)
-            (max-header-bytes 65536) (max-fields 256) max-body-bytes
+            (max-header-bytes 65536) (max-fields 256)
+            (max-body-bytes http-kit::*default-max-body-bytes*)
             (collect-body-p t) on-body-chunk qpack-decoder-table
             qpack-encoder-table (huffman-p nil) timeout deadline on-error)
   "Serve one HTTP/3 request stream over caller-supplied QUIC callbacks.
