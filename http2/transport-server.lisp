@@ -47,9 +47,6 @@
       (%hpack-decode-block block context
                            :max-header-bytes max-header-bytes
                            :max-fields max-fields)
-    (http-kit:http-size-limit-exceeded (condition)
-      (%h2-server-error "HTTP/2 header block exceeds the configured limit"
-                        condition +http2-enhance-your-calm+))
     (http-kit:http-protocol-error (condition)
       (%h2-server-error "HTTP/2 HPACK decoding failed"
                         condition +http2-compression-error+))))
