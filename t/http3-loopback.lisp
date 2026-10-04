@@ -85,7 +85,10 @@
                         (error "Receiver got unexpected POST body bytes."))
                       (write-sequence
                        (map '(vector (unsigned-byte 8)) #'char-code
-                            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nverified")
+                            (format nil "HTTP/1.1 200 OK~C~CContent-Length: 8~C~C~C~Cverified"
+                                    #\Return #\Linefeed
+                                    #\Return #\Linefeed
+                                    #\Return #\Linefeed))
                        stream)
                       (finish-output stream)
                       (format t "HTTP/3 POST receiver diagnostic response-written~%")
