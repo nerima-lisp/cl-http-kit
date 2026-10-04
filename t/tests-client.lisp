@@ -5347,6 +5347,18 @@
        (declare (ignore host))
        "not-an-ip"))))
 
+(deftest client-proxy-resolver-program-error-is-not-retried
+  (let ((calls 0))
+    (handler-case
+        (http-kit/client::%proxy-resolve-host
+         (lambda (host &key timeout deadline)
+           (declare (ignore host timeout deadline))
+           (incf calls)
+           (error 'program-error))
+         "service.example" 10.0 20.0 :keywords)
+      (program-error ()))
+    (ensure-equal 1 calls)))
+
 (deftest client-proxy-socks-address-boundaries
   (ensure-equal
    (octets 3 12 101 120 97 109 112 108 101 46 116 101 115 116)

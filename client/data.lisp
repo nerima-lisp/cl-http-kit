@@ -341,6 +341,7 @@ character in that range is a decimal digit, apart from an optional sign when
   proxy
   tls-upgrade
   resolve-host
+  resolve-host-style
   auth-provider
   challenge-auth-provider
   proxy-challenge-auth-provider

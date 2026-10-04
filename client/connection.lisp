@@ -15,6 +15,7 @@
   close-stream
   tls-upgrade
   resolve-host
+  resolve-host-style
   (max-idle 16)
   idle-timeout
   max-connection-age
@@ -84,6 +85,7 @@
     (&key open-stream close-stream
           tls-upgrade
           resolve-host
+          (resolve-host-style :keywords)
           (max-idle 16)
           (idle-timeout 60.0)
           (max-connection-age 300.0)
@@ -92,7 +94,9 @@
 
 OPEN-STREAM is called with REQUEST and :TIMEOUT, :DEADLINE, :PROXY-PLAN, and
 :PROXY keyword arguments.  CLOSE-STREAM receives a stream when the pool
-discards it.  Pool operations may be used concurrently from multiple threads."
+discards it.  RESOLVE-HOST-STYLE is :KEYWORDS by default; use :HOST-ONLY for
+a legacy RESOLVE-HOST callback that accepts only HOST.  Pool operations may
+be used concurrently from multiple threads."
   (%pool-ensure-function open-stream
                          "A connection pool requires an :OPEN-STREAM function.")
   (when close-stream
@@ -104,6 +108,10 @@ discards it.  Pool operations may be used concurrently from multiple threads."
   (when resolve-host
     (%pool-ensure-function resolve-host
                            "The connection pool host resolver must be a function."))
+  (unless (member resolve-host-style '(:keywords :host-only) :test #'eq)
+    (%pool-protocol-error
+     "The connection pool host resolver style must be :KEYWORDS or :HOST-ONLY."
+     resolve-host-style))
   (unless (and (integerp max-idle) (>= max-idle 0))
     (%pool-protocol-error
      "The connection pool maximum idle count must be a non-negative integer."
@@ -126,10 +134,12 @@ discards it.  Pool operations may be used concurrently from multiple threads."
                    open-stream close-stream
                    :tls-upgrade tls-upgrade
                    :resolve-host resolve-host
+                   :resolve-host-style resolve-host-style
                    :clock-function clock-function)
      :close-stream close-stream
      :tls-upgrade tls-upgrade
      :resolve-host resolve-host
+     :resolve-host-style resolve-host-style
      :max-idle max-idle
      :idle-timeout idle-timeout
      :max-connection-age max-connection-age

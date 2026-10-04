@@ -1374,7 +1374,7 @@ make-http-client (&key transport-function open-stream close-stream
 connection-pool
 default-headers cookie-jar cache strict-transport-store
 alternative-service-store redirect-policy
-retry-policy proxy tls-upgrade resolve-host auth-provider
+retry-policy proxy tls-upgrade resolve-host resolve-host-style auth-provider
 challenge-auth-provider proxy-challenge-auth-provider
 stale-while-revalidate-scheduler clock-function
 wall-clock-function sleep-function random-function default-timeout max-header-bytes max-fields max-body-bytes
@@ -1386,6 +1386,11 @@ optional for the direct stream transport boundary. Omitting
 strict-transport-store creates a new RFC 6797 store; explicitly passing nil
 disables HSTS. Omitting alternative-service-store creates a new RFC 7838 store;
 explicitly passing nil disables alternative-service discovery.
+
+`resolve-host-style` is `:keywords` by default. In that mode, the resolver
+receives HOST, `:timeout`, and `:deadline`. Set it to `:host-only` for a
+legacy resolver that accepts only HOST. The resolver is not retried when its
+body signals an error, so the style must match the callback.
 
 The injected transport-function must accept the complete keyword boundary used
 by the client, including timeout, deadline, limits, proxy context, request-body

@@ -426,7 +426,8 @@
             nil alternative-service-store-supplied-p)
           (redirect-policy (make-http-redirect-policy))
           (retry-policy (make-http-retry-policy))
-          proxy tls-upgrade resolve-host auth-provider challenge-auth-provider
+          proxy tls-upgrade resolve-host (resolve-host-style :keywords)
+          auth-provider challenge-auth-provider
           proxy-challenge-auth-provider
           stale-while-revalidate-scheduler
           (clock-function #'get-universal-time)
@@ -451,6 +452,8 @@ When STRICT-TRANSPORT-STORE is omitted, the client creates an RFC 6797 store
 and upgrades known hosts before sending.  When ALTERNATIVE-SERVICE-STORE is
 omitted, the client creates an RFC 7838 discovery store.  When no transport
 boundary is supplied, a native TCP/TLS connection pool is created lazily.
+RESOLVE-HOST-STYLE selects :KEYWORDS (the default) or :HOST-ONLY for a legacy
+resolver that accepts only HOST. A resolver is never retried after an error.
 Pass NIL explicitly to disable either store."
   (when (or (and transport-function open-stream)
             (and transport-function connection-pool)
@@ -516,6 +519,10 @@ Pass NIL explicitly to disable either store."
     (%ensure-function tls-upgrade "The TLS upgrade function must be a function."))
   (when resolve-host
     (%ensure-function resolve-host "The host resolver must be a function."))
+  (unless (member resolve-host-style '(:keywords :host-only) :test #'eq)
+    (%client-protocol-error
+     "The host resolver style must be :KEYWORDS or :HOST-ONLY."
+     resolve-host-style))
   (when on-request
     (%ensure-function on-request "The request hook must be a function."))
   (when on-response
@@ -600,7 +607,8 @@ Pass NIL explicitly to disable either store."
                      :open-stream effective-open-stream
                      :close-stream effective-close-stream
                      :tls-upgrade effective-tls-upgrade
-                     :resolve-host effective-resolve-host))))
+                     :resolve-host effective-resolve-host
+                     :resolve-host-style resolve-host-style))))
          (transport (or transport-function
                         (and effective-connection-pool
                              (%client-transport-from-connection-pool
@@ -610,6 +618,7 @@ Pass NIL explicitly to disable either store."
                           effective-open-stream effective-close-stream
                           :tls-upgrade effective-tls-upgrade
                           :resolve-host effective-resolve-host
+                          :resolve-host-style resolve-host-style
                           :clock-function #'%client-monotonic-time)
                          effective-close-stream))))
     (%make-http-client
@@ -626,6 +635,7 @@ Pass NIL explicitly to disable either store."
      :proxy proxy
      :tls-upgrade effective-tls-upgrade
      :resolve-host effective-resolve-host
+     :resolve-host-style resolve-host-style
      :auth-provider auth-provider
      :challenge-auth-provider challenge-auth-provider
      :proxy-challenge-auth-provider proxy-challenge-auth-provider
