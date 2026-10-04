@@ -59,11 +59,24 @@
         :key #'first
         :test #'eq))
 
+(defun %http3-quic-adapter-pending-stream-frame-p (quic-client stream)
+  (let ((stream-id (cl-quic-kit:stream-id stream)))
+    (some (lambda (entry)
+            (let ((frame (cdr entry)))
+              (and (eq (cl-quic-kit:frame-type frame) :stream)
+                   (= stream-id
+                      (cl-quic-kit:frame-field frame :stream-id)))))
+          (cl-quic-kit::quic-client-pending-frames quic-client))))
+
 (defun %http3-quic-adapter-await-stream-write
-    (quic-client stream &key timeout deadline)
+    (quic-client stream &key timeout deadline complete-p)
   (let ((end (%http3-quic-adapter-deadline timeout deadline)))
     (loop
-      (unless (%http3-quic-adapter-pending-stream-write-p quic-client stream)
+      (cl-quic-kit:client-flush quic-client)
+      (unless (or (%http3-quic-adapter-pending-stream-write-p quic-client stream)
+                  (and complete-p
+                       (%http3-quic-adapter-pending-stream-frame-p
+                        quic-client stream)))
         (return quic-client))
       (when (and end (>= (%http3-quic-adapter-now) end))
         (%http3-quic-adapter-error
@@ -291,7 +304,8 @@ to be selected without exposing QUIC implementation details."
                                    :fin-p fin-p :timeout timeout :deadline deadline)
                                   (%http3-quic-adapter-await-stream-write
                                    quic-client stream
-                                   :timeout timeout :deadline deadline))
+                                   :timeout timeout :deadline deadline
+                                   :complete-p fin-p))
                                 (prog1
                                     (cl-quic-kit:client-write-stream
                                      quic-client stream
@@ -300,7 +314,8 @@ to be selected without exposing QUIC implementation details."
                                   (when fin-p
                                     (%http3-quic-adapter-await-stream-write
                                      quic-client stream
-                                     :timeout timeout :deadline deadline))))))
+                                     :timeout timeout :deadline deadline
+                                     :complete-p fin-p))))))
                         :read-stream
                         (lambda (stream &key timeout deadline)
                           (%http3-quic-adapter-read
