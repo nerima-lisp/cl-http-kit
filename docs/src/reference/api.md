@@ -443,6 +443,13 @@ exceeding a cap raises `HTTP-PROTOCOL-ERROR` before the block is decoded.
 These caps are separate from the per-section `max-header-bytes` and
 `max-fields` limits.
 
+The HTTP/2 server also accepts `max-concurrent-streams`, `max-reset-streams`,
+and `max-hpack-table-size`. Their defaults are 100, 100, and 4096 bytes.
+The first two bound active request streams and resets per session; the last
+clamps the peer's HPACK dynamic-table capacity. The client connection path
+also clamps peer HPACK table settings to 4096 bytes by default through
+`*h2-max-peer-hpack-table-size*`.
+
 ### HTTP/2 connection manager
 
 `make-http2-connection-manager` constructs an owner-thread connection pool
@@ -538,6 +545,14 @@ enforced and emitted as Content-Length. It opens a request stream, writes
 request headers, DATA, and trailers, then parses the response. The QPACK tables
 are caller-owned and are not synchronized automatically. HTTP3-CLIENT accessors
 expose the callback slots, limits, settings, and open state.
+
+MAKE-HTTP3-CLIENT also accepts MAX-REQUEST-STREAMS,
+MAX-PEER-UNIDIRECTIONAL-STREAMS, MAX-STATE-BYTES,
+QPACK-MAX-INSTRUCTION-BYTES, and QPACK-MAX-BUFFER-BYTES. Their finite defaults
+are 100, 16, 4 MiB, 65,536 bytes, and 262,144 bytes respectively. The
+client, server-stream, push, and connection-manager body-limit entry points
+default MAX-BODY-BYTES to the core 16 MiB default; an explicitly supplied NIL
+disables that limit for the call.
 
 MAKE-HTTP3-CONNECTION-MANAGER pools clients by request origin. Its
 MAX-CONNECTIONS policy evicts the least recently used origin, while
