@@ -43,10 +43,12 @@
          :http2-error-code error-code))
 
 (defun %h2-server-decode-headers (block context max-header-bytes max-fields)
-  (handler-case
+    (handler-case
       (%hpack-decode-block block context
                            :max-header-bytes max-header-bytes
                            :max-fields max-fields)
+    (http-kit:http-size-limit-exceeded (condition)
+      (error condition))
     (http-kit:http-protocol-error (condition)
       (%h2-server-error "HTTP/2 HPACK decoding failed"
                         condition +http2-compression-error+))))
