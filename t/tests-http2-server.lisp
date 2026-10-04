@@ -509,6 +509,29 @@
                          (declare (ignore closed-stream)))))
       (ensure-equal 1 (length errors))))
 
+  (deftest http2-server-sends-protocol-error-for-idle-reset
+    (let* ((input (concatenate-octets
+                   (h2-preface)
+                   (h2-frame 4 0 0 (octets))
+                   (h2-frame 3 0 3 (octets 0 0 0 0))))
+           (stream (make-instance 'binary-session-stream :input input)))
+      (signals http-protocol-error
+        (http-kit/http2:serve-http2-session
+         stream
+         (lambda (request)
+           (declare (ignore request))
+           (make-http-response :status 204))))
+      (let ((goaway
+              (find-if (lambda (frame)
+                         (= (http-kit/http2::%h2-frame-type frame) 7))
+                       (server-output-frames
+                        (binary-session-output stream)))))
+        (ensure-true goaway)
+        (ensure-equal 0 (http-kit/http2::%h2-frame-stream-id goaway))
+        (ensure-equal 1
+                      (http-kit/http2::%h2-u32
+                       (http-kit/http2::%h2-frame-payload goaway) 4)))))
+
   (deftest http2-server-priority-update-boundaries
     (let* ((input (concatenate-octets
                    (h2-preface)
@@ -571,13 +594,27 @@
                                   (cons ":authority" "example.com")
                                   (cons ":path" "/two")))))
                (stream (make-instance 'binary-session-stream :input input)))
-          (signals http-protocol-error
-            (apply #'http-kit/http2:serve-http2-session
-                   stream
-                   (lambda (request)
-                     (declare (ignore request))
-                     (make-http-response :status 204))
-                   arguments))))))
+          (multiple-value-bind (count reason)
+              (apply #'http-kit/http2:serve-http2-session
+                     stream
+                     (lambda (request)
+                       (declare (ignore request))
+                       (make-http-response :status 204))
+                     arguments)
+            (declare (ignore count))
+            (ensure-equal :eof reason)
+            (let ((resets
+                    (remove-if-not
+                     (lambda (frame)
+                       (= (http-kit/http2::%h2-frame-type frame) 3))
+                     (server-output-frames
+                      (binary-session-output stream)))))
+              (ensure-equal 2 (length resets))
+              (dolist (frame resets)
+                (ensure-equal 7
+                              (http-kit/http2::%h2-u32
+                               (http-kit/http2::%h2-frame-payload frame)
+                               0)))))))))
 
   (deftest http2-server-releases-completed-and-reset-stream-state
     (let* ((headers (h2-header-block
@@ -648,7 +685,16 @@
          (lambda (request)
            (declare (ignore request))
            (make-http-response :status 204))
-         :max-reset-streams 1))))
+         :max-reset-streams 1))
+      (let ((goaway
+              (find-if (lambda (frame)
+                         (= (http-kit/http2::%h2-frame-type frame) 7))
+                       (server-output-frames
+                        (binary-session-output stream)))))
+        (ensure-true goaway)
+        (ensure-equal 11
+                      (http-kit/http2::%h2-u32
+                       (http-kit/http2::%h2-frame-payload goaway) 4)))))
 
   (deftest http2-server-clamps-peer-hpack-table-size
     (let* ((input (concatenate-octets

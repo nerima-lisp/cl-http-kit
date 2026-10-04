@@ -35,11 +35,24 @@
   send-window
   receive-window)
 
-(defun %h2-server-error (message detail)
+(defun %h2-server-error (message detail &optional (error-code +http2-protocol-error+))
   (error 'http-kit:http-protocol-error
          :message message
          :operation :http2-server
-         :detail detail))
+         :detail detail
+         :http2-error-code error-code))
+
+(defun %h2-server-decode-headers (block context max-header-bytes max-fields)
+  (handler-case
+      (%hpack-decode-block block context
+                           :max-header-bytes max-header-bytes
+                           :max-fields max-fields)
+    (http-kit:http-size-limit-exceeded (condition)
+      (%h2-server-error "HTTP/2 header block exceeds the configured limit"
+                        condition +http2-enhance-your-calm+))
+    (http-kit:http-protocol-error (condition)
+      (%h2-server-error "HTTP/2 HPACK decoding failed"
+                        condition +http2-compression-error+))))
 
 (defun %h2-server-invalid-header (name reason)
   (error 'http-kit:http-invalid-header
@@ -648,6 +661,13 @@ values.
                                  (%h2-server-error
                                   "Invalid HTTP/2 RST_STREAM frame" frame))
                                (let ((state (gethash stream-id streams)))
+                                 (when (and (null state)
+                                            (> stream-id last-client-stream-id))
+                                   ;; RST_STREAM on an idle stream is a
+                                   ;; connection error (RFC 9113, section 5.4.1).
+                                   (%h2-server-error
+                                    "HTTP/2 RST_STREAM targeted an idle stream"
+                                    stream-id))
                                  (let ((now (funcall clock-function)))
                                    (setf reset-times
                                          (cons now
@@ -660,7 +680,8 @@ values.
                                  (when (> reset-stream-count max-reset-streams)
                                    (%h2-server-error
                                     "HTTP/2 reset stream budget exceeded"
-                                    reset-stream-count))
+                                    reset-stream-count
+                                    +http2-enhance-your-calm+))
                                  (when state
                                    (setf (%h2-server-stream-reset-p state) t)
                                    (remhash stream-id streams)
@@ -969,10 +990,9 @@ values.
                                        "HTTP/2 trailer block must have END_STREAM"
                                        stream-id))
                                     (let ((fields
-                                            (%hpack-decode-block
+                                            (%h2-server-decode-headers
                                              block decoder-context
-                                             :max-header-bytes max-header-bytes
-                                             :max-fields max-fields)))
+                                             max-header-bytes max-fields)))
                                       (%h2-trailers fields)
                                       (setf (%h2-server-stream-trailers state)
                                             (mapcar
@@ -992,9 +1012,13 @@ values.
                                              (min max-concurrent-streams
                                                   (or peer-max-concurrent-streams
                                                       max-concurrent-streams)))
-                                    (%h2-server-error
-                                     "HTTP/2 maximum concurrent streams exceeded"
-                                     stream-id))
+                                    ;; REFUSED_STREAM is stream-local.  The
+                                    ;; connection remains usable for later
+                                    ;; increasing stream IDs.
+                                    (%h2-send-rst-stream
+                                     writer stream-id +http2-refused-stream+)
+                                    (setf last-client-stream-id stream-id)
+                                    (return-from handle-headers nil))
                                   (setf last-client-stream-id stream-id)
                                   (multiple-value-bind (block end-stream-p)
                                       (%h2-read-header-block
@@ -1003,10 +1027,9 @@ values.
                                        max-header-bytes stream-id
                                        #'next-frame)
                                     (let ((fields
-                                            (%hpack-decode-block
+                                            (%h2-server-decode-headers
                                              block decoder-context
-                                             :max-header-bytes max-header-bytes
-                                             :max-fields max-fields)))
+                                             max-header-bytes max-fields)))
                                       (multiple-value-bind
                                             (method scheme authority target protocol headers)
                                           (%h2-server-header-fields
@@ -1131,6 +1154,28 @@ values.
                           (setf termination :max-requests)
                           (return)))))))))
            (condition (caught-condition)
+             (let ((error-code
+                     (cond
+                       ((typep caught-condition
+                               'http-kit:http-size-limit-exceeded)
+                        +http2-enhance-your-calm+)
+                       ((typep caught-condition
+                               'http-kit:http-protocol-error)
+                        (or (http-kit::http-protocol-error-http2-error-code
+                             caught-condition)
+                            +http2-protocol-error+)))))
+               ;; A connection-level failure is observable on the wire before
+               ;; the transport is closed.  Do not catch a writer failure:
+               ;; callers must see the actual I/O error.
+               (when error-code
+                 (let ((payload (make-array 8
+                                            :element-type '(unsigned-byte 8))))
+                   (%h2-put-u32 payload 0 0)
+                   (%h2-put-u32 payload 4 error-code)
+                   (%h2-write-wire
+                    stream
+                    (%h2-frame-wire +http2-goaway-type+ 0 0 payload)
+                    deadline clock-function))))
              (when on-error
                (funcall on-error caught-condition current-request))
              (if (and (typep caught-condition
