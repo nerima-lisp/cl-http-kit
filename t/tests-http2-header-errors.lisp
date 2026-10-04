@@ -1,6 +1,76 @@
 (in-package #:http-kit/test)
 
 (deftest http2-header-block-errors
+  (labels ((read-header-block-with (continuations frame-limit continuation-limit
+                                    parts-limit)
+             (let ((remaining (copy-list continuations))
+                   (http-kit/http2::*h2-max-header-block-frames* frame-limit)
+                   (http-kit/http2::*h2-max-continuation-frames*
+                     continuation-limit)
+                   (http-kit/http2::*h2-max-header-block-parts* parts-limit))
+               (http-kit/http2::%h2-read-header-block
+                (h2-frame-object http-kit/http2::+http2-headers-type+ 0 1
+                                 (octets #x88))
+                (h2-reader-from-frames) 16384 nil (lambda () 0d0) 16384 1
+                (lambda () (pop remaining))))))
+    (multiple-value-bind (block end-stream)
+        (read-header-block-with
+         (list (h2-frame-object http-kit/http2::+http2-continuation-type+
+                                http-kit/http2::+http2-end-headers-flag+
+                                1 (octets)))
+         2 1 2)
+      (ensure-equal (octets #x88) block)
+      (ensure-false end-stream))
+    (signals http-protocol-error
+      (read-header-block-with
+       (list (h2-frame-object http-kit/http2::+http2-continuation-type+ 0 1
+                              (octets))
+             (h2-frame-object http-kit/http2::+http2-continuation-type+
+                              http-kit/http2::+http2-end-headers-flag+ 1
+                              (octets)))
+       2 10 10))
+    (signals http-protocol-error
+      (read-header-block-with
+       (list (h2-frame-object http-kit/http2::+http2-continuation-type+ 0 1
+                              (octets))
+             (h2-frame-object http-kit/http2::+http2-continuation-type+
+                              http-kit/http2::+http2-end-headers-flag+ 1
+                              (octets)))
+       10 1 10))
+    (signals http-protocol-error
+      (read-header-block-with
+       (list (h2-frame-object http-kit/http2::+http2-continuation-type+ 0 1
+                              (octets))
+             (h2-frame-object http-kit/http2::+http2-continuation-type+
+                              http-kit/http2::+http2-end-headers-flag+ 1
+                              (octets)))
+       10 10 2))
+    (let ((continuations
+            (loop repeat 127 collect
+              (h2-frame-object http-kit/http2::+http2-continuation-type+
+                               0 1 (octets)))))
+      (setf continuations
+            (nconc continuations
+                   (list
+                    (h2-frame-object http-kit/http2::+http2-continuation-type+
+                                     http-kit/http2::+http2-end-headers-flag+
+                                     1 (octets)))))
+      (signals http-protocol-error
+        (read-header-block-with continuations 128 127 128)))
+    (let ((remaining
+            (list (h2-frame-object http-kit/http2::+http2-continuation-type+
+                                   0 1 (octets))
+                  (h2-frame-object http-kit/http2::+http2-continuation-type+
+                                   http-kit/http2::+http2-end-headers-flag+
+                                   1 (octets))))
+          (http-kit/http2::*h2-max-header-block-frames* 2)
+          (http-kit/http2::*h2-max-continuation-frames* 1)
+          (http-kit/http2::*h2-max-header-block-parts* 2))
+      (signals http-protocol-error
+        (http-kit/http2::%h2-batch-read-header-block
+         (h2-frame-object http-kit/http2::+http2-headers-type+ 0 1
+                          (octets #x88))
+         (lambda () (pop remaining)) 16384 16384))))
   (let* ((first (h2-frame-object
                  http-kit/http2::+http2-headers-type+
                  http-kit/http2::+http2-end-stream-flag+

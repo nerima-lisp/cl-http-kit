@@ -387,9 +387,14 @@ this operation has no response stream to associate with it."
   (when max-frame-size
     (setf (%http2-connection-peer-max-frame-size connection)
           max-frame-size))
-  (when max-table-size
+  (unless (null max-table-size)
     (setf (%http2-connection-peer-max-table-size connection)
-          max-table-size))
+          max-table-size)
+    ;; The peer's SETTINGS value bounds the table size it may use in
+    ;; outbound header blocks, so the decoder must enforce it as well.
+    (%hpack-set-maximum-size
+     (%http2-connection-hpack-context connection)
+     (min max-table-size *h2-max-peer-hpack-table-size*)))
   (when max-concurrent-streams
     (setf (%http2-connection-peer-max-concurrent-streams connection)
           max-concurrent-streams))
@@ -1042,8 +1047,14 @@ CONTINUATION frames must still be consumed contiguously from that queue."
     (let ((first-fragment (%h2-header-fragment first-frame :first-p t))
           (parts nil)
           (header-block-bytes 0)
+          (frame-count 1)
+          (continuation-count 0)
           (frame first-frame))
       (push first-fragment parts)
+      (%h2-check-header-block-limit :frames frame-count
+                                    *h2-max-header-block-frames*)
+      (%h2-check-header-block-limit :parts (length parts)
+                                    *h2-max-header-block-parts*)
       (incf header-block-bytes (length first-fragment))
       (http-kit::%check-limit :headers header-block-bytes max-header-bytes)
       (loop until (/= 0 (logand (%h2-frame-flags frame)
@@ -1068,7 +1079,16 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                         :message "An HTTP/2 CONTINUATION has an invalid flag."
                         :operation :http2-headers
                         :detail (%h2-frame-flags frame)))
+               (incf frame-count)
+               (incf continuation-count)
+               (%h2-check-header-block-limit :frames frame-count
+                                             *h2-max-header-block-frames*)
+               (%h2-check-header-block-limit :continuations
+                                             continuation-count
+                                             *h2-max-continuation-frames*)
                (push (%h2-frame-payload frame) parts)
+               (%h2-check-header-block-limit :parts (length parts)
+                                             *h2-max-header-block-parts*)
                (incf header-block-bytes
                      (length (%h2-frame-payload frame)))
                (http-kit::%check-limit :headers header-block-bytes

@@ -296,12 +296,32 @@ pseudo-fields are kept separate because they are not ordinary HTTP headers.
                           (list body-length actual-body-length)))
       (values status headers trailers body actual-body-length no-body))))
 
+(defun %h2-server-settings-wire (max-frame-size max-concurrent-streams
+                                  enable-connect-p)
+  (let ((payload (make-array (if enable-connect-p 24 18)
+                             :element-type '(unsigned-byte 8)
+                             :initial-element 0)))
+    ;; Disable server push, advertise the local frame and stream limits.
+    (%h2-put-u16 payload 0 2)
+    (%h2-put-u32 payload 2 0)
+    (%h2-put-u16 payload 6 5)
+    (%h2-put-u32 payload 8 max-frame-size)
+    (%h2-put-u16 payload 12 3)
+    (%h2-put-u32 payload 14 max-concurrent-streams)
+    (when enable-connect-p
+      (%h2-put-u16 payload 18 8)
+      (%h2-put-u32 payload 20 1))
+    (%h2-frame-wire +http2-settings-type+ 0 0 payload)))
+
 (defun serve-http2-session
     (stream handler &key timeout deadline
              (max-frame-size +http2-default-max-frame-size+)
              (max-header-bytes http-kit::*default-max-header-bytes*)
              (max-fields 256)
              (max-body-bytes http-kit::*default-max-body-bytes*)
+             (max-concurrent-streams 100)
+             (max-reset-streams 100)
+             (max-hpack-table-size +hpack-default-table-size+)
              default-authority
              (collect-body-p t)
              on-body-chunk
@@ -369,6 +389,11 @@ values.
   (%h2-validate-limit :max-header-bytes max-header-bytes)
   (%h2-validate-limit :max-fields max-fields)
   (%h2-validate-limit :max-body-bytes max-body-bytes :allow-zero t)
+  (%h2-validate-limit :max-concurrent-streams max-concurrent-streams
+                      :allow-zero t)
+  (%h2-validate-limit :max-reset-streams max-reset-streams :allow-zero t)
+  (%h2-validate-limit :max-hpack-table-size max-hpack-table-size
+                      :allow-zero t)
   (let ((request-count 0)
         (termination :running)
         (current-request nil))
@@ -387,6 +412,8 @@ values.
                       (streams (make-hash-table :test #'eql))
                       (pending-frames '())
                       (last-client-stream-id 0)
+                      (peer-max-concurrent-streams nil)
+                      (reset-stream-count 0)
                       (goaway-sent-p nil)
                       (peer-max-frame-size +http2-default-max-frame-size+)
                       (peer-max-header-list-size nil)
@@ -395,8 +422,13 @@ values.
                       (receive-connection-window +http2-default-window-size+)
                       (decoder-context
                         (%make-hpack-context
-                         :max-size +hpack-default-table-size+
-                         :maximum-size +hpack-default-table-size+)))
+                         :max-size max-hpack-table-size
+                         :maximum-size max-hpack-table-size)))
+                 (labels
+                     ((set-peer-hpack-table-size (size)
+                        (%hpack-set-maximum-size
+                         decoder-context
+                         (min size max-hpack-table-size))))
                  (let ((preface
                          (%h2-reader-read reader
                                          (length +http2-connection-preface+)
@@ -432,23 +464,26 @@ values.
                           max-concurrent-streams max-header-list-size)
                        (%h2-settings (%h2-frame-payload first-frame)
                                      :peer-role :client)
-                     (declare (ignore enable-connect-protocol
-                                      max-concurrent-streams))
+                     (declare (ignore enable-connect-protocol))
                      (when new-max-frame-size
                        (setf peer-max-frame-size new-max-frame-size))
                      (when max-header-list-size
                        (setf peer-max-header-list-size max-header-list-size))
+                     (when max-concurrent-streams
+                       (setf peer-max-concurrent-streams
+                             max-concurrent-streams))
                      (when new-table-size
-                       (%hpack-set-maximum-size decoder-context new-table-size))
+                       (set-peer-hpack-table-size new-table-size))
                      (when new-initial-window-size
                        (setf peer-initial-window-size new-initial-window-size))))
                  (%h2-send-control writer
                                    +http2-settings-type+
                                    0
                                    0
-                                   (%h2-settings-wire
+                                   (%h2-server-settings-wire
                                     max-frame-size
-                                    :enable-connect-p enable-connect-p))
+                                    max-concurrent-streams
+                                    enable-connect-p))
                  (%h2-send-control writer
                                    +http2-settings-type+
                                    +http2-ack-flag+
@@ -469,16 +504,17 @@ values.
                                  new-initial-window-size enable-connect-protocol
                                  max-concurrent-streams max-header-list-size)
                             (%h2-settings payload :peer-role :client)
-                          (declare (ignore enable-connect-protocol
-                                           max-concurrent-streams))
+                          (declare (ignore enable-connect-protocol))
                           (when new-max-frame-size
                             (setf peer-max-frame-size new-max-frame-size))
                           (when max-header-list-size
                             (setf peer-max-header-list-size
                                   max-header-list-size))
+                          (when max-concurrent-streams
+                            (setf peer-max-concurrent-streams
+                                  max-concurrent-streams))
                           (when new-table-size
-                            (%hpack-set-maximum-size decoder-context
-                                                     new-table-size))
+                            (set-peer-hpack-table-size new-table-size))
                           (when new-initial-window-size
                             (let ((delta
                                     (- new-initial-window-size
@@ -604,8 +640,14 @@ values.
                                  (%h2-server-error
                                   "Invalid HTTP/2 RST_STREAM frame" frame))
                                (let ((state (gethash stream-id streams)))
+                                 (incf reset-stream-count)
+                                 (when (> reset-stream-count max-reset-streams)
+                                   (%h2-server-error
+                                    "HTTP/2 reset stream budget exceeded"
+                                    reset-stream-count))
                                  (when state
                                    (setf (%h2-server-stream-reset-p state) t)
+                                   (remhash stream-id streams)
                                    (when (and interested-state
                                               (eq state interested-state))
                                      (return-from process-control-frame :reset))))
@@ -867,6 +909,7 @@ values.
                                 (when (eq send-result :reset)
                                   (return-from finish-request :reset)))
                               (setf (%h2-server-stream-responded-p state) t)
+                              (remhash (%h2-server-stream-id state) streams)
                               (incf request-count)
                               (when (and max-requests
                                          (>= request-count max-requests))
@@ -928,6 +971,13 @@ values.
                                   (when (<= stream-id last-client-stream-id)
                                     (%h2-server-error
                                      "HTTP/2 request stream IDs must increase"
+                                     stream-id))
+                                  (when (>= (hash-table-count streams)
+                                             (min max-concurrent-streams
+                                                  (or peer-max-concurrent-streams
+                                                      max-concurrent-streams)))
+                                    (%h2-server-error
+                                     "HTTP/2 maximum concurrent streams exceeded"
                                      stream-id))
                                   (setf last-client-stream-id stream-id)
                                   (multiple-value-bind (block end-stream-p)
@@ -1063,7 +1113,7 @@ values.
                           (return))
                          (:max-requests
                           (setf termination :max-requests)
-                          (return))))))))
+                          (return)))))))))
            (condition (caught-condition)
              (when on-error
                (funcall on-error caught-condition current-request))

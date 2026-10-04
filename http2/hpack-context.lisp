@@ -1,5 +1,8 @@
 (in-package #:http-kit/http2)
 
+(defparameter *h2-max-peer-hpack-table-size* +hpack-default-table-size+
+  "Maximum HPACK dynamic-table capacity accepted from a peer.")
+
 (defstruct (%hpack-entry (:constructor %make-hpack-entry))
   name
   value

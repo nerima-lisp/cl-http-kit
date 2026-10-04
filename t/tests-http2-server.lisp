@@ -549,3 +549,119 @@
            (lambda (request)
              (declare (ignore request))
              (make-http-response :status 204))))))))
+
+  (deftest http2-server-enforces-peer-and-local-concurrent-stream-limits
+    (dolist (settings-and-arguments
+             (list (list (octets 0 3 0 0 0 0) nil)
+                   (list (octets) '(:max-concurrent-streams 0))))
+      (destructuring-bind (settings arguments) settings-and-arguments
+        (let* ((input (concatenate-octets
+                       (h2-preface)
+                       (h2-frame 4 0 0 settings)
+                       (h2-frame 1 4 1
+                                 (h2-header-block
+                                  (cons ":method" "GET")
+                                  (cons ":scheme" "https")
+                                  (cons ":authority" "example.com")
+                                  (cons ":path" "/one")))
+                       (h2-frame 1 5 3
+                                 (h2-header-block
+                                  (cons ":method" "GET")
+                                  (cons ":scheme" "https")
+                                  (cons ":authority" "example.com")
+                                  (cons ":path" "/two")))))
+               (stream (make-instance 'binary-session-stream :input input)))
+          (signals http-protocol-error
+            (apply #'http-kit/http2:serve-http2-session
+                   stream
+                   (lambda (request)
+                     (declare (ignore request))
+                     (make-http-response :status 204))
+                   arguments))))))
+
+  (deftest http2-server-releases-completed-and-reset-stream-state
+    (let* ((headers (h2-header-block
+                     (cons ":method" "GET")
+                     (cons ":scheme" "https")
+                     (cons ":authority" "example.com")
+                     (cons ":path" "/ok")))
+           (input (concatenate-octets
+                   (h2-preface)
+                   (h2-frame 4 0 0 (octets))
+                   (h2-frame 1 5 1 headers)
+                   (h2-frame 1 5 3 headers)))
+           (stream (make-instance 'binary-session-stream :input input))
+           (count 0))
+      (multiple-value-bind (requests reason)
+          (http-kit/http2:serve-http2-session
+           stream
+           (lambda (request)
+             (declare (ignore request))
+             (incf count)
+             (make-http-response :status 204))
+           :max-concurrent-streams 1)
+        (ensure-equal 2 count)
+        (ensure-equal 2 requests)
+        (ensure-equal :eof reason)))
+    (let* ((headers (h2-header-block
+                     (cons ":method" "GET")
+                     (cons ":scheme" "https")
+                     (cons ":authority" "example.com")
+                     (cons ":path" "/reset")))
+           (input (concatenate-octets
+                   (h2-preface)
+                   (h2-frame 4 0 0 (octets))
+                   (h2-frame 1 4 1 headers)
+                   (h2-frame 3 0 1 (octets 0 0 0 0))
+                   (h2-frame 1 5 3 headers)))
+           (stream (make-instance 'binary-session-stream :input input))
+           (count 0))
+      (multiple-value-bind (requests reason)
+          (http-kit/http2:serve-http2-session
+           stream
+           (lambda (request)
+             (declare (ignore request))
+             (incf count)
+             (make-http-response :status 204))
+           :max-concurrent-streams 1)
+        (ensure-equal 1 count)
+        (ensure-equal 1 requests)
+        (ensure-equal :eof reason))))
+
+  (deftest http2-server-bounds-reset-stream-budget
+    (let* ((headers (h2-header-block
+                     (cons ":method" "GET")
+                     (cons ":scheme" "https")
+                     (cons ":authority" "example.com")
+                     (cons ":path" "/reset")))
+           (input (concatenate-octets
+                   (h2-preface)
+                   (h2-frame 4 0 0 (octets))
+                   (h2-frame 1 4 1 headers)
+                   (h2-frame 3 0 1 (octets 0 0 0 0))
+                   (h2-frame 1 4 3 headers)
+                   (h2-frame 3 0 3 (octets 0 0 0 0))))
+           (stream (make-instance 'binary-session-stream :input input)))
+      (signals http-protocol-error
+        (http-kit/http2:serve-http2-session
+         stream
+         (lambda (request)
+           (declare (ignore request))
+           (make-http-response :status 204))
+         :max-reset-streams 1))))
+
+  (deftest http2-server-clamps-peer-hpack-table-size
+    (let* ((input (concatenate-octets
+                   (h2-preface)
+                   (h2-frame 4 0 0 (octets 0 1 0 0 0 0))
+                   (h2-frame 1 4 1
+                             (octets #x3f #xff #xff #xe3 #x1d
+                                     #x82 #x87))))
+           (stream (make-instance 'binary-session-stream :input input)))
+      (signals http-protocol-error
+        (http-kit/http2:serve-http2-session
+         stream
+         (lambda (request)
+           (declare (ignore request))
+           (make-http-response :status 204))
+         :max-hpack-table-size 0))))

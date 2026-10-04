@@ -44,9 +44,9 @@
                :operation :http2-settings
                :detail (%h2-frame-length frame)))
       (progn
-        ;; SETTINGS_HEADER_TABLE_SIZE limits the dynamic table that this
-        ;; endpoint may use for its outbound header blocks.  It does not
-        ;; change the table used to decode the peer's response blocks.
+        ;; SETTINGS_HEADER_TABLE_SIZE limits the dynamic table used by the
+        ;; sender of the SETTINGS frame for outbound header blocks.  The
+        ;; connection callback also applies it to the decoder context.
         (%h2-settings (%h2-frame-payload frame))
         (%h2-send-control writer +http2-settings-type+ +http2-ack-flag+ 0
                           (http-kit::%empty-octets)))))
