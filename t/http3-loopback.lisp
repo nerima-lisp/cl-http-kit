@@ -187,6 +187,11 @@
                      (string= "verified"
                               (%octets-as-string
                                (http-kit:http-response-body response))))
+          (format t "HTTP/3 POST diagnostic status=~S protocol=~S headers=~S body=~S~%"
+                  (http-kit:http-response-status response)
+                  (http-kit:http-response-protocol-version response)
+                  (http-kit:http-response-headers response)
+                  (%octets-as-string (http-kit:http-response-body response)))
           (error "HTTP/3 known-length POST was not verified by the receiver."))))
     (when post-receiver
       (sb-thread:join-thread post-receiver))
