@@ -58,52 +58,39 @@
     (values
      (sb-thread:make-thread
       (lambda ()
-        (handler-case
-            (unwind-protect
+        (unwind-protect
              (let* ((socket (sb-bsd-sockets:socket-accept listener))
                     (stream (sb-bsd-sockets:socket-make-stream
                              socket :input t :output t :element-type '(unsigned-byte 8)
                              :buffering :full)))
-               (format t "HTTP/3 POST receiver diagnostic accepted~%")
-               (finish-output)
                (unwind-protect
                     (let* ((headers (%read-http1-headers stream))
-                               (marker (search "content-length:" headers
-                                               :test #'char-equal))
-                               (line-end (and marker (position #\Newline headers
-                                                                :start marker)))
-                               (length (and marker line-end
-                                             (parse-integer headers
-                                                            :start (+ marker 15)
-                                                            :end line-end
-                                                            :junk-allowed t)))
+                           (marker (search "content-length:" headers
+                                           :test #'char-equal))
+                           (line-end (and marker (position #\Newline headers
+                                                            :start marker)))
+                           (length (and marker line-end
+                                         (parse-integer headers
+                                                        :start (+ marker 15)
+                                                        :end line-end
+                                                        :junk-allowed t)))
                            (body (make-array (or length 0)
                                              :element-type '(unsigned-byte 8))))
-                      (format t "HTTP/3 POST receiver diagnostic headers-length=~D content-length=~S~%"
-                              (length headers) length)
-                      (finish-output)
-                          (unless (= (or length -1) expected-length)
-                            (error "Receiver got Content-Length ~S, expected ~D."
-                                   length expected-length))
-                      (let ((received (read-sequence body stream)))
-                        (format t "HTTP/3 POST receiver diagnostic received=~D~%"
-                                received)
-                        (finish-output)
-                        (unless (= received expected-length)
-                          (error "Receiver got a truncated POST body.")))
-                          (unless (every (lambda (octet) (= octet #x5a)) body)
-                            (error "Receiver got unexpected POST body bytes."))
-                          (write-sequence
-                           (map '(vector (unsigned-byte 8)) #'char-code
-                                "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nverified")
-                           stream)
-                          (finish-output stream))
-                     (close stream :abort t)
-                     (sb-bsd-sockets:socket-close socket)))
-              (sb-bsd-sockets:socket-close listener))
-          (condition (condition)
-            (format t "HTTP/3 POST receiver diagnostic condition=~S~%"
-                    condition))))
+                      (unless (= (or length -1) expected-length)
+                        (error "Receiver got Content-Length ~S, expected ~D."
+                               length expected-length))
+                      (unless (= (read-sequence body stream) expected-length)
+                        (error "Receiver got a truncated POST body."))
+                      (unless (every (lambda (octet) (= octet #x5a)) body)
+                        (error "Receiver got unexpected POST body bytes."))
+                      (write-sequence
+                       (map '(vector (unsigned-byte 8)) #'char-code
+                            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nverified")
+                       stream)
+                      (finish-output stream))
+                 (close stream)
+                 (sb-bsd-sockets:socket-close socket)))
+          (sb-bsd-sockets:socket-close listener)))
       :name "cl-http-kit-post-receiver")
      listener)))
 
@@ -200,11 +187,6 @@
                      (string= "verified"
                               (%octets-as-string
                                (http-kit:http-response-body response))))
-          (format t "HTTP/3 POST diagnostic status=~S protocol=~S headers=~S body=~S~%"
-                  (http-kit:http-response-status response)
-                  (http-kit:http-response-protocol-version response)
-                  (http-kit:http-response-headers response)
-                  (%octets-as-string (http-kit:http-response-body response)))
           (error "HTTP/3 known-length POST was not verified by the receiver."))))
     (when post-receiver
       (sb-thread:join-thread post-receiver))
