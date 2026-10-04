@@ -225,6 +225,7 @@ to be selected without exposing QUIC implementation details."
             :on-close on-close))
          (stream-prefixes (make-hash-table :test #'eq))
          (stream-prefix-sent (make-hash-table :test #'eq))
+         (stream-buffers (make-hash-table :test #'eq))
          (adapter (%make-http3-quic-adapter
                    :quic-client quic-client
                    :poll-interval poll-interval)))
@@ -264,11 +265,21 @@ to be selected without exposing QUIC implementation details."
                                        (progn
                                          (setf (gethash stream stream-prefix-sent) t)
                                          (subseq octets (length prefix)))
-                                       octets)))
+                                       octets))
+                                 (buffered (gethash stream stream-buffers)))
+                            (if (and (null prefix) (not fin-p))
+                                (setf (gethash stream stream-buffers)
+                                      (if buffered
+                                          (%http3-concatenate-octets buffered payload)
+                                          payload))
                             (prog1
                                 (cl-quic-kit:client-write-stream
-                                 quic-client stream payload
-                                 :fin-p fin-p :timeout timeout :deadline deadline))))
+                                 quic-client stream
+                                 (if buffered
+                                     (%http3-concatenate-octets buffered payload)
+                                     payload)
+                                 :fin-p fin-p :timeout timeout :deadline deadline)
+                              (remhash stream stream-buffers)))))
                         :read-stream
                         (lambda (stream &key timeout deadline)
                           (%http3-quic-adapter-read
