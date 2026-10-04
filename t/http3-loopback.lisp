@@ -177,6 +177,12 @@
                       (string= "ok"
                                (%octets-as-string
                                 (http-kit:http-response-body response))))
+           (format t "HTTP/3 diagnostic mode=~A status=~S protocol=~S headers=~S body=~S~%"
+                   mode
+                   (http-kit:http-response-status response)
+                   (http-kit:http-response-protocol-version response)
+                   (http-kit:http-response-headers response)
+                   (%octets-as-string (http-kit:http-response-body response)))
            (error "HTTP/3 loopback mode ~A returned an unexpected response." mode)))))
     (when (string= mode "explicit")
       (let ((response
