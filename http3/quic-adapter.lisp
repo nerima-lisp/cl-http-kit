@@ -53,6 +53,25 @@
           :closed-error (cl-quic-kit::quic-connection-closed-error connection)
           :closed-reason (cl-quic-kit::quic-connection-closed-reason connection))))
 
+(defun %http3-quic-adapter-pending-stream-write-p (quic-client stream)
+  (find stream
+        (cl-quic-kit::quic-client-pending-stream-writes quic-client)
+        :key #'first
+        :test #'eq))
+
+(defun %http3-quic-adapter-await-stream-write
+    (quic-client stream &key timeout deadline)
+  (let ((end (%http3-quic-adapter-deadline timeout deadline)))
+    (loop
+      (unless (%http3-quic-adapter-pending-stream-write-p quic-client stream)
+        (return quic-client))
+      (when (and end (>= (%http3-quic-adapter-now) end))
+        (%http3-quic-adapter-error
+         "Timed out waiting for HTTP/3 request body flow control."
+         (list :timeout timeout :deadline deadline)))
+      (cl-quic-kit:client-poll quic-client)
+      (sleep 0.005))))
+
 (defun %http3-quic-adapter-read
     (quic-client http3-client stream &key timeout deadline poll-interval)
   (let ((end (%http3-quic-adapter-deadline timeout deadline)))
@@ -225,6 +244,7 @@ to be selected without exposing QUIC implementation details."
             :on-close on-close))
          (stream-prefixes (make-hash-table :test #'eq))
          (stream-prefix-sent (make-hash-table :test #'eq))
+         (stream-buffers (make-hash-table :test #'eq))
          (adapter (%make-http3-quic-adapter
                    :quic-client quic-client
                    :poll-interval poll-interval)))
@@ -264,12 +284,25 @@ to be selected without exposing QUIC implementation details."
                                        (progn
                                          (setf (gethash stream stream-prefix-sent) t)
                                          (subseq octets (length prefix)))
-                                       octets)))
-                            (cl-quic-kit:client-write-stream
-                             quic-client stream payload
-                             :fin-p fin-p :timeout timeout :deadline deadline)
-                            (cl-quic-kit:client-poll quic-client)
-                            (sleep 0.005)))
+                                       octets))
+                                 (buffered (gethash stream stream-buffers)))
+                            (if (and (null prefix) (not fin-p))
+                                (setf (gethash stream stream-buffers)
+                                      (if buffered
+                                          (%http3-concatenate-octets buffered payload)
+                                          payload))
+                                (prog1
+                                    (cl-quic-kit:client-write-stream
+                                     quic-client stream
+                                     (if buffered
+                                         (%http3-concatenate-octets buffered payload)
+                                         payload)
+                                     :fin-p fin-p :timeout timeout :deadline deadline)
+                                  (remhash stream stream-buffers)
+                                  (when fin-p
+                                    (%http3-quic-adapter-await-stream-write
+                                     quic-client stream
+                                     :timeout timeout :deadline deadline))))))
                         :read-stream
                         (lambda (stream &key timeout deadline)
                           (%http3-quic-adapter-read
