@@ -321,6 +321,7 @@ pseudo-fields are kept separate because they are not ordinary HTTP headers.
              (max-body-bytes http-kit::*default-max-body-bytes*)
              (max-concurrent-streams 100)
              (max-reset-streams 100)
+             (max-reset-window 1.0d0)
              (max-hpack-table-size +hpack-default-table-size+)
              default-authority
              (collect-body-p t)
@@ -392,6 +393,12 @@ values.
   (%h2-validate-limit :max-concurrent-streams max-concurrent-streams
                       :allow-zero t)
   (%h2-validate-limit :max-reset-streams max-reset-streams :allow-zero t)
+  (unless (and (realp max-reset-window)
+               (not (minusp max-reset-window)))
+    (error 'http-kit:http-protocol-error
+           :message "HTTP/2 max-reset-window must be a non-negative real"
+           :operation :http2-server
+           :detail max-reset-window))
   (%h2-validate-limit :max-hpack-table-size max-hpack-table-size
                       :allow-zero t)
   (let ((request-count 0)
@@ -414,6 +421,7 @@ values.
                       (last-client-stream-id 0)
                       (peer-max-concurrent-streams nil)
                       (reset-stream-count 0)
+                      (reset-times '())
                       (goaway-sent-p nil)
                       (peer-max-frame-size +http2-default-max-frame-size+)
                       (peer-max-header-list-size nil)
@@ -640,7 +648,15 @@ values.
                                  (%h2-server-error
                                   "Invalid HTTP/2 RST_STREAM frame" frame))
                                (let ((state (gethash stream-id streams)))
-                                 (incf reset-stream-count)
+                                 (let ((now (funcall clock-function)))
+                                   (setf reset-times
+                                         (cons now
+                                               (delete-if
+                                                (lambda (timestamp)
+                                                  (> (- now timestamp)
+                                                     max-reset-window))
+                                                reset-times))))
+                                 (setf reset-stream-count (length reset-times))
                                  (when (> reset-stream-count max-reset-streams)
                                    (%h2-server-error
                                     "HTTP/2 reset stream budget exceeded"
