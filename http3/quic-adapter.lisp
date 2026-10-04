@@ -264,10 +264,10 @@ to be selected without exposing QUIC implementation details."
                                        (progn
                                          (setf (gethash stream stream-prefix-sent) t)
                                          (subseq octets (length prefix)))
-                                       octets))
+                                       octets)))
                             (cl-quic-kit:client-write-stream
                              quic-client stream payload
-                             :fin-p fin-p :timeout timeout :deadline deadline))))
+                             :fin-p fin-p :timeout timeout :deadline deadline)))
                         :read-stream
                         (lambda (stream &key timeout deadline)
                           (%http3-quic-adapter-read
