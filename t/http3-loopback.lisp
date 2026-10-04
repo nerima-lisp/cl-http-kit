@@ -60,12 +60,14 @@
       (lambda ()
         (handler-case
             (unwind-protect
-                 (let* ((socket (sb-bsd-sockets:socket-accept listener))
-                        (stream (sb-bsd-sockets:socket-make-stream
-                                 socket :input t :output t :element-type '(unsigned-byte 8)
-                                 :buffering :full)))
-                   (unwind-protect
-                        (let* ((headers (%read-http1-headers stream))
+             (let* ((socket (sb-bsd-sockets:socket-accept listener))
+                    (stream (sb-bsd-sockets:socket-make-stream
+                             socket :input t :output t :element-type '(unsigned-byte 8)
+                             :buffering :full)))
+               (format t "HTTP/3 POST receiver diagnostic accepted~%")
+               (finish-output)
+               (unwind-protect
+                    (let* ((headers (%read-http1-headers stream))
                                (marker (search "content-length:" headers
                                                :test #'char-equal))
                                (line-end (and marker (position #\Newline headers
@@ -75,13 +77,20 @@
                                                             :start (+ marker 15)
                                                             :end line-end
                                                             :junk-allowed t)))
-                               (body (make-array (or length 0)
-                                                 :element-type '(unsigned-byte 8))))
+                           (body (make-array (or length 0)
+                                             :element-type '(unsigned-byte 8))))
+                      (format t "HTTP/3 POST receiver diagnostic headers-length=~D content-length=~S~%"
+                              (length headers) length)
+                      (finish-output)
                           (unless (= (or length -1) expected-length)
                             (error "Receiver got Content-Length ~S, expected ~D."
                                    length expected-length))
-                          (unless (= (read-sequence body stream) expected-length)
-                            (error "Receiver got a truncated POST body."))
+                      (let ((received (read-sequence body stream)))
+                        (format t "HTTP/3 POST receiver diagnostic received=~D~%"
+                                received)
+                        (finish-output)
+                        (unless (= received expected-length)
+                          (error "Receiver got a truncated POST body.")))
                           (unless (every (lambda (octet) (= octet #x5a)) body)
                             (error "Receiver got unexpected POST body bytes."))
                           (write-sequence
