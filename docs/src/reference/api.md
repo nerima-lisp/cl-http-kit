@@ -445,7 +445,9 @@ These caps are separate from the per-section `max-header-bytes` and
 
 The HTTP/2 server also accepts `max-concurrent-streams`, `max-reset-streams`,
 and `max-hpack-table-size`. Their defaults are 100, 100, and 4096 bytes.
-The first two bound active request streams and resets per session; the last
+The first bounds active request streams per session. The reset budget defaults
+to 100 resets in a one-second window and closes the session with
+`HTTP-PROTOCOL-ERROR` when exceeded. The last
 clamps the peer's HPACK dynamic-table capacity. The client connection path
 also clamps peer HPACK table settings to 4096 bytes by default through
 `*h2-max-peer-hpack-table-size*`.
