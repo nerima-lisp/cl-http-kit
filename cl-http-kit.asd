@@ -176,7 +176,7 @@
              (uiop:symbol-call "HTTP-KIT/TEST-CORE" "RUN-TESTS")))
 
 (asdf:defsystem "cl-http-kit/test"
-  :description "Tests for cl-http-kit and its optional HTTP/2 transport."
+  :description "Tests for cl-http-kit and its optional protocol and network systems."
   :depends-on ("cl-http-kit/test-core"
                "cl-http-kit/client"
                "cl-http-kit/http2"

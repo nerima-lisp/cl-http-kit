@@ -1,11 +1,11 @@
 # Changelog
 
-This page records the current source version and the next integration
-candidate. The ASDF systems in this checkout are version 0.4.0.
+This page records the current source version. The ASDF systems in this
+checkout are version 0.4.0.
 
 ## 0.4.0
 
-The candidate scope is a breaking integration release for the 0.x series:
+The 0.4.0 release is a breaking integration release for the 0.x series:
 
 - add a URL-and-method client path with native TCP/TLS, redirects, cookies,
   content coding, and pooling enabled by default;
@@ -20,13 +20,21 @@ The candidate scope is a breaking integration release for the 0.x series:
 - keep HTTP/2 protocol selection in the native client path; HTTP/3 is not
   selected automatically, while an explicitly supplied cl-quic-kit adapter can
   drive the client QUIC connection and HTTP/3 stream lifecycle;
+- add HTTP/3 client loopback coverage through the cl-quic-kit adapter for
+  Alt-Svc, fallback, and explicit HTTP/3 modes;
+- update the dependency pins for cl-crypto-kit, cl-deflate-kit, cl-tls-kit,
+  and cl-quic-kit to their release integration branches;
+- verify the release gate on Ubuntu x86_64 with `nix flake check`, including
+  the test, lint, and coverage checks defined by the flake, and run the
+  separate strict MkDocs build for documentation.
 
-These entries describe the integrated 0.4.0 source.
+The documented runtime verification is limited to Ubuntu x86_64. The HTTP/3
+connection path is verified through the cl-quic-kit adapter; native QUIC
+sockets and server acceptance remain outside this release boundary.
 
-The current worktree has cl-deflate-kit and cl-tls-kit dependency declarations.
 The HTTP/3 client adapter uses cl-quic-kit; QUIC implementation details,
 certificate and TLS policy, and the server-side TLS driver remain outside the
-candidate boundary.
+library boundary.
 
 ## Earlier 0.3.x source
 

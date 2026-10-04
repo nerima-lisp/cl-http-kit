@@ -148,9 +148,10 @@ decodes client request streams, and provides a server session for one injected
 request stream. It provides static, literal, and Huffman QPACK representations
 plus caller-owned dynamic tables. Dynamic-table instruction streams are exposed
 to the caller and are not synchronized automatically. The system does not
-implement QUIC packets, loss recovery, TLS, ALPN, native sockets, or native
-HTTP/3 connection and stream acceptance; the QUIC layer must provide those
-callbacks.
+implement QUIC packets, loss recovery, native sockets, or native HTTP/3 server
+acceptance. The optional cl-quic-kit adapter supplies client connection and
+stream setup when explicitly configured; certificate, socket, and server-accept
+policy remain application-owned.
 
 Load metrics integration when cl-observability-kit is available:
 
@@ -161,4 +162,4 @@ Load metrics integration when cl-observability-kit is available:
 Continue with [Core Concepts](guide/core-concepts.md) for the value model, or
 the [API Reference](reference/api.md) for the primary exported symbols. The
 [migration guide](project/migration.md) records the 0.4.0 compatibility
-boundary and the still-deferred native HTTP/3 connection layer.
+boundary and the optional cl-quic-kit HTTP/3 client adapter.

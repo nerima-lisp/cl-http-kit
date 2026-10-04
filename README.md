@@ -157,9 +157,9 @@ extension selection, codec state, and masking-key generation remain
 application-owned; the server session handles Ping/Pong and the close
 handshake it owns.
 
-The 0.4.0 target completes verification of the native four-kit path and
-retains `make-http-client` and `http-client-send` as compatibility entry
-points. When a client supplies `:http3-transport-function`, an advertised
+The 0.4.0 integration retains `make-http-client` and `http-client-send` as
+compatibility entry points. The documented runtime verification is limited to
+Ubuntu x86_64. When a client supplies `:http3-transport-function`, an advertised
 Alt-Svc `h3` alternative is attempted before TCP and a failed QUIC attempt
 falls back to HTTP/2 or HTTP/1.1. An explicit HTTP/3 request is a hard
 requirement and does not fall back.
