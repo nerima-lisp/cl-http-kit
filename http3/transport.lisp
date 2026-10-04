@@ -1666,20 +1666,12 @@ receives each validated informational response in wire order."
                                      :fin-p t :timeout timeout :deadline deadline))
                                   (return))))
                    (unless (zerop (length body))
-                     (loop with position = 0
-                           while (< position (length body))
-                           for end = (min (length body)
-                                          (+ position
-                                             (http3-client-max-frame-size client)))
-                           for last-p = (= end (length body))
-                           do (%h3-write-frame
-                               client stream
-                               (make-http3-frame
-                                :type +http3-data-type+
-                                :payload (subseq body position end))
-                               :fin-p (and last-p (null trailer-fields))
-                               :timeout timeout :deadline deadline)
-                              (setf position end))))
+                     (%h3-write-frame
+                      client stream
+                      (make-http3-frame
+                       :type +http3-data-type+ :payload body)
+                      :fin-p (null trailer-fields)
+                      :timeout timeout :deadline deadline)))
                (when trailer-fields
                  (%h3-write-request-field-section
                   client stream trailer-fields encoder-table encoder-state
