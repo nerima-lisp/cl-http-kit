@@ -528,10 +528,11 @@
                   -addext 'basicConstraints=critical,CA:TRUE' \
                   -addext 'keyUsage=critical,keyCertSign,digitalSignature'
                 printf '%s\n' \
-                  '{' '  admin off' '  auto_https off' \
+                  '{' '  debug' '  admin off' '  auto_https off' \
                   '  servers {' '    protocols h1 h2 h3' '  }' '}' \
                   "localhost:$caddy_port {" '  bind 127.0.0.1' \
                   "  tls $TMPDIR/self.crt $TMPDIR/self.key" \
+                  '  log {' '    output stdout' '    format json' '  }' \
                   "  header Alt-Svc \"h3=\\\":$caddy_port\\\"; ma=60\"" \
                   '  handle /upload {' \
                   '    reverse_proxy 127.0.0.1:'"$receiver_port" \
@@ -548,10 +549,13 @@
                 done
                 grep -q 'serving initial configuration' "$TMPDIR/caddy.log"
                 for mode in alt-svc fallback explicit; do
-                  HTTP3_LOOPBACK_MODE="$mode" CADDY_PORT="$caddy_port" \
+                  HTTP3_LOOPBACK_DIAGNOSTICS=1 HTTP3_LOOPBACK_MODE="$mode" CADDY_PORT="$caddy_port" \
                     RECEIVER_PORT="$receiver_port" \
                     CADDY_ROOT="$TMPDIR/self.crt" \
-                    sbcl --non-interactive --load t/http3-loopback.lisp
+                    sbcl --non-interactive --load t/http3-loopback.lisp || {
+                      cat "$TMPDIR/caddy.log"
+                      exit 1
+                    }
                 done
                 touch "$out"
               '';

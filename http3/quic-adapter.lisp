@@ -18,6 +18,20 @@
 (defun %http3-quic-adapter-now ()
   (/ (get-internal-real-time) internal-time-units-per-second))
 
+(defun %http3-quic-adapter-diagnostic (stage quic-client &optional stream)
+  (when (string= "1" (sb-ext:posix-getenv "HTTP3_LOOPBACK_DIAGNOSTICS"))
+    (let ((connection (cl-quic-kit:quic-client-connection quic-client)))
+      (format *error-output*
+              "HTTP3-DIAG ~A state=~S sent=~D received=~D udp=~S port=~S readable=~S~%"
+              stage
+              (cl-quic-kit:connection-state connection)
+              (length (cl-quic-kit::quic-client-sent-packets quic-client))
+              (length (cl-quic-kit::quic-client-received-packets quic-client))
+              (not (null (cl-quic-kit::quic-client-udp-socket quic-client)))
+              (cl-quic-kit::quic-client-server-port quic-client)
+              (and stream (cl-quic-kit:stream-readable-bytes stream)))
+      (finish-output *error-output*))))
+
 (defun %http3-quic-adapter-configure-protection ()
   (let* ((protection (find-package "CL-QUIC-KIT.PROTECTION"))
          (crypto (find-package "CRYPTO-KIT"))
@@ -228,10 +242,12 @@ to be selected without exposing QUIC implementation details."
                    :poll-interval poll-interval)))
     (unwind-protect
          (progn
+           (%http3-quic-adapter-diagnostic "client-start" quic-client)
            (cl-quic-kit:client-start quic-client)
            (setf (http3-quic-adapter-started-p adapter) t)
            (%http3-quic-adapter-await-established
             quic-client :timeout timeout :deadline deadline)
+           (%http3-quic-adapter-diagnostic "handshake-complete" quic-client)
            (setf (http3-quic-adapter-http3-client adapter)
                  (apply #'make-http3-client
                         :open-stream
@@ -242,16 +258,26 @@ to be selected without exposing QUIC implementation details."
                                    :stream-type stream-type
                                    :timeout timeout
                                    :deadline deadline)))
+                            (%http3-quic-adapter-diagnostic
+                             "open-stream-complete" quic-client stream)
                             (values stream (cl-quic-kit:stream-id stream))))
                         :write-stream
                         (lambda (stream octets &key fin-p timeout deadline)
+                          (%http3-quic-adapter-diagnostic
+                           (if fin-p "write-fin-start" "write-start")
+                           quic-client stream)
                           (prog1
                               (cl-quic-kit:client-write-stream
                                quic-client stream octets
                                :fin-p fin-p :timeout timeout :deadline deadline)
-                            (cl-quic-kit:client-flush quic-client)))
+                            (cl-quic-kit:client-flush quic-client))
+                          (%http3-quic-adapter-diagnostic
+                           (if fin-p "write-fin-complete" "write-complete")
+                           quic-client stream))
                         :read-stream
                         (lambda (stream &key timeout deadline)
+                          (%http3-quic-adapter-diagnostic
+                           "read-start" quic-client stream)
                           (%http3-quic-adapter-read
                            quic-client
                            (http3-quic-adapter-http3-client adapter)
