@@ -334,6 +334,8 @@ pseudo-fields are kept separate because they are not ordinary HTTP headers.
              (max-concurrent-streams 100)
              (max-reset-streams 100)
              (max-reset-window 1.0d0)
+             (max-control-frames 100)
+             (max-control-window 1.0d0)
              (max-hpack-table-size +hpack-default-table-size+)
              default-authority
              (collect-body-p t)
@@ -411,6 +413,13 @@ values.
            :message "HTTP/2 max-reset-window must be a non-negative real"
            :operation :http2-server
            :detail max-reset-window))
+  (%h2-validate-limit :max-control-frames max-control-frames :allow-zero t)
+  (unless (and (realp max-control-window)
+               (not (minusp max-control-window)))
+    (error 'http-kit:http-protocol-error
+           :message "HTTP/2 max-control-window must be a non-negative real"
+           :operation :http2-server
+           :detail max-control-window))
   (%h2-validate-limit :max-hpack-table-size max-hpack-table-size
                       :allow-zero t)
   (let ((request-count 0)
@@ -434,6 +443,7 @@ values.
                       (peer-max-concurrent-streams nil)
                       (reset-stream-count 0)
                       (reset-times '())
+                      (control-frame-times '())
                       (goaway-sent-p nil)
                       (peer-max-frame-size +http2-default-max-frame-size+)
                       (peer-max-header-list-size nil)
@@ -478,6 +488,17 @@ values.
                      (%h2-server-error
                       "HTTP/2 first frame must be a non-ACK SETTINGS frame"
                       first-frame))
+                   (multiple-value-bind (new-times exceeded)
+                       (%h2-control-budget-note
+                        control-frame-times (%h2-frame-type first-frame)
+                        max-control-frames max-control-window clock-function)
+                     (setf control-frame-times new-times)
+                     (when exceeded
+                       (%h2-server-error
+                        "HTTP/2 control frame budget exceeded"
+                        (list (%h2-frame-type first-frame)
+                              (length new-times))
+                        +http2-enhance-your-calm+)))
                    (multiple-value-bind
                          (new-max-frame-size new-table-size
                           new-initial-window-size enable-connect-protocol
@@ -577,6 +598,16 @@ values.
                                 (flags (%h2-frame-flags frame))
                                 (stream-id (%h2-frame-stream-id frame))
                                 (payload (%h2-frame-payload frame)))
+                            (multiple-value-bind (new-times exceeded)
+                                (%h2-control-budget-note
+                                 control-frame-times type max-control-frames
+                                 max-control-window clock-function)
+                              (setf control-frame-times new-times)
+                              (when exceeded
+                                (%h2-server-error
+                                 "HTTP/2 control frame budget exceeded"
+                                 (list type (length new-times))
+                                 +http2-enhance-your-calm+)))
                             (cond
                               ((= type +http2-settings-type+)
                                (unless (zerop stream-id)

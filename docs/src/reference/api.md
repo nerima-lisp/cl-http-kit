@@ -384,7 +384,7 @@ Return true when the object is an HTTP2-CLIENT.
 
 Construct a client with make-http2-client (&key exchange open-stream
 close-stream max-frame-size max-header-bytes max-fields max-body-bytes
-clock-function).
+max-control-frames max-control-window clock-function).
 Exactly one of exchange or open-stream must be supplied. Frame size must be
 between 16384 and 16777215. `max-fields` limits each decoded response header or
 trailer section and defaults to 256.
@@ -499,11 +499,18 @@ snapshot and does not expose the manager's internal list structure.
 Serve HTTP/2 requests on a caller-supplied binary stream. The signature is
 serve-http2-session (stream handler &key timeout deadline max-frame-size
 max-header-bytes max-fields max-body-bytes default-authority collect-body-p
-on-body-chunk max-requests on-error close-stream clock-function). The session
+on-body-chunk max-requests on-error close-stream clock-function
+max-control-frames max-control-window). The session
 owns the HTTP/2 preface, SETTINGS, HPACK, stream state, flow control, request
 body collection, and response framing, and returns a request count and
 termination reason. `max-fields` defaults to 256 for each request header or
-trailer section. The handler's primary value is the final response. Its
+trailer section. `max-control-frames` defaults to 100 frames in a one-second
+`max-control-window`; RST_STREAM is excluded from this budget, while all other
+control frames, including SETTINGS, PING, PRIORITY, WINDOW_UPDATE, GOAWAY, and
+PRIORITY_UPDATE, are counted.
+Exceeding the budget sends GOAWAY with ENHANCE_YOUR_CALM before closing. The
+same keywords are accepted by `make-http2-client` and
+`make-http2-connection`. The handler's primary value is the final response. Its
 optional second value is a list of informational responses, which are emitted
 in order before the final response; informational responses must use a status
 from 100 through 199 other than 101 and cannot carry a body or trailers.

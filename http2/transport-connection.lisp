@@ -15,6 +15,8 @@
           (max-header-bytes http-kit::*default-max-header-bytes*)
           (max-fields 256)
           (max-body-bytes http-kit::*default-max-body-bytes*)
+          (max-control-frames 100)
+          (max-control-window 1.0d0)
           (clock-function #'http-kit::%monotonic-time))
   "Create a reusable HTTP/2 connection over an already negotiated stream.
 
@@ -35,6 +37,13 @@ SETTINGS, stream identifiers, HPACK decoder state, and control frames."
   (%h2-validate-limit :max-header-bytes max-header-bytes)
   (%h2-validate-limit :max-fields max-fields)
   (%h2-validate-limit :max-body-bytes max-body-bytes :allow-zero t)
+  (%h2-validate-limit :max-control-frames max-control-frames :allow-zero t)
+  (unless (and (realp max-control-window)
+               (not (minusp max-control-window)))
+    (error 'http-kit:http-protocol-error
+           :message "The HTTP/2 max-control-window must be a non-negative real."
+           :operation :http2-client
+           :detail max-control-window))
   (unless (functionp clock-function)
     (error 'http-kit:http-protocol-error
            :message "An HTTP/2 connection clock function must be callable."
@@ -47,6 +56,8 @@ SETTINGS, stream identifiers, HPACK decoder state, and control frames."
    :max-header-bytes max-header-bytes
    :max-fields max-fields
    :max-body-bytes max-body-bytes
+   :max-control-frames max-control-frames
+   :max-control-window max-control-window
    :clock-function clock-function
    :hpack-context
    (%make-hpack-context
@@ -676,10 +687,12 @@ this operation has no response stream to associate with it."
              :detail (list (%h2-frame-type frame)
                            (%h2-frame-stream-id frame)
                            (%h2-frame-flags frame))))
+    (%h2-client-control-budget-check connection frame writer)
     (%h2-connection-note-settings connection frame writer)
     (setf (%http2-connection-session-started-p connection) t)))
 
 (defun %h2-connection-control-handler (connection frame writer expected-stream-id)
+  (%h2-client-control-budget-check connection frame writer)
   (let ((type (%h2-frame-type frame))
         (stream-id (%h2-frame-stream-id frame))
         (payload (%h2-frame-payload frame)))
@@ -926,6 +939,7 @@ concurrent streams should use SEND-HTTP2-REQUESTS-OVER-CONNECTION."
                            :hpack-context
                            (%http2-connection-hpack-context connection)
                            :max-fields field-limit
+                           :budget-owner connection
                            :read-initial-settings-p read-initial-settings-p
                            :peer-max-frame-size
                            (%http2-connection-peer-max-frame-size connection)

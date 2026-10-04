@@ -17,6 +17,7 @@
         (initial-frames nil)
         (on-peer-settings nil)
         (control-handler nil)
+        (budget-owner nil)
         (max-fields nil)
         (keyword-options options)
         (missing-value (gensym "MISSING-VALUE-")))
@@ -47,6 +48,7 @@
                (:initial-frames (setf initial-frames value))
                (:on-peer-settings (setf on-peer-settings value))
                (:control-handler (setf control-handler value))
+               (:budget-owner (setf budget-owner value))
                (otherwise
                 (error 'http-kit:http-protocol-error
                        :message "An unknown HTTP/2 response option was supplied."
@@ -78,9 +80,13 @@
           (error 'http-kit:http-protocol-error
                  :message "The first HTTP/2 peer frame must be a non-ACK SETTINGS frame."
                  :operation :http2-read
-                 :detail (list (%h2-frame-type first-frame)
-                               (%h2-frame-stream-id first-frame)
-                               (%h2-frame-flags first-frame))))
+                     :detail (list (%h2-frame-type first-frame)
+                                   (%h2-frame-stream-id first-frame)
+                                   (%h2-frame-flags first-frame))))
+        (when budget-owner
+          ;; Count the initial SETTINGS without dispatching it twice.  The
+          ;; normal validation below remains responsible for the ACK.
+          (%h2-client-control-budget-check budget-owner first-frame writer))
         (multiple-value-bind (peer-frame-size peer-table-size peer-window-size
                               peer-enable-connect peer-max-concurrent-streams
                               peer-max-header-list-size)
@@ -223,7 +229,13 @@
                                      header-limit body-limit
                                      (http-kit:http-request-method request)
                                      on-body-chunk collect-body-p
-                                     :max-fields field-limit)))
+                                     :max-fields field-limit
+                                     :budget-owner client
+                                     :control-handler
+                                     (lambda (frame response-writer expected-id)
+                                       (declare (ignore expected-id))
+                                       (%h2-client-control-budget-check
+                                        client frame response-writer)))))
                (t
                 (setf stream
                       (funcall (%http2-open-stream client)
@@ -248,6 +260,8 @@
                        :max-header-bytes header-limit
                        :max-fields field-limit
                        :max-body-bytes body-limit
+                       :max-control-frames (%http2-max-control-frames client)
+                       :max-control-window (%http2-max-control-window client)
                        :clock-function clock))
                 (send-http2-request-over-connection
                  temporary-connection request

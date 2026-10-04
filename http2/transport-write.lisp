@@ -58,6 +58,22 @@
                      +http2-priority-update-type+)
           :test #'=))
 
+(defun %h2-budgeted-control-frame-p (type)
+  "Return true for every control frame except RST_STREAM."
+  (and (%h2-control-frame-p type)
+       (/= type +http2-rst-stream-type+)))
+
+(defun %h2-control-budget-note (times type max-frames window clock-function)
+  "Record TYPE and return the pruned timestamps and whether the budget failed."
+  (if (not (%h2-budgeted-control-frame-p type))
+      (values times nil)
+      (let* ((now (funcall clock-function))
+             (live (delete-if (lambda (timestamp)
+                               (> (- now timestamp) window))
+                             times))
+             (updated (cons now live)))
+        (values updated (> (length updated) max-frames)))))
+
 (defun %h2-handle-control-frame (frame writer &optional (expected-stream-id 1))
   (let ((type (%h2-frame-type frame))
         (stream-id (%h2-frame-stream-id frame))

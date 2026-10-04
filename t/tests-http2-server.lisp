@@ -711,3 +711,35 @@
            (declare (ignore request))
            (make-http-response :status 204))
          :max-hpack-table-size 0))))
+
+  (deftest http2-server-control-budget-counts-all-but-rst-stream
+    (let* ((input (concatenate-octets
+                   (h2-preface)
+                   (h2-frame 4 0 0 (octets))
+                   (h2-frame 6 0 0 (octets 1 2 3 4 5 6 7 8))
+                   (h2-frame 6 0 0 (octets 9 10 11 12 13 14 15 16))))
+           (stream (make-instance 'binary-session-stream :input input)))
+      (signals http-protocol-error
+        (http-kit/http2:serve-http2-session
+         stream
+         (lambda (request)
+           (declare (ignore request))
+           (make-http-response :status 204))
+         :max-control-frames 2
+         :max-control-window 10.0d0
+         :close-stream nil))
+      (let* ((frames (server-output-frames (binary-session-output stream)))
+             (acks (count-if
+                    (lambda (frame)
+                      (and (= (http-kit/http2::%h2-frame-type frame) 6)
+                           (= (http-kit/http2::%h2-frame-flags frame) 1)))
+                    frames))
+             (goaway (find-if
+                      (lambda (frame)
+                        (= (http-kit/http2::%h2-frame-type frame) 7))
+                      frames)))
+        (ensure-equal 1 acks)
+        (ensure-true goaway)
+        (ensure-equal 11
+                      (http-kit/http2::%h2-u32
+                       (http-kit/http2::%h2-frame-payload goaway) 4)))))

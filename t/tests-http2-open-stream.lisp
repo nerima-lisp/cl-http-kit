@@ -1265,3 +1265,38 @@
         (ensure-equal (length body) (funcall body-position))
         (ensure-true (plusp (funcall body-calls)))
         (http-kit/http2:close-http2-connection connection))))
+
+  (deftest http2-client-control-budget-counts-all-but-rst-stream
+    (let* ((stream (make-instance 'binary-session-stream
+                                  :input
+                                  (concatenate-octets
+                                   (h2-frame 4 0 0 (octets))
+                                   (h2-frame 6 0 0 (octets 1 2 3 4 5 6 7 8))
+                                   (h2-frame 6 0 0 (octets 9 10 11 12 13 14 15 16))
+                                   (h2-frame 1 5 1 (octets #x88)))))
+           (connection
+             (http-kit/http2:make-http2-connection
+              :stream stream
+              :max-control-frames 2
+              :max-control-window 10.0d0
+              :close-stream nil)))
+      (signals http-protocol-error
+        (http-kit/http2:send-http2-request-over-connection
+         connection
+         (make-http-request :method "GET"
+                            :uri "https://127.0.0.1/data")))
+      (let* ((frames (h2-output-frames stream))
+             (acks (count-if
+                    (lambda (frame)
+                      (and (= (http-kit/http2::%h2-frame-type frame) 6)
+                           (= (http-kit/http2::%h2-frame-flags frame) 1)))
+                    frames))
+             (goaway (find-if
+                      (lambda (frame)
+                        (= (http-kit/http2::%h2-frame-type frame) 7))
+                      frames)))
+        (ensure-equal 1 acks)
+        (ensure-true goaway)
+        (ensure-equal 11
+                      (http-kit/http2::%h2-u32
+                       (http-kit/http2::%h2-frame-payload goaway) 4)))))

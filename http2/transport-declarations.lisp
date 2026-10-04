@@ -5,7 +5,7 @@
              (:constructor %make-http2-client
                  (&key exchange open-stream connection close-stream
                        max-frame-size max-header-bytes max-fields max-body-bytes
-                       clock-function)))
+                       clock-function max-control-frames max-control-window)))
   (exchange nil)
   (open-stream nil)
   (connection nil)
@@ -14,7 +14,10 @@
   (max-header-bytes nil)
   (max-fields 256)
   (max-body-bytes nil)
-  (clock-function nil))
+  (clock-function nil)
+  (max-control-frames 100)
+  (max-control-window 1.0d0)
+  (control-frame-times nil))
 
 (defstruct (http2-connection
              (:conc-name %http2-connection-)
@@ -26,7 +29,8 @@
                        peer-initial-window-size peer-enable-connect-protocol-p
                        peer-connection-window-size
                        peer-stream-windows session-started-p
-                       goaway-last-stream-id closed-p)))
+                       goaway-last-stream-id closed-p max-control-frames
+                       max-control-window control-frame-times)))
   stream
   (close-stream #'close)
   max-frame-size
@@ -48,7 +52,10 @@
   (goaway-last-stream-id nil)
   (local-goaway-last-stream-id nil)
   (draining-p nil)
-  (closed-p nil))
+  (closed-p nil)
+  (max-control-frames 100)
+  (max-control-window 1.0d0)
+  (control-frame-times nil))
 
 (defun http2-connection-open-p (connection)
   (and (http2-connection-p connection)
