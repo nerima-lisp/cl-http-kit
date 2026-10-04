@@ -268,7 +268,8 @@ to be selected without exposing QUIC implementation details."
                             (cl-quic-kit:client-write-stream
                              quic-client stream payload
                              :fin-p fin-p :timeout timeout :deadline deadline)
-                            (cl-quic-kit:client-poll quic-client)))
+                            (cl-quic-kit:client-poll quic-client)
+                            (sleep 0.005)))
                         :read-stream
                         (lambda (stream &key timeout deadline)
                           (%http3-quic-adapter-read
