@@ -58,39 +58,43 @@
     (values
      (sb-thread:make-thread
       (lambda ()
-        (unwind-protect
-             (let* ((socket (sb-bsd-sockets:socket-accept listener))
-                    (stream (sb-bsd-sockets:socket-make-stream
-                             socket :input t :output t :element-type '(unsigned-byte 8)
-                             :buffering :full)))
-               (unwind-protect
-                    (let* ((headers (%read-http1-headers stream))
-                           (marker (search "content-length:" headers
-                                           :test #'char-equal))
-                           (line-end (and marker (position #\Newline headers
-                                                            :start marker)))
-                           (length (and marker line-end
-                                         (parse-integer headers
-                                                        :start (+ marker 15)
-                                                        :end line-end
-                                                        :junk-allowed t)))
-                           (body (make-array (or length 0)
-                                             :element-type '(unsigned-byte 8))))
-                      (unless (= (or length -1) expected-length)
-                        (error "Receiver got Content-Length ~S, expected ~D."
-                               length expected-length))
-                      (unless (= (read-sequence body stream) expected-length)
-                        (error "Receiver got a truncated POST body."))
-                      (unless (every (lambda (octet) (= octet #x5a)) body)
-                        (error "Receiver got unexpected POST body bytes."))
-                      (write-sequence
-                       (map '(vector (unsigned-byte 8)) #'char-code
-                            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nverified")
-                       stream)
-                      (finish-output stream))
-                 (close stream :abort t)
-                 (sb-bsd-sockets:socket-close socket)))
-          (sb-bsd-sockets:socket-close listener)))
+        (handler-case
+            (unwind-protect
+                 (let* ((socket (sb-bsd-sockets:socket-accept listener))
+                        (stream (sb-bsd-sockets:socket-make-stream
+                                 socket :input t :output t :element-type '(unsigned-byte 8)
+                                 :buffering :full)))
+                   (unwind-protect
+                        (let* ((headers (%read-http1-headers stream))
+                               (marker (search "content-length:" headers
+                                               :test #'char-equal))
+                               (line-end (and marker (position #\Newline headers
+                                                                :start marker)))
+                               (length (and marker line-end
+                                             (parse-integer headers
+                                                            :start (+ marker 15)
+                                                            :end line-end
+                                                            :junk-allowed t)))
+                               (body (make-array (or length 0)
+                                                 :element-type '(unsigned-byte 8))))
+                          (unless (= (or length -1) expected-length)
+                            (error "Receiver got Content-Length ~S, expected ~D."
+                                   length expected-length))
+                          (unless (= (read-sequence body stream) expected-length)
+                            (error "Receiver got a truncated POST body."))
+                          (unless (every (lambda (octet) (= octet #x5a)) body)
+                            (error "Receiver got unexpected POST body bytes."))
+                          (write-sequence
+                           (map '(vector (unsigned-byte 8)) #'char-code
+                                "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nverified")
+                           stream)
+                          (finish-output stream))
+                     (close stream :abort t)
+                     (sb-bsd-sockets:socket-close socket)))
+              (sb-bsd-sockets:socket-close listener))
+          (condition (condition)
+            (format t "HTTP/3 POST receiver diagnostic condition=~S~%"
+                    condition))))
       :name "cl-http-kit-post-receiver")
      listener)))
 
