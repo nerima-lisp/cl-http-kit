@@ -2,6 +2,9 @@
 
 cl-http-kit is loaded through ASDF. The core system has no built-in socket
 dependency: an application supplies the binary stream or exchange boundary.
+The instructions on this page describe the checked-in 0.4.0 API. The
+migration notes are documented in the
+[migration guide](project/migration.md).
 
 ## Load the core system
 
@@ -66,8 +69,8 @@ The parser and transport accept optional :max-header-bytes and
 stable or different policy; the current values are documented with the core
 parsing and transport APIs.
 
-For an SBCL-native TCP and DNS boundary, load the optional network system and
-connect it to the client pool:
+For the checked-in API, an SBCL-native TCP and DNS boundary is supplied
+by the optional network system and can be connected to the client pool:
 
 ```lisp
 (asdf:load-system "cl-http-kit/network")
@@ -102,9 +105,19 @@ HTTP/1 session dispatch for the requested number of connections; applications
 that need HTTP/2 or protocol selection can keep using
 `accept-http-tcp-stream` and dispatch to `serve-http2-session` themselves.
 
-This boundary deliberately does not negotiate TLS, ALPN, or proxies. Supply
-those policies through the client's callbacks or use an application-owned
-transport when they are required.
+The socket boundary itself does not negotiate TLS, ALPN, or proxies. Load
+`cl-http-kit/tls` and compose `http-kit/tls:make-http-tls-upgrader` with the
+client opener. The wrapper defaults to `:verify :required`, passes the request
+host as TLS SNI, loads the platform trust store, and accepts an ALPN offer
+list. Server TLS wrapping signals an explicit unsupported-feature condition
+because cl-tls-kit does not expose a server driver. For an HTTPS server,
+terminate TLS in a reverse proxy or load balancer and forward HTTP to the
+listener above. Configure that proxy to preserve the original host and scheme
+according to the application's trusted-forwarding policy; cl-http-kit does not
+validate proxy headers automatically.
+
+The high-level client creates this native TCP/TLS path automatically when no
+custom transport is supplied.
 
 ## Optional systems
 
@@ -116,9 +129,16 @@ stream:
 (asdf:load-system "cl-http-kit/client")
 ```
 
-The client system adds URI, authentication, cookie, cache, proxy, redirect,
-and retry policies around the core messages. It still receives an
-application-provided transport function or stream callback.
+The client system adds URI, authentication, RFC 9110 challenge parsing and safe
+single-retry origin and forward-proxy authentication, cookie, cache, proxy,
+redirect, and retry policies around the core messages. Collected response bodies are
+automatically decoded for `gzip` and `deflate` content codings, and eligible
+requests advertise those codings with `Accept-Encoding`; pass
+`:automatic-decompression-p nil` to `make-http-client` to retain the encoded
+body. The body-size limit is enforced while decoding, so compressed responses
+cannot allocate an unbounded expanded body. Streaming body callbacks
+receive transport bytes and are not automatically decoded. The client still
+receives an application-provided transport function or stream callback.
 
 Load HTTP/3 request-stream support when the application supplies QUIC stream
 callbacks with ASDF system cl-http-kit/http3.
@@ -128,9 +148,10 @@ decodes client request streams, and provides a server session for one injected
 request stream. It provides static, literal, and Huffman QPACK representations
 plus caller-owned dynamic tables. Dynamic-table instruction streams are exposed
 to the caller and are not synchronized automatically. The system does not
-implement QUIC packets, loss recovery, TLS, ALPN, native sockets, or native
-HTTP/3 connection and stream acceptance; the QUIC layer must provide those
-callbacks.
+implement QUIC packets, loss recovery, native sockets, or native HTTP/3 server
+acceptance. The optional cl-quic-kit adapter supplies client connection and
+stream setup when explicitly configured; certificate, socket, and server-accept
+policy remain application-owned.
 
 Load metrics integration when cl-observability-kit is available:
 
@@ -139,4 +160,6 @@ Load metrics integration when cl-observability-kit is available:
 ```
 
 Continue with [Core Concepts](guide/core-concepts.md) for the value model, or
-the [API Reference](reference/api.md) for the primary exported symbols.
+the [API Reference](reference/api.md) for the primary exported symbols. The
+[migration guide](project/migration.md) records the 0.4.0 compatibility
+boundary and the optional cl-quic-kit HTTP/3 client adapter.

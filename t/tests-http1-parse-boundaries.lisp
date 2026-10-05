@@ -1,4 +1,4 @@
-(in-package #:http-kit/test)
+(in-package #:http-kit/test-core)
 
 (deftest http1-input-and-line-boundaries
   (let* ((wire (concatenate-octets
@@ -47,9 +47,16 @@
 (deftest http1-body-and-trailer-boundaries
   (let ((response
           (parse-http-response
-           (ascii "HTTP/1.1 200 OK|CRLF|Transfer-Encoding: chunked|CRLF||CRLF|1;foo=bar|CRLF|a|CRLF|0|CRLF||CRLF|"))))
+           (ascii "HTTP/1.1 200 OK|CRLF|Transfer-Encoding: chunked|CRLF||CRLF|1 ; foo = \"bar\\\"baz\";flag|CRLF|a|CRLF|0|CRLF||CRLF|"))))
     (ensure-equal "a" (octets-as-string (http-response-body response))
                   "chunk extensions are ignored"))
+  (dolist (chunk-line '("1;" "1;=value" "1;name=" "1;name=\"unterminated"
+                        "1;name=bad value" "1 " "1;na(me=value"))
+    (signals http-protocol-error
+      (parse-http-response
+       (ascii (format nil
+                      "HTTP/1.1 200 OK|CRLF|Transfer-Encoding: chunked|CRLF||CRLF|~A|CRLF|a|CRLF|0|CRLF||CRLF|"
+                      chunk-line)))))
   (signals http-protocol-error
     (parse-http-response
      (ascii "HTTP/1.1 200 OK|CRLF|Content-Length: 1|CRLF||CRLF|")))
@@ -65,9 +72,22 @@
   (signals http-protocol-error
     (parse-http-response
      (ascii "HTTP/1.1 200 OK|CRLF|Transfer-Encoding: chunked|CRLF||CRLF|1|CRLF|a")))
+  (signals http-size-limit-exceeded
+    (parse-http-response
+     (ascii (format nil
+                    "HTTP/1.1 200 OK|CRLF|Transfer-Encoding: chunked|CRLF||CRLF|~A|CRLF|"
+                    (make-string 10000 :initial-element #\f)))
+     :max-body-bytes 0))
   (signals http-invalid-header
     (parse-http-response
      (ascii "HTTP/1.1 200 OK|CRLF|Transfer-Encoding: chunked|CRLF||CRLF|0|CRLF|Broken|CRLF||CRLF|")))
+  (dolist (name '("Authorization" "If-None-Match" "Content-Type"
+                  "Cache-Control" "Set-Cookie"))
+    (signals http-invalid-header
+      (parse-http-response
+       (ascii (format nil
+                      "HTTP/1.1 200 OK|CRLF|Transfer-Encoding: chunked|CRLF||CRLF|0|CRLF|~A: forbidden|CRLF||CRLF|"
+                      name)))))
   (signals http-protocol-error
     (parse-http-response
      (ascii "HTTP/1.1 200 OK|CRLF|Content-Length: 2|CRLF||CRLF|1")))
@@ -89,7 +109,37 @@
      (ascii "HTTP/1.1 101 Switching Protocols|CRLF|Transfer-Encoding: chunked|CRLF||CRLF|")))
   (signals http-invalid-header
     (parse-http-response
-     (ascii "HTTP/1.1 304 Not Modified|CRLF|Content-Length: 1|CRLF||CRLF|"))))
+     (ascii "HTTP/1.1 101 Switching Protocols|CRLF|Content-Length: 0|CRLF||CRLF|")))
+  (signals http-invalid-header
+    (parse-http-response
+     (ascii "HTTP/1.1 100 Continue|CRLF|Content-Length: 0|CRLF||CRLF|HTTP/1.1 200 OK|CRLF|Content-Length: 0|CRLF||CRLF|")))
+  (signals http-invalid-header
+    (parse-http-response
+     (ascii "HTTP/1.1 103 Early Hints|CRLF|Transfer-Encoding: chunked|CRLF||CRLF|HTTP/1.1 200 OK|CRLF|Content-Length: 0|CRLF||CRLF|")))
+  (signals http-invalid-header
+    (parse-http-response
+     (ascii "HTTP/1.1 204 No Content|CRLF|Transfer-Encoding: chunked|CRLF||CRLF|0|CRLF||CRLF|")))
+  (let ((response
+          (parse-http-response
+           (ascii "HTTP/1.1 205 Reset Content|CRLF|Transfer-Encoding: chunked|CRLF||CRLF|0|CRLF||CRLF|"))))
+    (ensure-equal 205 (http-response-status response))
+    (ensure-equal 0 (length (http-response-body response))))
+  (signals http-protocol-error
+    (parse-http-response
+     (ascii "HTTP/1.1 205 Reset Content|CRLF|Transfer-Encoding: chunked|CRLF||CRLF|1|CRLF|a|CRLF|0|CRLF||CRLF|")))
+  (signals http-protocol-error
+    (parse-http-response
+     (ascii "HTTP/1.1 205 Reset Content|CRLF|Transfer-Encoding: chunked|CRLF||CRLF|1|CRLF|a|CRLF|0|CRLF||CRLF|")
+     :collect-body-p nil))
+  (signals http-invalid-header
+    (parse-http-response
+     (ascii "HTTP/1.1 200 Connection Established|CRLF|Content-Length: 0|CRLF||CRLF|")
+     :request-method "CONNECT"))
+  (let ((response
+          (parse-http-response
+           (ascii "HTTP/1.1 304 Not Modified|CRLF|Content-Length: 1|CRLF||CRLF|"))))
+    (ensure-equal 304 (http-response-status response)
+                  "304 may describe the selected representation length")))
 
 (deftest http1-framing-and-header-error-boundaries
   (signals http-protocol-error
@@ -116,6 +166,21 @@
   (signals http-invalid-header
     (parse-http-response
      (ascii "HTTP/1.1 200 OK|CRLF|Content-Length: 1|CRLF|Content-Length: 2|CRLF||CRLF|")))
+  (let ((response
+          (parse-http-response
+           (ascii "HTTP/1.1 200 OK|CRLF|Content-Length: 16|CRLF||CRLF|0123456789abcdef")
+           :max-body-bytes 16)))
+    (ensure-equal 16 (length (http-response-body response))))
+  (signals http-size-limit-exceeded
+    (parse-http-response
+     (ascii "HTTP/1.1 200 OK|CRLF|Content-Length: 17|CRLF||CRLF|")
+     :max-body-bytes 16))
+  (signals http-size-limit-exceeded
+    (parse-http-response
+     (ascii (format nil
+                    "HTTP/1.1 200 OK|CRLF|Content-Length: ~A|CRLF||CRLF|"
+                    (make-string 1000 :initial-element #\9)))
+     :max-body-bytes 16))
   (signals http-protocol-error
     (parse-http-response
      (ascii "HTTP/1.1 200 OK|CRLF||CRLF|")
@@ -124,6 +189,33 @@
     (parse-http-response
      (ascii "HTTP/1.1 200 OK|CRLF||CRLF|")
      :max-header-bytes "invalid"))
+  (let ((response
+          (parse-http-response
+           (ascii "HTTP/1.1 200 OK|CRLF|X-One: 1|CRLF|X-Two: 2|CRLF||CRLF|")
+           :max-fields 2)))
+    (ensure-equal 2 (length (http-response-headers response))))
+  (let ((response
+          (parse-http-response
+           (ascii "HTTP/1.1 103 Early Hints|CRLF|Link: </one>|CRLF|Link: </two>|CRLF||CRLF|HTTP/1.1 200 OK|CRLF|X-One: 1|CRLF|X-Two: 2|CRLF||CRLF|")
+           :max-fields 2)))
+    (ensure-equal 200 (http-response-status response))
+    (ensure-equal 2 (length (http-response-headers response))))
+  (signals http-size-limit-exceeded
+    (parse-http-response
+     (ascii "HTTP/1.1 200 OK|CRLF|X-One: 1|CRLF|X-Two: 2|CRLF||CRLF|")
+     :max-fields 1))
+  (signals http-size-limit-exceeded
+    (parse-http-response
+     (ascii "HTTP/1.1 103 Early Hints|CRLF|Link: </one>|CRLF|Link: </two>|CRLF|Link: </three>|CRLF||CRLF|HTTP/1.1 200 OK|CRLF||CRLF|")
+     :max-fields 2))
+  (signals http-size-limit-exceeded
+    (parse-http-response
+     (ascii "HTTP/1.1 200 OK|CRLF|Transfer-Encoding: chunked|CRLF||CRLF|0|CRLF|X-One: 1|CRLF|X-Two: 2|CRLF||CRLF|")
+     :max-fields 1))
+  (signals http-protocol-error
+    (parse-http-response
+     (ascii "HTTP/1.1 200 OK|CRLF||CRLF|")
+     :max-fields 0))
   (signals http-protocol-error
     (parse-http-response
      (ascii "HTTP/1.1 200 OK|CRLF||CRLF|")

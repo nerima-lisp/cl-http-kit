@@ -6,6 +6,8 @@
 
 (defconstant +http-sse-default-max-data-bytes+ (* 16 1024 1024))
 
+(defconstant +http-sse-default-max-event-bytes+ (* 16 1024 1024))
+
 (defun %sse-protocol-error (message &optional detail)
   (error 'http-protocol-error
          :message message

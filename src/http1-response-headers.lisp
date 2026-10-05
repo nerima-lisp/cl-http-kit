@@ -28,7 +28,7 @@
       (values version code reason))))
 
 (defun %parse-response-header-line (line)
-  (when (and (plusp (length line))
+  (when (and (not (string= line ""))
              (find (char line 0) '(#\Space #\Tab)))
     (error 'http-invalid-header
            :message "Obsolete folded response headers are not accepted."
@@ -43,36 +43,27 @@
     (make-http-header (subseq line 0 colon)
                       (subseq line (1+ colon)))))
 
-(defun %read-response-headers (source deadline clock-function max-header-bytes header-used)
+(defun %read-response-headers
+    (source deadline clock-function max-header-bytes max-fields header-used)
   (let ((headers '())
-        (bytes header-used))
+        (bytes header-used)
+        (field-count 0))
     (loop
       (multiple-value-bind (line updated-bytes)
           (%read-crlf-line source deadline clock-function max-header-bytes bytes)
         (setf bytes updated-bytes)
-        (if (zerop (length line))
+        (if (string= line "")
             (return (values (nreverse headers) bytes))
-            (push (%parse-response-header-line line) headers))))))
+            (progn
+              (incf field-count)
+              (%check-limit :fields field-count max-fields
+                            :operation :response-parse)
+              (push (%parse-response-header-line line) headers)))))))
 
 (defun %split-comma-values (values)
-  (let ((result '()))
-    (dolist (value values (nreverse result))
-      (let ((start 0))
-        (loop
-          for position = (position #\, value :start start)
-          for piece = (%trim-ows (subseq value start position))
-          do (when (zerop (length piece))
-               (error 'http-invalid-header
-                      :message "A comma-separated header contains an empty item."
-                      :operation :response-parse
-                      :name "transfer-encoding"
-                      :reason :empty-item))
-             (push (string-downcase piece) result)
-             (if position
-                 (setf start (1+ position))
-                 (return)))))))
+  (%parse-http1-transfer-codings values :response-parse "transfer-encoding"))
 
-(defun %response-content-length (headers)
+(defun %response-content-length (headers max-body-bytes)
   (let ((values (http-header-values headers "content-length")))
     (cond
       ((null values) nil)
@@ -83,14 +74,18 @@
               :name "content-length"
               :reason :value))
       ((not (every (lambda (value)
-                     (= (%parse-decimal value) (%parse-decimal (first values))))
+                     (= (%parse-decimal-limited value max-body-bytes
+                                                :operation :response-parse)
+                        (%parse-decimal-limited (first values) max-body-bytes
+                                                :operation :response-parse)))
                    values))
        (error 'http-invalid-header
               :message "Duplicate Content-Length values must agree."
               :operation :response-parse
               :name "content-length"
               :reason :duplicate))
-      (t (%parse-decimal (first values))))))
+      (t (%parse-decimal-limited (first values) max-body-bytes
+                                 :operation :response-parse)))))
 
 (defun %response-transfer-encoding (headers)
   (let ((values (http-header-values headers "transfer-encoding")))

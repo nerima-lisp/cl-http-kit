@@ -20,7 +20,7 @@
      (h2-reader-from-frames
       (h2-frame http-kit/http2::+http2-settings-type+ 0 0 (octets)))
      nil 16384 nil (lambda () 0d0) 1024 1024 "GET"))
-  (signals http-unsupported-feature
+  (signals http-protocol-error
     (http-kit/http2::%h2-read-response
      (h2-reader-from-frames
       (h2-frame http-kit/http2::+http2-settings-type+ 0 0 (octets))

@@ -24,6 +24,18 @@
     (signals http-invalid-header
       (http-kit/http2::%h2-finish-response
        204 (list (make-http-header "content-length" "1")) '() (octets 1)))
+    (signals http-invalid-header
+      (http-kit/http2::%h2-finish-response
+       204 (list (make-http-header "content-length" "0")) '() (octets)))
+    (signals http-invalid-header
+      (http-kit/http2::%h2-finish-response
+       200 (list (make-http-header "content-length" "0")) '() (octets)
+       :request-method "CONNECT" :no-body t))
+    (ensure-equal 205
+                  (http-response-status
+                   (http-kit/http2::%h2-finish-response
+                    205 (list (make-http-header "content-length" "0"))
+                    '() (octets) :no-body t)))
     (ensure-equal (octets)
                   (http-response-body
                    (http-kit/http2::%h2-finish-response
@@ -66,6 +78,16 @@
            1024 context nil nil body "GET")
         (declare (ignore headers response))
         (ensure-true (null status))))
+    (signals http-invalid-header
+      (http-kit/http2::%h2-process-headers-frame
+       (h2-frame-object
+        http-kit/http2::+http2-headers-type+
+        http-kit/http2::+http2-end-headers-flag+
+        1
+        (h2-header-block (cons ":status" "103")
+                         (cons "content-length" "0")))
+       (h2-reader-from-frames) 16384 nil (lambda () 0d0)
+       1024 context nil nil body "GET"))
     (signals http-protocol-error
       (http-kit/http2::%h2-process-headers-frame
        (h2-frame-object
@@ -80,6 +102,24 @@
       (http-kit/http2::%h2-process-headers-frame
        headers-frame (h2-reader-from-frames) 16384 nil (lambda () 0d0)
        1024 context 200 '() body "GET")))
+
+(deftest http2-batch-rejects-informational-content-length
+  (let ((entry
+          (http-kit/http2::%make-h2-batch-entry
+           :request (make-http-request :method "GET"
+                                       :uri "https://127.0.0.1/")
+           :stream-id 1))
+        (frame
+          (h2-frame-object
+           http-kit/http2::+http2-headers-type+
+           http-kit/http2::+http2-end-headers-flag+
+           1
+           (h2-header-block (cons ":status" "103")
+                            (cons "content-length" "0"))))
+        (context (http-kit/http2::%make-hpack-context)))
+    (signals http-invalid-header
+      (http-kit/http2::%h2-batch-process-headers-frame
+       entry frame (lambda () :eof) 16384 1024 context "GET"))))
   (let* ((context (http-kit/http2::%make-hpack-context))
          (body (make-array 0 :element-type '(unsigned-byte 8)
                            :adjustable t :fill-pointer 0))
@@ -140,10 +180,19 @@
                       :element-type '(unsigned-byte 8)
                       :initial-element 0)))
     (multiple-value-bind (end-stream new-body-length data-length)
-        (http-kit/http2::%h2-append-data-frame
+        (%test-h2-append-data-frame
          (h2-frame-object http-kit/http2::+http2-data-type+ 0 1 payload)
          200 body "GET" 2000000)
       (ensure-true (not end-stream))
       (ensure-equal (length payload) new-body-length)
       (ensure-equal (length payload) data-length)
-      (ensure-equal (length payload) (length body)))))
+      (ensure-equal (length payload) (length body)))
+    (multiple-value-bind (end-stream new-body-length data-length)
+        (http-kit/http2::%h2-append-data-frame
+         (h2-frame-object http-kit/http2::+http2-data-type+
+                          http-kit/http2::+http2-end-stream-flag+
+                          1 (octets 1 2 3))
+         200 body "CONNECT" 2000000)
+      (ensure-true end-stream)
+      (ensure-equal (+ (length payload) 3) new-body-length)
+      (ensure-equal 3 data-length))))

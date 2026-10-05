@@ -45,6 +45,58 @@
     (declare (ignore stream))
     nil)
 
+  (defun h2-output-frames (stream)
+    (let ((reader
+            (http-kit/http2::%h2-reader-for
+             (subseq (binary-session-output stream)
+                     (length (h2-preface)))))
+          (frames nil))
+      (loop for frame = (http-kit/http2::%h2-read-frame
+                         reader 16384 nil nil)
+            until (eq frame :eof)
+            do (push frame frames))
+      (nreverse frames)))
+
+  (defun h2-output-data-summary (stream)
+    (let ((data-body
+            (make-array 0
+                        :element-type '(unsigned-byte 8)
+                        :adjustable t
+                        :fill-pointer 0))
+          (data-frame-count 0)
+          (settings-ack-count 0))
+      (dolist (frame (h2-output-frames stream))
+        (cond
+          ((= 0 (http-kit/http2::%h2-frame-type frame))
+           (incf data-frame-count)
+           (loop for octet across (http-kit/http2::%h2-frame-payload frame)
+                 do (vector-push-extend octet data-body)))
+          ((and (= 4 (http-kit/http2::%h2-frame-type frame))
+                (= 1 (http-kit/http2::%h2-frame-flags frame)))
+           (incf settings-ack-count))))
+      (values data-body data-frame-count settings-ack-count)))
+
+  (defun make-octet-body-producer (body &key on-maximum-size)
+    (let ((position 0)
+          (calls 0))
+      (values
+       (lambda (maximum-size)
+         (incf calls)
+         (when on-maximum-size
+           (funcall on-maximum-size maximum-size))
+         (when (< position (length body))
+           (let* ((size (min maximum-size
+                             (- (length body) position)))
+                  (chunk (make-array size
+                                     :element-type '(unsigned-byte 8))))
+             (replace chunk body
+                      :start2 position
+                      :end2 (+ position size))
+             (incf position size)
+             chunk)))
+       (lambda () position)
+       (lambda () calls))))
+
   (deftest http2-public-open-stream-transport
     (let* ((expected-preface (h2-preface))
            (stream (make-instance 'binary-session-stream
@@ -93,7 +145,7 @@
                                   (concatenate-octets
                                    (h2-response-wire (octets 1 2))
                                    (h2-frame 1 4 3 (octets #x88))
-                                   (h2-frame 0 1 3 (octets 3 4)))))
+                                   (h2-frame 0 9 3 (octets 2 3 4 0 0)))))
            (closed nil)
            (connection
              (http-kit/http2:make-http2-connection
@@ -175,16 +227,165 @@
       (ensure-equal 3
                     (http-kit/http2::%h2-frame-stream-id
                      second-stream-window-update))
+      (ensure-equal (octets 0 0 0 5)
+                    (http-kit/http2::%h2-frame-payload
+                     second-stream-window-update))
       (ensure-equal 8
                     (http-kit/http2::%h2-frame-type
                      second-connection-window-update))
       (ensure-equal 0
                     (http-kit/http2::%h2-frame-stream-id
                      second-connection-window-update))
+      (ensure-equal (octets 0 0 0 5)
+                    (http-kit/http2::%h2-frame-payload
+                     second-connection-window-update))
       (http-kit/http2:close-http2-connection connection)
       (ensure-true closed)
       (ensure-true
        (not (http-kit/http2:http2-connection-open-p connection)))))
+
+  (deftest http2-public-connection-survives-peer-stream-reset
+    (let* ((stream
+             (make-instance
+              'binary-session-stream
+              :input
+              (concatenate-octets
+               (h2-frame 4 0 0 (octets))
+               (h2-frame 3 0 1 (octets 0 0 0 8))
+               (h2-frame 1 5 3 (octets #x88)))))
+           (connection
+             (http-kit/http2:make-http2-connection :stream stream)))
+      (signals http-connection-error
+        (http-kit/http2:send-http2-request-over-connection
+         connection
+         (make-http-request :method "GET"
+                            :uri "https://127.0.0.1/reset")))
+      (ensure-true (http-kit/http2:http2-connection-open-p connection))
+      (let ((response
+              (http-kit/http2:send-http2-request-over-connection
+               connection
+               (make-http-request :method "GET"
+                                  :uri "https://127.0.0.1/next"))))
+        (ensure-equal 200 (http-response-status response))
+        (ensure-equal (octets) (http-response-body response)))
+      (http-kit/http2:close-http2-connection connection)))
+
+  (deftest http2-public-priority-update
+    (let* ((stream
+             (make-instance
+              'binary-session-stream
+              :input (h2-response-wire (octets))))
+           (connection
+             (http-kit/http2:make-http2-connection :stream stream)))
+      (http-kit/http2:send-http2-request-over-connection
+       connection
+       (make-http-request :method "GET"
+                          :uri "https://127.0.0.1/priority"))
+      (http-kit/http2:send-http2-priority-update
+       connection 1 :urgency 0 :incremental t)
+      (let* ((output (binary-session-output stream))
+             (reader (http-kit/http2::%h2-reader-for
+                      (subseq output (length (h2-preface)))))
+             (priority nil))
+        (loop for frame = (http-kit/http2::%h2-read-frame
+                           reader 16384 nil nil)
+              until (eq frame :eof)
+              when (= http-kit/http2::+http2-priority-update-type+
+                      (http-kit/http2::%h2-frame-type frame))
+                do (setf priority frame))
+        (ensure-true priority)
+        (ensure-equal 0 (http-kit/http2::%h2-frame-stream-id priority))
+        (ensure-equal
+         (concatenate '(vector (unsigned-byte 8))
+                      (octets 0 0 0 1)
+                      (http-kit::%string-octets "u=0, i"))
+         (http-kit/http2::%h2-frame-payload priority)))
+      (signals http-protocol-error
+        (http-kit/http2:send-http2-priority-update connection 0))
+      (signals http-protocol-error
+        (http-kit/http2:send-http2-priority-update
+         connection 1 :priority-field-value (string #\Newline)))
+      (http-kit/http2:close-http2-connection connection)))
+
+  (deftest http2-public-connection-cancel-callback-default-code
+    (let* ((stream (make-instance 'binary-session-stream
+                                  :input (h2-response-wire (octets))))
+           (connection
+             (http-kit/http2:make-http2-connection :stream stream))
+           (opened-stream-id nil)
+           (response
+             (http-kit/http2:send-http2-request-over-connection
+              connection
+              (make-http-request :method "GET"
+                                 :uri "https://127.0.0.1/cancel")
+              :on-stream-open
+              (lambda (stream-id cancel-function)
+                (setf opened-stream-id stream-id)
+                (funcall cancel-function))))
+           (reader
+             (http-kit/http2::%h2-reader-for
+              (subseq (binary-session-output stream)
+                      (length (h2-preface)))))
+           (reset-frame nil))
+      (loop for frame = (http-kit/http2::%h2-read-frame
+                         reader 16384 nil nil)
+            until (eq frame :eof)
+            when (= 3 (http-kit/http2::%h2-frame-type frame))
+              do (setf reset-frame frame))
+      (ensure-equal 200 (http-response-status response))
+      (ensure-equal 1 opened-stream-id)
+      (ensure-true reset-frame)
+      (ensure-equal 1 (http-kit/http2::%h2-frame-stream-id reset-frame))
+      (ensure-equal (octets 0 0 0 8)
+                    (http-kit/http2::%h2-frame-payload reset-frame))
+      (http-kit/http2:close-http2-connection connection)))
+
+  (deftest http2-public-connection-cancel-custom-and-direct-api
+    (let* ((stream (make-instance 'binary-session-stream
+                                  :input (h2-response-wire (octets))))
+           (connection
+             (http-kit/http2:make-http2-connection :stream stream)))
+      (http-kit/http2:send-http2-request-over-connection
+       connection
+       (make-http-request :method "GET"
+                          :uri "https://127.0.0.1/cancel-custom")
+       :on-stream-open
+       (lambda (stream-id cancel-function)
+         (ensure-equal 1 stream-id)
+         (funcall cancel-function :error-code 7)))
+      (ensure-true
+       (http-kit/http2:cancel-http2-stream connection 1 :error-code 9))
+      (let ((reader
+              (http-kit/http2::%h2-reader-for
+               (subseq (binary-session-output stream)
+                       (length (h2-preface)))))
+            (reset-payloads nil))
+        (loop for frame = (http-kit/http2::%h2-read-frame
+                           reader 16384 nil nil)
+              until (eq frame :eof)
+              when (= 3 (http-kit/http2::%h2-frame-type frame))
+                do (progn
+                     (ensure-equal
+                      1 (http-kit/http2::%h2-frame-stream-id frame))
+                     (push (http-kit/http2::%h2-frame-payload frame)
+                           reset-payloads)))
+        (ensure-equal (list (octets 0 0 0 7) (octets 0 0 0 9))
+                      (nreverse reset-payloads)))
+      (http-kit/http2:close-http2-connection connection)))
+
+  (deftest http2-public-connection-cancel-rejects-invalid-callback
+    (let* ((stream (make-instance 'binary-session-stream
+                                  :input (h2-response-wire (octets))))
+           (connection
+             (http-kit/http2:make-http2-connection :stream stream)))
+      (signals http-protocol-error
+        (http-kit/http2:send-http2-request-over-connection
+         connection
+         (make-http-request :method "GET"
+                            :uri "https://127.0.0.1/cancel-invalid")
+         :on-stream-open 7))
+      (ensure-equal 0 (length (binary-session-output stream)))
+      (http-kit/http2:close-http2-connection connection)))
 
   (deftest http2-public-connection-uploads-through-window-updates
     (let* ((body (make-array 65536
@@ -591,6 +792,135 @@
 
 #+sbcl
 (progn
+  (deftest http2-public-connection-schedules-batch-in-peer-limited-waves
+    (let* ((requests
+             (list (make-http-request :method "GET"
+                                      :uri "https://127.0.0.1/one")
+                   (make-http-request :method "GET"
+                                      :uri "https://127.0.0.1/two")
+                   (make-http-request :method "GET"
+                                      :uri "https://127.0.0.1/three")))
+           (stream
+             (make-instance
+              'binary-session-stream
+              :input
+              (concatenate-octets
+               (h2-frame 1 4 3
+                         (h2-header-block (cons ":status" "200")
+                                          (cons "content-length" "1")))
+               (h2-frame 0 1 3 (octets 2))
+               (h2-frame 1 4 1
+                         (h2-header-block (cons ":status" "200")
+                                          (cons "content-length" "1")))
+               (h2-frame 0 1 1 (octets 1))
+               (h2-frame 1 4 5
+                         (h2-header-block (cons ":status" "200")
+                                          (cons "content-length" "1")))
+               (h2-frame 0 1 5 (octets 3)))))
+           (connection
+             (http-kit/http2:make-http2-connection :stream stream)))
+      (setf (http-kit/http2::%http2-connection-session-started-p connection)
+            t
+            (http-kit/http2::%http2-connection-peer-max-concurrent-streams
+             connection)
+            2)
+      (let* ((responses
+               (http-kit/http2:send-http2-requests-over-connection
+                connection requests))
+             (reader
+               (http-kit/http2::%h2-reader-for
+                (binary-session-output stream)))
+             (request-stream-ids nil))
+        (loop for frame = (http-kit/http2::%h2-read-frame
+                           reader 16384 nil nil)
+              until (eq frame :eof)
+              do (when (= 1 (http-kit/http2::%h2-frame-type frame))
+                   (push (http-kit/http2::%h2-frame-stream-id frame)
+                         request-stream-ids)))
+        (ensure-equal '(1 3 5) (nreverse request-stream-ids))
+        (ensure-equal (list (octets 1) (octets 2) (octets 3))
+                      (mapcar #'http-response-body responses)))
+      (http-kit/http2:close-http2-connection connection))))
+
+#+sbcl
+(progn
+  (deftest http2-public-single-request-waits-for-peer-stream-capacity
+    (let* ((request
+             (make-http-request :method "GET"
+                                :uri "https://127.0.0.1/resumed-single"))
+           (stream
+             (make-instance
+              'binary-session-stream
+              :input
+              (concatenate-octets
+               (h2-frame 4 0 0 (octets 0 3 0 0 0 1))
+               (h2-frame 1 4 1
+                         (h2-header-block (cons ":status" "200")
+                                          (cons "content-length" "1")))
+               (h2-frame 0 1 1 (octets 9)))))
+           (connection
+             (http-kit/http2:make-http2-connection :stream stream)))
+      (setf (http-kit/http2::%http2-connection-session-started-p connection)
+            t
+            (http-kit/http2::%http2-connection-peer-max-concurrent-streams
+             connection)
+            0)
+      (let ((response
+              (http-kit/http2:send-http2-request-over-connection
+               connection request)))
+        (ensure-equal (octets 9) (http-response-body response)))
+      (http-kit/http2:close-http2-connection connection)))
+
+  (deftest http2-public-connection-waits-for-peer-stream-capacity
+    (let* ((request
+             (make-http-request :method "GET"
+                                :uri "https://127.0.0.1/resumed"))
+           (stream
+             (make-instance
+              'binary-session-stream
+              :input
+              (concatenate-octets
+               (h2-frame 4 0 0 (octets 0 3 0 0 0 1))
+               (h2-frame 1 4 1
+                         (h2-header-block (cons ":status" "200")
+                                          (cons "content-length" "1")))
+               (h2-frame 0 1 1 (octets 7)))))
+           (connection
+             (http-kit/http2:make-http2-connection :stream stream)))
+      (setf (http-kit/http2::%http2-connection-session-started-p connection)
+            t
+            (http-kit/http2::%http2-connection-peer-max-concurrent-streams
+             connection)
+            0)
+      (let* ((response
+               (first
+                (http-kit/http2:send-http2-requests-over-connection
+                 connection (list request))))
+             (reader
+               (http-kit/http2::%h2-reader-for
+                (binary-session-output stream)))
+             (frames nil))
+        (loop for frame = (http-kit/http2::%h2-read-frame
+                           reader 16384 nil nil)
+              until (eq frame :eof)
+              do (push frame frames))
+        (setf frames (nreverse frames))
+        (ensure-equal 1
+                      (count-if
+                       (lambda (frame)
+                         (and (= 4 (http-kit/http2::%h2-frame-type frame))
+                              (= 1 (http-kit/http2::%h2-frame-flags frame))))
+                       frames))
+        (ensure-equal '(1)
+                      (loop for frame in frames
+                            when (= 1 (http-kit/http2::%h2-frame-type frame))
+                              collect (http-kit/http2::%h2-frame-stream-id
+                                       frame)))
+        (ensure-equal (octets 7) (http-response-body response)))
+      (http-kit/http2:close-http2-connection connection))))
+
+#+sbcl
+(progn
   (deftest http2-public-connection-multiplexes-produced-request-bodies
     (let* ((produced-body (octets 1 2 3))
            (produced-position 0)
@@ -714,6 +1044,64 @@
       (ensure-true (http-kit/http2:http2-connection-open-p connection))
       (http-kit/http2:close-http2-connection connection)))
 
+  (deftest http2-public-connection-extended-connect-requires-peer-setting
+    (let* ((stream
+             (make-instance
+              'binary-session-stream
+              :input (h2-frame 4 0 0 (octets))))
+           (connection
+             (http-kit/http2:make-http2-connection :stream stream)))
+      (signals http-protocol-error
+        (http-kit/http2:send-http2-request-over-connection
+         connection
+         (make-http-request :method "CONNECT"
+                            :protocol "websocket"
+                            :uri "https://127.0.0.1/")))
+      (let* ((output (binary-session-output stream))
+             (reader (http-kit/http2::%h2-reader-for
+                      (subseq output (length (h2-preface)))))
+             (settings (http-kit/http2::%h2-read-frame
+                        reader 16384 nil nil))
+             (ack (http-kit/http2::%h2-read-frame
+                   reader 16384 nil nil)))
+        (ensure-equal 4 (http-kit/http2::%h2-frame-type settings))
+        (ensure-equal 4 (http-kit/http2::%h2-frame-type ack))
+        (ensure-true (logbitp 0 (http-kit/http2::%h2-frame-flags ack)))
+        (ensure-equal :eof
+                      (http-kit/http2::%h2-read-frame
+                       reader 16384 nil nil)))))
+
+  (deftest http2-public-connection-extended-connect-after-peer-setting
+    (let* ((stream
+             (make-instance
+              'binary-session-stream
+              :input (concatenate-octets
+                      (h2-frame 4 0 0 (octets 0 8 0 0 0 1))
+                      (h2-frame 1 5 1 (octets #x88)))))
+           (connection
+             (http-kit/http2:make-http2-connection :stream stream))
+           (response
+             (http-kit/http2:send-http2-request-over-connection
+              connection
+              (make-http-request :method "CONNECT"
+                                 :protocol "websocket"
+                                 :uri "https://127.0.0.1/")))
+           (output (binary-session-output stream))
+           (reader (http-kit/http2::%h2-reader-for
+                    (subseq output (length (h2-preface)))))
+           (settings (http-kit/http2::%h2-read-frame
+                      reader 16384 nil nil))
+           (ack (http-kit/http2::%h2-read-frame
+                 reader 16384 nil nil))
+           (headers (http-kit/http2::%h2-read-frame
+                     reader 16384 nil nil)))
+      (ensure-equal 200 (http-response-status response))
+      (ensure-equal 4 (http-kit/http2::%h2-frame-type settings))
+      (ensure-equal 4 (http-kit/http2::%h2-frame-type ack))
+      (ensure-true (logbitp 0 (http-kit/http2::%h2-frame-flags ack)))
+      (ensure-equal 1 (http-kit/http2::%h2-frame-type headers))
+      (http-kit/http2:close-http2-connection connection)))
+
   (deftest http2-public-connection-graceful-shutdown
     (let* ((stream
              (make-instance
@@ -751,8 +1139,164 @@
                     (http-kit/http2:http2-connection-local-goaway-last-stream-id
                      connection))
       (signals http-protocol-error
+        (http-kit/http2:send-http2-goaway connection :last-stream-id 3))
+      (ensure-equal 1
+                    (http-kit/http2:http2-connection-local-goaway-last-stream-id
+                     connection))
+      (signals http-protocol-error
         (http-kit/http2:send-http2-request-over-connection
          connection
          (make-http-request :method "GET"
                             :uri "https://127.0.0.1/rejected")))
       (http-kit/http2:close-http2-connection connection)))
+(deftest http2-public-connection-state-accessors
+    (let ((connection
+            (http-kit/http2:make-http2-connection
+             :stream
+             (make-instance
+              'binary-session-stream
+              :input (make-array 0 :element-type '(unsigned-byte 8))))))
+      (ensure-true (http-kit/http2:http2-connection-open-p connection))
+      (ensure-true
+       (not (http-kit/http2:http2-connection-session-started-p connection)))
+      (ensure-equal 16384
+                    (http-kit/http2:http2-connection-peer-max-frame-size
+                     connection))
+      (ensure-equal 4096
+                    (http-kit/http2:http2-connection-peer-max-table-size
+                     connection))
+      (ensure-equal 65535
+                    (http-kit/http2:http2-connection-peer-initial-window-size
+                     connection))
+      (ensure-equal 65535
+                    (http-kit/http2:http2-connection-peer-connection-window-size
+                     connection))
+      (ensure-true
+       (not (http-kit/http2:http2-connection-goaway-last-stream-id connection)))
+      (ensure-true
+       (not (http-kit/http2:http2-connection-local-goaway-last-stream-id
+             connection)))
+      (ensure-true
+       (not (http-kit/http2:http2-connection-draining-p connection)))
+      (setf (http-kit/http2::%http2-connection-session-started-p connection) t
+            (http-kit/http2::%http2-connection-peer-max-frame-size connection)
+            8192
+            (http-kit/http2::%http2-connection-peer-max-table-size connection)
+            1024
+            (http-kit/http2::%http2-connection-peer-initial-window-size
+             connection)
+            32768
+            (http-kit/http2::%http2-connection-peer-connection-window-size
+             connection)
+            32768
+            (http-kit/http2::%http2-connection-goaway-last-stream-id connection)
+            7
+            (http-kit/http2::%http2-connection-local-goaway-last-stream-id
+             connection)
+            5
+            (http-kit/http2::%http2-connection-draining-p connection) t)
+      (ensure-true
+       (http-kit/http2:http2-connection-session-started-p connection))
+      (ensure-equal 8192
+                    (http-kit/http2:http2-connection-peer-max-frame-size
+                     connection))
+      (ensure-equal 1024
+                    (http-kit/http2:http2-connection-peer-max-table-size
+                     connection))
+      (ensure-equal 32768
+                    (http-kit/http2:http2-connection-peer-initial-window-size
+                     connection))
+      (ensure-equal 32768
+                    (http-kit/http2:http2-connection-peer-connection-window-size
+                     connection))
+      (ensure-equal 7
+                    (http-kit/http2:http2-connection-goaway-last-stream-id
+                     connection))
+      (ensure-equal 5
+                    (http-kit/http2:http2-connection-local-goaway-last-stream-id
+                     connection))
+      (ensure-true (http-kit/http2:http2-connection-draining-p connection))
+      (ensure-true (not (http-kit/http2:http2-connection-open-p nil)))
+      (ensure-true
+       (not (http-kit/http2:http2-connection-session-started-p nil)))
+      (ensure-true
+       (not (http-kit/http2:http2-connection-peer-max-frame-size nil)))
+      (ensure-true
+       (not (http-kit/http2:http2-connection-draining-p nil)))))
+
+(deftest http2-public-client-streams-produced-body
+    (let* ((body (make-array 65536
+                             :element-type '(unsigned-byte 8)
+                             :initial-element #x5a))
+           (window-increment (octets 0 0 1 0))
+           (stream (make-instance 'binary-session-stream
+                                  :input
+                                  (concatenate-octets
+                                   (h2-frame 4 0 0 (octets))
+                                   (h2-frame 8 0 1 window-increment)
+                                   (h2-frame 8 0 0 window-increment)
+                                   (h2-frame 1 4 1 (octets #x88))
+                                   (h2-frame 0 1 1 (octets 9 8)))))
+           (connection
+             (http-kit/http2:make-http2-connection :stream stream))
+           (client
+             (make-http-client
+              :cache nil
+              :transport-function
+              (http-kit/http2:make-http2-connection-transport connection)))
+           (response nil)
+           (request-body-function nil)
+           (body-position nil)
+           (body-calls nil))
+      (multiple-value-setq (request-body-function body-position body-calls)
+        (make-octet-body-producer body))
+      (setf response
+             (http-client-send
+              client
+              (http-client-request client "POST"
+                                   "https://127.0.0.1/upload")
+              :request-body-function request-body-function
+              :request-body-length (length body)))
+      (multiple-value-bind (data-body)
+          (h2-output-data-summary stream)
+        (ensure-equal 200 (http-response-status response))
+        (ensure-equal (octets 9 8) (http-response-body response))
+        (ensure-equal body data-body)
+        (ensure-equal (length body) (funcall body-position))
+        (ensure-true (plusp (funcall body-calls)))
+        (http-kit/http2:close-http2-connection connection))))
+
+  (deftest http2-client-control-budget-counts-all-but-rst-stream
+    (let* ((stream (make-instance 'binary-session-stream
+                                  :input
+                                  (concatenate-octets
+                                   (h2-frame 4 0 0 (octets))
+                                   (h2-frame 6 0 0 (octets 1 2 3 4 5 6 7 8))
+                                   (h2-frame 6 0 0 (octets 9 10 11 12 13 14 15 16))
+                                   (h2-frame 1 5 1 (octets #x88)))))
+           (connection
+             (http-kit/http2:make-http2-connection
+              :stream stream
+              :max-control-frames 2
+              :max-control-window 10.0d0
+              :close-stream nil)))
+      (signals http-protocol-error
+        (http-kit/http2:send-http2-request-over-connection
+         connection
+         (make-http-request :method "GET"
+                            :uri "https://127.0.0.1/data")))
+      (let* ((frames (h2-output-frames stream))
+             (acks (count-if
+                    (lambda (frame)
+                      (and (= (http-kit/http2::%h2-frame-type frame) 6)
+                           (= (http-kit/http2::%h2-frame-flags frame) 1)))
+                    frames))
+             (goaway (find-if
+                      (lambda (frame)
+                        (= (http-kit/http2::%h2-frame-type frame) 7))
+                      frames)))
+        (ensure-equal 1 acks)
+        (ensure-true goaway)
+        (ensure-equal 11
+                      (http-kit/http2::%h2-u32
+                       (http-kit/http2::%h2-frame-payload goaway) 4)))))

@@ -12,10 +12,13 @@
    #:http2-connection-p
    #:make-http2-connection
    #:close-http2-connection
+   #:cancel-http2-stream
    #:http2-connection-open-p
    #:http2-connection-session-started-p
    #:http2-connection-peer-max-frame-size
    #:http2-connection-peer-max-table-size
+   #:http2-connection-peer-max-concurrent-streams
+   #:http2-connection-peer-max-header-list-size
    #:http2-connection-peer-initial-window-size
    #:http2-connection-peer-connection-window-size
    #:http2-connection-goaway-last-stream-id
@@ -27,6 +30,9 @@
    #:close-http2-connection-manager
    #:http2-connection-manager-open-p
    #:http2-connection-manager-max-connections
+   #:http2-connection-manager-idle-timeout
+   #:http2-connection-manager-max-connection-age
+   #:http2-connection-manager-clock-function
    #:http2-connection-manager-connection-count
    #:http2-connection-manager-connections
    #:send-http2-request-over-connection-manager
@@ -35,6 +41,7 @@
    #:make-http2-connection-transport
    #:ping-http2-connection
    #:send-http2-goaway
+   #:send-http2-priority-update
    #:graceful-shutdown-http2-connection
    #:send-http2-request
    #:send-http2-request/cps

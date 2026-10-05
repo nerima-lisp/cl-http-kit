@@ -67,9 +67,9 @@
     (signals http-protocol-error
       (http-kit/http2::%hpack-huffman-decode
        (octets #xff #xff #xff #xfc)))
-    (signals http-protocol-error
-      (http-kit/http2::%hpack-huffman-decode
-       (octets #xff #xff #xea)))
+    (ensure-equal (octets 9)
+                  (http-kit/http2::%hpack-huffman-decode
+                   (octets #xff #xff #xea)))
     (ensure-equal (octets)
                   (http-kit/http2::%hpack-huffman-decode (octets)))
     (signals http-invalid-header
@@ -121,3 +121,45 @@
 (deftest hpack-name-p-boundaries
   (ensure-true (http-kit/http2::%hpack-name-p "x-header"))
   (ensure-true (not (http-kit/http2::%hpack-name-p 42))))
+
+(deftest hpack-field-count-limit
+  (let ((block
+          (http-kit/http2::%hpack-encode-block
+           (list (cons ":status" "200")
+                 (cons "content-type" "text/plain")))))
+    (ensure-equal
+     2
+     (length
+      (http-kit/http2::%hpack-decode-block
+       block (http-kit/http2::%make-hpack-context) :max-fields 2)))
+    (signals http-size-limit-exceeded
+      (http-kit/http2::%hpack-decode-block
+       block (http-kit/http2::%make-hpack-context) :max-fields 1))
+    (signals http-protocol-error
+      (http-kit/http2::%hpack-decode-block
+       block (http-kit/http2::%make-hpack-context) :max-fields 0))))
+
+(deftest hpack-huffman-round-trips-every-octet
+  ;; Symbol 9 (TAB) was carried as #xfffea, four bits short of its declared
+  ;; 24-bit width, so encoding a tab produced a stream no decoder could read
+  ;; back. Coverage above exercises decode error paths and tree construction
+  ;; but never encodes a symbol and reads it back, which is how one missing
+  ;; hex digit survived: tab is the only code in that region shorter than its
+  ;; neighbours', so it reads as a plausible entry.
+  (let ((tab (octets 9)))
+    (ensure-equal tab
+                  (http-kit/http2::%hpack-huffman-decode
+                   (http-kit/http2::%hpack-huffman-encode tab))))
+  (let ((every-octet
+          (map '(vector (unsigned-byte 8)) #'identity
+               (loop for code below 256 collect code))))
+    (ensure-equal every-octet
+                  (http-kit/http2::%hpack-huffman-decode
+                   (http-kit/http2::%hpack-huffman-encode every-octet))))
+  ;; Every code must fit inside the width the length table declares for it; a
+  ;; value narrower than its declared width encodes leading zeros that shift
+  ;; the whole stream.
+  (ensure-true
+   (loop for symbol below (length http-kit/http2::+hpack-huffman-codes+)
+         always (< (aref http-kit/http2::+hpack-huffman-codes+ symbol)
+                   (ash 1 (aref http-kit/http2::+hpack-huffman-lengths+ symbol))))))

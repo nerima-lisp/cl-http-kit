@@ -19,7 +19,7 @@
 
 (defun %h2-no-body-response-p (request-method status)
   (or (and (stringp request-method)
-           (string-equal request-method "HEAD"))
+           (string= request-method "HEAD"))
       (member status '(204 205 304) :test #'=)))
 
 (defun %h2-data-payload (frame)
@@ -48,10 +48,11 @@
      &key (body-length (length body)))
   (%h2-finish-response status headers trailers body
                        :no-body (%h2-no-body-response-p request-method status)
+                       :request-method request-method
                        :body-length body-length))
 
 (defun %h2-process-headers-frame*
-    (frame reader max-frame-size deadline clock-function max-header-bytes
+    (frame reader max-frame-size deadline clock-function max-header-bytes max-fields
      context status headers body body-length request-method expected-stream-id)
   (%h2-validate-response-stream-id (%h2-frame-stream-id frame)
                                    (%h2-frame-type frame)
@@ -60,7 +61,8 @@
       (%h2-read-header-block frame reader max-frame-size deadline clock-function
                              max-header-bytes expected-stream-id)
     (let ((fields (%hpack-decode-block block context
-                                       :max-header-bytes max-header-bytes)))
+                                       :max-header-bytes max-header-bytes
+                                       :max-fields max-fields)))
       (if status
           (progn
             (unless end-stream
@@ -76,6 +78,13 @@
               (%h2-status-and-headers fields)
             (if (< candidate-status 200)
                 (progn
+                  (when (http-kit:http-header-values
+                         candidate-headers "content-length")
+                    (error 'http-kit:http-invalid-header
+                           :message "An informational HTTP/2 response cannot contain Content-Length."
+                           :operation :http2-response
+                           :name "content-length"
+                           :reason :forbidden))
                   (when end-stream
                     (error 'http-kit:http-protocol-error
                            :message "An informational HTTP/2 response cannot end the stream."
@@ -99,17 +108,22 @@ Content-Length without rescanning a non-collecting response body."
   (cond
     ((= (length arguments) 1)
      (%h2-process-headers-frame*
-      frame reader max-frame-size deadline clock-function max-header-bytes
+      frame reader max-frame-size deadline clock-function max-header-bytes nil
       context status headers body (length body) (first arguments) 1))
     ((= (length arguments) 2)
      (%h2-process-headers-frame*
-      frame reader max-frame-size deadline clock-function max-header-bytes
+      frame reader max-frame-size deadline clock-function max-header-bytes nil
       context status headers body (first arguments) (second arguments) 1))
     ((= (length arguments) 3)
      (%h2-process-headers-frame*
-      frame reader max-frame-size deadline clock-function max-header-bytes
+      frame reader max-frame-size deadline clock-function max-header-bytes nil
       context status headers body (first arguments) (second arguments)
       (third arguments)))
+    ((= (length arguments) 4)
+     (%h2-process-headers-frame*
+      frame reader max-frame-size deadline clock-function max-header-bytes
+      (fourth arguments) context status headers body (first arguments)
+      (second arguments) (third arguments)))
     (t
      (error 'http-kit:http-protocol-error
             :message "Invalid HTTP/2 HEADERS processing arguments."
@@ -127,18 +141,13 @@ Content-Length without rescanning a non-collecting response body."
            :message "HTTP/2 DATA arrived before final response HEADERS."
            :operation :http2-read
            :detail :data-before-headers))
-  (when (and (stringp request-method)
-             (string-equal request-method "HEAD"))
+  (when (%h2-no-body-response-p request-method status)
     (error 'http-kit:http-protocol-error
-           :message "An HTTP/2 HEAD response cannot carry DATA."
+           :message "This HTTP/2 response cannot carry DATA."
            :operation :http2-read
-           :detail :head-body))
-  (when (member status '(204 205 304) :test #'=)
-    (error 'http-kit:http-protocol-error
-           :message "This HTTP/2 response status cannot carry a body."
-           :operation :http2-read
-           :detail status))
-  (let* ((payload (%h2-data-payload frame))
+           :detail (list request-method status)))
+  (let* ((flow-controlled-length (length (%h2-frame-payload frame)))
+         (payload (%h2-data-payload frame))
          (new-body-length (+ body-length (length payload))))
     (http-kit::%check-limit :body
                             new-body-length
@@ -146,11 +155,11 @@ Content-Length without rescanning a non-collecting response body."
     (when collect-body-p
       (loop for octet across payload
             do (vector-push-extend octet body)))
-    (when (and on-body-chunk (plusp (length payload)))
+    (when (and on-body-chunk (plusp (array-total-size payload)))
       (funcall on-body-chunk payload))
     (values (/= 0 (logand (%h2-frame-flags frame) +http2-end-stream-flag+))
             new-body-length
-            (length payload))))
+            flow-controlled-length)))
 
 (defun %h2-append-data-frame (frame status body &rest arguments)
   "Append a DATA frame, accepting both the legacy and streaming call forms.

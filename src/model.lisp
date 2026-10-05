@@ -20,20 +20,33 @@
        (loop for character across target
              for code = (char-code character)
              always (and (>= code #x21)
-                         (/= code #x7f)))))
+                         (<= code #x7e)))))
 
 (defun make-http-request
-    (&key method uri request-target headers trailers body
+    (&key method protocol uri request-target headers trailers body
           (protocol-version "HTTP/1.1"))
   (unless (and (stringp method) (%token-p method))
     (error 'http-protocol-error
            :message "HTTP request methods must be non-empty tokens."
            :operation :request
            :detail method))
+  (when (and (string= method "TRACE")
+             body
+             (plusp (length body)))
+    (error 'http-protocol-error
+           :message "TRACE requests must not contain content."
+           :operation :request
+           :detail :trace-content))
+  (when (and protocol
+             (not (and (stringp protocol) (%token-p protocol))))
+    (error 'http-protocol-error
+           :message "HTTP request protocols must be non-empty tokens."
+           :operation :request
+           :detail protocol))
   (when (and request-target
              (not (%request-target-value-p request-target)))
     (error 'http-protocol-error
-           :message "HTTP request-target must be a non-empty string without controls or spaces."
+           :message "HTTP request-target must contain only visible ASCII characters."
            :operation :request
            :detail request-target))
   (unless (and (stringp protocol-version)
@@ -44,7 +57,8 @@
            :operation :request
            :detail protocol-version))
   (%make-http-request :protocol-version protocol-version
-                      :method (string-upcase method)
+                      :method (copy-seq method)
+                      :protocol (and protocol (string-downcase protocol))
                       :uri (%coerce-uri uri)
                       :target (and request-target (copy-seq request-target))
                       :headers (%normalize-headers headers)
@@ -56,6 +70,10 @@
 
 (defun http-request-method (request)
   (%request-method request))
+
+(defun http-request-protocol (request)
+  (and (%request-protocol request)
+       (copy-seq (%request-protocol request))))
 
 (defun http-request-uri (request)
   (%copy-http-uri (%request-uri request)))
@@ -152,7 +170,8 @@ BODY-FUNCTION is called with no arguments until it returns NIL.  Each
 non-NIL value must be a one-dimensional octet vector.  BODY-LENGTH, when
 supplied, is the exact representation length and allows the HTTP/1 server to
 use Content-Length; otherwise HTTP/1.1 uses chunked transfer coding."
-  (unless (functionp body-function)
+  (unless (or (null body-function)
+              (functionp body-function))
     (error 'http-protocol-error
            :message "HTTP response stream body-function must be a function."
            :operation :response

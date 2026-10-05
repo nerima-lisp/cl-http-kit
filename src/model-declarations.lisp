@@ -4,6 +4,7 @@
                          (:conc-name %request-))
   protocol-version
   method
+  protocol
   uri
   target
   headers

@@ -1,4 +1,4 @@
-(in-package #:http-kit/test)
+(in-package #:http-kit/test-core)
 
 (deftest uri-authority-and-component-boundaries
   (dolist (authority '(""
@@ -7,6 +7,15 @@
                        "[::1]x"
                        "[::1]:"
                        "[::1]:not-a-port"
+                       "[not-an-ip]"
+                       "[2001:db8:::1]"
+                       "[2001:db8::1::2]"
+                       "[2001:db8::12345]"
+                       "[::ffff:192.0.2.256]"
+                       "[::ffff:192.00.2.1]"
+                       "[fe80::1%25en0]"
+                       "[v.example]"
+                       "[v1.]"
                        "host:not-a-port"
                        "host:65536"
                        "1:2:3"
@@ -32,6 +41,43 @@
     (make-http-uri :authority "example.com" :query 42))
   (signals http-invalid-uri
     (make-http-uri :authority "example.com" :query "x#fragment"))
+  (dolist (character '(#\\ #\[ #\] #\^ #\| #\{ #\}))
+    (signals http-invalid-uri
+      (make-http-uri
+       :authority "example.com"
+       :path (concatenate 'string "/path" (string character))))
+    (signals http-invalid-uri
+      (make-http-uri
+       :authority "example.com"
+       :query (concatenate 'string "value" (string character)))))
+  (let ((uri (make-http-uri
+              :authority "example.com"
+              :path "/a:@!$&'()*+,;=%20"
+              :query "x=/?:@!$&'()*+,;=%20")))
+    (ensure-equal "/a:@!$&'()*+,;=%20" (http-uri-path uri))
+    (ensure-equal "x=/?:@!$&'()*+,;=%20" (http-uri-query uri)))
+  (let* ((authority (copy-seq "example.com"))
+         (path (copy-seq "/original"))
+         (query (copy-seq "key=original"))
+         (uri (make-http-uri :authority authority :path path :query query)))
+    (setf (char authority 0) #\X
+          (char path 1) #\X
+          (char query 0) #\X)
+    (ensure-equal "example.com" (http-uri-authority uri))
+    (ensure-equal "/original" (http-uri-path uri))
+    (ensure-equal "key=original" (http-uri-query uri))
+    (let ((returned-authority (http-uri-authority uri))
+          (returned-host (http-uri-host uri))
+          (returned-path (http-uri-path uri))
+          (returned-query (http-uri-query uri)))
+      (setf (char returned-authority 0) #\X
+            (char returned-host 0) #\X
+            (char returned-path 1) #\X
+            (char returned-query 0) #\X)
+      (ensure-equal "example.com" (http-uri-authority uri))
+      (ensure-equal "example.com" (http-uri-host uri))
+      (ensure-equal "/original" (http-uri-path uri))
+      (ensure-equal "key=original" (http-uri-query uri))))
   (let ((uri (make-http-uri :authority "example.com")))
     (ensure-equal "http" (http-uri-scheme uri) "default URI scheme")
     (ensure-equal "/" (http-uri-path uri) "default URI path"))
@@ -53,7 +99,14 @@
                   "URI without query")
     (let ((printed (with-output-to-string (stream)
                      (write uri :stream stream :escape nil))))
-      (ensure-true (not (search "?<redacted>" printed))))))
+      (ensure-true (not (search "?<redacted>" printed)))))
+  (dolist (authority '("[::]"
+                       "[::ffff:192.0.2.128]"
+                       "[2001:db8:0:1:1:1:1:1]"
+                       "[v1.example:token]"))
+    (ensure-equal authority
+                  (http-uri-authority (make-http-uri :authority authority))
+                  "valid IP-literal authority")))
 
 (deftest uri-parser-and-printing-boundaries
   (signals http-invalid-uri
@@ -67,10 +120,10 @@
     (ensure-equal "http://example.com/"
                   (http-uri-string uri)
                   "default path round trip"))
-  (let* ((uri (parse-http-uri "http://example.com/path?secret=value"))
-         (printed (with-output-to-string (stream)
-                    (write uri :stream stream :escape nil))))
-    (ensure-true (search "?<redacted>" printed)
-                 "URI printing redacts query")
-    (ensure-true (not (search "secret=value" printed))
-                 "URI printing omits query contents")))
+  (let ((uri (parse-http-uri "http://example.com/path?secret=value")))
+    (ensure-printed=
+     "#<HTTP-URI http://example.com/path?<redacted>>"
+     uri)
+    (ensure-true
+     (not (search "secret=value" (princ-to-string uri)))
+     "URI printing omits query contents")))

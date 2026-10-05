@@ -1,4 +1,4 @@
-(in-package #:http-kit/test)
+(in-package #:http-kit/test-core)
 
 (deftest request-serialization
   (let* ((request (make-http-request
@@ -6,8 +6,8 @@
                    :uri "http://127.0.0.1/submit?x=1"
                    :body (vector 0 #xff)))
          (wire (serialize-http-request request))
-         (head (ascii "POST /submit?x=1 HTTP/1.1|CRLF|Host: 127.0.0.1|CRLF|Content-Length: 2|CRLF||CRLF|")))
-    (ensure-equal "POST" (http-request-method request) "request method")
+         (head (ascii "post /submit?x=1 HTTP/1.1|CRLF|Host: 127.0.0.1|CRLF|Content-Length: 2|CRLF||CRLF|")))
+    (ensure-equal "post" (http-request-method request) "request method")
     (ensure-equal "127.0.0.1" (http-request-authority request) "request authority")
     (ensure-equal "/submit" (http-request-path request) "request path")
     (ensure-equal "x=1" (http-request-query request) "request query")
@@ -17,7 +17,21 @@
       (serialize-http-request
        (make-http-request :method "GET"
                           :uri "http://127.0.0.1/submit?x=1"
-                          :headers (list (cons "Host" "127.0.0.2"))))))
+                          :headers (list (cons "Host" "127.0.0.2")))))
+    (signals http-protocol-error
+      (make-http-request :method "GET"
+                         :uri "http://127.0.0.1/"
+                         :request-target "/café"))
+    (signals http-protocol-error
+      (make-http-request :method "TRACE"
+                         :uri "http://127.0.0.1/"
+                         :body #(1)))
+    (ensure-equal #(1)
+                  (http-request-body
+                   (make-http-request :method "trace"
+                                      :uri "http://127.0.0.1/"
+                                      :body #(1)))
+                  "HTTP method names are case-sensitive"))
 
 (deftest header-lookup-and-duplicates
   (let ((headers (list (make-http-header "X-Test" "one")
@@ -77,6 +91,15 @@
                     (octets 1 0 #xff)))))
     (ensure-equal (octets 1 0 #xff) (http-response-body response)
                   "connection-close response body")))
+
+(deftest response-method-semantics-are-case-sensitive
+  (let ((wire (ascii "HTTP/1.1 200 OK|CRLF|Content-Length: 1|CRLF||CRLF|x")))
+    (ensure-equal (octets)
+                  (http-response-body
+                   (parse-http-response wire :request-method "HEAD")))
+    (ensure-equal (ascii "x")
+                  (http-response-body
+                   (parse-http-response wire :request-method "head")))))
 
 (deftest interim-response
   (let* ((statuses '())
@@ -160,6 +183,10 @@
     (parse-http-uri "http://[::1]:"))
   (signals http-invalid-uri
     (parse-http-uri "http://127.0.0.1]/"))
+  (signals http-invalid-uri
+    (parse-http-uri "http://example.test\\redirect/"))
+  (signals http-invalid-uri
+    (parse-http-uri "http://example.test\"redirect/"))
   (signals http-invalid-uri
     (parse-http-uri (concatenate 'string "http://127.0.0.1/" (string (code-char #x80))))))
 
@@ -267,3 +294,15 @@
     (ensure-true (not (search "secret-token"
                               (princ-to-string (http-request-uri request))))
                  "secret must not appear in URI debug output")))
+
+(deftest http-priority-field-value-formatting
+  (ensure-equal "u=3" (format-http-priority-field-value))
+  (ensure-equal "u=0, i"
+                (format-http-priority-field-value :urgency 0 :incremental t))
+  (ensure-equal "u=7" (format-http-priority-field-value :urgency 7))
+  (signals http-protocol-error
+    (format-http-priority-field-value :urgency -1))
+  (signals http-protocol-error
+    (format-http-priority-field-value :urgency 8))
+  (signals http-protocol-error
+    (format-http-priority-field-value :incremental :yes)))
