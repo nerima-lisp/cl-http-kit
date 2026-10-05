@@ -32,13 +32,12 @@
   (make-http-header (http-header-name header)
                     (http-header-content header)))
 
-(defmethod print-object ((header http-header) stream)
-  (print-unreadable-object (header stream :type t)
-    (format stream "~A: ~A"
-            (http-header-name header)
-            (if (%sensitive-header-p (http-header-name header))
-                "<redacted>"
-                (%bounded-diagnostic (http-header-content header))))))
+(define-http-diagnostic-printer (http-header header stream)
+  (:string (http-header-name header))
+  (:string ": ")
+  (:string (if (%sensitive-header-p (http-header-name header))
+               "<redacted>"
+               (%bounded-diagnostic (http-header-content header)))))
 
 (defun %normalize-headers (headers)
   (mapcar (lambda (header)

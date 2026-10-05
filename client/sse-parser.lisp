@@ -2,16 +2,18 @@
 
 (defstruct (%sse-state
              (:constructor %make-sse-state
-                 (&key max-events max-line-bytes max-data-bytes
+                 (&key max-events max-line-bytes max-data-bytes max-event-bytes
                        on-event collect-events-p)))
   max-events
   max-line-bytes
   max-data-bytes
+  max-event-bytes
   on-event
   collect-events-p
   (event-field nil)
   (data-lines nil)
   (data-bytes 0)
+  (event-bytes 0)
   (id-field nil)
   (retry nil)
   (comments nil)
@@ -25,16 +27,19 @@
   (events nil))
 
 (defun %sse-make-state
-    (&key max-events max-line-bytes max-data-bytes on-event collect-events-p)
+    (&key max-events max-line-bytes max-data-bytes max-event-bytes
+          on-event collect-events-p)
   (%sse-validate-limit max-events "MAX-EVENTS")
   (%sse-validate-limit max-line-bytes "MAX-LINE-BYTES")
   (%sse-validate-limit max-data-bytes "MAX-DATA-BYTES")
+  (%sse-validate-limit max-event-bytes "MAX-EVENT-BYTES")
   (when (and on-event (not (functionp on-event)))
     (%sse-protocol-error "ON-EVENT must be a function or NIL." on-event))
   (%make-sse-state
    :max-events max-events
    :max-line-bytes max-line-bytes
    :max-data-bytes max-data-bytes
+   :max-event-bytes max-event-bytes
    :on-event on-event
    :collect-events-p collect-events-p))
 
@@ -42,7 +47,7 @@
   (setf (%sse-state-event-field state) nil
         (%sse-state-data-lines state) nil
         (%sse-state-data-bytes state) 0
-        (%sse-state-id-field state) nil
+        (%sse-state-event-bytes state) 0
         (%sse-state-retry state) nil
         (%sse-state-comments state) nil)
   state)
@@ -60,7 +65,7 @@
     (let ((event
             (%make-http-sse-event
              :event (if (and (%sse-state-event-field state)
-                            (plusp (length (%sse-state-event-field state))))
+                             (not (string= (%sse-state-event-field state) "")))
                         (%sse-state-event-field state)
                         "message")
              :data (with-output-to-string (result)
@@ -77,12 +82,12 @@
       (when (%sse-state-collect-events-p state)
         (push event (%sse-state-events state)))
       (when (%sse-state-on-event state)
-        (funcall (%sse-state-on-event state) event)))
-    (%sse-state-reset-event state))
+        (funcall (%sse-state-on-event state) event))))
+  (%sse-state-reset-event state)
   state)
 
 (defun %sse-parse-retry (octets)
-  (when (and (plusp (length octets))
+  (when (and (plusp (array-total-size octets))
              (loop for byte across octets
                    always (<= #x30 byte #x39)))
     (parse-integer (%sse-utf8-string octets))))
@@ -97,6 +102,16 @@
                  (= (aref line 1) #xbb)
                  (= (aref line 2) #xbf))
         (setf start 3)))
+    (when (and (/= start end)
+               (%sse-state-max-event-bytes state))
+      (let ((observed (+ (%sse-state-event-bytes state) (- end start) 1)))
+        (when (> observed (%sse-state-max-event-bytes state))
+          (%sse-size-error
+           "An SSE event block exceeded its size limit."
+           (%sse-state-max-event-bytes state)
+           observed
+           :event))
+        (setf (%sse-state-event-bytes state) observed)))
     (if (= start end)
         (%sse-state-dispatch state)
         (if (= (aref line start) #x3a)
@@ -181,12 +196,8 @@
   (when (%sse-state-pending-cr-p state)
     (setf (%sse-state-pending-cr-p state) nil)
     (%sse-state-finish-line state))
-  (when (plusp (length (%sse-state-line state)))
+  (when (plusp (fill-pointer (%sse-state-line state)))
     (%sse-state-finish-line state))
-  ;; A final event without a blank line is useful for complete finite bodies;
-  ;; a live stream still dispatches normally as soon as it receives a blank
-  ;; line.
-  (%sse-state-dispatch state)
   state)
 
 (defun %sse-state-result (state)
@@ -194,7 +205,7 @@
       (nreverse (%sse-state-events state))))
 
 (defun %sse-input-octets (input)
-  (cond ((stringp input) (http-utf8-octets input))
+  (cond ((stringp input) (cl-codec-kit:string-to-octets input :encoding :utf-8))
         ((%client-octet-vector-p input) (%copy-client-octets input))
         (t
          (%sse-protocol-error
@@ -204,17 +215,19 @@
 (defun parse-http-sse-events
     (input &key (max-events +http-sse-default-max-events+)
                  (max-line-bytes +http-sse-default-max-line-bytes+)
-                 (max-data-bytes +http-sse-default-max-data-bytes+))
+                 (max-data-bytes +http-sse-default-max-data-bytes+)
+                 (max-event-bytes +http-sse-default-max-event-bytes+))
   "Parse an SSE body into HTTP-SSE-EVENT values.
 
 The parser accepts UTF-8 strings or octet vectors, recognizes CRLF, LF, and
-CR line endings, strips an initial UTF-8 BOM, and dispatches a final event at
-EOF even when the body has no trailing blank line.  Limits are safety bounds;
-NIL disables an individual bound."
+CR line endings, strips an initial UTF-8 BOM, and discards an event that is
+not terminated by a blank line.  Limits are safety bounds; NIL disables an
+individual bound.  MAX-EVENT-BYTES includes comment and metadata lines."
   (let ((state (%sse-make-state
                 :max-events max-events
                 :max-line-bytes max-line-bytes
                 :max-data-bytes max-data-bytes
+                :max-event-bytes max-event-bytes
                 :collect-events-p t)))
     (loop for byte across (%sse-input-octets input)
           do (%sse-state-feed-byte state byte))
@@ -225,6 +238,7 @@ NIL disables an individual bound."
     (stream &key (max-events +http-sse-default-max-events+)
                   (max-line-bytes +http-sse-default-max-line-bytes+)
                   (max-data-bytes +http-sse-default-max-data-bytes+)
+                  (max-event-bytes +http-sse-default-max-event-bytes+)
                   on-event (collect-events-p t))
   "Read SSE events from STREAM.
 
@@ -237,6 +251,7 @@ COLLECT-EVENTS-P is true, otherwise NIL."
                 :max-events max-events
                 :max-line-bytes max-line-bytes
                 :max-data-bytes max-data-bytes
+                :max-event-bytes max-event-bytes
                 :on-event on-event
                 :collect-events-p collect-events-p)))
     (if (handler-case
@@ -244,7 +259,7 @@ COLLECT-EVENTS-P is true, otherwise NIL."
           (error () nil)) ; paredit:ignore handler-case-swallows-error -- streams may hide their element type; binary reading is the safe fallback.
         (loop for character = (read-char stream nil :eof)
               until (eq character :eof)
-              do (loop for byte across (http-utf8-octets (string character))
+              do (loop for byte across (cl-codec-kit:string-to-octets (string character) :encoding :utf-8)
                        do (%sse-state-feed-byte state byte)))
         (loop for byte = (read-byte stream nil :eof)
               until (eq byte :eof)

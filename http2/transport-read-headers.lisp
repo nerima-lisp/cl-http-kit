@@ -1,5 +1,22 @@
 (in-package #:http-kit/http2)
 
+(defparameter *h2-max-header-block-frames* 128
+  "Maximum number of frames allowed in one assembled header block.")
+
+(defparameter *h2-max-continuation-frames* 127
+  "Maximum number of CONTINUATION frames allowed in one header block.")
+
+(defparameter *h2-max-header-block-parts* 128
+  "Maximum number of fragments retained while assembling a header block.")
+
+(defun %h2-check-header-block-limit (kind observed limit)
+  (when (and limit (> observed limit))
+    (error 'http-kit:http-protocol-error
+           :message (format nil "HTTP/2 header block ~A limit was exceeded."
+                            kind)
+           :operation :http2-headers
+           :detail (list :limit limit :observed observed :kind kind))))
+
 (defun %h2-header-fragment (frame &key first-p)
   "Return the header-block fragment after removing HEADERS padding/priority."
   (let* ((payload (%h2-frame-payload frame))
@@ -53,7 +70,13 @@
     (let ((first-fragment (%h2-header-fragment first-frame :first-p t)))
       (let ((parts (list first-fragment))
             (header-block-bytes (length first-fragment))
+            (frame-count 1)
+            (continuation-count 0)
             (frame first-frame))
+        (%h2-check-header-block-limit :frames frame-count
+                                      *h2-max-header-block-frames*)
+        (%h2-check-header-block-limit :parts (length parts)
+                                      *h2-max-header-block-parts*)
         (http-kit::%check-limit :headers header-block-bytes max-header-bytes)
         (loop until (/= 0 (logand (%h2-frame-flags frame)
                                   +http2-end-headers-flag+))
@@ -80,7 +103,16 @@
                           :message "An HTTP/2 CONTINUATION has an invalid flag."
                           :operation :http2-headers
                           :detail (%h2-frame-flags frame)))
+                 (incf frame-count)
+                 (incf continuation-count)
+                 (%h2-check-header-block-limit :frames frame-count
+                                               *h2-max-header-block-frames*)
+                 (%h2-check-header-block-limit :continuations
+                                               continuation-count
+                                               *h2-max-continuation-frames*)
                  (push (%h2-frame-payload frame) parts)
+                 (%h2-check-header-block-limit :parts (length parts)
+                                               *h2-max-header-block-parts*)
                  (incf header-block-bytes (length (%h2-frame-payload frame)))
                  (http-kit::%check-limit :headers header-block-bytes
                                          max-header-bytes))
@@ -88,7 +120,7 @@
                 (/= 0 (logand (%h2-frame-flags first-frame)
                               +http2-end-stream-flag+)))))))
 
-(defun %h2-regular-header-valid-p (name value)
+(defun %h2-regular-header-valid-p (name value &key allow-te-p)
   (unless (and (plusp (length name))
                (string= name (string-downcase name)))
     (error 'http-kit:http-invalid-header
@@ -103,6 +135,12 @@
            :name name
            :reason :connection-specific))
   (when (string= name "te")
+    (unless allow-te-p
+      (error 'http-kit:http-invalid-header
+             :message "HTTP/2 TE is permitted only in request header sections."
+             :operation :http2-headers
+             :name name
+             :reason :forbidden))
     (unless (every (lambda (item) (string= item "trailers"))
                    (%h2-comma-items (list value) name))
       (error 'http-kit:http-invalid-header
@@ -119,7 +157,7 @@
     (dolist (field fields)
       (let ((name (car field))
             (value (cdr field)))
-        (unless (plusp (length name))
+        (unless (string/= name "")
           (error 'http-kit:http-invalid-header
                  :message "HTTP/2 header field names cannot be empty."
                  :operation :http2-headers
@@ -161,17 +199,18 @@
              :line fields
              :code status))
     (when (= status 101)
-      (error 'http-kit:http-unsupported-feature
+      (error 'http-kit:http-invalid-status
              :message "HTTP/2 does not support the HTTP/1.1 101 status transition."
              :operation :http2-headers
-             :feature :http2-switching-protocols))
+             :line fields
+             :code status))
     (values status (nreverse regular))))
 
 (defun %h2-trailers (fields)
   (mapcar (lambda (field)
             (let ((name (car field))
                   (value (cdr field)))
-              (unless (plusp (length name))
+              (unless (string/= name "")
                 (error 'http-kit:http-invalid-header
                        :message "HTTP/2 trailer field names cannot be empty."
                        :operation :http2-trailers
@@ -183,9 +222,9 @@
                        :operation :http2-trailers
                        :name name
                        :reason :pseudo-header))
-              (when (string= name "content-length")
+              (when (http-kit::%forbidden-trailer-field-name-p name)
                 (error 'http-kit:http-invalid-header
-                       :message "HTTP/2 trailers cannot contain Content-Length."
+                       :message "The field definition does not permit this HTTP/2 trailer."
                        :operation :http2-trailers
                        :name name
                        :reason :forbidden))
@@ -194,7 +233,8 @@
           fields))
 
 (defun %h2-finish-response (status headers trailers body
-                            &key no-body (body-length (length body)))
+                            &key no-body request-method
+                              (body-length (length body)))
   (let ((content-lengths (http-kit:http-header-values headers "content-length")))
     (when content-lengths
       (unless (every #'http-kit::%decimal-string-p content-lengths)
@@ -212,10 +252,14 @@
                  :operation :http2-response
                  :name "content-length"
                  :reason :duplicate))
-        (when (and (member status '(204 205) :test #'=)
-                   (plusp expected))
+        (when (or (< status 200)
+                  (= status 204)
+                  (and (stringp request-method)
+                       (string= request-method "CONNECT")
+                       (<= 200 status 299))
+                  (and (= status 205) (plusp expected)))
           (error 'http-kit:http-invalid-header
-                 :message "HTTP/2 204 and 205 responses cannot have a positive Content-Length."
+                 :message "HTTP/2 response Content-Length is forbidden for this response."
                  :operation :http2-response
                  :name "content-length"
                  :reason :forbidden))

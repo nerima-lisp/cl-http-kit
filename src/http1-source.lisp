@@ -8,8 +8,10 @@
 (defun %make-byte-source-for (input &key (operation :response-parse))
   (cond
     ((and (arrayp input) (= (array-rank input) 1)
-          (not (stringp input)))
-     (%make-byte-source :vector (%copy-octets input) :position 0))
+          (not (stringp input))
+          (loop for item across input
+                always (and (integerp item) (<= 0 item 255))))
+     (%make-byte-source :vector input :position 0))
     ((and (listp input)
           (every (lambda (octet) (and (integerp octet) (<= 0 octet 255))) input))
      (%make-byte-source :vector (%copy-octets input) :position 0))
@@ -24,7 +26,21 @@
 (defun %source-read-byte (source deadline clock-function)
   (%check-deadline deadline clock-function :read)
   (if (%byte-source-stream source)
-      (read-byte (%byte-source-stream source) nil :eof)
+      (let ((stream (%byte-source-stream source)))
+        #+sbcl
+        (if deadline
+            (handler-case
+                (sb-ext:with-timeout
+                    (max 0 (- deadline (funcall clock-function)))
+                  (read-byte stream nil :eof))
+              (sb-ext:timeout ()
+                (error 'http-timeout
+                       :message "The HTTP read operation exceeded its deadline."
+                       :operation :read
+                       :kind :read)))
+            (read-byte stream nil :eof))
+        #-sbcl
+        (read-byte stream nil :eof))
       (let ((position (%byte-source-position source))
             (vector (%byte-source-vector source)))
         (if (>= position (length vector))
@@ -62,7 +78,7 @@
       for octet = (%source-read-byte source deadline clock-function)
       do (when (eq octet :eof)
          (if (and allow-eof-p
-                  (zerop (length builder))
+                  (zerop (fill-pointer builder))
                   (= bytes header-used))
              (return (values :eof bytes))
              (error 'http-protocol-error

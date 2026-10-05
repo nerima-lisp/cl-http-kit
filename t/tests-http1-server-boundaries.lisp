@@ -8,6 +8,10 @@
 (deftest http1-request-target-boundaries
   (let ((request
           (parse-http-request
+           (ascii "mIxEd / HTTP/1.1|CRLF|Host: example.com|CRLF||CRLF|"))))
+    (ensure-equal "mIxEd" (http-request-method request)))
+  (let ((request
+          (parse-http-request
            (ascii "POST /upload?x=1 HTTP/1.1|CRLF|Host: Example.COM:80|CRLF|Content-Length: 2|CRLF||CRLF|ab"))))
     (ensure-equal "POST" (http-request-method request))
     (ensure-equal "/upload?x=1" (http-request-target request))
@@ -65,6 +69,10 @@
                             (push (octets-as-string chunk) chunks)))))
     (ensure-equal (octets) (http-request-body request))
     (ensure-equal '("abc") (nreverse chunks)))
+  (signals http-protocol-error
+    (parse-http-request
+     (ascii "TRACE / HTTP/1.1|CRLF|Host: example.com|CRLF|Content-Length: 1|CRLF||CRLF|a")
+     :collect-body-p nil))
   (signals http-invalid-header
     (parse-http-request
      (ascii "POST / HTTP/1.1|CRLF|Host: example.com|CRLF|Transfer-Encoding: chunked|CRLF||CRLF|1|CRLF|a|CRLF|0|CRLF|Content-Length: 1|CRLF||CRLF|")))
@@ -79,9 +87,33 @@
      (ascii "POST / HTTP/1.1|CRLF|Host: example.com|CRLF|Transfer-Encoding: chunked|CRLF||CRLF|1|CRLF|a|CRLF|0|CRLF|Content-Length: 1|CRLF||CRLF|")))
   (signals http-invalid-header
     (parse-http-request
-     (ascii "POST / HTTP/1.1|CRLF|Host: example.com|CRLF|Transfer-Encoding: chunked|CRLF||CRLF|0|CRLF|Host: forbidden|CRLF||CRLF|"))))
+     (ascii "POST / HTTP/1.1|CRLF|Host: example.com|CRLF|Transfer-Encoding: chunked|CRLF||CRLF|0|CRLF|Host: forbidden|CRLF||CRLF|")))
+  (dolist (chunk-line '("1;" "1;=value" "1;name=" "1;name=\"unterminated"
+                        "1;name=bad value" "1 " "1;na(me=value"))
+    (signals http-protocol-error
+      (parse-http-request
+       (ascii (format nil
+                      "POST / HTTP/1.1|CRLF|Host: example.com|CRLF|Transfer-Encoding: chunked|CRLF||CRLF|~A|CRLF|a|CRLF|0|CRLF||CRLF|"
+                      chunk-line))))))
 
 (deftest http1-request-framing-error-boundaries
+  (let ((request
+          (parse-http-request
+           (ascii "GET / HTTP/1.1|CRLF|Host: example.com|CRLF|X-One: 1|CRLF||CRLF|")
+           :max-fields 2)))
+    (ensure-equal 2 (length (http-request-headers request))))
+  (signals http-size-limit-exceeded
+    (parse-http-request
+     (ascii "GET / HTTP/1.1|CRLF|Host: example.com|CRLF|X-One: 1|CRLF||CRLF|")
+     :max-fields 1))
+  (signals http-size-limit-exceeded
+    (parse-http-request
+     (ascii "POST / HTTP/1.1|CRLF|Host: example.com|CRLF|Transfer-Encoding: chunked|CRLF||CRLF|0|CRLF|X-One: 1|CRLF|X-Two: 2|CRLF|X-Three: 3|CRLF||CRLF|")
+     :max-fields 2))
+  (signals http-protocol-error
+    (parse-http-request
+     (ascii "GET / HTTP/1.1|CRLF|Host: example.com|CRLF||CRLF|")
+     :max-fields 0))
   (signals http-protocol-error
     (parse-http-request
      (ascii "GET / HTTP/1.1|CRLF|Host: example.com|CRLF|Transfer-Encoding: chunked|CRLF||CRLF|Z|CRLF|0|CRLF||CRLF|")))
@@ -145,6 +177,13 @@
    (serialize-http-response
     (make-http-response :status 205 :reason "Reset Content")))
   (ensure-equal
+   (ascii "HTTP/1.1 205 Reset Content|CRLF|Transfer-Encoding: chunked|CRLF||CRLF|0|CRLF||CRLF|")
+   (serialize-http-response
+    (make-http-response
+     :status 205
+     :reason "Reset Content"
+     :headers (list (make-http-header "Transfer-Encoding" "chunked")))))
+  (ensure-equal
    (ascii "HTTP/1.1 304 Not Modified|CRLF|Content-Length: 4|CRLF||CRLF|")
    (serialize-http-response
     (make-http-response
@@ -152,6 +191,23 @@
      :headers (list (make-http-header "Content-Length" "4"))))))
 
 (deftest http1-response-serialization-error-boundaries
+  (dolist (status '(100 204))
+    (signals http-invalid-header
+      (serialize-http-response
+       (make-http-response
+        :status status
+        :headers (list (make-http-header "Content-Length" "0"))))))
+  (signals http-invalid-header
+    (serialize-http-response
+     (make-http-response
+      :status 204
+      :headers (list (make-http-header "Transfer-Encoding" "chunked")))))
+  (signals http-invalid-header
+    (serialize-http-response
+     (make-http-response
+      :status 200
+      :headers (list (make-http-header "Content-Length" "0")))
+     :request-method "CONNECT"))
   (signals http-invalid-header
     (serialize-http-response
      (make-http-response
@@ -273,6 +329,52 @@
         (ensure-true (search "/one" wire-string))
         (ensure-true (search "/two" wire-string))))))
 
+(deftest http1-session-informational-responses
+  (multiple-value-bind (count reason wire)
+      (%run-http1-session-from-file
+       (ascii "GET /resource HTTP/1.1|CRLF|Host: example.com|CRLF||CRLF|")
+       (lambda (request)
+         (declare (ignore request))
+         (values
+          (make-http-response :status 204)
+          (list
+           (make-http-response
+            :status 103
+            :headers (list (make-http-header
+                            "Link"
+                            "</style.css>; rel=preload")))
+           (make-http-response :status 102))))
+       :close-stream nil)
+    (ensure-equal 1 count)
+    (ensure-equal :eof reason)
+    (ensure-equal
+     (ascii "HTTP/1.1 103 Early Hints|CRLF|Link: </style.css>; rel=preload|CRLF||CRLF|HTTP/1.1 102 Processing|CRLF||CRLF|HTTP/1.1 204 No Content|CRLF||CRLF|")
+     wire))
+  (signals http-protocol-error
+    (%run-http1-session-from-file
+     (ascii "GET /resource HTTP/1.1|CRLF|Host: example.com|CRLF||CRLF|")
+     (lambda (request)
+       (declare (ignore request))
+       (values (make-http-response :status 204)
+               (make-http-response :status 103)))
+     :close-stream nil))
+  (signals http-protocol-error
+    (%run-http1-session-from-file
+     (ascii "GET /resource HTTP/1.1|CRLF|Host: example.com|CRLF||CRLF|")
+     (lambda (request)
+       (declare (ignore request))
+       (values (make-http-response :status 204)
+               (list (make-http-response :status 101))))
+     :close-stream nil))
+  (signals http-protocol-error
+    (%run-http1-session-from-file
+     (ascii "GET /resource HTTP/1.0|CRLF|Host: example.com|CRLF||CRLF|")
+     (lambda (request)
+       (declare (ignore request))
+       (values (make-http-response :status 204)
+               (list (make-http-response :status 103))))
+     :close-stream nil)))
+
 (deftest http1-session-connection-close
   (let ((seen '()))
     (multiple-value-bind (count reason wire)
@@ -392,6 +494,45 @@
       (ensure-true (search "HTTP/1.1 101 Switching Protocols"
                            (octets-as-string wire))))))
 
+(deftest http1-session-upgrade-validation
+  (flet ((upgrade-response (&optional (protocol "websocket")
+                                     (connection "Upgrade"))
+           (make-http-response
+            :status 101
+            :headers (remove nil
+                             (list (and connection
+                                        (make-http-header "Connection" connection))
+                                   (and protocol
+                                        (make-http-header "Upgrade" protocol)))))))
+    (signals http-protocol-error
+      (%run-http1-session-from-file
+       (ascii "GET /chat HTTP/1.1|CRLF|Host: example.com|CRLF|Upgrade: websocket|CRLF||CRLF|")
+       (lambda (request)
+         (declare (ignore request))
+         (upgrade-response))
+       :close-stream nil))
+    (signals http-protocol-error
+      (%run-http1-session-from-file
+       (ascii "GET /chat HTTP/1.1|CRLF|Host: example.com|CRLF|Connection: Upgrade|CRLF|Upgrade: websocket|CRLF||CRLF|")
+       (lambda (request)
+         (declare (ignore request))
+         (upgrade-response "websocket" nil))
+       :close-stream nil))
+    (signals http-protocol-error
+      (%run-http1-session-from-file
+       (ascii "GET /chat HTTP/1.1|CRLF|Host: example.com|CRLF|Connection: Upgrade|CRLF|Upgrade: websocket|CRLF||CRLF|")
+       (lambda (request)
+         (declare (ignore request))
+         (upgrade-response "h2c"))
+       :close-stream nil))
+    (signals http-protocol-error
+      (%run-http1-session-from-file
+       (ascii "GET /chat HTTP/1.0|CRLF|Host: example.com|CRLF|Connection: Upgrade|CRLF|Upgrade: websocket|CRLF||CRLF|")
+       (lambda (request)
+         (declare (ignore request))
+         (upgrade-response))
+       :close-stream nil))))
+
 (deftest http1-session-response-stream-known-length
   (let ((chunks (list (ascii "ab") (ascii "cd") nil)))
     (multiple-value-bind (count reason wire)
@@ -456,6 +597,72 @@
         (ensure-equal 0 (length (http-response-body parsed))))
       (ensure-true (not body-called))
       (ensure-true (null (search "payload" (octets-as-string wire)))))))
+
+(deftest http1-session-response-stream-framing-boundaries
+  (let ((body-called nil))
+    (multiple-value-bind (count reason wire)
+        (%run-http1-session-from-file
+         (ascii "GET /stream HTTP/1.1|CRLF|Host: example.com|CRLF||CRLF|")
+         (lambda (request)
+           (declare (ignore request))
+           (make-http-response-stream
+            :status 304
+            :headers (list (make-http-header "Content-Length" "7"))
+            :body-function (lambda ()
+                             (setf body-called t)
+                             (ascii "payload"))))
+         :close-stream nil)
+      (ensure-equal 1 count)
+      (ensure-equal :eof reason)
+      (ensure-equal
+       (ascii "HTTP/1.1 304 Not Modified|CRLF|Content-Length: 7|CRLF||CRLF|")
+       wire)
+      (ensure-true (not body-called))))
+  (let ((body-called nil))
+    (multiple-value-bind (count reason wire)
+        (%run-http1-session-from-file
+         (ascii "GET /reset HTTP/1.1|CRLF|Host: example.com|CRLF||CRLF|")
+         (lambda (request)
+           (declare (ignore request))
+           (make-http-response-stream
+            :status 205
+            :reason "Reset Content"
+            :headers (list (make-http-header "Transfer-Encoding" "chunked"))
+            :body-length 0
+            :body-function (lambda ()
+                             (setf body-called t)
+                             (ascii "payload"))))
+         :close-stream nil)
+      (ensure-equal 1 count)
+      (ensure-equal :eof reason)
+      (ensure-equal
+       (ascii "HTTP/1.1 205 Reset Content|CRLF|Transfer-Encoding: chunked|CRLF||CRLF|0|CRLF||CRLF|")
+       wire)
+      (ensure-true (not body-called))))
+  (signals http-invalid-header
+    (%run-http1-session-from-file
+     (ascii "GET /stream HTTP/1.1|CRLF|Host: example.com|CRLF||CRLF|")
+     (lambda (request)
+       (declare (ignore request))
+       (make-http-response-stream
+        :status 204
+        :headers (list (make-http-header "Content-Length" "0"))))))
+  (signals http-invalid-header
+    (%run-http1-session-from-file
+     (ascii "CONNECT example.com:443 HTTP/1.1|CRLF|Host: example.com:443|CRLF||CRLF|")
+     (lambda (request)
+       (declare (ignore request))
+       (make-http-response-stream
+        :status 200
+        :headers (list (make-http-header "Content-Length" "0"))))))
+  (signals http-protocol-error
+    (%run-http1-session-from-file
+     (ascii "GET /stream HTTP/1.1|CRLF|Host: example.com|CRLF||CRLF|")
+     (lambda (request)
+       (declare (ignore request))
+       (make-http-response-stream
+        :status 200
+        :headers (list (make-http-header "Content-Length" "4")))))))
 
 (deftest http1-session-response-stream-http10-close-delimited
   (let ((chunks (list (ascii "abc") nil)))

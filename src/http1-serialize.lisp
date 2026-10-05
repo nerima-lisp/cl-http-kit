@@ -44,18 +44,11 @@
               :reason :mismatch))
       (t (%parse-decimal (first values))))))
 
-(defun %http1-forbidden-trailer-name-p (name)
-  (member (string-downcase name)
-          '("connection" "content-length" "host" "keep-alive"
-            "proxy-authenticate" "proxy-authorization" "proxy-connection"
-            "te" "trailer" "transfer-encoding" "upgrade")
-          :test #'string=))
-
 (defun %validate-http1-trailers (trailers operation)
   (dolist (trailer trailers)
-    (when (%http1-forbidden-trailer-name-p (http-header-name trailer))
+    (when (%forbidden-trailer-field-name-p (http-header-name trailer))
       (error 'http-invalid-header
-             :message "A trailer field is forbidden by HTTP/1 framing rules."
+             :message "The field definition does not permit this HTTP trailer."
              :operation operation
              :name (http-header-name trailer)
              :reason :forbidden-trailer))))
@@ -87,7 +80,7 @@
                       :operation operation
                       :name "trailer"
                       :reason :value))
-             (when (%http1-forbidden-trailer-name-p name)
+             (when (%forbidden-trailer-field-name-p name)
                (error 'http-invalid-header
                       :message "A Trailer declaration contains a forbidden field name."
                       :operation operation
@@ -101,6 +94,7 @@
 
 (defun %http1-ensure-trailer-declaration
     (headers trailers transfer-mode operation)
+  (%validate-http1-trailers trailers operation)
   (let* ((declared-values (http-header-values headers "trailer"))
          (declared-names (and declared-values
                               (%parse-http1-trailer-declaration
@@ -131,41 +125,18 @@
                        (format nil "~{~A~^, ~}" actual-names)))))))
 
 (defun %request-transfer-encoding (values)
-  (when values
-    (let ((codings '()))
-      (dolist (value values)
-        (let ((start 0))
-          (loop
-            for comma = (position #\, value :start start)
-            for end = (or comma (length value))
-            for coding = (%trim-ows (subseq value start end))
-            do (when (zerop (length coding))
-                 (error 'http-invalid-header
-                        :message "A comma-separated Transfer-Encoding contains an empty item."
-                        :operation :serialization
-                        :name "transfer-encoding"
-                        :reason :empty-item))
-               (push (string-downcase coding) codings)
-               (if comma
-                   (setf start (1+ comma))
-                   (return)))))
-      (setf codings (nreverse codings))
-      (unless (and (consp codings)
-                   (null (cdr codings))
-                   (string= (first codings) "chunked"))
-        (error 'http-unsupported-feature
-               :message "Only a single HTTP/1.1 chunked transfer coding is supported."
-               :operation :serialization
-               :detail codings
-               :feature :http1-request-transfer-encoding))
-      :chunked)))
+  (%http1-chunked-transfer-mode
+   (%parse-http1-transfer-codings values :serialization "transfer-encoding")
+   :serialization
+   :http1-request-transfer-encoding))
 
 (defun %http-request-target (request request-target)
   (let ((target
           (or request-target
-              (http-request-target request))))
+              (http-request-target request)))
+        (method (http-request-method request)))
     (unless (and (stringp target)
-                 (plusp (length target))
+                 (not (string= target ""))
                  (loop for character across target
                        for code = (char-code character)
                        always (and (>= code #x21)
@@ -174,7 +145,72 @@
              :message "HTTP request-target must be a non-empty token without controls or spaces."
              :operation :serialization
              :detail target))
+    (when (and (string= target "*")
+               (not (string= method "OPTIONS")))
+      (error 'http-protocol-error
+             :message "The asterisk-form request-target is valid only for OPTIONS."
+             :operation :serialization
+             :detail target))
     target))
+
+(defun %serialization-effective-port (uri)
+  (or (http-uri-port uri)
+      (if (string= (http-uri-scheme uri) "https") 443 80)))
+
+(defun %serialization-authorities-agree-p (left right)
+  (and (string= (http-uri-host left) (http-uri-host right))
+       (= (%serialization-effective-port left)
+          (%serialization-effective-port right))))
+
+(defun %absolute-http-request-target-p (target)
+  (or (and (>= (length target) 7)
+           (string-equal target "http://" :end1 7 :end2 7))
+      (and (>= (length target) 8)
+           (string-equal target "https://" :end1 8 :end2 8))))
+
+(defun %validate-request-target-form (method target effective-authority)
+  (cond
+    ((string= method "CONNECT")
+     (when (or (char= (char target 0) #\/)
+               (string= target "*")
+               (search "://" target))
+       (error 'http-protocol-error
+              :message "CONNECT request-targets must use authority-form."
+              :operation :serialization
+              :detail target))
+     (let ((target-uri
+             (make-http-uri :scheme (http-uri-scheme effective-authority)
+                            :authority target
+                            :path "/")))
+       (unless (http-uri-port target-uri)
+         (error 'http-protocol-error
+                :message "A CONNECT authority-form target must include a port."
+                :operation :serialization
+                :detail target))
+       (unless (%serialization-authorities-agree-p effective-authority
+                                                   target-uri)
+         (error 'http-invalid-header
+                :message "The CONNECT authority must agree with the effective Host."
+                :operation :serialization
+                :name "host"
+                :reason :host-authority-mismatch))))
+    ((or (char= (char target 0) #\/)
+         (string= target "*"))
+     nil)
+    ((%absolute-http-request-target-p target)
+     (let ((target-uri (parse-http-uri target)))
+       (unless (%serialization-authorities-agree-p effective-authority
+                                                   target-uri)
+         (error 'http-invalid-header
+                :message "The absolute request-target authority must agree with the effective Host."
+                :operation :serialization
+                :name "host"
+                :reason :host-authority-mismatch))))
+    (t
+     (error 'http-protocol-error
+            :message "A non-CONNECT request-target must use origin-, absolute-, or asterisk-form."
+            :operation :serialization
+            :detail target))))
 
 (defun %request-head-wire
     (request &key request-target body-length (body-length-known-p t))
@@ -212,15 +248,19 @@
              :operation :serialization
              :name "host"
              :reason :duplicate))
-    (when (and (= host-count 1)
-               (not (string-equal (first host-values)
-                                  (http-uri-authority uri))))
-      (error 'http-invalid-header
-             :message "The HTTP Host field must agree with the URI authority."
-             :operation :serialization
-             :name "host"
-             :reason :host-authority-mismatch))
-    (let* ((effective-headers (if (zerop host-count)
+    (let* ((host-uri (and (= host-count 1)
+                          (make-http-uri :scheme (http-uri-scheme uri)
+                                         :authority (first host-values)
+                                         :path "/")))
+           (effective-authority (or host-uri uri)))
+      (when (and host-uri
+                 (not (%serialization-authorities-agree-p host-uri uri)))
+        (error 'http-invalid-header
+               :message "The HTTP Host field must agree with the URI authority."
+               :operation :serialization
+               :name "host"
+               :reason :host-authority-mismatch))
+      (let* ((effective-headers (if (zerop host-count)
                                   (append headers
                                           (list (make-http-header
                                                  "Host"
@@ -233,8 +273,10 @@
                (%validated-content-length
                 effective-headers body-length
                 :body-length-known-p body-length-known-p)))
-           (target (%http-request-target request request-target))
-           (builder (%make-byte-builder)))
+             (target (%http-request-target request request-target))
+             (builder (%make-byte-builder)))
+        (%validate-request-target-form (http-request-method request)
+                                       target effective-authority)
       (when (and transfer-mode content-length-values)
         (error 'http-invalid-header
                :message "Transfer-Encoding and Content-Length must not be combined."
@@ -271,19 +313,13 @@
       (%builder-write-string builder " ")
       (%builder-write-string builder protocol-version :context :protocol-version)
       (%builder-crlf builder)
-      (dolist (header effective-headers)
-        (%builder-write-string builder (http-header-name header)
-                               :context :header-name)
-        (%builder-write-string builder ": ")
-        (%builder-write-string builder (http-header-content header)
-                               :context :header-value)
-        (%builder-crlf builder))
+      (%write-http1-headers builder effective-headers)
       (%builder-crlf builder)
       (let ((result (make-array (length builder)
                                 :element-type '(unsigned-byte 8))))
         (replace result builder)
-        (values result transfer-mode
-                (if body-length-known-p body-length content-length))))))
+          (values result transfer-mode
+                  (if body-length-known-p body-length content-length)))))))
 
 (defun serialize-http-request (request &key request-target)
   (check-type request http-request)
@@ -297,20 +333,14 @@
         (%builder-write-octets builder head)
         (if transfer-mode
             (progn
-              (unless (zerop (length body))
+              (unless (zerop (array-total-size body))
                 (%builder-write-string builder (format nil "~X" (length body)))
                 (%builder-crlf builder)
                 (%builder-write-octets builder body)
                 (%builder-crlf builder))
             (%builder-write-string builder "0")
             (%builder-crlf builder)
-              (dolist (trailer (http-request-trailers request))
-                (%builder-write-string builder (http-header-name trailer)
-                                       :context :header-name)
-                (%builder-write-string builder ": ")
-                (%builder-write-string builder (http-header-content trailer)
-                                       :context :header-value)
-                (%builder-crlf builder))
+              (%write-http1-trailers builder (http-request-trailers request))
               (%builder-crlf builder))
             (%builder-write-octets builder body))
         (let ((result (make-array (length builder)

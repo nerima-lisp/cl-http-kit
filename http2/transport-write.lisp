@@ -26,6 +26,11 @@
       (%h2-put-u32 payload 0 increment)
       (%h2-send-control writer +http2-window-update-type+ 0 stream-id payload))))
 
+(defun %h2-send-rst-stream (writer stream-id error-code)
+  (let ((payload (make-array 4 :element-type '(unsigned-byte 8))))
+    (%h2-put-u32 payload 0 error-code)
+    (%h2-send-control writer +http2-rst-stream-type+ 0 stream-id payload)))
+
 (defun %h2-validate-settings-frame (frame writer)
   (unless (zerop (%h2-frame-stream-id frame))
     (error 'http-kit:http-protocol-error
@@ -39,9 +44,9 @@
                :operation :http2-settings
                :detail (%h2-frame-length frame)))
       (progn
-        ;; SETTINGS_HEADER_TABLE_SIZE limits the dynamic table that this
-        ;; endpoint may use for its outbound header blocks.  It does not
-        ;; change the table used to decode the peer's response blocks.
+        ;; SETTINGS_HEADER_TABLE_SIZE limits the dynamic table used by the
+        ;; sender of the SETTINGS frame for outbound header blocks.  The
+        ;; connection callback also applies it to the decoder context.
         (%h2-settings (%h2-frame-payload frame))
         (%h2-send-control writer +http2-settings-type+ +http2-ack-flag+ 0
                           (http-kit::%empty-octets)))))
@@ -49,8 +54,25 @@
 (defun %h2-control-frame-p (type)
   (member type (list +http2-settings-type+ +http2-ping-type+
                      +http2-window-update-type+ +http2-goaway-type+
-                     +http2-rst-stream-type+ +http2-priority-type+)
+                     +http2-rst-stream-type+ +http2-priority-type+
+                     +http2-priority-update-type+)
           :test #'=))
+
+(defun %h2-budgeted-control-frame-p (type)
+  "Return true for every control frame except RST_STREAM."
+  (and (%h2-control-frame-p type)
+       (/= type +http2-rst-stream-type+)))
+
+(defun %h2-control-budget-note (times type max-frames window clock-function)
+  "Record TYPE and return the pruned timestamps and whether the budget failed."
+  (if (not (%h2-budgeted-control-frame-p type))
+      (values times nil)
+      (let* ((now (funcall clock-function))
+             (live (delete-if (lambda (timestamp)
+                               (> (- now timestamp) window))
+                             times))
+             (updated (cons now live)))
+        (values updated (> (length updated) max-frames)))))
 
 (defun %h2-handle-control-frame (frame writer &optional (expected-stream-id 1))
   (let ((type (%h2-frame-type frame))
@@ -132,4 +154,9 @@
        ;; active streams can validate and ignore it without violating the
        ;; wire protocol.
        nil)
+      ((= type +http2-priority-update-type+)
+       (error 'http-kit:http-protocol-error
+              :message "An HTTP/2 server cannot send PRIORITY_UPDATE."
+              :operation :http2-control
+              :detail (list stream-id (length payload))))
       (t nil))))

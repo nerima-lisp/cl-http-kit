@@ -17,6 +17,8 @@
         (initial-frames nil)
         (on-peer-settings nil)
         (control-handler nil)
+        (budget-owner nil)
+        (max-fields nil)
         (keyword-options options)
         (missing-value (gensym "MISSING-VALUE-")))
     (declare (ignorable peer-max-frame-size))
@@ -39,12 +41,14 @@
              (case key
                (:expected-stream-id (setf expected-stream-id value))
                (:hpack-context (setf hpack-context value))
+               (:max-fields (setf max-fields value))
                (:read-initial-settings-p
                 (setf read-initial-settings-p value))
                (:peer-max-frame-size (setf peer-max-frame-size value))
                (:initial-frames (setf initial-frames value))
                (:on-peer-settings (setf on-peer-settings value))
                (:control-handler (setf control-handler value))
+               (:budget-owner (setf budget-owner value))
                (otherwise
                 (error 'http-kit:http-protocol-error
                        :message "An unknown HTTP/2 response option was supplied."
@@ -76,14 +80,21 @@
           (error 'http-kit:http-protocol-error
                  :message "The first HTTP/2 peer frame must be a non-ACK SETTINGS frame."
                  :operation :http2-read
-                 :detail (list (%h2-frame-type first-frame)
-                               (%h2-frame-stream-id first-frame)
-                               (%h2-frame-flags first-frame))))
-        (multiple-value-bind (peer-frame-size peer-table-size peer-window-size)
+                     :detail (list (%h2-frame-type first-frame)
+                                   (%h2-frame-stream-id first-frame)
+                                   (%h2-frame-flags first-frame))))
+        (when budget-owner
+          ;; Count the initial SETTINGS without dispatching it twice.  The
+          ;; normal validation below remains responsible for the ACK.
+          (%h2-client-control-budget-check budget-owner first-frame writer))
+        (multiple-value-bind (peer-frame-size peer-table-size peer-window-size
+                              peer-enable-connect peer-max-concurrent-streams
+                              peer-max-header-list-size)
             (%h2-settings (%h2-frame-payload first-frame))
           (when on-peer-settings
             (funcall on-peer-settings peer-frame-size peer-table-size
-                     peer-window-size)))
+                     peer-window-size peer-enable-connect
+                     peer-max-concurrent-streams peer-max-header-list-size)))
         (%h2-validate-settings-frame first-frame writer)))
     (loop
       for frame = (if initial-frames
@@ -102,23 +113,23 @@
                   (funcall control-handler frame writer expected-stream-id)
                   (%h2-handle-control-frame frame writer expected-stream-id)))
              ((= type +http2-push-promise-type+)
-              (error 'http-kit:http-unsupported-feature
-                     :message "HTTP/2 server push is not supported by this client."
+              (error 'http-kit:http-protocol-error
+                     :message "The peer sent HTTP/2 PUSH_PROMISE after server push was disabled."
                      :operation :http2-read
-                     :feature :http2-server-push))
+                     :detail :protocol-error))
              ((= type +http2-headers-type+)
               (multiple-value-bind (new-status new-headers response)
                   (%h2-process-headers-frame
                    frame reader max-frame-size deadline clock-function
                    max-header-bytes context status headers body body-length
-                   request-method expected-stream-id)
+                   request-method expected-stream-id max-fields)
                 (setf status new-status
                       headers new-headers)
                 (when response
                   (return-from %h2-read-response response))))
              ((= type +http2-data-type+)
               (multiple-value-bind (end-stream new-body-length data-length)
-                  (%h2-append-data-frame*
+                  (%h2-append-data-frame
                    frame status body body-length request-method max-body-bytes
                    on-body-chunk collect-body-p expected-stream-id)
                 (setf body-length new-body-length)
@@ -144,7 +155,7 @@
 
 (defun send-http2-request
     (client request
-     &key timeout deadline max-header-bytes max-body-bytes clock-function
+     &key timeout deadline max-header-bytes max-fields max-body-bytes clock-function
        request-body-function request-body-length
        on-body-chunk (collect-body-p t) (huffman-p nil))
   (unless (http2-client-p client)
@@ -167,6 +178,8 @@
            :detail collect-body-p))
   (let* ((clock (or clock-function (%http2-clock-function client)))
          (header-limit (or max-header-bytes (%http2-max-header-bytes client)))
+         (field-limit (min (or max-fields most-positive-fixnum)
+                           (%http2-max-fields client)))
          (body-limit (or max-body-bytes (%http2-max-body-bytes client)))
          (wire nil)
          (stream nil)
@@ -175,6 +188,7 @@
                                    :inherited deadline
                                    :clock-function clock)
       (%h2-validate-limit :max-header-bytes header-limit)
+      (%h2-validate-limit :max-fields field-limit)
       (%h2-validate-limit :max-body-bytes body-limit :allow-zero t)
         (http-kit::%with-http-error-translation
           ("The HTTP/2 client request failed." :http2-client)
@@ -186,6 +200,7 @@
                  :timeout timeout
                  :deadline absolute-deadline
                  :max-header-bytes header-limit
+                 :max-fields field-limit
                  :max-body-bytes body-limit
                  :clock-function clock
                  :request-body-function request-body-function
@@ -213,7 +228,15 @@
                                      absolute-deadline clock
                                      header-limit body-limit
                                      (http-kit:http-request-method request)
-                                     on-body-chunk collect-body-p)))
+                                     on-body-chunk collect-body-p
+                                     :max-fields field-limit
+                                     :budget-owner client
+                                     :control-handler
+                                     (lambda (frame response-writer expected-id)
+                                       (%h2-client-control-budget-check
+                                        client frame response-writer)
+                                       (%h2-handle-control-frame
+                                        frame response-writer expected-id)))))
                (t
                 (setf stream
                       (funcall (%http2-open-stream client)
@@ -236,13 +259,17 @@
                        :close-stream (%http2-close-stream client)
                        :max-frame-size (%http2-max-frame-size client)
                        :max-header-bytes header-limit
+                       :max-fields field-limit
                        :max-body-bytes body-limit
+                       :max-control-frames (%http2-max-control-frames client)
+                       :max-control-window (%http2-max-control-window client)
                        :clock-function clock))
                 (send-http2-request-over-connection
                  temporary-connection request
                  :timeout timeout
                  :deadline absolute-deadline
                  :max-header-bytes header-limit
+                 :max-fields field-limit
                  :max-body-bytes body-limit
                  :clock-function clock
                  :request-body-function request-body-function
@@ -257,7 +284,7 @@
 
 (defun send-http2-request/cps
     (client request on-success
-     &key on-error timeout deadline max-header-bytes max-body-bytes
+     &key on-error timeout deadline max-header-bytes max-fields max-body-bytes
        clock-function request-body-function request-body-length
        on-body-chunk (collect-body-p t) (huffman-p nil))
   "Send an HTTP/2 request and dispatch its result to CPS continuations."
@@ -268,6 +295,7 @@
       :timeout timeout
       :deadline deadline
       :max-header-bytes max-header-bytes
+      :max-fields max-fields
       :max-body-bytes max-body-bytes
       :clock-function clock-function
       :request-body-function request-body-function

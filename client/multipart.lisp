@@ -138,8 +138,8 @@ serialize implementation-specific objects into a request body."
 (defun %multipart-header-safe-p (string)
   (and (stringp string)
        (not (find-if (lambda (character)
-                       (or (char= character #\Return)
-                           (char= character #\Linefeed)
+                       (or (< (char-code character) 32)
+                           (= (char-code character) 127)
                            (char= character #\")))
                      string))))
 
@@ -151,46 +151,87 @@ serialize implementation-specific objects into a request body."
                (write-char #\\ stream))
              (write-char character stream))))
 
+(defun %multipart-boundary-character-p (character &optional space-p)
+  (or (and (char<= #\A character) (char<= character #\Z))
+      (and (char<= #\a character) (char<= character #\z))
+      (and (char<= #\0 character) (char<= character #\9))
+      (find character "'()+_,-./:=?" :test #'char=)
+      (and space-p (char= character #\Space))))
+
+(defun %multipart-valid-boundary-p (boundary)
+  (and (stringp boundary)
+       (<= 1 (length boundary) 70)
+       (every (lambda (character)
+                (%multipart-boundary-character-p character t))
+              boundary)
+       (%multipart-boundary-character-p
+        (char boundary (1- (length boundary))))))
+
 (defun %generated-boundary ()
   (format nil "------------------------cl-http-kit-~36R-~36R"
           (get-universal-time)
           (random (expt 36 8))))
 
 (defun %multipart-append-string (result string)
-  (loop for byte across (http-utf8-octets string)
+  (loop for byte across (cl-codec-kit:string-to-octets string :encoding :utf-8)
         do (vector-push-extend byte result))
   result)
 
 (defun %client-crlf ()
   (coerce (list #\Return #\Linefeed) 'string))
 
+(defun %multipart-boundary-collides-p (parts boundary)
+  (let ((marker (http-utf8-octets (format nil "--~A" boundary))))
+    (some (lambda (part)
+            (let ((value (http-multipart-part-value part)))
+              (%multipart-first-delimiter
+               (if (stringp value)
+                   (http-utf8-octets value)
+                   (%copy-client-octets value))
+               marker)))
+          parts)))
+
+(defun %multipart-select-boundary (parts boundary)
+  (if boundary
+      (progn
+        (unless (%multipart-valid-boundary-p boundary)
+          (%client-protocol-error
+           "A multipart boundary contains invalid characters."
+           boundary))
+        (when (%multipart-boundary-collides-p parts boundary)
+          (%client-protocol-error
+           "A multipart boundary occurs as a delimiter in a part body."
+           boundary))
+        boundary)
+      (loop repeat 100
+            for candidate = (%generated-boundary)
+            unless (%multipart-boundary-collides-p parts candidate)
+              return candidate
+            finally
+               (%client-protocol-error
+                "Could not generate a collision-free multipart boundary."
+                nil))))
+
 (defun make-http-multipart-body (parts &key boundary)
   "Return two values: multipart octets and its Content-Type value.
 
 Each item in PARTS should be an HTTP-MULTIPART-PART.  The boundary can be
 provided for deterministic tests; an implementation-generated boundary is
-otherwise used."
+otherwise used.  An explicit boundary must satisfy the RFC 2046 boundary
+grammar.  The returned Content-Type quotes its boundary parameter."
   (unless (listp parts)
     (%client-protocol-error "Multipart parts must be a list." parts))
-  (let ((boundary (or boundary (%generated-boundary))))
-    (unless (and (stringp boundary)
-                 (plusp (length boundary))
-                 (not (find-if (lambda (character)
-                                 (or (char= character #\Return)
-                                     (char= character #\Linefeed)
-                                     (char= character #\Space)))
-                               boundary)))
-      (%client-protocol-error "A multipart boundary contains invalid characters."
-                              boundary))
+  (dolist (part parts)
+    (unless (http-multipart-part-p part)
+      (%client-protocol-error "Multipart parts must be HTTP-MULTIPART-PART values."
+                              part)))
+  (let ((boundary (%multipart-select-boundary parts boundary)))
     (let ((crlf (%client-crlf))
           (result (make-array 0
                               :element-type '(unsigned-byte 8)
                               :adjustable t
                               :fill-pointer 0)))
       (dolist (part parts)
-        (unless (http-multipart-part-p part)
-          (%client-protocol-error "Multipart parts must be HTTP-MULTIPART-PART values."
-                                  part))
         (let ((name (http-multipart-part-name part))
               (filename (http-multipart-part-filename part))
               (content-type (http-multipart-part-content-type part))
@@ -231,7 +272,7 @@ otherwise used."
       (let ((copy (make-array (length result)
                               :element-type '(unsigned-byte 8))))
         (replace copy result)
-        (values copy (format nil "multipart/form-data; boundary=~A" boundary))))))
+        (values copy (format nil "multipart/form-data; boundary=\"~A\"" boundary))))))
 
 (defun %multipart-octets-string (octets start end)
   (map 'string #'code-char (subseq octets start end)))
@@ -294,7 +335,11 @@ otherwise used."
        (%client-protocol-error
         "A multipart parameter has invalid quote placement."
         detail))
-      (t value))))
+      ((http-kit::%token-p value) value)
+      (t
+       (%client-protocol-error
+        "An unquoted multipart parameter value is not a token."
+        detail)))))
 
 (defun %multipart-parse-parameters (text operation)
   (let* ((segments (%multipart-parameter-segments text))
@@ -313,7 +358,7 @@ otherwise used."
                (value (%multipart-parameter-value
                        (subseq segment (1+ equals))
                        segment)))
-          (unless (plusp (length name))
+          (unless (http-kit::%token-p name)
             (%client-protocol-error operation segment))
           (when (assoc name parameters :test #'string=)
             (%client-protocol-error
@@ -342,26 +387,32 @@ otherwise used."
            content-type))
         boundary))))
 
-(defun %multipart-valid-boundary-p (boundary)
-  (and (stringp boundary)
-       (<= 1 (length boundary) 70)
-       (every (lambda (character)
-                (let ((code (char-code character)))
-                  (<= #x21 code #x7e)))
-              boundary)))
-
 (defun %multipart-delimiter-kind (octets position marker)
-  (let ((suffix (+ position (length marker))))
+  (let* ((length (length octets))
+         (position (+ position (length marker)))
+         (final-p (and (<= (+ position 2) length)
+                       (= (aref octets position) #x2d)
+                       (= (aref octets (1+ position)) #x2d))))
+    (when final-p
+      (incf position 2))
+    (loop while (and (< position length)
+                     (or (= (aref octets position) #x20)
+                         (= (aref octets position) #x09)))
+          do (incf position))
     (cond
-      ((and (<= (+ suffix 2) (length octets))
-            (= (aref octets suffix) #x2d)
-            (= (aref octets (1+ suffix)) #x2d))
-       :final)
-      ((and (<= (+ suffix 2) (length octets))
-            (= (aref octets suffix) #x0d)
-            (= (aref octets (1+ suffix)) #x0a))
-       :next)
+      ((and final-p (= position length)) :final)
+      ((and (<= (+ position 2) length)
+            (= (aref octets position) #x0d)
+            (= (aref octets (1+ position)) #x0a))
+       (if final-p :final :next))
       (t nil))))
+
+(defun %multipart-next-part-position (octets position marker)
+  (let ((position (+ position (length marker))))
+    (loop while (or (= (aref octets position) #x20)
+                    (= (aref octets position) #x09))
+          do (incf position))
+    (+ position 2)))
 
 (defun %multipart-first-delimiter (octets marker)
   (loop for position = (%multipart-find-sequence octets marker 0)
@@ -374,6 +425,15 @@ otherwise used."
                   (%multipart-delimiter-kind octets position marker))
           return position))
 
+(defun %multipart-next-delimiter (octets separator marker start)
+  (loop for position = (%multipart-find-sequence octets separator start)
+          then (%multipart-find-sequence octets separator (1+ position))
+        while position
+        for marker-position = (+ position 2)
+        for kind = (%multipart-delimiter-kind octets marker-position marker)
+        when kind
+          return (values position kind)))
+
 (defun %multipart-header-block (octets start end max-header-bytes)
   (let ((position start)
         (headers '()))
@@ -384,7 +444,7 @@ otherwise used."
           (%client-protocol-error
            "A multipart part has no complete header block."
            (list :start start :end end)))
-        (let ((header-bytes (+ (- (+ line-end 2) start) 2)))
+        (let ((header-bytes (- (+ line-end 2) start)))
           (when (and max-header-bytes (> header-bytes max-header-bytes))
             (error 'http-size-limit-exceeded
                    :message "A multipart header block exceeded its size limit."
@@ -410,11 +470,17 @@ otherwise used."
               (setf position (+ line-end 2)))))))))
 
 (defun %multipart-part-metadata (headers)
-  (let ((disposition (http-header-value headers "Content-Disposition")))
-    (unless disposition
+  (let ((dispositions (http-header-values headers "Content-Disposition"))
+        (content-types (http-header-values headers "Content-Type")))
+    (unless (= (length dispositions) 1)
       (%client-protocol-error
-       "A multipart part must have Content-Disposition."
-       headers))
+       "A multipart part must have exactly one Content-Disposition."
+       dispositions))
+    (when (> (length content-types) 1)
+      (%client-protocol-error
+       "A multipart part must not have multiple Content-Type fields."
+       content-types))
+    (let ((disposition (first dispositions)))
     (multiple-value-bind (kind parameters)
         (%multipart-parse-parameters
          disposition
@@ -425,23 +491,39 @@ otherwise used."
          disposition))
       (let ((name (cdr (assoc "name" parameters :test #'string=)))
             (filename (cdr (assoc "filename" parameters :test #'string=)))
-            (content-type (http-header-value headers "Content-Type")))
+            (content-type (first content-types)))
         (unless (and name (plusp (length name)))
           (%client-protocol-error
            "A multipart part must have a non-empty name parameter."
            disposition))
-        (values name filename content-type)))))
+        (values name filename content-type))))))
 
 (defun parse-http-multipart-body
     (body &key content-type boundary (max-parts 1000) (max-header-bytes 65536)
-       max-body-bytes)
+       max-body-bytes (max-input-bytes (* 64 1024 1024)))
   "Parse a multipart/form-data BODY into HTTP-MULTIPART-PART values.
 
 CONTENT-TYPE may be the complete Content-Type header value.  BOUNDARY is an
 explicit alternative for callers that already parsed that header.  Part
 values remain octets when they are not valid text; callers may interpret them
 according to each part's Content-Type.  MAX-BODY-BYTES limits the sum of part
-bodies, while MAX-HEADER-BYTES applies to each part's header block."
+bodies, while MAX-HEADER-BYTES applies to each part's header block.
+MAX-INPUT-BYTES limits the complete encoded body before it is copied."
+  (unless (or (null max-input-bytes)
+              (and (integerp max-input-bytes) (>= max-input-bytes 0)))
+    (%client-protocol-error
+     "MAX-INPUT-BYTES must be NIL or a non-negative integer."
+     max-input-bytes))
+  (unless (%client-octet-vector-p body)
+    (%client-protocol-error
+     "Expected a one-dimensional vector containing octets."
+     body))
+  (when (and max-input-bytes (> (length body) max-input-bytes))
+    (error 'http-size-limit-exceeded
+           :message "A multipart input exceeded its encoded size limit."
+           :operation :multipart
+           :detail (list :limit max-input-bytes
+                         :observed (length body))))
   (let* ((octets (%copy-client-octets body))
          (header-boundary (%multipart-content-type-boundary content-type))
          (boundary (or boundary header-boundary)))
@@ -452,7 +534,7 @@ bodies, while MAX-HEADER-BYTES applies to each part's header block."
        (list boundary header-boundary)))
     (unless (%multipart-valid-boundary-p boundary)
       (%client-protocol-error
-       "A multipart boundary must contain one to seventy visible ASCII characters."
+       "A multipart boundary does not conform to the MIME boundary grammar."
        boundary))
     (unless (or (null max-parts)
                 (and (integerp max-parts) (>= max-parts 0)))
@@ -482,15 +564,15 @@ bodies, while MAX-HEADER-BYTES applies to each part's header block."
          "A multipart body does not contain a valid opening boundary."
          boundary))
       (let ((kind (%multipart-delimiter-kind octets delimiter marker))
-            (position (+ delimiter (length marker)))
             (parts '())
             (part-count 0)
             (body-bytes 0))
         (when (eq kind :final)
           (return-from parse-http-multipart-body))
-        (incf position 2)
-        (loop
-          (let ((next (%multipart-find-sequence octets separator position)))
+        (loop with position = (%multipart-next-part-position
+                               octets delimiter marker)
+              do (multiple-value-bind (next delimiter-kind)
+              (%multipart-next-delimiter octets separator marker position)
             (unless next
               (%client-protocol-error
                "A multipart body has no terminating boundary."
@@ -522,13 +604,9 @@ bodies, while MAX-HEADER-BYTES applies to each part's header block."
                            :filename filename
                            :content-type content-type)
                           parts)))))
-            (let* ((marker-position (+ next 2))
-                   (delimiter-kind
-                     (%multipart-delimiter-kind octets marker-position marker)))
-              (unless delimiter-kind
-                (%client-protocol-error
-                 "A multipart boundary has an invalid delimiter suffix."
-                 boundary))
+            (let ((marker-position (+ next 2)))
               (if (eq delimiter-kind :final)
                   (return (nreverse parts))
-                  (setf position (+ marker-position (length marker) 2))))))))))
+                  (setf position
+                        (%multipart-next-part-position octets marker-position
+                                                       marker))))))))))

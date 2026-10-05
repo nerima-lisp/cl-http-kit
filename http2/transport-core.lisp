@@ -1,5 +1,37 @@
 (in-package #:http-kit/http2)
 
+(defun %h2-client-control-budget-check (client frame writer)
+  "Count a peer control frame and send GOAWAY before reporting a flood."
+  (let ((times (if (http2-client-p client)
+                   (%http2-control-frame-times client)
+                   (%http2-connection-control-frame-times client)))
+        (max-frames (if (http2-client-p client)
+                        (%http2-max-control-frames client)
+                        (%http2-connection-max-control-frames client)))
+        (window (if (http2-client-p client)
+                    (%http2-max-control-window client)
+                    (%http2-connection-max-control-window client)))
+        (clock (if (http2-client-p client)
+                   (%http2-clock-function client)
+                   (%http2-connection-clock-function client))))
+    (multiple-value-bind (new-times exceeded)
+        (%h2-control-budget-note times (%h2-frame-type frame)
+                                 max-frames window clock)
+      (if (http2-client-p client)
+          (setf (%http2-control-frame-times client) new-times)
+          (setf (%http2-connection-control-frame-times client) new-times))
+    (when exceeded
+      (let ((payload (make-array 8 :element-type '(unsigned-byte 8))))
+        (%h2-put-u32 payload 0 0)
+        (%h2-put-u32 payload 4 +http2-enhance-your-calm+)
+        (%h2-send-control writer +http2-goaway-type+ 0 0 payload))
+      (error 'http-kit:http-protocol-error
+             :message "The HTTP/2 control frame budget was exceeded."
+             :operation :http2-control
+             :http2-error-code +http2-enhance-your-calm+
+             :detail (%h2-frame-type frame)))))
+  nil)
+
 (defun %h2-validate-limit (name value &key allow-zero)
   (unless (and (integerp value)
                (if allow-zero (>= value 0) (plusp value)))
@@ -23,8 +55,11 @@
                                (max-frame-size +http2-default-max-frame-size+)
                                (max-header-bytes
                                 http-kit::*default-max-header-bytes*)
+                               (max-fields 256)
                                (max-body-bytes
                                 http-kit::*default-max-body-bytes*)
+                               (max-control-frames 100)
+                               (max-control-window 1.0d0)
                                (clock-function #'http-kit::%monotonic-time))
   "Create an HTTP/2 client around an injected exchange, stream, or connection.
 
@@ -49,7 +84,15 @@ persistent HTTP2-CONNECTION created by MAKE-HTTP2-CONNECTION."
            :detail close-stream))
   (%h2-validate-frame-size max-frame-size)
   (%h2-validate-limit :max-header-bytes max-header-bytes)
+  (%h2-validate-limit :max-fields max-fields)
   (%h2-validate-limit :max-body-bytes max-body-bytes :allow-zero t)
+  (%h2-validate-limit :max-control-frames max-control-frames :allow-zero t)
+  (unless (and (realp max-control-window)
+               (not (minusp max-control-window)))
+    (error 'http-kit:http-protocol-error
+           :message "The HTTP/2 max-control-window must be a non-negative real."
+           :operation :http2-client
+           :detail max-control-window))
   (unless (functionp clock-function)
     (error 'http-kit:http-protocol-error
            :message "An HTTP/2 clock function must be callable."
@@ -62,5 +105,8 @@ persistent HTTP2-CONNECTION created by MAKE-HTTP2-CONNECTION."
    :close-stream (or close-stream #'close)
    :max-frame-size max-frame-size
    :max-header-bytes max-header-bytes
+   :max-fields max-fields
    :max-body-bytes max-body-bytes
+   :max-control-frames max-control-frames
+   :max-control-window max-control-window
    :clock-function clock-function))

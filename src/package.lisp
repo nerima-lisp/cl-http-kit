@@ -28,6 +28,7 @@
    #:make-http-request
    #:http-request-protocol-version
    #:http-request-method
+   #:http-request-protocol
    #:http-request-uri
    #:http-request-target
    #:http-request-headers
@@ -36,6 +37,7 @@
    #:http-request-authority
    #:http-request-path
    #:http-request-query
+   #:http-request-summary
    #:http-response
    #:http-response-p
    #:make-http-response
@@ -45,6 +47,8 @@
    #:http-response-headers
    #:http-response-trailers
    #:http-response-body
+   #:http-response-summary
+   #:format-http-priority-field-value
    #:http-response-stream
    #:http-response-stream-p
    #:make-http-response-stream

@@ -91,7 +91,7 @@ for connection close."
          (protocol-version (http-response-protocol-version response))
          (http10-p (string= protocol-version "HTTP/1.0"))
          (http11-p (string= protocol-version "HTTP/1.1"))
-         (bodyless-p (or (string-equal method "HEAD")
+         (bodyless-p (or (string= method "HEAD")
                          (= status 204)
                          (= status 205)
                          (= status 304)
@@ -106,7 +106,7 @@ for connection close."
          (or http11-p
              (%http-header-token-p response-headers "Connection" "keep-alive"))
          (not (= status 101))
-         (not (and (string-equal method "CONNECT")
+         (not (and (string= method "CONNECT")
                    (<= 200 status 299)))
          self-delimited-p)))
 
@@ -131,6 +131,12 @@ for connection close."
            :message "A request body length requires a request body producer."
            :operation :body
            :detail request-body-length))
+  (when (and request-body-function
+             (string= (http-request-method request) "TRACE"))
+    (error 'http-protocol-error
+           :message "TRACE requests must not contain content."
+           :operation :body
+           :detail :trace-content))
   (when request-body-function
     (unless (zerop (length (http-request-body request)))
       (error 'http-protocol-error
@@ -241,7 +247,7 @@ for connection close."
 
 (defun send-http-request-over-open-stream
     (request stream &key timeout deadline
-                      max-header-bytes max-body-bytes
+                      max-header-bytes max-fields max-body-bytes
                       request-target on-body-chunk on-information
                       request-body-function request-body-length
                       (collect-body-p t)
@@ -326,6 +332,7 @@ TLS, proxy, or concurrency dependencies on the core system."
                   (parse-http-response stream
                                        :deadline absolute-deadline
                                        :max-header-bytes max-header-bytes
+                                       :max-fields max-fields
                                        :max-body-bytes max-body-bytes
                                        :request-method (http-request-method request)
                                        :on-body-chunk on-body-chunk
@@ -340,7 +347,7 @@ TLS, proxy, or concurrency dependencies on the core system."
 
 (defun send-http-request-over-stream
     (request &key open-stream close-stream timeout deadline
-                   max-header-bytes max-body-bytes
+                   max-header-bytes max-fields max-body-bytes
                    request-target on-body-chunk on-information
                    request-body-function request-body-length
                    (collect-body-p t)
@@ -377,6 +384,7 @@ outside this direct function boundary."
                   request stream
                   :deadline absolute-deadline
                   :max-header-bytes max-header-bytes
+                  :max-fields max-fields
                   :max-body-bytes max-body-bytes
                   :request-target request-target
                   :on-body-chunk on-body-chunk
@@ -391,7 +399,7 @@ outside this direct function boundary."
 (defun send-http-request-over-stream/cps
     (request on-success
      &key on-error open-stream close-stream timeout deadline
-       max-header-bytes max-body-bytes
+       max-header-bytes max-fields max-body-bytes
        request-target on-body-chunk on-information
        request-body-function request-body-length
        (collect-body-p t)
@@ -406,6 +414,7 @@ outside this direct function boundary."
       :timeout timeout
       :deadline deadline
       :max-header-bytes max-header-bytes
+      :max-fields max-fields
       :max-body-bytes max-body-bytes
       :request-target request-target
       :on-body-chunk on-body-chunk

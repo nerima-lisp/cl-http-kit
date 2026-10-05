@@ -6,7 +6,7 @@
   result)
 
 (defun %sse-append-string (result string)
-  (%sse-append-octets result (http-utf8-octets string)))
+  (%sse-append-octets result (cl-codec-kit:string-to-octets string :encoding :utf-8)))
 
 (defun %sse-emit-line (result prefix value)
   (%sse-append-string result prefix)
@@ -68,7 +68,7 @@
        retry))
     (dolist (comment comments)
       (%sse-emit-line result ":" comment))
-    (when (and (plusp (length event-name))
+    (when (and (not (string= event-name ""))
                (not (string= event-name "message")))
       (%sse-emit-line result "event:" event-name))
     (when id

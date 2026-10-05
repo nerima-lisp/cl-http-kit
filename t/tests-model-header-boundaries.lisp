@@ -1,4 +1,4 @@
-(in-package #:http-kit/test)
+(in-package #:http-kit/test-core)
 
 (deftest message-model-boundaries
   (dolist (entry '((100 "Continue")
@@ -8,33 +8,65 @@
                    (200 "OK")
                    (201 "Created")
                    (202 "Accepted")
+                   (203 "Non-Authoritative Information")
                    (204 "No Content")
+                   (205 "Reset Content")
                    (206 "Partial Content")
+                   (207 "Multi-Status")
+                   (208 "Already Reported")
+                   (226 "IM Used")
+                   (300 "Multiple Choices")
                    (301 "Moved Permanently")
                    (302 "Found")
+                   (303 "See Other")
                    (304 "Not Modified")
+                   (305 "Use Proxy")
+                   (306 "Switch Proxy")
                    (307 "Temporary Redirect")
                    (308 "Permanent Redirect")
                    (400 "Bad Request")
                    (401 "Unauthorized")
+                   (402 "Payment Required")
                    (403 "Forbidden")
                    (404 "Not Found")
                    (405 "Method Not Allowed")
+                   (406 "Not Acceptable")
+                   (407 "Proxy Authentication Required")
                    (408 "Request Timeout")
                    (409 "Conflict")
+                   (410 "Gone")
+                   (411 "Length Required")
+                   (412 "Precondition Failed")
+                   (413 "Content Too Large")
+                   (414 "URI Too Long")
+                   (415 "Unsupported Media Type")
+                   (416 "Range Not Satisfiable")
+                   (417 "Expectation Failed")
+                   (418 "I'm a teapot")
+                   (421 "Misdirected Request")
+                   (422 "Unprocessable Content")
+                   (423 "Locked")
+                   (424 "Failed Dependency")
+                   (425 "Too Early")
+                   (426 "Upgrade Required")
+                   (428 "Precondition Required")
                    (429 "Too Many Requests")
+                   (431 "Request Header Fields Too Large")
+                   (451 "Unavailable For Legal Reasons")
                    (500 "Internal Server Error")
                    (501 "Not Implemented")
                    (502 "Bad Gateway")
                    (503 "Service Unavailable")
                    (504 "Gateway Timeout")
-                   (505 "HTTP Version Not Supported")))
+                   (505 "HTTP Version Not Supported")
+                   (510 "Not Extended")
+                   (511 "Network Authentication Required")))
     (let ((response (make-http-response :status (first entry))))
       (ensure-equal (second entry)
                     (http-response-reason response)
                     "known HTTP reason phrase")))
   (ensure-equal ""
-                (http-response-reason (make-http-response :status 418))
+                (http-response-reason (make-http-response :status 299))
                 "unknown HTTP reason phrase")
   (let ((response (make-http-response
                    :status 299
@@ -50,15 +82,21 @@
                   (http-header-value (http-response-trailers response)
                                      "x-trailer"))
     (ensure-equal (octets 1 2 3) (http-response-body response))
-    (let ((printed (princ-to-string response)))
-      (ensure-true (search "status=299" printed))
-      (ensure-true (search "body-bytes=3" printed))))
+    (ensure-summary=
+     "HTTP/1.1 299 Application-defined headers=1 trailers=1 body-bytes=3"
+     (http-response-summary response)))
   (let* ((request (make-http-request
                    :method "GET"
                    :uri "http://127.0.0.1/"))
-         (printed (princ-to-string request)))
-    (ensure-true (search "GET http://127.0.0.1/" printed))
-    (ensure-true (not (search "?<redacted>" printed))))
+         (summary (http-request-summary request)))
+    (ensure-summary=
+     "GET http://127.0.0.1/ headers=0 trailers=0 body-bytes=0"
+     summary)
+    (ensure-summary-contains
+     summary
+     "GET"
+     "http://127.0.0.1/"
+     "body-bytes=0"))
   (signals http-protocol-error
     (make-http-request :method nil :uri "http://127.0.0.1/"))
   (signals http-protocol-error
@@ -112,8 +150,12 @@
     (ensure-equal "fallback" (http-header-value headers "x-missing" "fallback"))
     (ensure-true (http-header-present-p headers "x-object"))
     (ensure-true (not (http-header-present-p headers "x-missing")))
-    (ensure-true (search "visible"
-                        (princ-to-string (make-http-header "X-Visible" "visible")))))
+    (ensure-printed=
+     "#<HTTP-HEADER X-Visible: visible>"
+     (make-http-header "X-Visible" "visible"))
+    (ensure-printed=
+     "#<HTTP-HEADER Authorization: <redacted>>"
+     (make-http-header "Authorization" "secret-token")))
   (signals http-invalid-header
     (make-http-request :method "GET"
                        :uri "http://127.0.0.1/"

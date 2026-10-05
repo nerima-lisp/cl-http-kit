@@ -109,8 +109,8 @@
     (ensure-equal (octets 1 2 3) (http-response-body response)
                   "WINDOW_UPDATE response body")
     (ensure-equal
-     (list (h2-frame 8 0 0 (octets 0 0 0 3))
-           (h2-frame 8 0 1 (octets 0 0 0 3))
+     (list (h2-frame 8 0 0 (octets 0 0 0 6))
+           (h2-frame 8 0 1 (octets 0 0 0 6))
            (h2-frame 4 1 0 (octets)))
      sent
      "HTTP/2 stream and connection receive windows are restored")))
@@ -198,6 +198,39 @@
                      (h2-frame 1 5 1 large-header-block))))
        (make-http-request :method "GET" :uri "https://127.0.0.1/")
        :max-header-bytes 4))))
+
+(deftest http2-enforces-response-field-count-limit
+  (let ((response-headers
+          (h2-header-block
+           (cons ":status" "200")
+           (cons "content-type" "text/plain"))))
+    (signals http-size-limit-exceeded
+      (http-kit/http2:send-http2-request
+       (http-kit/http2:make-http2-client
+        :exchange (lambda (request wire &key timeout deadline)
+                    (declare (ignore request wire timeout deadline))
+                    (concatenate-octets
+                     (h2-frame 4 0 0 (octets))
+                     (h2-frame 1 5 1 response-headers))))
+       (make-http-request :method "GET" :uri "https://127.0.0.1/")
+       :max-fields 1))))
+
+(deftest http2-request-cannot-weaken-client-field-count-limit
+  (let ((response-headers
+          (h2-header-block
+           (cons ":status" "200")
+           (cons "content-type" "text/plain"))))
+    (signals http-size-limit-exceeded
+      (http-kit/http2:send-http2-request
+       (http-kit/http2:make-http2-client
+        :exchange (lambda (request wire &key timeout deadline)
+                    (declare (ignore request wire timeout deadline))
+                    (concatenate-octets
+                     (h2-frame 4 0 0 (octets))
+                     (h2-frame 1 5 1 response-headers)))
+        :max-fields 1)
+       (make-http-request :method "GET" :uri "https://127.0.0.1/")
+       :max-fields 2))))
 
 (deftest http2-rejects-oversized-table-update
   (let ((oversized-table-update

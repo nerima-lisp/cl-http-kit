@@ -238,4 +238,16 @@
   (http-kit/http2::%h2-handle-control-frame
    (http-kit/http2::%make-h2-frame
     :length 0 :type 99 :flags 0 :stream-id 0 :payload (octets))
-   nil))
+   nil)
+  (ensure-true
+   (http-kit/http2::%h2-control-frame-p
+    http-kit/http2::+http2-priority-update-type+))
+  (signals http-protocol-error
+    (http-kit/http2::%h2-handle-control-frame
+     (http-kit/http2::%make-h2-frame
+      :length 7
+      :type http-kit/http2::+http2-priority-update-type+
+      :flags 0
+      :stream-id 0
+      :payload (octets 0 0 0 1 117 61 48))
+     nil)))

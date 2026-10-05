@@ -105,6 +105,99 @@ Both values are seconds.  NIL means that no bound was requested."
   (and (plusp (length string))
        (every #'%ascii-name-char-p string)))
 
+(defun %forbidden-trailer-field-name-p (name)
+  (member (string-downcase name)
+          '("age" "authorization" "cache-control" "connection"
+            "content-encoding" "content-language" "content-length"
+            "content-location" "content-range" "content-type" "cookie"
+            "date" "expect" "expires" "host" "if-match"
+            "if-modified-since" "if-none-match" "if-range"
+            "if-unmodified-since" "keep-alive" "location" "max-forwards"
+            "proxy-authenticate" "proxy-authentication-info"
+            "proxy-authorization" "proxy-connection" "range" "retry-after"
+            "set-cookie" "te" "trailer" "transfer-encoding" "upgrade"
+            "vary" "via" "warning" "www-authenticate")
+          :test #'string=))
+
+(defun %http1-chunk-size-text (line)
+  (labels ((ows-p (character)
+             (or (char= character #\Space)
+                 (char= character #\Tab)))
+           (skip-ows (index)
+             (loop while (and (< index (length line))
+                              (ows-p (char line index)))
+                   do (incf index)
+                   finally (return index)))
+           (skip-token (index)
+             (loop while (and (< index (length line))
+                              (%ascii-name-char-p (char line index)))
+                   do (incf index)
+                   finally (return index)))
+           (skip-quoted-string (index)
+             (loop with escaped-p = nil
+                   for cursor from (1+ index) below (length line)
+                   for character = (char line cursor)
+                   for code = (char-code character)
+                   do (cond
+                        (escaped-p
+                         (unless (or (= code #x09)
+                                     (<= #x20 code #x7e)
+                                     (<= #x80 code #xff))
+                           (return nil))
+                         (setf escaped-p nil))
+                        ((char= character #\\)
+                         (setf escaped-p t))
+                        ((char= character #\")
+                         (return (1+ cursor)))
+                        ((not (or (= code #x09)
+                                  (= code #x20)
+                                  (= code #x21)
+                                  (<= #x23 code #x5b)
+                                  (<= #x5d code #x7e)
+                                  (<= #x80 code #xff)))
+                         (return nil)))
+                   finally (return nil))))
+    (let ((size-end 0)
+          (cursor 0))
+      (loop while (and (< size-end (length line))
+                       (%hex-character-p (char line size-end)))
+            do (incf size-end))
+      (when (zerop size-end)
+        (return-from %http1-chunk-size-text nil))
+      (setf cursor size-end)
+      (loop
+        (when (= cursor (length line))
+          (return (subseq line 0 size-end)))
+        (let ((extension-start cursor))
+          (setf cursor (skip-ows cursor))
+          (unless (and (< cursor (length line))
+                       (char= (char line cursor) #\;))
+            (return nil))
+          (incf cursor)
+          (setf cursor (skip-ows cursor))
+          (let ((name-start cursor))
+            (setf cursor (skip-token cursor))
+            (when (= cursor name-start)
+              (return nil)))
+          (setf cursor (skip-ows cursor))
+          (when (and (< cursor (length line))
+                     (char= (char line cursor) #\=))
+            (incf cursor)
+            (setf cursor (skip-ows cursor))
+            (cond
+              ((and (< cursor (length line))
+                    (char= (char line cursor) #\"))
+               (setf cursor (skip-quoted-string cursor)))
+              (t
+               (let ((value-start cursor))
+                 (setf cursor (skip-token cursor))
+                 (when (= cursor value-start)
+                   (return nil)))))
+            (unless cursor
+              (return nil)))
+          (when (= extension-start cursor)
+            (return nil)))))))
+
 (defun %header-name-p (string)
   (%token-p string))
 
@@ -134,41 +227,22 @@ Both values are seconds.  NIL means that no bound was requested."
     (setf (aref result (length vector)) octet)
     result))
 
-(defun %decimal-string-p (string)
-  (and (plusp (length string))
-       (every (lambda (character)
-                (let ((code (char-code character)))
-                  (and (<= (char-code #\0) code)
-                       (<= code (char-code #\9)))))
-              string)))
-
-(defun %parse-decimal (string)
-  (unless (%decimal-string-p string)
-    (error 'http-protocol-error
-           :message "Expected an ASCII decimal integer."
-           :operation :integer
-           :detail string))
-  (parse-integer string))
-
-(defun %hex-digit (character)
-  (let ((code (char-code character)))
-    (cond ((and (<= (char-code #\0) code)
-                (<= code (char-code #\9)))
-           (- code (char-code #\0)))
-          ((and (<= (char-code #\A) code)
-                (<= code (char-code #\F)))
-           (+ 10 (- code (char-code #\A))))
-          ((and (<= (char-code #\a) code)
-                (<= code (char-code #\f)))
-           (+ 10 (- code (char-code #\a))))
-          (t
-           (error 'http-protocol-error
-                  :message "Expected a hexadecimal digit."
-                  :operation :chunk-size
-                  :detail character)))))
-
 (defun %bounded-diagnostic (value &optional (limit 160))
   (let ((text (princ-to-string value)))
     (if (> (length text) limit)
         (concatenate 'string (subseq text 0 limit) "...")
         text)))
+
+(defun format-http-priority-field-value (&key (urgency 3) incremental)
+  "Return a canonical RFC 9218 Priority field value."
+  (unless (and (integerp urgency) (<= 0 urgency 7))
+    (error 'http-protocol-error
+           :message "HTTP priority urgency must be an integer from 0 through 7."
+           :operation :http-priority
+           :detail urgency))
+  (unless (typep incremental 'boolean)
+    (error 'http-protocol-error
+           :message "HTTP priority incremental must be a boolean."
+           :operation :http-priority
+           :detail incremental))
+  (format nil "u=~D~:[~;, i~]" urgency incremental))

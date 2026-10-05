@@ -7,7 +7,9 @@
              (format stream "~A" (http-error-message condition)))))
 
 (define-condition http-protocol-error (http-error)
-  ((detail :initarg :detail :initform nil :reader http-protocol-error-detail)))
+  ((detail :initarg :detail :initform nil :reader http-protocol-error-detail)
+   (http2-error-code :initarg :http2-error-code :initform nil
+                     :reader http-protocol-error-http2-error-code)))
 
 (define-condition http-invalid-uri (http-protocol-error)
   ((input :initarg :input :reader http-invalid-uri-input)))
