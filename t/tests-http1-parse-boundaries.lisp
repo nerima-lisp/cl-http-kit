@@ -44,6 +44,81 @@
            (ascii "HTTP/1.1 200 |CRLF||CRLF|"))))
     (ensure-equal "" (http-response-reason response))))
 
+(deftest http1-head-and-304-metadata-length-budget
+  (dolist (case '(("HEAD" 200) ("GET" 304)))
+    (let ((response
+            (parse-http-response
+             (ascii (format nil "HTTP/1.1 ~D OK|CRLF|Content-Length: 100|CRLF||CRLF|"
+                            (second case)))
+             :request-method (first case)
+             :max-body-bytes 0)))
+      (ensure-equal 0 (length (http-response-body response)))
+      (ensure-equal "100" (http-header-value
+                           (http-response-headers response) "Content-Length"))))
+  (signals http-size-limit-exceeded
+    (parse-http-response
+     (ascii "HTTP/1.1 200 OK|CRLF|Content-Length: 100|CRLF||CRLF|")
+     :max-body-bytes 0))
+  (dolist (headers '("Content-Length: nope"
+                     "Content-Length: 100|CRLF|Content-Length: 101"))
+    (signals http-invalid-header
+      (parse-http-response
+       (ascii (format nil "HTTP/1.1 200 OK|CRLF|~A|CRLF||CRLF|" headers))
+       :request-method "HEAD"
+       :max-body-bytes 0))))
+
+(deftest http1-chunked-payload-and-framing-budgets
+  (let* ((payload (make-string 80 :initial-element #\a))
+         (prefix (ascii "HTTP/1.1 200 OK|CRLF|Transfer-Encoding: chunked|CRLF||CRLF|"))
+         (wire (concatenate-octets
+                prefix (ascii (format nil "50|CRLF|~A|CRLF|0|CRLF||CRLF|" payload))))
+         (header-limit (+ (length prefix) 11)))
+    (ensure-equal payload
+                  (octets-as-string
+                   (http-response-body
+                    (parse-http-response
+                     (ascii (format nil "HTTP/1.1 200 OK|CRLF|Content-Length: 80|CRLF||CRLF|~A"
+                                    payload))
+                     :max-header-bytes header-limit :max-body-bytes 80))))
+    (ensure-equal payload
+                  (octets-as-string
+                   (http-response-body
+                    (parse-http-response wire :max-header-bytes header-limit
+                                              :max-body-bytes 80))))
+    (let ((received 0))
+      (ensure-equal 0
+                    (length (http-response-body
+                             (parse-http-response
+                              wire :max-header-bytes header-limit :max-body-bytes 80
+                              :collect-body-p nil
+                              :on-body-chunk (lambda (chunk)
+                                               (incf received (length chunk)))))))
+      (ensure-equal 80 received))
+    (signals http-size-limit-exceeded
+      (parse-http-response wire :max-header-bytes (1- header-limit)
+                               :max-body-bytes 80))
+    (signals http-size-limit-exceeded
+      (parse-http-response wire :max-header-bytes header-limit :max-body-bytes 79))
+    (dolist (suffix '("1;long-extension=value|CRLF|a|CRLF|0|CRLF||CRLF|"
+                      "1|CRLF|a|CRLF|0|CRLF|X-Trailer: long-value|CRLF||CRLF|"))
+      (signals http-size-limit-exceeded
+        (parse-http-response (concatenate-octets prefix (ascii suffix))
+                             :max-header-bytes header-limit :max-body-bytes 80)))))
+
+(deftest http1-head-205-chunked-metadata
+  (dolist (status '(200 205))
+    (let ((response
+            (parse-http-response
+             (ascii (format nil "HTTP/1.1 ~D OK|CRLF|Transfer-Encoding: chunked|CRLF||CRLF|"
+                            status))
+             :request-method "HEAD" :max-body-bytes 0
+             :on-body-chunk (lambda (chunk)
+                              (declare (ignore chunk))
+                              (error "A HEAD response must not deliver a body.")))))
+      (ensure-equal status (http-response-status response))
+      (ensure-equal 0 (length (http-response-body response)))
+      (ensure-equal nil (http-response-trailers response)))))
+
 (deftest http1-body-and-trailer-boundaries
   (let ((response
           (parse-http-response
@@ -222,6 +297,55 @@
      :max-body-bytes "invalid"))
   (signals http-invalid-header
     (http-kit::%parse-response-header-line "")))
+
+(deftest http1-response-option-rejects-nonfunction-body-callback
+  (let ((condition
+          (handler-case
+              (parse-http-response (octets) :on-body-chunk :invalid)
+            (http-protocol-error (condition) condition))))
+    (ensure-true (typep condition 'http-protocol-error))
+    (ensure-equal :response-parse (http-error-operation condition))
+    (ensure-equal :invalid (http-protocol-error-detail condition))))
+
+(deftest http1-response-option-rejects-nonfunction-information-callback
+  (let ((condition
+          (handler-case
+              (parse-http-response (octets) :on-information 42)
+            (http-protocol-error (condition) condition))))
+    (ensure-true (typep condition 'http-protocol-error))
+    (ensure-equal :response-parse (http-error-operation condition))
+    (ensure-equal 42 (http-protocol-error-detail condition))))
+
+(deftest http1-response-option-rejects-nonboolean-collection
+  (let ((condition
+          (handler-case
+              (parse-http-response (octets) :collect-body-p 1)
+            (http-protocol-error (condition) condition))))
+    (ensure-true (typep condition 'http-protocol-error))
+    (ensure-equal :response-parse (http-error-operation condition))
+    (ensure-equal 1 (http-protocol-error-detail condition))))
+
+(deftest http1-response-option-callbacks-with-and-without-collection
+  (dolist (collect-body-p '(nil t))
+    (let* ((chunks '())
+           (information '())
+           (response
+             (parse-http-response
+              (ascii "HTTP/1.1 103 Early Hints|CRLF|Link: </style.css>|CRLF||CRLF|HTTP/1.1 200 OK|CRLF|Content-Length: 3|CRLF||CRLF|abc")
+              :collect-body-p collect-body-p
+              :on-body-chunk (lambda (chunk) (push chunk chunks))
+              :on-information (lambda (response) (push response information)))))
+      (ensure-equal 200 (http-response-status response))
+      (ensure-octets-equal (if collect-body-p (ascii "abc") (octets))
+                           (http-response-body response))
+      (ensure-equal 1 (length chunks))
+      (ensure-octets-equal (ascii "abc") (first chunks))
+      (ensure-equal 1 (length information))
+      (ensure-equal 103 (http-response-status (first information)))
+      (ensure-equal '("</style.css>")
+                    (http-header-values
+                     (http-response-headers (first information)) "link"))
+      (ensure-equal 0 (length (http-response-body (first information)))))))
 
 (deftest http1-persistence-boundaries
   (let ((request (make-http-request :method "GET" :uri "http://127.0.0.1/")))

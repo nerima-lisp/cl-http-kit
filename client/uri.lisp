@@ -64,11 +64,9 @@
 
 (defun %merge-relative-path (base-path reference-path)
   (let ((slash (position #\/ base-path :from-end t)))
-    (if slash
-        (concatenate 'string
-                     (subseq base-path 0 (1+ slash))
-                     reference-path)
-        (concatenate 'string "/" reference-path))))
+    (concatenate 'string
+                 (subseq base-path 0 (1+ slash))
+                 reference-path)))
 
 (defun resolve-http-uri (base reference)
   "Resolve an absolute or relative HTTP reference against BASE.
@@ -134,8 +132,7 @@ fresh HTTP-URI value with dot segments removed from its path."
           (default-port (if (string= (http-uri-scheme uri) "https")
                             443
                             80)))
-      (if (and (= port default-port)
-               (null (http-uri-port uri)))
+      (if (= port default-port)
           host
           (format nil "~A:~D" host port)))))
 
@@ -197,12 +194,10 @@ have the same origin as their omitted forms."
                       (write-char character output)
                       (setf escaped-p nil))
                      ((char= character #\\) (setf escaped-p t))
-                     (t (write-char character output)))
-            finally (when escaped-p (return-from %alt-svc-unquote nil))))))
+                     (t (write-char character output)))))))
 
 (defun %alt-svc-protocol-id-p (string)
-  (and (plusp (length string))
-       (loop with index = 0
+  (loop with index = 0
              while (< index (length string))
              for character = (char string index)
              do (if (char= character #\%)
@@ -225,7 +220,7 @@ have the same origin as their omitted forms."
                     (unless (http-kit::%ascii-name-char-p character)
                       (return nil)))
                 (incf index (if (char= character #\%) 3 1))
-             finally (return t))))
+             finally (return t)))
 
 (defun %ensure-alternative-service-store (store)
   (unless (http-alternative-service-store-p store)
@@ -255,8 +250,7 @@ have the same origin as their omitted forms."
                    (<= (http-uri-port uri) 65535)
                    (string= authority (http-uri-authority uri)))
           (values (http-uri-host uri) (http-uri-port uri))))
-    (http-error () nil)
-    (error () nil)))
+    (http-error () nil)))
 
 (defun %parse-alt-svc-value (text origin-uri origin now age)
   (let* ((parts (%alt-svc-split text #\;))

@@ -1,5 +1,44 @@
 (in-package #:http-kit/client)
 
+(defun %push-utf8-code-point (code result)
+  (cond ((<= code #x7f)
+         (vector-push-extend code result))
+        ((<= code #x7ff)
+         (vector-push-extend (+ #xc0 (ldb (byte 5 6) code)) result)
+         (vector-push-extend (+ #x80 (ldb (byte 6 0) code)) result))
+        ((<= code #xffff)
+         (when (<= #xd800 code #xdfff)
+           (%client-protocol-error
+            "UTF-8 cannot encode a surrogate code point."
+            code))
+         (vector-push-extend (+ #xe0 (ldb (byte 4 12) code)) result)
+         (vector-push-extend (+ #x80 (ldb (byte 6 6) code)) result)
+         (vector-push-extend (+ #x80 (ldb (byte 6 0) code)) result))
+        ((<= code #x10ffff)
+         (vector-push-extend (+ #xf0 (ldb (byte 3 18) code)) result)
+         (vector-push-extend (+ #x80 (ldb (byte 6 12) code)) result)
+         (vector-push-extend (+ #x80 (ldb (byte 6 6) code)) result)
+         (vector-push-extend (+ #x80 (ldb (byte 6 0) code)) result))
+        (t
+         (%client-protocol-error
+          "A character is outside the Unicode scalar value range."
+          code))))
+
+(defun http-utf8-octets (string)
+  "Encode STRING as UTF-8 octets without depending on implementation codecs."
+  (unless (stringp string)
+    (%client-protocol-error "UTF-8 encoding requires a string." string))
+  (let ((result (make-array 0
+                            :element-type '(unsigned-byte 8)
+                            :adjustable t
+                            :fill-pointer 0)))
+    (loop for character across string
+          do (%push-utf8-code-point (char-code character) result))
+    (let ((copy (make-array (length result)
+                            :element-type '(unsigned-byte 8))))
+      (replace copy result)
+      copy)))
+
 (defun %hex-digit (value)
   (char "0123456789ABCDEF" value))
 
@@ -7,20 +46,20 @@
   (or (and (<= (char-code #\A) byte) (<= byte (char-code #\Z)))
       (and (<= (char-code #\a) byte) (<= byte (char-code #\z)))
       (and (<= (char-code #\0) byte) (<= byte (char-code #\9)))
-      (and safe (find (code-char byte) safe :test #'char=))))
+      (and (< byte #x80) safe
+           (find (code-char byte) safe :test #'char=))))
 
 (defun http-percent-encode (string &key (safe "-._~") (space-as-plus-p nil))
-  "Percent-encode STRING as UTF-8 octets.
+  "Percent-encode STRING after UTF-8 conversion.
 
-SAFE contains additional ASCII bytes that remain literal.  When
-SPACE-AS-PLUS-P is true, spaces are emitted as plus signs; all other bytes
-outside the safe set use uppercase hexadecimal escapes."
+SAFE contains ASCII characters that remain literal.  SPACE-AS-PLUS-P is for
+application/x-www-form-urlencoded rather than generic URI components."
   (unless (stringp string)
     (%client-protocol-error "Percent encoding requires a string." string))
   (unless (or (null safe) (stringp safe))
     (%client-protocol-error "The percent-encoding safe set must be a string or NIL."
                             safe))
-  (let ((octets (cl-codec-kit:string-to-octets string :encoding :utf-8)))
+  (let ((octets (http-utf8-octets string)))
     (with-output-to-string (stream)
       (loop for byte across octets
             do (cond ((and space-as-plus-p (= byte #x20))
@@ -42,17 +81,15 @@ outside the safe set use uppercase hexadecimal escapes."
                           (%client-protocol-error
                            "Form fields must be name/value pairs."
                            field))))))
-       ((and (consp field) (consp (cdr field))
-             (null (cddr field)) (stringp (first field)))
-        (values (first field) (second field)))
        (t
-        (%client-protocol-error "Form fields must be name/value pairs." field))))
+         (%client-protocol-error "Form fields must be name/value pairs." field))))
 
 (defun http-form-urlencode (fields)
-  "Encode FIELDS as an application/x-www-form-urlencoded string.
+  "Return FIELDS in application/x-www-form-urlencoded form.
 
-Each field is a two-element list containing a string name and a string or NIL
-value.  NIL values are represented by an empty value."
+FIELDS is a list of cons pairs or two-element lists.  NIL values encode as an
+empty value; non-string values are rejected so callers cannot accidentally
+serialize implementation-specific objects into a request body."
   (unless (listp fields)
     (%client-protocol-error "Form fields must be a list." fields))
   (with-output-to-string (stream)
@@ -61,16 +98,18 @@ value.  NIL values are represented by an empty value."
           do (multiple-value-bind (name value) (%form-field field)
                (unless (or (null value) (stringp value))
                  (%client-protocol-error
-                  "Form field values must be strings or NIL." value))
+                  "Form field values must be strings or NIL."
+                  value))
                (unless firstp (write-char #\& stream))
-               (write-string (http-percent-encode name :safe "-._*"
+               (write-string (http-percent-encode name
+                                                  :safe "-._*"
                                                   :space-as-plus-p t)
                              stream)
                (write-char #\= stream)
-               (write-string (http-percent-encode (or value "") :safe "-._*"
+               (write-string (http-percent-encode (or value "")
+                                                  :safe "-._*"
                                                   :space-as-plus-p t)
                              stream)))))
 
 (defun http-form-urlencoded-octets (fields)
-  "Encode FIELDS as UTF-8 octets for an HTTP request body."
-  (cl-codec-kit:string-to-octets (http-form-urlencode fields) :encoding :utf-8))
+  (http-utf8-octets (http-form-urlencode fields)))

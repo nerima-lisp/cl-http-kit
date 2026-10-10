@@ -6,11 +6,11 @@ WebSocket sessions, and native TCP/DNS integration. This page describes the
 behavior implemented by the registered systems; it is not a claim of complete
 RFC coverage.
 
-The registered systems in this checkout are version 0.4.0. The current
-integration source already has native default client wiring, proxy-environment
+The registered systems in this checkout are version 0.4.1. The current
+integration source has native default client wiring, proxy-environment
 parsing, lock-backed pool/cookie state, and four-kit dependency declarations.
 The URL-and-method convenience form is available through `http-client-send`.
-The TLS wrapper uses cl-tls-kit for the native TLS 1.3 client path; server
+The TLS wrapper requires cl-tls-kit 0.1.2 or later for the native TLS 1.3 client path; server
 wrapping remains an explicit unsupported boundary because the kit does not
 expose a server driver.
 
@@ -31,6 +31,12 @@ The response parser supports:
 - close-delimited bodies;
 - no-body rules for HEAD responses and the relevant status codes;
 - header and body byte limits.
+
+HEAD responses preserve Content-Length metadata without reading a body,
+including for status 205. Other 205 responses are bodyless and reject a
+nonzero Content-Length. Chunked payload bytes count toward the body limit;
+chunk-size lines, chunk extensions, delimiters, and trailers count toward
+the header limit separately.
 
 Conflicting transfer framing, malformed chunk data, invalid status lines, and
 truncated fixed-length bodies raise public conditions.
@@ -77,6 +83,8 @@ decoding.
 
 The optional cl-http-kit/http3 system implements HTTP/3 control and
 request-stream framing over callbacks supplied by a QUIC implementation. It
+requires SBCL at load time: its cl-quic-kit dependency loads the UDP
+implementation even when the caller supplies QUIC callbacks. It
 supports a client and serve-http3-request-stream for one injected server
 request stream, including request/response headers and trailers, DATA frames,
 content-length checks, static and literal QPACK field sections, HPACK Huffman
@@ -113,7 +121,9 @@ The client can advertise `MAX_PUSH_ID`, receive promised responses on injected
 push streams, and cancel pushes. The server boundary can emit a push promise
 and its matching push stream when the surrounding QUIC transport supplies the
 required callbacks.
-The optional cl-quic-kit client adapter drives a caller-selected QUIC client,
+The `on-push-promise` callback receives its own copy of the field names and
+values. Changing those strings does not change the client's retained promise.
+The cl-quic-kit client adapter can drive a caller-selected QUIC client,
 including its TLS handshake and HTTP/3 stream lifecycle; it does not replace
 the caller's QUIC, socket, certificate, or server-accept policy.
 Invalid or deliberately unsupported protocol features raise public protocol or
@@ -127,6 +137,10 @@ retry, and thread-safe HTTP/1.1 connection-pool policies around core messages.
 The client creates native TCP, TLS 1.3, and pooling boundaries when no custom
 transport is supplied. The `cl-http-kit/tls` system uses cl-tls-kit for client
 certificate verification, trust-store loading, and handshake deadlines.
+Verification defaults to `:required`; `:optional` applies the same policy.
+Only `nil` skips certificate-chain, hostname, and trust checks, and it does
+not disable the TLS CertificateVerify signature check. The TLS stream
+requires a peer close_notify before treating transport EOF as clean closure.
 Server-side TLS wrapping is explicitly unsupported by the current kit boundary.
 For an HTTPS server, terminate TLS in a reverse proxy or load balancer and
 forward plain HTTP to `cl-http-kit/network`. Configure the proxy to preserve
@@ -141,19 +155,30 @@ proxy provider supplies credentials for its parsed challenge.
 The client enables an in-memory RFC 6797 HSTS store by default. Valid secure
 responses can add, replace, expire, or remove host policies; matching HTTP
 requests and redirect targets are upgraded before transport selection. IP
-literals and insecure responses cannot establish policy. Applications can
-inject a store to retain policy across client instances, clear it explicitly,
-or pass `:strict-transport-store nil` to disable HSTS.
+literals and HTTP URIs cannot establish policy. The store checks the HTTPS
+scheme, not the transport's certificate-verification result. Applications
+using custom transports must ensure successful TLS verification before
+learning policies, or pass `:strict-transport-store nil` to disable HSTS.
+Applications can inject a store to retain policy across client instances or
+clear it explicitly.
 The client also enables an in-memory RFC 7838 alternative-service store by
 default. It learns valid `Alt-Svc` response fields, accounts for `Age`, applies
 the default `ma`, handles `clear`, expiry, and `persist=1`, and can discard
-non-persistent alternatives when the network changes. Applications select from
-the discovered services and remove a rejected service after a 421 response.
-When `:http3-transport-function` is supplied, an advertised `h3` alternative is
-attempted before TCP; a failed QUIC attempt removes that alternative for the
-request and falls back to HTTP/2 or HTTP/1.1. The transport boundary must
-authenticate the certificate for the origin, send the origin as TLS SNI, and
-preserve proxy policy. An explicit HTTP/3 request does not fall back. Pass
+non-persistent alternatives when the network changes. When
+`:http3-transport-function` is supplied, the client selects the first unexpired
+`h3` alternative and attempts it before TCP. Applications must remove a
+rejected service after a 421 response; the client does not do so automatically.
+A failed attempt falls back to the primary transport only
+for `http-connection-error` with `:request-sent-p nil`, before any request-body
+producer or response callback has run. Other errors propagate. If no HTTP/3
+transport is configured, discovered alternatives do not prevent TCP use.
+The native primary transport uses HTTP/1.1; a custom primary transport can
+provide HTTP/2. The HTTP/3 transport must authenticate the origin certificate,
+send the origin as TLS SNI, and preserve proxy policy. The cl-quic-kit adapter
+requires the origin hostname and leaves trust policy with the caller. Its default
+TLS driver uses the default trust store when trust anchors are omitted. The HTTP/3
+manager rejects proxies rather than silently bypassing them. An explicit HTTP/3
+request does not fall back. Pass
 `:alternative-service-store nil` to disable discovery.
 Collected client responses automatically decode `gzip` and `deflate`
 `Content-Encoding` values, including stacked codings, and remove stale
@@ -176,7 +201,7 @@ revalidation function and owns asynchronous execution and duplicate-request
 coalescing; returning false makes the request perform normal synchronous
 validation. Serving stale updates `Age`, honors the response window, and is
 suppressed by explicit request revalidation directives.
-Fresh authenticated responses also honor RFC 8246 `immutable` for ordinary
+Fresh HTTPS responses also honor RFC 8246 `immutable` for ordinary
 `max-age=0` reloads. The extension is ignored for plain HTTP and for explicit
 `no-cache` force reloads.
 
@@ -187,18 +212,10 @@ partition key. The cache layer evaluates request directives such as `no-store`,
 when policy allows, and merges cache metadata from a 304 revalidation response
 without discarding the stored body.
 
-Client transport functions use one canonical keyword contract: they receive
-the timeout, deadline, size limits, proxy context, request-body producer,
-response callbacks, and `collect-body-p` keyword arguments described by the
-client API. Older transports that accept only a subset of these keywords are
-not supported; define the complete boundary or use the provided stream or
-connection-pool constructors.
-
-The current integration keeps these policy objects and compatibility entry
-points, and its native default supplies TCP/TLS, redirects, cookies, content
-coding, proxy environment lookup, and pooling when the optional systems are
-available. HTTP/3 connection selection is available when the cl-quic-kit
-adapter is explicitly supplied.
+Client transport functions must accept the keywords used by the request.
+The [client API](api.md#make-http-client) distinguishes always-passed keywords
+from optional body-producer and response-callback keywords. Use the provided
+stream or connection-pool constructors to compose those boundaries.
 
 ## WebSocket
 
@@ -257,8 +274,10 @@ implementation. Applications can adapt those concerns to their deployment,
 including the optional SBCL network boundary, and can supply callbacks to the
 library's pool without changing the message and wire layers. The optional
 high-level client supplies native TCP/TLS when its default boundary is used;
-custom transports retain ownership of their network and TLS setup. Proxy
-negotiation, character encoding, and logging policy remain application-owned.
+custom transports retain ownership of their network and TLS setup. The standard
+proxy stream opener implements HTTP forward/CONNECT and SOCKS5 negotiation;
+injected transports must implement the supplied proxy plan themselves. Character
+encoding and logging policy remain application-owned.
 
 ## Portability
 

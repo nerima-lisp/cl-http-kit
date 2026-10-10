@@ -1,8 +1,6 @@
 (in-package #:http-kit/websocket)
 
 (defun %websocket-header-tokens (value)
-  (unless (stringp value)
-    (%websocket-protocol-error "A WebSocket header value must be a string." value))
   (let ((tokens '())
         (start 0)
         (length (length value)))
@@ -259,10 +257,6 @@ NIL denotes a valueless parameter."
         (handler-case
             (progn
               (dolist (value values)
-                (unless (stringp value)
-                  (%websocket-protocol-error
-                   "A WebSocket subprotocol header must be a string."
-                   value))
                 (let ((start 0)
                       (length (length value)))
                   (loop

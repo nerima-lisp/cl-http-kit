@@ -134,7 +134,8 @@
 
   (defun %proxy-e2e-connect-proxy (target-port)
     (let ((listener (open-http-tcp-listener :host "127.0.0.1" :port 0))
-          (seen-requests nil) (authorized-p nil) (error-value nil) (thread nil))
+          (seen-requests nil) (authorized-p nil) (error-value nil) (thread nil)
+          (phase :accept))
       (setf thread
             (sb-thread:make-thread
              (lambda ()
@@ -142,9 +143,12 @@
                    (loop repeat 1
                          for client-stream =
                            (accept-http-tcp-stream listener :timeout 5)
-                         for wire = (%proxy-e2e-read-headers client-stream)
+                         for wire = (progn
+                                      (setf phase :read-headers)
+                                      (%proxy-e2e-read-headers client-stream))
                          for text = (octets-as-string wire)
                          do (push text seen-requests)
+                            (setf phase :validate-connect)
                             (if (search "Proxy-Authorization: Basic dXNlcjpwYXNz"
                                         text :test #'char-equal)
                                 (progn
@@ -164,34 +168,43 @@
                                             :uri (format nil "http://127.0.0.1:~D/"
                                                          target-port)))
                                          (target-stream
-                                           (open-http-tcp-stream target-request
-                                                                 :timeout 5)))
+                                           (progn
+                                             (setf phase :open-origin)
+                                             (open-http-tcp-stream target-request
+                                                                   :timeout 5))))
                                     (unwind-protect
                                          (progn
+                                           (setf phase :write-connect-response)
                                            (write-sequence
                                             (ascii "HTTP/1.1 200 Connection Established|CRLF|Proxy-Agent: e2e|CRLF||CRLF|")
                                             client-stream)
                                            (finish-output client-stream)
+                                           (setf phase :relay)
                                            (multiple-value-bind (relay-errors)
                                                (%proxy-e2e-relay client-stream
                                                                  target-stream)
                                              (when relay-errors
                                                (error "Proxy relay failed: ~S"
-                                                      relay-errors))))
+                                                      relay-errors)))
+                                           (setf phase :close-origin))
                                       (close-http-tcp-stream target-stream))))
                                 (progn
+                                  (setf phase :write-connect-response)
                                   (write-sequence
                                    (ascii "HTTP/1.1 407 Proxy Authentication Required|CRLF|Proxy-Authenticate: Basic realm=proxy-e2e|CRLF|Connection: close|CRLF||CRLF|proxy-auth-required")
                                    client-stream)
                                   (finish-output client-stream)))
-                            (close-http-tcp-stream client-stream))
+                            (setf phase :close-client)
+                            (close-http-tcp-stream client-stream)
+                         finally (setf phase :done))
                  (error (condition) (setf error-value condition))))))
       (values listener thread
               (lambda ()
                 (sb-thread:join-thread thread)
                 (when error-value (error error-value)))
               (lambda () (nreverse seen-requests))
-              (lambda () authorized-p)))))
+              (lambda () authorized-p)
+              (lambda () (values phase (when error-value (type-of error-value))))))))
 
   (defun %proxy-e2e-certificate (directory)
     (let ((certificate (namestring (merge-pathnames "server.crt" directory)))
@@ -216,23 +229,28 @@
            (input (uiop:process-info-input process))
            (output (uiop:process-info-output process))
            (error-value nil)
+           (phase :read-headers)
            (thread (sb-thread:make-thread
                     (lambda ()
                       (handler-case
                           (let ((wire (%proxy-e2e-read-headers output)))
+                            (setf phase :validate-request)
                             (unless (search "GET /proxy-tls HTTP/1.1"
                                             (octets-as-string wire))
                               (error "OpenSSL origin received unexpected request."))
+                            (setf phase :write-response)
                             (write-sequence
                              (ascii "HTTP/1.1 200 OK|CRLF|Connection: close|CRLF|Content-Length: 13|CRLF||CRLF|tls-origin-ok")
                              input)
-                            (finish-output input))
+                            (finish-output input)
+                            (setf phase :done))
                         (error (condition) (setf error-value condition)))))))
       (%e2e-wait-for-tcp "127.0.0.1" port)
       (values process input output thread
               (lambda ()
                 (sb-thread:join-thread thread)
-                (when error-value (error error-value))))))
+                (when error-value (error error-value)))
+              (lambda () (values phase (when error-value (type-of error-value)))))))
 
   (deftest e2e-http-proxy-environment-basic-retry
     (multiple-value-bind (origin-listener origin-thread join-origin)
@@ -275,8 +293,8 @@
                   (search "http://127.0.0.1:"
                           (http-request-target (first seen))))
                  (ensure-equal "Basic dXNlcjpwYXNz" (funcall auth))))
-          (ignore-errors (sb-thread:join-thread proxy-thread))
-          (ignore-errors (sb-thread:join-thread origin-thread))
+          (ignore-errors (sb-thread:join-thread proxy-thread)) ; paredit:ignore handler-case-swallows-error -- cleanup joins must preserve the test failure; worker errors are checked by JOIN-PROXY above.
+          (ignore-errors (sb-thread:join-thread origin-thread)) ; paredit:ignore handler-case-swallows-error -- cleanup joins must preserve the test failure; worker errors are checked by JOIN-ORIGIN above.
           (close-http-tcp-listener proxy-listener)
           (close-http-tcp-listener origin-listener)))))
 
@@ -286,9 +304,9 @@
            (origin-listener (open-http-tcp-listener :host "127.0.0.1" :port 0))
            (origin-port (http-network-listener-port origin-listener))
            (proxy-listener nil) (proxy-thread nil) (join-proxy nil)
-           (proxy-requests nil) (proxy-authorized-p nil)
+           (proxy-requests nil) (proxy-authorized-p nil) (proxy-state nil)
            (process nil) (tls-input nil) (tls-output nil)
-           (tls-thread nil) (join-tls nil))
+           (tls-thread nil) (join-tls nil) (origin-state nil))
       (close-http-tcp-listener origin-listener)
       (ensure-directories-exist directory)
       (multiple-value-bind (openssl certificate key)
@@ -298,12 +316,13 @@
                  (cl-tls-kit:pem-block-der
                   (first (cl-tls-kit:pem-decode
                           (uiop:read-file-string certificate)))))))
-          (multiple-value-setq (process tls-input tls-output tls-thread join-tls)
+          (multiple-value-setq (process tls-input tls-output tls-thread join-tls
+                                       origin-state)
             (%proxy-e2e-openssl-server openssl origin-port certificate key))
           (multiple-value-setq (proxy-listener proxy-thread join-proxy
-                                               proxy-requests proxy-authorized-p)
+                                               proxy-requests proxy-authorized-p proxy-state)
             (%proxy-e2e-connect-proxy origin-port))
-          (let ((failure nil))
+          (let ((failure nil) (child-exit nil))
             (unwind-protect
                  (handler-case
                      (%proxy-e2e-set-environment
@@ -339,9 +358,19 @@
                                            (http-response-body response)))))))
                    (error (condition)
                      (setf failure condition)))
+            (when failure
+              (multiple-value-bind (origin-phase origin-condition)
+                  (funcall origin-state)
+                (multiple-value-bind (proxy-phase proxy-condition)
+                    (funcall proxy-state)
+                  (format *error-output*
+                          "~&PROXY-E2E-FAILURE primary=~S origin-phase=~S origin-condition=~S proxy-phase=~S proxy-condition=~S child-alive-before-cleanup=~S~%"
+                          (type-of failure) origin-phase origin-condition
+                          proxy-phase proxy-condition (uiop:process-alive-p process))
+                  (finish-output *error-output*))))
             (when process
-              (ignore-errors (uiop:terminate-process process))
-              (ignore-errors (uiop:wait-process process)))
+              (ignore-errors (uiop:terminate-process process)) ; paredit:ignore handler-case-swallows-error -- process cleanup must preserve FAILURE and allow worker validation to run.
+              (setf child-exit (ignore-errors (uiop:wait-process process)))) ; paredit:ignore handler-case-swallows-error -- reaping the test process must preserve FAILURE and allow worker validation to run.
             (handler-case
                 (funcall join-proxy)
               (error (condition)
@@ -358,6 +387,16 @@
               (error (condition)
                 (unless failure (setf failure condition))))
             (when proxy-listener (close-http-tcp-listener proxy-listener))
+            (when failure
+              (multiple-value-bind (origin-phase origin-condition)
+                  (funcall origin-state)
+                (multiple-value-bind (proxy-phase proxy-condition)
+                    (funcall proxy-state)
+                  (format *error-output*
+                          "~&PROXY-E2E-FAILURE primary=~S origin-phase=~S origin-condition=~S proxy-phase=~S proxy-condition=~S child-cleanup-exit=~S~%"
+                          (type-of failure) origin-phase origin-condition
+                          proxy-phase proxy-condition child-exit)
+                  (finish-output *error-output*))))
             (when failure (error failure))))))))
 
   (deftest e2e-no-proxy-lowercase-direct-no-proxy-connection

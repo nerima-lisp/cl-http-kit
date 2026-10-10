@@ -117,12 +117,22 @@
         (seen (make-hash-table :test #'equalp))
         (max-age nil)
         (include-subdomains-p nil))
-    (loop for separator = (position #\; value :start start)
+    (loop for separator = (loop with quoted-p = nil
+                                with escaped-p = nil
+                                for index from start below (length value)
+                                for character = (char value index)
+                                do (cond
+                                     (escaped-p (setf escaped-p nil))
+                                     ((and quoted-p (char= character #\\))
+                                      (setf escaped-p t))
+                                     ((char= character #\")
+                                      (setf quoted-p (not quoted-p)))
+                                     ((and (not quoted-p) (char= character #\;))
+                                      (return index))))
           for segment = (string-trim '(#\Space #\Tab)
                                      (subseq value start separator))
-          do (when (zerop (length segment))
-               (return-from %strict-transport-parse nil))
-             (let* ((equals (position #\= segment))
+          do (unless (zerop (length segment))
+               (let* ((equals (position #\= segment))
                       (name (string-trim '(#\Space #\Tab)
                                          (subseq segment 0 equals)))
                       (raw-value (and equals (subseq segment (1+ equals)))))
@@ -134,8 +144,7 @@
                  (cond
                    ((string-equal name "max-age")
                     (let ((parsed (and raw-value
-                                       (string-trim '(#\Space #\Tab)
-                                                    raw-value))))
+                                       (%strict-transport-value raw-value))))
                       (unless (and parsed
                                    (plusp (length parsed))
                                    (every #'digit-char-p parsed))
@@ -147,7 +156,7 @@
                     (setf include-subdomains-p t))
                    (raw-value
                     (unless (%strict-transport-value raw-value)
-                      (return-from %strict-transport-parse nil)))))
+                      (return-from %strict-transport-parse nil))))))
           while separator
           do (setf start (1+ separator)))
     (and max-age (list max-age include-subdomains-p))))
@@ -225,19 +234,14 @@
         uri)))
 
 (defun %client-request-rebuild
-    (request &key method uri headers body protocol-version
-                    (trailers nil trailers-supplied-p))
+    (request &key method uri headers body protocol-version trailers)
   (make-http-request :method (or method (http-request-method request))
                      :protocol-version (or protocol-version
                                            (http-request-protocol-version request))
                      :uri (or uri (http-request-uri request))
                      :headers (or headers (http-request-headers request))
-                     :trailers (if trailers-supplied-p
-                                   trailers
-                                   (http-kit:http-request-trailers request))
-                     :body (if (null body)
-                               (%client-empty-octets)
-                               body)))
+                     :trailers trailers
+                     :body body))
 
 (defun %client-monotonic-time ()
   (/ (float (get-internal-real-time))
@@ -377,10 +381,6 @@
     (unless factory
       (%client-missing-native-feature :native-tcp "HTTP-KIT/NETWORK"))
     (let ((opener (funcall factory)))
-      (unless (functionp opener)
-        (%client-protocol-error
-         "The native network stream opener factory must return a function."
-         opener))
       opener)))
 
 (defun %client-native-open-stream ()
@@ -463,10 +463,7 @@ Pass NIL explicitly to disable either store."
      "Specify only one of :TRANSPORT-FUNCTION, :OPEN-STREAM, or :CONNECTION-POOL."
      (list transport-function open-stream connection-pool close-stream)))
   (unless (or transport-function open-stream connection-pool
-              (and (null transport-function)
-                   (null open-stream)
-                   (null connection-pool)
-                   (null close-stream)))
+              (null close-stream))
     (%client-protocol-error
      "An HTTP client requires a transport boundary or the native default boundary."
      nil))
@@ -677,7 +674,7 @@ headers replace client default headers with the same case-insensitive name."
                        :body (%client-body-octets body))))
 
 (defun %client-request-with
-    (request &key headers body method uri protocol-version
+    (request &key headers method uri protocol-version
                     (trailers nil trailers-supplied-p))
   (%client-request-rebuild
    request
@@ -688,9 +685,7 @@ headers replace client default headers with the same case-insensitive name."
    :trailers (if trailers-supplied-p
                  trailers
                  (http-kit:http-request-trailers request))
-   :body (if (null body)
-             (http-request-body request)
-             (%client-body-octets body))))
+   :body (http-request-body request)))
 
 (defun %client-validate-collect-body-p (value)
   (unless (member value '(nil t) :test #'eq)
@@ -735,10 +730,12 @@ headers replace client default headers with the same case-insensitive name."
           :test #'eql))
 
 (defun %client-retryable-condition-p (policy condition)
-  (or (and (typep condition 'http-timeout)
-           (http-retry-policy-retry-on-timeout-p policy))
-      (and (typep condition 'http-connection-error)
-           (http-retry-policy-retry-on-connection-error-p policy))))
+  (typecase condition
+    (http-timeout
+      (http-retry-policy-retry-on-timeout-p policy))
+    (http-connection-error
+      (http-retry-policy-retry-on-connection-error-p policy))
+    (t nil)))
 
 (defun %client-unprocessed-condition-p (condition)
   (and (typep condition 'http-connection-error)
@@ -807,7 +804,9 @@ headers replace client default headers with the same case-insensitive name."
                                       request-body-length on-body-chunk
                                       on-information
                                       (collect-body-p t))
-  (let* ((arguments
+  (let* ((request-body-started-p nil)
+         (response-observed-p nil)
+         (arguments
            (list :timeout timeout
                  :deadline deadline
                  :max-header-bytes (http-client-max-header-bytes client)
@@ -821,14 +820,26 @@ headers replace client default headers with the same case-insensitive name."
     ;; keywords while exposing them whenever the caller uses the feature.
     (when on-body-chunk
       (setf arguments
-            (append arguments (list :on-body-chunk on-body-chunk))))
+            (append arguments
+                    (list :on-body-chunk
+                          (lambda (chunk)
+                            (setf response-observed-p t)
+                            (funcall on-body-chunk chunk))))))
     (when on-information
       (setf arguments
-            (append arguments (list :on-information on-information))))
+            (append arguments
+                    (list :on-information
+                          (lambda (response)
+                            (setf response-observed-p t)
+                            (funcall on-information response))))))
     (when (or request-body-function request-body-length)
       (setf arguments
             (append arguments
-                    (list :request-body-function request-body-function
+                    (list :request-body-function
+                          (and request-body-function
+                               (lambda (limit)
+                                 (setf request-body-started-p t)
+                                 (funcall request-body-function limit)))
                           :request-body-length request-body-length))))
     (unless collect-body-p
       (setf arguments
@@ -849,6 +860,12 @@ headers replace client default headers with the same case-insensitive name."
       (labels ((call-tcp ()
                  (apply (http-client-transport-function client)
                         effective-request arguments))
+              (fallback-to-tcp ()
+                 (http-alternative-service-store-remove
+                  (http-client-alternative-service-store client)
+                  (http-request-uri request)
+                  alternative)
+                 (call-tcp))
               (call-http3 (service &optional attempt-deadline)
                  (unless http3-transport
                    (%client-missing-native-feature :http3-transport
@@ -869,18 +886,21 @@ headers replace client default headers with the same case-insensitive name."
                    ;; An explicit HTTP/3 request is a hard requirement.
                    (call-http3 nil))
                   (alternative
-                   (handler-case
-                       (call-http3
-                        alternative
-                        (%client-http3-fallback-deadline client deadline))
-                     (error (condition)
-                       ;; Failed Alt-Svc knowledge is stale.  Retry via TCP.
-                       (declare (ignore condition))
-                       (http-alternative-service-store-remove
-                        (http-client-alternative-service-store client)
-                        (http-request-uri request)
-                        alternative)
-                       (call-tcp))))
+                   (if (null http3-transport)
+                       (fallback-to-tcp)
+                       (handler-case
+                           (call-http3
+                            alternative
+                            (%client-http3-fallback-deadline client deadline))
+                         (http-connection-error (condition)
+                           ;; Replay requires a transport guarantee and no
+                           ;; producer or user callback already invoked.
+                           (if (and (null (http-kit:http-connection-error-request-sent-p
+                                           condition))
+                                    (not request-body-started-p)
+                                    (not response-observed-p))
+                               (fallback-to-tcp)
+                               (error condition))))))
                   (t (call-tcp)))))
           (unless (http-response-p response)
             (%client-protocol-error
@@ -1133,8 +1153,6 @@ headers replace client default headers with the same case-insensitive name."
   (declare (ignore redirect-count))
   (let ((location (%client-header-value
                    (http-response-headers response) "Location")))
-    (unless location
-      (return-from %client-redirect-request nil))
     (let* ((target (resolve-http-uri (http-request-uri request) location))
            (target
              (if (http-client-strict-transport-store client)
@@ -1204,7 +1222,9 @@ headers replace client default headers with the same case-insensitive name."
       (dolist (name '("Location" "Content-Location"))
         (dolist (value (http-header-values
                         (http-response-headers response) name))
-          (let ((target (ignore-errors (resolve-http-uri request-uri value))))
+          (let ((target (handler-case
+                            (resolve-http-uri request-uri value)
+                          (http-error () nil))))
             (when (and target (http-same-origin-p request-uri target))
               (http-cache-invalidate cache target)))))))
   cache)
@@ -1257,8 +1277,6 @@ Partitioned cookies.  ALLOW-STALE-WHILE-REVALIDATE-P controls whether an
 eligible stale cache entry may be returned through the configured scheduler."
   (unless (http-client-p client)
     (%client-protocol-error "The client must be an HTTP-CLIENT." client))
-  (unless (http-request-p request)
-    (%client-protocol-error "The request must be an HTTP-REQUEST." request))
   (%client-validate-request-body-stream
    request request-body-function request-body-factory request-body-length)
   (when on-body-chunk
@@ -1340,8 +1358,7 @@ eligible stale cache entry may be returned through the configured scheduler."
       (multiple-value-bind (response state entry forward-reason)
           (http-cache-lookup (http-client-cache client) current-request)
         (setf cache-forward-reason
-              (or forward-reason
-                  (if (eq state :stale) :stale :miss)))
+              (or forward-reason :miss))
         (when response
           (setf response
                 (%cache-status-hit-response

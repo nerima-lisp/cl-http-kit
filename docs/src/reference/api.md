@@ -6,10 +6,7 @@ auxiliary exports not described here. Common arguments such as timeout,
 deadline, byte limits, and clock-function are accepted by the direct and CPS
 transport APIs where shown.
 
-The registered systems in this checkout are version 0.4.0. The current
-integration includes native default client wiring and the URL-and-method
-convenience form. The signatures below describe the current callback and
-stream API.
+The registered systems in this checkout are version 0.4.1.
 
 ## Core package
 
@@ -84,17 +81,20 @@ Return the trimmed header content string.
 
 ### `http-header-values`
 
-Return all values in headers whose names match name case-insensitively. The
-order of duplicate values is preserved.
+`http-header-values (headers name)` returns all matching values in order.
+HEADERS must be a list of HTTP-HEADER values, not the header pairs accepted by
+message constructors. NAME must be a non-empty ASCII token. Matching is
+case-insensitive.
 
 ### `http-header-value`
 
-Return the first matching header value, or the optional default when no value
-is present.
+`http-header-value (headers name &optional default)` returns the first matching
+value, or DEFAULT (NIL when omitted). Inputs follow `http-header-values`.
 
 ### `http-header-present-p`
 
-Return true when at least one header with the requested name is present.
+`http-header-present-p (headers name)` returns true when a matching header is
+present. Inputs follow `http-header-values`.
 
 ### `http-request`
 
@@ -106,17 +106,45 @@ Return true when the object is an HTTP-REQUEST.
 
 ### `make-http-request`
 
-Construct a request with make-http-request (&key method uri headers trailers
-body). Methods are normalized to upper-case tokens, URI strings are parsed,
-headers and trailers are normalized, and the body is copied.
+```lisp
+(make-http-request &key method protocol uri request-target headers trailers body
+                       (protocol-version "HTTP/1.1"))
+```
+
+METHOD is required and must be a non-empty ASCII token; its case is preserved.
+URI is required and accepts an HTTP-URI or a URI string. PROTOCOL is an optional
+token normalized to lower case. REQUEST-TARGET is an optional non-empty string
+of visible ASCII characters. PROTOCOL-VERSION accepts `"HTTP/1.0"`, `"HTTP/1.1"`,
+`"HTTP/2"`, or `"HTTP/3"`.
+
+HEADERS and TRAILERS accept lists containing HTTP-HEADER values, dotted pairs
+such as `("Accept" . "text/plain")`, or two-item lists such as
+`("Accept" "text/plain")`. They are normalized and copied. BODY accepts NIL,
+a one-dimensional non-string vector or a list, with every element an octet
+(an integer from 0 to 255); it is copied to an octet vector. Strings are not
+accepted as bodies.
+An omitted body becomes an empty octet vector. A `"TRACE"` request cannot have
+a non-empty body.
+
+### `http-request-protocol-version`
+
+Return the protocol version string.
 
 ### `http-request-method`
 
-Return the normalized method string.
+Return the method string with its original case.
+
+### `http-request-protocol`
+
+Return the lower-case protocol token or NIL.
 
 ### `http-request-uri`
 
 Return the HTTP-URI value.
+
+### `http-request-target`
+
+Return the explicit request target or NIL.
 
 ### `http-request-headers`
 
@@ -153,9 +181,18 @@ Return true when the object is an HTTP-RESPONSE.
 
 ### `make-http-response`
 
-Construct a response with make-http-response (&key status reason headers
-trailers body). Status must be between 100 and 599; an omitted reason uses the
-default reason for the status when one is known.
+```lisp
+(make-http-response &key status reason headers trailers body
+                        (protocol-version "HTTP/1.1"))
+```
+
+STATUS is required and must be an integer from 100 to 599. An omitted REASON
+uses the known reason phrase for the status, or an empty string. HEADERS,
+TRAILERS, BODY, and PROTOCOL-VERSION follow `make-http-request`.
+
+### `http-response-protocol-version`
+
+Return the protocol version string.
 
 ### `http-response-status`
 
@@ -178,6 +215,69 @@ Return the response trailer list.
 Return the response body as an octet vector. An omitted body is represented by
 an empty octet vector.
 
+### `http-response-stream`
+
+The streaming response type accepted by a `serve-http1-session` handler.
+
+### `http-response-stream-p`
+
+Return true when the object is an HTTP-RESPONSE-STREAM.
+
+### `make-http-response-stream`
+
+```lisp
+(make-http-response-stream &key status reason headers trailers body-function
+                               body-length (protocol-version "HTTP/1.1"))
+```
+
+Response metadata follows `make-http-response`. BODY-FUNCTION is NIL or a
+zero-argument function. For a response that sends a body, supply a function
+that returns a one-dimensional non-string octet vector for each chunk and NIL
+to finish. Lists are not accepted as chunks; an empty vector does not finish
+the response. BODY-LENGTH is NIL or the non-negative total number of body
+octets. For a response that sends a body, a mismatch between that length and
+the produced body signals an error.
+
+The HTTP/1 server uses the request's protocol version for the response. For a
+response that sends a body, an explicit Content-Length requires a matching
+BODY-LENGTH. Without explicit framing or trailers, a known length produces
+Content-Length; an unknown length uses chunked framing for HTTP/1.1 and
+connection-close framing for HTTP/1.0. Trailers require HTTP/1.1 chunked
+framing and cannot be combined with Content-Length or a bodyless response.
+The producer is not called for HEAD or other bodyless responses, including a
+successful CONNECT response. For HEAD, BODY-LENGTH may describe the body that
+would have been sent and supply Content-Length without invoking the producer.
+A positive BODY-LENGTH is rejected for status 204, 205, or 304 and for a
+successful CONNECT response.
+
+### `http-response-stream-protocol-version`
+
+Return the protocol version string.
+
+### `http-response-stream-status`
+
+Return the numeric response status.
+
+### `http-response-stream-reason`
+
+Return the response reason string.
+
+### `http-response-stream-headers`
+
+Return the normalized header list.
+
+### `http-response-stream-trailers`
+
+Return the normalized trailer list.
+
+### `http-response-stream-body-function`
+
+Return the body producer function or NIL.
+
+### `http-response-stream-body-length`
+
+Return the declared body length or NIL.
+
 ### `serialize-http-request`
 
 Serialize a request to a one-dimensional octet vector using HTTP/1.1 request
@@ -188,31 +288,59 @@ framing. The serializer derives Host from the URI and validates body framing.
 Parse an HTTP/1.0 or HTTP/1.1 request from an octet vector or binary input
 stream. The signature is parse-http-request (input &key timeout deadline
 max-header-bytes max-fields max-body-bytes default-authority on-body-chunk
-collect-body-p on-expect-continue clock-function). MAX-FIELDS defaults to 256
-and applies independently to request headers and request trailers.
+(collect-body-p t) on-expect-continue clock-function allow-eof-p). MAX-FIELDS
+defaults to 256 and applies independently to request headers and trailers.
+
+ON-BODY-CHUNK is NIL or a function receiving each decoded body chunk as an
+octet vector; its return value is ignored. With COLLECT-BODY-P NIL, the parser
+still consumes and validates the body and calls this callback, but returns an
+empty body vector. ON-EXPECT-CONTINUE is NIL or a function receiving a request
+with empty body and trailers before reading an HTTP/1.1 body with
+Expect: 100-continue. It is called only for chunked framing or a positive
+Content-Length; its return value is ignored. Body callbacks can run before
+chunk terminators and trailers have been validated, so receiving a chunk does
+not establish that parsing succeeded. ALLOW-EOF-P defaults to NIL. When true,
+EOF before a request line returns NIL; incomplete requests still signal an error.
 
 ### `parse-http-response`
 
-Parse an HTTP/1.1 response from an octet vector or binary input stream. The signature is
+Parse an HTTP/1.0 or HTTP/1.1 response from an octet vector or binary input stream. The signature is
 parse-http-response (input &key timeout deadline max-header-bytes
-max-fields max-body-bytes request-method clock-function). It handles fixed-length,
+max-fields max-body-bytes request-method on-body-chunk on-information
+(collect-body-p t) clock-function). It handles fixed-length,
 chunked, close-delimited, and no-body responses subject to the supplied byte
 and field-count limits. MAX-FIELDS defaults to 256 and applies independently
 to each informational, final, and trailer field section.
+
+Supply REQUEST-METHOD as the exact upper-case string `"HEAD"` or `"CONNECT"`
+when applicable so the parser recognizes a bodyless HEAD response or a
+successful CONNECT tunnel response. Method matching is case-sensitive.
+
+ON-BODY-CHUNK and COLLECT-BODY-P follow `parse-http-request`. ON-INFORMATION
+is NIL or a function receiving each informational HTTP-RESPONSE in wire
+order, with empty body and trailers. Its return value is ignored. Parsing
+continues until a final response or 101 Switching Protocols, which is returned
+without calling ON-INFORMATION.
 
 ### `send-http-request-over-stream`
 
 Send a request through an injected binary stream. The signature is
 send-http-request-over-stream (request &key open-stream close-stream timeout
-deadline max-header-bytes max-fields max-body-bytes clock-function). The open callback
-receives the request and effective timeout and deadline; close-stream receives
-the returned stream.
+deadline max-header-bytes max-fields max-body-bytes request-target on-body-chunk
+on-information request-body-function request-body-length (collect-body-p t)
+clock-function). The synchronous opener has the signature
+`(request &key timeout deadline)` and returns a binary stream;
+`close-stream` receives that stream.
 
 ### `send-http-request-over-stream/cps`
 
 The CPS form of send-http-request-over-stream. It takes
 send-http-request-over-stream/cps (request on-success &key on-error open-stream
-close-stream timeout deadline max-header-bytes max-fields max-body-bytes clock-function).
+close-stream timeout deadline max-header-bytes max-fields max-body-bytes
+request-target on-body-chunk on-information request-body-function
+request-body-length (collect-body-p t) clock-function). It uses the same
+synchronous stream opener, not a CPS opener. `on-success` receives the response;
+`on-error`, when supplied, receives the condition instead of resignaling it.
 
 ### serve-http1-session
 
@@ -228,7 +356,7 @@ HTTP/1.0 requests. The session supports request-body streaming, Expect:
 100-continue, trailers, protocol upgrades, and bounded request counts.
 MAX-FIELDS defaults to 256 and applies independently to request headers and
 request trailers. It returns the number of final responses written and one of
-EOF, CLOSE, UPGRADE, or MAX-REQUESTS.
+`:eof`, `:close`, `:upgrade`, or `:max-requests`.
 
 ### `recording-session`
 
@@ -269,12 +397,17 @@ arguments.
 Compute an absolute deadline from a timeout. The signature is
 http-deadline (timeout &key deadline clock-function). A nil timeout leaves an
 inherited deadline unchanged; timeout values must be non-negative.
+Timeouts are durations in seconds. Deadlines are absolute seconds on the
+clock returned by `clock-function`, which defaults to a monotonic clock.
+When both bounds are supplied, the earlier deadline applies.
 
 ### `with-http-deadline`
 
 Bind an effective deadline around body forms. The macro signature is
 with-http-deadline ((deadline timeout &key inherited clock-function kind)
-&body body). It checks the deadline before and after the body.
+&body body). It checks the deadline before running the body. Body operations
+must check the bound during execution; the macro does not interrupt them or
+check the deadline after they return. The default timeout kind is `:connect`.
 
 ### `http-size-limit-exceeded`
 
@@ -346,11 +479,18 @@ Return the invalid or unsupported status code.
 
 ### `http-connection-error`
 
-The condition type for failures from an injected transport boundary.
+The condition type for failures from a native or custom transport boundary.
 
 ### `http-connection-error-cause`
 
 Return the underlying transport cause.
+
+### `http-connection-error-request-sent-p`
+
+Return whether the request may have been sent. This defaults to true; a
+transport must guarantee a failure before transmission before supplying
+`:request-sent-p nil`. Alt-Svc fallback also requires that no request-body
+producer or response callback has run.
 
 ### `http-timeout`
 
@@ -421,7 +561,10 @@ per decoded header or trailer section is 256.
 `send-http2-goaway` and its convenience alias
 `graceful-shutdown-http2-connection` make the connection drain without
 discarding already-created streams. `close-http2-connection` closes it
-idempotently.
+idempotently. PING and GOAWAY require a started, open session and raise
+`HTTP-PROTOCOL-ERROR` after the connection is closed. GOAWAY's payload,
+including its eight-byte fixed portion, must fit the peer's advertised
+maximum frame size.
 
 Connection state is exposed by `http2-connection-p`,
 `http2-connection-open-p`, `http2-connection-session-started-p`,
@@ -459,8 +602,7 @@ failure paths use these RFC 9113 error codes:
 | Reset budget | GOAWAY / ENHANCE_YOUR_CALM | §7 |
 | HPACK decoding failure | GOAWAY / COMPRESSION_ERROR | §4.3, §5.4.1 |
 
-The last
-clamps the peer's HPACK dynamic-table capacity. The client connection path
+`max-hpack-table-size` clamps the peer's HPACK dynamic-table capacity. The client connection path
 also clamps peer HPACK table settings to 4096 bytes by default through
 `*h2-max-peer-hpack-table-size*`.
 
@@ -472,8 +614,9 @@ clock-function`.
 Connections are reused by origin unless a caller supplies `connection-key`,
 the least-recently-used idle connection is evicted at the configured cap, and
 an idle timeout of `nil` disables idle expiry. `max-connection-age` optionally
-recycles connections after a total lifetime even when they remain active. The open callback receives
-the request and may accept `timeout` and `deadline`; it must return an
+recycles connections after a total lifetime even when they remain active. The
+open callback must accept `(request &key timeout deadline)`: both keywords are
+passed on every call. It must return an
 `http2-connection`.
 
 `send-http2-request-over-connection-manager` sends one request through the
@@ -498,9 +641,10 @@ snapshot and does not expose the manager's internal list structure.
 
 Serve HTTP/2 requests on a caller-supplied binary stream. The signature is
 serve-http2-session (stream handler &key timeout deadline max-frame-size
-max-header-bytes max-fields max-body-bytes default-authority collect-body-p
-on-body-chunk max-requests on-error close-stream clock-function
-max-control-frames max-control-window). The session
+max-header-bytes max-fields max-body-bytes max-concurrent-streams
+max-reset-streams max-reset-window max-control-frames max-control-window
+max-hpack-table-size default-authority collect-body-p on-body-chunk max-requests
+on-error close-stream clock-function huffman-p enable-connect-p). The session
 owns the HTTP/2 preface, SETTINGS, HPACK, stream state, flow control, request
 body collection, and response framing, and returns a request count and
 termination reason. `max-fields` defaults to 256 for each request header or
@@ -509,7 +653,7 @@ trailer section. `max-control-frames` defaults to 100 frames in a one-second
 control frames, including SETTINGS, PING, PRIORITY, WINDOW_UPDATE, GOAWAY, and
 PRIORITY_UPDATE, are counted.
 Exceeding the budget sends GOAWAY with ENHANCE_YOUR_CALM before closing. The
-same keywords are accepted by `make-http2-client` and
+control-frame limit keywords are accepted by `make-http2-client` and
 `make-http2-connection`. The handler's primary value is the final response. Its
 optional second value is a list of informational responses, which are emitted
 in order before the final response; informational responses must use a status
@@ -543,6 +687,10 @@ caller-supplied OPEN-STREAM, WRITE-STREAM, and READ-STREAM callbacks. The
 callbacks receive stream type, timeout, deadline, and FIN options as
 appropriate. MAX-HEADER-BYTES and MAX-FIELDS bound decoded response field
 sections. CLOSE-HTTP3-CLIENT closes the control stream.
+ATTACH-HTTP3-PEER-CONTROL-STREAM accepts one incoming control stream while the
+client is open. Closing retains the attachment identity; a closed client
+rejects both an initial attachment and a replacement. Rejected streams remain
+caller-owned.
 
 ACCEPT-HTTP3-PEER-UNIDIRECTIONAL-STREAM reads a possibly fragmented stream-type
 prefix and routes control and QPACK streams to the client's singleton stream
@@ -588,6 +736,38 @@ never weaken the retained client's configured limits.
 CLOSE-HTTP3-CONNECTION-MANAGER closes all retained clients and rejects
 subsequent sends.
 
+MAKE-HTTP3-QUIC-ADAPTER connects the HTTP/3 client boundary to a caller-owned
+cl-quic-kit client. Its HTTP3-OPTIONS argument is a flat property list of
+MAKE-HTTP3-CLIENT keyword arguments; malformed or non-keyword lists are
+rejected before the QUIC client is created. QUIC, TLS, certificate, socket,
+and shutdown policy remain caller-owned.
+HOSTNAME must be a non-empty string identifying the origin for TLS SNI and
+certificate verification. SERVER-HOST and SERVER-PORT select the UDP peer,
+which can differ from that origin. Native sockets require a numeric IPv4
+SERVER-HOST; HOSTNAME supplies the separate certificate name. ALPN defaults
+to `("h3")`.
+TLS-TRUST-ANCHORS is forwarded to cl-quic-kit. With the default TLS driver,
+omitting anchors loads the environment or platform trust store in cl-tls-kit.
+The adapter does not call the HTTP TLS upgrader's CA-file loading path.
+It configures packet protection through the declared cl-quic-kit and
+cl-crypto-kit dependencies before starting QUIC. A protection setup failure
+propagates without sending network data.
+
+Construction starts QUIC and synchronously waits for the TLS handshake and
+peer HTTP/3 SETTINGS before returning. TIMEOUT bounds each wait separately;
+DEADLINE is an absolute cutoff shared by the waits. When both are supplied,
+each wait uses the earlier cutoff. Request stream writes wait for queued
+bytes to be sent, not for peer acknowledgement or application receipt.
+
+HTTP3-QUIC-ADAPTER-START starts the QUIC client once and returns the adapter;
+construction has normally already started it. Starting a closed adapter
+signals a protocol error. HTTP3-QUIC-ADAPTER-POLL
+starts an open adapter if needed, forwards its optional clock value to QUIC,
+and returns the adapter. Polling a closed adapter does not drive QUIC.
+CLOSE-HTTP3-QUIC-ADAPTER closes the HTTP/3 streams and then the QUIC client,
+forwarding ERROR-CODE and REASON. Repeated close calls return T without
+closing QUIC again. HTTP/3 stream-cleanup errors do not prevent QUIC shutdown.
+
 RECEIVE-HTTP3-PUSH accepts per-receive MAX-HEADER-BYTES, MAX-FIELDS, and
 MAX-BODY-BYTES limits. Header limits can tighten but never weaken the HTTP/3
 client's configured limits, matching ordinary response handling.
@@ -598,7 +778,8 @@ Serve one HTTP/3 request stream over caller-supplied QUIC stream callbacks.
 The signature is serve-http3-request-stream (stream handler &key read-stream
 write-stream close-stream max-frame-size max-header-bytes max-fields
 max-body-bytes collect-body-p on-body-chunk qpack-decoder-table
-qpack-encoder-table huffman-p timeout deadline on-error). The session owns
+qpack-decoder-context stream-id await-qpack qpack-serialize qpack-encoder-table
+huffman-p enable-connect-p timeout deadline on-error). The session owns
 HTTP/3 framing, QPACK field sections, request-body limits, and response
 framing; the caller owns QPACK instruction-stream synchronization, QUIC, TLS,
 ALPN, and connection-level stream dispatch.
@@ -618,6 +799,11 @@ and proxy negotiation remain outside this system.
 
 SERVE-HTTP1-LISTENER combines accept and SERVE-HTTP1-SESSION dispatch for a
 caller-owned listener, with connection limits and accept/error callbacks.
+The listener closes the accepted stream if STREAM-WRAPPER, ON-ACCEPT, or
+session argument validation exits before the session takes cleanup ownership,
+including on non-local exits. After that transfer, only the session invokes
+CLOSE-STREAM; NIL retains the stream, and a successful upgrade transfers
+ownership to ON-UPGRADE.
 
 ## TLS package
 
@@ -630,6 +816,15 @@ protocol name must contain 1 to 255 ASCII characters. CERTIFICATE, KEY, and
 PASSWORD are reserved for a future client-certificate integration and currently
 signal an unsupported-feature condition when supplied. The client wrapper
 preserves the binary-stream boundary and applies handshake deadlines.
+:OPTIONAL applies the same certificate-chain, hostname, and trust checks as
+:REQUIRED. NIL skips those checks but still requires a valid CertificateVerify
+signature; use it only for deliberately unauthenticated test connections.
+TRUST-ANCHORS accepts parsed X.509 certificate objects. When anchors are not
+supplied and VERIFY is :OPTIONAL or :REQUIRED, the upgrader loads PEM
+certificates from the CA file selected by cl-tls-kit: SSL_CERT_FILE takes
+precedence over NIX_SSL_CERT_FILE, followed by an existing platform CA file.
+The wrapper rejects transport EOF without a peer close_notify instead of
+treating a truncated TLS stream as a completed HTTP response.
 MAKE-HTTP-TLS-SERVER-WRAPPER validates its certificate arguments then signals
 an explicit unsupported-feature condition because the current kit does not
 expose a server driver. For an HTTPS server, terminate TLS in a reverse proxy
@@ -669,19 +864,24 @@ Return the request counter. It uses method and outcome labels.
 
 ### `http-metrics-error-counter`
 
-Return the error counter. It uses method and condition-kind labels.
+Return the error counter. It uses `method` and `kind` labels. The `kind`
+values are `timeout`, `protocol`, `connection`, and `error`.
 
 ### `call-with-http-observability/cps`
 
 Wrap an operation with metrics collection. The signature is
 call-with-http-observability/cps (metrics request operation on-success &key
-on-error).
+on-error). The operation receives two continuations: a success function taking
+one response and a failure function taking one condition. Invoke exactly one
+continuation once. Each continuation records the outcome before calling the
+corresponding caller callback; callback errors propagate without recording a
+second outcome.
 
 ## Client package
 
 The optional package name is HTTP-KIT/CLIENT. It builds request policies around
-the core HTTP-KIT request and response values while leaving network setup to the
-application.
+the core HTTP-KIT request and response values, with a native TCP/TLS connection
+pool by default. Injected transports or pools own their network setup.
 
 ## Conditions
 
@@ -737,11 +937,16 @@ The condition type for proxy selection or planning failures.
 
 ### `resolve-http-uri`
 
-Resolve a URI reference against a base URI and return an HTTP-URI.
+`resolve-http-uri (base reference)` returns an HTTP-URI. BASE accepts an
+HTTP-URI or an absolute HTTP(S) URI string. REFERENCE accepts an HTTP-URI or a
+URI-reference string, including a relative path or query. Fragments are removed;
+absolute references must use HTTP or HTTPS.
 
 ### `http-uri-origin`
 
-Return the scheme-and-authority origin for a URI.
+Return the scheme-and-authority origin for a URI, omitting the default HTTP
+port 80 or HTTPS port 443. Explicit and omitted default ports identify the
+same origin.
 
 ### `http-same-origin-p`
 
@@ -749,16 +954,24 @@ Return true when two URIs have the same origin.
 
 ### `http-percent-encode`
 
-Encode a string for URI use. The signature is
-http-percent-encode (string &key (safe "-._~") (space-as-plus-p nil)).
+`http-percent-encode (string &key (safe "-._~") (space-as-plus-p nil))`
+percent-encodes the string's UTF-8 bytes. ASCII letters and digits remain
+literal, along with ASCII characters in SAFE, which accepts a string or NIL.
+SPACE-AS-PLUS-P encodes spaces as `+` for form encoding; otherwise they become
+`%20`.
 
 ### `http-form-urlencode`
 
-Encode form fields as an application/x-www-form-urlencoded string.
+`http-form-urlencode (fields)` returns an application/x-www-form-urlencoded
+string. FIELDS is a list of dotted name/value pairs or two-element lists. Names
+must be strings; values must be strings or NIL, with NIL encoded as an empty
+value. Field order and duplicate names are preserved. Names and values use
+UTF-8 percent encoding with spaces encoded as `+`.
 
 ### `http-form-urlencoded-octets`
 
-Encode form fields as an application/x-www-form-urlencoded octet vector.
+`http-form-urlencoded-octets (fields)` accepts the same FIELDS as
+`http-form-urlencode` and returns the encoded form as an octet vector.
 
 ### `make-http-content-decoders`
 
@@ -785,8 +998,11 @@ Return true when the object is an HTTP-MULTIPART-PART.
 
 ### `make-http-multipart-part`
 
-Construct a multipart part with a name, value, and optional filename and
-content type.
+`make-http-multipart-part (&key name value filename content-type)` constructs
+a part. NAME is a required nonempty string; VALUE is a string or a
+one-dimensional octet vector. FILENAME and CONTENT-TYPE each accept a string
+or NIL. When the part is encoded, string values become UTF-8 bytes; vector
+values are validated as octets.
 
 ### `http-multipart-part-name`
 
@@ -806,23 +1022,28 @@ Return the optional multipart part content type.
 
 ### `make-http-multipart-body`
 
-Construct a multipart body from parts. The signature is
-make-http-multipart-body (parts &key boundary). It returns the body octets and
+`make-http-multipart-body (parts &key boundary)` accepts a list of
+HTTP-MULTIPART-PART values. It returns the body octets and
 the corresponding Content-Type value with a quoted boundary parameter. An
 explicit boundary must satisfy the RFC 2046 boundary grammar: one through
-seventy ASCII boundary characters, with no trailing space.
+seventy ASCII boundary characters, with no trailing space. A boundary that
+collides with a delimiter line in a part's value is rejected. When BOUNDARY is
+omitted, the encoder generates a noncolliding boundary.
 
 ### `parse-http-multipart-body`
 
-Parse a multipart/form-data octet vector into multipart parts. The signature
-is parse-http-multipart-body (body &key content-type boundary max-parts
-max-header-bytes max-body-bytes max-input-bytes). Content-Type and an explicit
-boundary may both be supplied only when they agree. The parser validates
+`parse-http-multipart-body (body &key content-type boundary (max-parts 1000)
+(max-header-bytes 65536) max-body-bytes (max-input-bytes (* 64 1024 1024)))`
+accepts a one-dimensional octet vector and returns a list of multipart parts
+in wire order. Parsed part values are octet vectors, including text fields.
+Supply CONTENT-TYPE with a boundary parameter, an explicit BOUNDARY, or both
+with matching values. The parser validates
 delimiter lines, requires exactly one Content-Disposition per part, rejects
 duplicate Content-Type fields, and applies the configured per-part header,
 aggregate part-body, part-count, and complete encoded-input limits. The input
-limit defaults to 64 MiB and is checked before the parser copies the body; NIL
-disables it.
+limit defaults to 64 MiB and is checked before the parser copies the body.
+Each limit accepts a nonnegative integer or NIL to disable that limit;
+MAX-BODY-BYTES defaults to NIL.
 
 ## Date and authentication
 
@@ -1011,8 +1232,13 @@ The redirect-policy structure type.
 
 ### `make-http-redirect-policy`
 
-Construct a redirect policy with a maximum redirect count, allowed status
-codes, downgrade policy, and authorization preservation policy.
+Construct a redirect policy:
+
+```lisp
+(make-http-redirect-policy &key (max-redirects 10)
+  (statuses '(301 302 303 307 308))
+  (allow-downgrade-p nil) (preserve-authorization-p nil))
+```
 
 ### `http-redirect-policy-max-redirects`
 
@@ -1036,12 +1262,22 @@ The retry-policy structure type.
 
 ### `make-http-retry-policy`
 
-Construct a retry policy with method and status allowlists, delay bounds,
-optional exponential-backoff jitter, and timeout and connection-error behavior.
+Construct a retry policy:
+
+```lisp
+(make-http-retry-policy &key (max-attempts 1)
+  (methods '("GET" "HEAD" "OPTIONS" "PUT" "DELETE" "TRACE"))
+  (statuses '(408 425 429 500 502 503 504))
+  (base-delay 0.25) (max-delay 30.0) (jitter-ratio 0.0)
+  (respect-retry-after-p t) (retry-on-timeout-p t)
+  (retry-on-connection-error-p t))
+```
+
+`max-attempts` includes the first send, so its default disables retries.
 
 ### `http-retry-policy-max-attempts`
 
-Return the maximum retry attempts.
+Return the maximum total send attempts, including the first send.
 
 ### `http-retry-policy-methods`
 
@@ -1098,8 +1334,16 @@ literals never match.
 
 ### `http-strict-transport-store-note-response`
 
-Process the first Strict-Transport-Security field from a secure response.
-Malformed fields and fields received over HTTP are ignored.
+Process the first Strict-Transport-Security field for an HTTPS URI.
+Malformed fields, HTTP URIs, and IP literals are ignored. The caller must
+ensure that TLS certificate verification succeeded: this function checks the
+URI scheme, not the transport's verification result. When using deliberately
+unauthenticated TLS or a custom transport without that guarantee, disable the
+client's store with `:strict-transport-store nil`.
+Quoted `max-age` values are decoded before validating their digits. Empty
+directives and valid unknown directives are ignored; semicolons inside quoted
+values do not separate directives. A field without `max-age` does not change
+the stored policy.
 
 ### `http-strict-transport-store-upgrade-uri`
 
@@ -1158,9 +1402,10 @@ Clear one origin when given a URI, or clear the entire store when omitted.
 The service accessors are `http-alternative-service-origin`,
 `http-alternative-service-protocol-id`, `http-alternative-service-host`,
 `http-alternative-service-port`, `http-alternative-service-expires-at`, and
-`http-alternative-service-persist-p`. Selecting and dialing an alternative is
-application-owned so the transport can authenticate the origin certificate,
-send origin SNI, and retain the applicable proxy policy.
+`http-alternative-service-persist-p`. The client selects an unexpired `h3`
+alternative for its configured HTTP/3 transport. That transport owns dialing,
+authenticating the origin certificate, sending origin SNI, and retaining the
+applicable proxy policy.
 
 ## Cache
 
@@ -1270,6 +1515,10 @@ When `http-client-send` revalidates a stale entry, valid `stale-if-error`
 request or response directives permit a collected cached response after
 eligible server or connection failures. The returned `Age` reflects its
 current age. Streaming callbacks do not use this fallback.
+During revalidation, a 304 response must identify the cached validator with a
+matching `ETag` or `Last-Modified`. When the cached response has no validator,
+the 304 response must also omit both fields. A mismatch raises
+`http-protocol-error` rather than merging unrelated metadata.
 
 ### `http-cache-store`
 
@@ -1281,6 +1530,9 @@ codes carrying `must-understand` are not stored.
 ### `http-cache-invalidate`
 
 Invalidate entries matching a request or URI.
+The client also invalidates the request URI after an unsafe method receives a
+2xx or 3xx response. Valid same-origin `Location` and `Content-Location` targets
+are invalidated as well; malformed and cross-origin targets are ignored.
 
 ### `http-cache-clear`
 
@@ -1334,6 +1586,10 @@ Return the proxy applicable to a URI, or nil when the URI is bypassed.
 Return true when a URI matches a proxy bypass rule. Rules may be exact hosts,
 domains that also match their subdomains, optional `host:port` pairs, IPv4 or
 IPv6 CIDR blocks, or `*` to bypass every destination.
+Explicit port suffixes must contain ASCII decimal digits and identify a port
+from 1 through 65535. Malformed suffixes do not match a destination. Use
+brackets for IPv6 rules with a port, such as `[::1]:443`; an unbracketed IPv6
+address has no port restriction.
 
 ### `http-proxy-plan`
 
@@ -1371,7 +1627,7 @@ Return true when the object is an HTTP-CLIENT.
 
 Construct a client. The signature is
 make-http-client (&key transport-function open-stream close-stream
-connection-pool
+connection-pool http3-transport-function
 default-headers cookie-jar cache strict-transport-store
 alternative-service-store redirect-policy
 retry-policy proxy tls-upgrade resolve-host resolve-host-style auth-provider
@@ -1380,25 +1636,56 @@ stale-while-revalidate-scheduler clock-function
 wall-clock-function sleep-function random-function default-timeout max-header-bytes max-fields max-body-bytes
 automatic-decompression-p content-decoders on-request on-response). At most one
 of transport-function, open-stream, or connection-pool may be supplied;
-omitting all three selects the native TCP/TLS connection pool.
+omitting all three and close-stream selects the native TCP/TLS connection pool.
 The connection pool owns pooled stream opening and closing; close-stream is
 optional for the direct stream transport boundary. Omitting
 strict-transport-store creates a new RFC 6797 store; explicitly passing nil
 disables HSTS. Omitting alternative-service-store creates a new RFC 7838 store;
 explicitly passing nil disables alternative-service discovery.
 
+By default, each client has a new cookie jar, no cache, and automatic
+gzip/deflate response decoding enabled. `cookie-jar` must be an
+`http-cookie-jar`; nil is not accepted. Supply an `http-cache` to enable
+caching. Automatic decoding applies to collected response bodies without
+`on-body-chunk`, except for HEAD responses, statuses 204/205/304, and successful
+CONNECT responses. Each content decoder is called as
+`(decoder octets max-body-bytes)`; custom decoders must enforce the supplied
+limit themselves.
+
 `resolve-host-style` is `:keywords` by default. In that mode, the resolver
 receives HOST, `:timeout`, and `:deadline`. Set it to `:host-only` for a
 legacy resolver that accepts only HOST. The resolver is not retried when its
 body signals an error, so the style must match the callback.
 
-The injected transport-function must accept the complete keyword boundary used
-by the client, including timeout, deadline, limits, proxy context, request-body
-callbacks, response callbacks, and collect-body-p. Partial legacy keyword
-signatures are intentionally unsupported.
+The native default requires the optional `cl-http-kit/network` and
+`cl-http-kit/tls` systems for TCP and HTTPS respectively. An injected
+transport-function or connection-pool owns its network and TLS setup;
+`tls-upgrade` and `resolve-host` cannot be supplied with those boundaries.
+A direct `open-stream` boundary can use these two callbacks for proxy/TLS
+composition. Its synchronous opener receives
+`(request &key timeout deadline)` and returns a binary stream. The library's
+proxy wrapper handles `proxy` and `proxy-plan` before calling this raw endpoint
+opener; the request passed to the opener can target the proxy endpoint.
 
-`HTTP-CLIENT-SEND` also accepts a method and URL convenience form while
-retaining its request-object form.
+The transport-function returns an HTTP response and must support the complete
+contract for any request features the application uses:
+
+```lisp
+(request &key timeout deadline max-header-bytes max-fields max-body-bytes
+  proxy proxy-plan request-body-function request-body-length
+  on-body-chunk on-information (collect-body-p t))
+```
+
+The first seven keywords, through `proxy-plan`, are always passed. The body
+producer and length keywords are passed together when either is supplied;
+response callbacks are passed only when supplied; `collect-body-p` is passed
+only when false. A legacy transport supporting only the always-passed keywords
+can serve requests that do not use these features.
+
+`http3-transport-function` has the same contract plus `alternative-service`.
+That keyword is always passed: a selected `http-alternative-service` for
+Alt-Svc, or nil for an explicit HTTP/3 request. It must preserve origin
+authentication and proxy policy, not authenticate only the alternative host.
 
 ### Client and HTTP/1.1 defaults
 
@@ -1407,16 +1694,19 @@ retaining its request-object form.
 | Client request timeout | 30 seconds | One request deadline covering DNS, connect, TLS, write, read, redirects, and retries |
 | Maximum header bytes | 65,536 | HTTP/1.1 headers and trailers |
 | Maximum fields | 256 | Each HTTP/1.1 field section |
-| Maximum wire body bytes | 16 MiB | HTTP/1.1 collected request or response body |
+| Maximum wire body bytes | 16 MiB | HTTP/1.1 request or response body, including streaming with `collect-body-p nil` |
 | Maximum decoded body bytes | 16 MiB | Automatic gzip/deflate response decoding, enforced during expansion |
 | Connection-pool max idle | 16 | Idle streams retained per pool |
 | Connection-pool idle timeout | 60 seconds | Idle stream expiry during pool operations |
 | Connection-pool max connection age | 300 seconds | Absolute stream lifetime during pool operations |
 
-Passing `:timeout NIL`, `:idle-timeout NIL`, or `:max-connection-age NIL`
-explicitly opts into an unbounded value. Passing `:max-body-bytes NIL` returns
-to the corresponding finite default; specify a sufficiently large integer when
-an application needs a larger body limit. The native
+Passing `:timeout nil` removes the relative request timeout; an explicit
+deadline still applies. Passing `:idle-timeout nil` or
+`:max-connection-age nil` disables the corresponding pool expiry. For HTTP/1.1
+parsing, `:max-body-bytes nil` selects the finite default. Automatic response
+decoding instead passes nil to the decoder; built-in decoders omit their
+explicit output-limit argument. Use a finite integer to explicitly bound
+built-in gzip/deflate expansion. The native
 client offers only `http/1.1` through ALPN; HTTP/2 requires the explicit
 `cl-http-kit/http2` transport boundary until native client dispatch is provided.
 
@@ -1526,38 +1816,60 @@ Return the client's maximum response body size.
 
 ### `http-client-on-request`
 
-Return the request hook.
+Return the optional request hook, called as `(hook request attempt)` before a
+transport attempt.
 
 ### `http-client-on-response`
 
-Return the response hook.
+Return the optional response hook, called as `(hook response request attempt)`.
+Cache hits and synthesized only-if-cached responses use attempt zero.
 
 ### `http-client-request`
 
-Construct a validated core request with client defaults. The signature is
-http-client-request (client method uri &key headers trailers body). TRAILERS
-are sent after the request body when the selected transport supports request
+```lisp
+(http-client-request client method uri
+                     &key headers trailers body
+                          (protocol-version "HTTP/1.1"))
+```
+
+Construct a validated request using the client's default headers. Explicit
+headers replace defaults with the same case-insensitive name. BODY accepts
+nil, a string encoded as UTF-8, or a one-dimensional octet array. Trailers are
+sent after the request body when the selected transport supports request
 trailers.
 
 ### `http-client-send`
 
-Send a request through the client. The signature is
-http-client-send (client request &key timeout deadline redirect-policy
-retry-policy request-body-function request-body-factory request-body-length
-on-body-chunk on-information collect-body-p cookie-same-site-p
-cookie-top-level-navigation-p cookie-partition-key). It returns the response
-and the effective request after redirects or retries. REQUEST-BODY-FUNCTION
-produces octet chunks; REQUEST-BODY-FACTORY returns a fresh producer for each
-retry or same-method redirect. A non-replayable producer is sent once.
-ON-BODY-CHUNK and ON-INFORMATION receive response body and informational
-responses, and COLLECT-BODY-P controls whether the response body is retained.
+```lisp
+(http-client-send client request-or-method &rest arguments)
+```
+
+Accept an `http-request` followed by send keywords, a method and URI followed
+by keywords, or a URI followed by keywords. The URI-only form defaults to GET;
+`:method` overrides it. Convenience forms accept string or symbol methods and
+uppercase them. They consume `:headers`, `:trailers`, `:body`, and
+`:protocol-version` as request options; remaining keywords use the
+request-object send contract. The function returns the response and effective
+request after redirects or retries.
+
+Send keywords are TIMEOUT, DEADLINE, REDIRECT-POLICY, RETRY-POLICY,
+REQUEST-BODY-FUNCTION, REQUEST-BODY-FACTORY, REQUEST-BODY-LENGTH,
+ON-BODY-CHUNK, ON-INFORMATION, COLLECT-BODY-P, COOKIE-SAME-SITE-P,
+COOKIE-TOP-LEVEL-NAVIGATION-P, and COOKIE-PARTITION-KEY.
+
+REQUEST-BODY-FUNCTION is called with a chunk-size argument and returns an
+octet chunk, or nil at end of input. REQUEST-BODY-FACTORY takes no arguments
+and returns a fresh producer for every attempt using the streamed body,
+including the first. The producer and factory are mutually exclusive and
+cannot accompany a nonempty in-memory body. REQUEST-BODY-LENGTH requires a
+producer or factory. A non-replayable producer is sent once.
+
+ON-BODY-CHUNK is called with one body chunk; ON-INFORMATION is called with one
+informational response. COLLECT-BODY-P defaults to true and controls whether
+the response body is retained.
 COOKIE-SAME-SITE-P and COOKIE-TOP-LEVEL-NAVIGATION-P supply the request context
 for SameSite cookie selection. COOKIE-PARTITION-KEY supplies the canonical
-top-level-site identifier for Partitioned cookie acceptance and selection. The
-convenience forms are http-client-send (client method uri &rest arguments) and
-http-client-send (client uri &key method ...); request options such as HEADERS,
-TRAILERS, and BODY are consumed while the remaining keywords use the
-request-object send contract.
+top-level-site identifier for Partitioned cookie acceptance and selection.
 
 ## WebSocket package
 
@@ -1596,8 +1908,9 @@ version, while `WEBSOCKET-UPGRADE-RESPONSE` constructs a 101 response and
 only selects a subprotocol or extension that the request offered.
 
 `PARSE-WEBSOCKET-EXTENSIONS` returns normalized `WEBSOCKET-EXTENSION` objects
-with name and parameter accessors. It rejects malformed separators, quoted
-values, and duplicate parameters. `permessage-deflate` also enforces RFC 7692
+with name and parameter accessors. It rejects malformed separators, malformed
+quoted strings, values that are not tokens after unquoting, and duplicate
+parameters. `permessage-deflate` also enforces RFC 7692
 parameter names, valueless takeover flags, window-bit ranges, and
 offer/response asymmetry.
 
@@ -1641,14 +1954,18 @@ Return true when the object is an HTTP-SSE-EVENT.
 ### `make-http-sse-event`
 
 Construct an event with make-http-sse-event (&key (event "message") (data "")
-id retry comments). EVENT and DATA must be strings without line breaks; ID
+id retry comments). EVENT must be a string without CR or LF; DATA must be a
+string and may contain line breaks, which the serializer emits as separate
+`data:` lines. ID
 must be a string without line breaks or NUL when supplied; RETRY must be a
-non-negative integer when supplied; COMMENTS may be a string or a list of
-strings and is emitted as SSE comment lines.
+non-negative integer when supplied; COMMENTS may be a string or a finite
+proper list of strings, each without CR or LF, and is emitted as SSE comment
+lines. Invalid fields, including dotted or cyclic comment lists, signal
+`http-protocol-error` with operation `:sse`.
 
 ### `http-sse-event-event`
 
-Return the event's field name, defaulting to "message".
+Return the event type, defaulting to "message".
 
 ### `http-sse-event-data`
 
@@ -1660,7 +1977,8 @@ Return the event's optional ID string.
 
 ### `http-sse-event-retry`
 
-Return the event's optional retry field as a non-negative integer.
+Return the event's optional retry field as a non-negative integer in
+milliseconds. Applying that reconnection delay is the application's responsibility.
 
 ### `http-sse-event-comments`
 
@@ -1674,8 +1992,12 @@ max-data-bytes max-event-bytes). INPUT is a UTF-8 string or an octet vector. The
 recognizes CRLF, LF, and CR line endings, strips a leading UTF-8 BOM, and
 discards an event that is not terminated by a blank line. Event IDs persist
 across event blocks until another `id` field replaces them. Each limit is a
-safety bound; `max-event-bytes` also bounds retained comment and metadata
-lines, and passing NIL for a limit disables it.
+safety bound. Defaults are 10,000 events, 65,536 bytes per line, 16 MiB of data
+per event, and 16 MiB of retained event content, respectively.
+`max-event-bytes` also bounds retained comment and metadata lines. Exceeding
+a limit signals `http-size-limit-exceeded`; passing NIL disables that limit.
+Only blocks containing a `data` field dispatch an event; comment-only
+heartbeats do not produce HTTP-SSE-EVENT values.
 
 ### `read-http-sse-events`
 
@@ -1683,15 +2005,21 @@ Read SSE events from an already-open stream. The signature is
 read-http-sse-events (stream &key max-events max-line-bytes max-data-bytes max-event-bytes
 on-event (collect-events-p t)). STREAM may be binary or character. ON-EVENT,
 when supplied, is called with each dispatched HTTP-SSE-EVENT as it arrives.
-The call returns the collected event list when COLLECT-EVENTS-P is true,
-otherwise NIL.
+The call reads until EOF and returns the collected event list when
+COLLECT-EVENTS-P is true, otherwise NIL. Callback return values do not stop
+reading. The limits and dispatch rules are the same as for
+`parse-http-sse-events`. The application owns connection setup, read deadlines,
+reconnection, and sending `Last-Event-ID` on a subsequent request.
 
 ### `serialize-http-sse-event`
 
 Serialize one HTTP-SSE-EVENT to UTF-8 octets ending in a blank line, suitable
 for writing to an SSE response body. Comment lines are emitted first, then
 event, id, retry, and one or more data lines split on the event's own line
-breaks.
+breaks. CRLF, LF, and CR in data become CRLF-delimited lines.
+Leading spaces in event names, IDs, and data are preserved when parsed back;
+comment lines retain their leading spaces. Serialization revalidates the
+event fields, including changes made through the structure accessors.
 
 ## Example
 
@@ -1701,8 +2029,4 @@ breaks.
          :method "GET"
          :uri "https://example.test/health")))
   (http-kit:serialize-http-request request))
-;; => #(71 69 84 32 47 104 101 97 108 116 104 32 72 84 84 80 47 49 46 49
-;;      13 10 72 111 115 116 58 32 101 120 97 109 112 108 101 46 116 101
-;;      115 116 13 10 67 111 110 116 101 110 116 45 76 101 110 103 116 104
-;;      58 32 48 13 10 13 10)
 ```

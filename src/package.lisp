@@ -101,6 +101,7 @@
    #:http-invalid-status-code
    #:http-connection-error
    #:http-connection-error-cause
+   #:http-connection-error-request-sent-p
    #:http-timeout
    #:http-timeout-kind
    #:http-unsupported-feature

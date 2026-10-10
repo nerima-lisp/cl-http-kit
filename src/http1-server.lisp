@@ -42,8 +42,7 @@
       (values method target version))))
 
 (defun %parse-request-header-line (line)
-  (when (and (plusp (length line))
-             (find (char line 0) '(#\Space #\Tab)))
+  (when (find (char line 0) '(#\Space #\Tab))
     (%request-parse-error
      "Obsolete folded request headers are not accepted."
      line))
@@ -512,24 +511,6 @@ read."
       (= status 205)
       (= status 304)))
 
-(defun %write-http1-headers (builder headers)
-  (dolist (header headers)
-    (%builder-write-string builder (http-header-name header)
-                           :context :header-name)
-    (%builder-write-string builder ": ")
-    (%builder-write-string builder (http-header-content header)
-                           :context :header-value)
-    (%builder-crlf builder)))
-
-(defun %write-http1-trailers (builder trailers)
-  (dolist (trailer trailers)
-    (%builder-write-string builder (http-header-name trailer)
-                           :context :header-name)
-    (%builder-write-string builder ": ")
-    (%builder-write-string builder (http-header-content trailer)
-                           :context :header-value)
-    (%builder-crlf builder)))
-
 (defun serialize-http-response (response &key request-method head-p)
   "Serialize one HTTP/1.0 or HTTP/1.1 response into an octet vector.
 
@@ -652,7 +633,6 @@ body is never written to the wire."
            headers trailers transfer-mode :serialization))
     (when (and (null transfer-mode)
                (null content-length)
-               (null (http-header-values headers "trailer"))
                (or (= status 205)
                    (not (or status-bodyless-p connect-bodyless-p))))
       (let ((wire-length (if (= status 205) 0 (length body))))
@@ -803,7 +783,7 @@ body is never written to the wire."
                                              "keep-alive"))
          (not (= status 101))
          (not (and (string= method "CONNECT")
-                   (and (>= status 200) (< status 300)))))))
+                   (< status 300))))))
 
 (defun %http1-session-response-for-request (request response)
   (let ((protocol-version (http-request-protocol-version request)))
@@ -836,7 +816,7 @@ body is never written to the wire."
         "HTTP/1 informational responses must be HTTP responses."
         (type-of response)))
      (let ((status (http-response-status response)))
-       (unless (and (>= status 100) (< status 200) (/= status 101))
+       (unless (and (< status 200) (/= status 101))
          (%http1-session-error
           "HTTP/1 informational response status must be 100-199 except 101."
           status)))
@@ -1070,12 +1050,6 @@ body is never written to the wire."
                              :message "The streamed response body exceeded body-length."
                              :operation :serialization
                              :detail body-length))
-                    (when (and content-length (> produced content-length))
-                      (error 'http-invalid-header
-                             :message "The streamed response body exceeded Content-Length."
-                             :operation :serialization
-                             :name "content-length"
-                             :reason :mismatch))
                     (%write-http1-response-stream-chunk
                      stream octets transfer-mode))))
          (when (and body-length (/= produced body-length))
@@ -1083,12 +1057,6 @@ body is never written to the wire."
                   :message "The streamed response body ended before body-length."
                   :operation :serialization
                   :detail (list :expected body-length :observed produced)))
-         (when (and content-length (/= produced content-length))
-           (error 'http-invalid-header
-                  :message "Content-Length does not match the streamed response body."
-                  :operation :serialization
-                  :name "content-length"
-                  :reason :mismatch))
          (when (eq transfer-mode :chunked)
            (%write-http1-response-stream-final-chunk stream trailers))))
       (values wire-response
@@ -1155,6 +1123,9 @@ body is never written to the wire."
                                             written-response)))))
             (values (if reusable-p :running :close) nil))))))
 
+;; The listener retains cleanup until the session's unwind-protect is active.
+(defvar *http1-session-ownership-marker* nil)
+
 (defun serve-http1-session
     (stream handler &key timeout deadline max-header-bytes max-fields max-body-bytes
              default-authority on-body-chunk (collect-body-p t)
@@ -1176,84 +1147,88 @@ ON-EXPECT-CONTINUE defaults to :AUTOMATIC and writes a 100 Continue response
 before an expected request body is read.  NIL disables that response; a
 function receives the metadata-only request and can write its own interim
 response."
-  (unless (streamp stream)
-    (%http1-session-error "HTTP/1 session stream must be a stream."
-                          (type-of stream)))
-  (unless (functionp handler)
-    (%http1-session-error "HTTP/1 session handler must be a function."
-                          (type-of handler)))
-  (unless (or (null max-requests)
-              (and (integerp max-requests)
-                   (>= max-requests 0)))
-    (%http1-session-error "HTTP/1 session max-requests must be a non-negative integer or NIL."
-                          max-requests))
-  (unless (or (null on-error) (functionp on-error))
-    (%http1-session-error "HTTP/1 session on-error must be a function or NIL."
-                          (type-of on-error)))
-  (unless (or (null on-upgrade) (functionp on-upgrade))
-    (%http1-session-error "HTTP/1 session on-upgrade must be a function or NIL."
-                          (type-of on-upgrade)))
-  (unless (or (eq on-expect-continue :automatic)
-              (null on-expect-continue)
-              (functionp on-expect-continue))
-    (%http1-session-error
-     "HTTP/1 session on-expect-continue must be :AUTOMATIC, a function, or NIL."
-     (type-of on-expect-continue)))
-  (unless (or (null close-stream) (functionp close-stream))
-    (%http1-session-error "HTTP/1 session close-stream must be a function or NIL."
-                          (type-of close-stream)))
-  (let* ((expect-continue-callback
-           (cond
-             ((eq on-expect-continue :automatic)
-              (lambda (request)
-                (%http1-session-write-continue stream request)))
-             ((null on-expect-continue) nil)
-             (t on-expect-continue)))
-         (absolute-deadline
-           (http-deadline timeout
-                          :deadline deadline
-                          :clock-function clock-function))
-         (count 0)
-         (termination :running)
-         (handed-off-p nil))
-    (unwind-protect
-         (progn
-           (loop while (eq termination :running)
-                 do (if (and max-requests
-                             (>= count max-requests))
-                        (setf termination :max-requests)
-                        (let ((request nil))
-                          (handler-case
-                              (let ((parsed
-                                      (parse-http-request
-                                       stream
-                                       :deadline absolute-deadline
-                                       :max-header-bytes max-header-bytes
-                                       :max-fields max-fields
-                                       :max-body-bytes max-body-bytes
-                                       :default-authority default-authority
-                                       :on-body-chunk on-body-chunk
-                                       :collect-body-p collect-body-p
-                                       :on-expect-continue expect-continue-callback
-                                       :clock-function clock-function
-                                       :allow-eof-p t)))
-                                (if (null parsed)
-                                    (setf termination :eof)
-                                    (progn
-                                      (setf request parsed)
-                                      (multiple-value-bind (response information)
-                                          (funcall handler request)
-                                        (multiple-value-bind (next-termination
-                                                              next-handed-off-p)
-                                            (%http1-session-write-handler-response
-                                             stream request response information on-upgrade)
-                                          (incf count)
-                                          (setf termination next-termination
-                                                handed-off-p next-handed-off-p))))))
-                            (error (caught-condition)
-                              (when on-error
-                                (funcall on-error caught-condition request))
-                              (error caught-condition))))))
-           (values count termination))
-      (when (and close-stream (not handed-off-p))
-        (funcall close-stream stream)))))
+  (let ((ownership-marker *http1-session-ownership-marker*)
+        (*http1-session-ownership-marker* nil))
+    (unless (streamp stream)
+      (%http1-session-error "HTTP/1 session stream must be a stream."
+                            (type-of stream)))
+    (unless (functionp handler)
+      (%http1-session-error "HTTP/1 session handler must be a function."
+                            (type-of handler)))
+    (unless (or (null max-requests)
+                (and (integerp max-requests)
+                     (>= max-requests 0)))
+      (%http1-session-error "HTTP/1 session max-requests must be a non-negative integer or NIL."
+                            max-requests))
+    (unless (or (null on-error) (functionp on-error))
+      (%http1-session-error "HTTP/1 session on-error must be a function or NIL."
+                            (type-of on-error)))
+    (unless (or (null on-upgrade) (functionp on-upgrade))
+      (%http1-session-error "HTTP/1 session on-upgrade must be a function or NIL."
+                            (type-of on-upgrade)))
+    (unless (or (eq on-expect-continue :automatic)
+                (null on-expect-continue)
+                (functionp on-expect-continue))
+      (%http1-session-error
+       "HTTP/1 session on-expect-continue must be :AUTOMATIC, a function, or NIL."
+       (type-of on-expect-continue)))
+    (unless (or (null close-stream) (functionp close-stream))
+      (%http1-session-error "HTTP/1 session close-stream must be a function or NIL."
+                            (type-of close-stream)))
+    (let* ((expect-continue-callback
+             (cond
+               ((eq on-expect-continue :automatic)
+                (lambda (request)
+                  (%http1-session-write-continue stream request)))
+               ((null on-expect-continue) nil)
+               (t on-expect-continue)))
+           (absolute-deadline
+             (http-deadline timeout
+                            :deadline deadline
+                            :clock-function clock-function))
+           (count 0)
+           (termination :running)
+           (handed-off-p nil))
+      (unwind-protect
+           (progn
+             (when ownership-marker
+               (setf (car ownership-marker) t))
+             (loop while (eq termination :running)
+                   do (if (and max-requests
+                               (>= count max-requests))
+                          (setf termination :max-requests)
+                          (let ((request nil))
+                            (handler-case
+                                (let ((parsed
+                                        (parse-http-request
+                                         stream
+                                         :deadline absolute-deadline
+                                         :max-header-bytes max-header-bytes
+                                         :max-fields max-fields
+                                         :max-body-bytes max-body-bytes
+                                         :default-authority default-authority
+                                         :on-body-chunk on-body-chunk
+                                         :collect-body-p collect-body-p
+                                         :on-expect-continue expect-continue-callback
+                                         :clock-function clock-function
+                                         :allow-eof-p t)))
+                                  (if (null parsed)
+                                      (setf termination :eof)
+                                      (progn
+                                        (setf request parsed)
+                                        (multiple-value-bind (response information)
+                                            (funcall handler request)
+                                          (multiple-value-bind (next-termination
+                                                                next-handed-off-p)
+                                              (%http1-session-write-handler-response
+                                               stream request response information on-upgrade)
+                                            (incf count)
+                                            (setf termination next-termination
+                                                  handed-off-p next-handed-off-p))))))
+                              (error (caught-condition)
+                                (when on-error
+                                  (funcall on-error caught-condition request))
+                                (error caught-condition))))))
+             (values count termination))
+        (when (and close-stream (not handed-off-p))
+          (funcall close-stream stream))))))

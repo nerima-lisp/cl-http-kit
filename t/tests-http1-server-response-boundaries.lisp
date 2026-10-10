@@ -1,5 +1,70 @@
 (in-package #:http-kit/test-core)
 
+(deftest core-coverage-http1-response-framing-error-metadata
+  (dolist (case '((200 (("Content-Length" "bad")) "a" "content-length" :value)
+                  (200 (("Content-Length" "1") ("Content-Length" "2"))
+                   "a" "content-length" :duplicate)
+                  (200 (("Content-Length" "2")) "a" "content-length" :mismatch)
+                  (205 (("Content-Length" "1")) "" "content-length" :forbidden)
+                  (200 (("Transfer-Encoding" "")) "a" "transfer-encoding" :empty-item)
+                  (200 (("Transfer-Encoding" "chunked,"))
+                   "a" "transfer-encoding" :empty-item)))
+    (destructuring-bind (status headers body name reason) case
+      (let ((condition
+              (handler-case
+                  (serialize-http-response
+                   (make-http-response
+                    :status status :body (ascii body)
+                    :headers (mapcar (lambda (pair) (apply #'make-http-header pair)) headers)))
+                (http-invalid-header (condition) condition))))
+        (ensure-true (typep condition 'http-invalid-header))
+        (ensure-equal :serialization (http-error-operation condition))
+        (ensure-equal name (http-invalid-header-name condition))
+        (ensure-equal reason (http-invalid-header-reason condition))
+        (ensure-equal nil (http-protocol-error-detail condition))))))
+
+(deftest core-coverage-http1-response-unsupported-metadata
+  (dolist (case '(("HTTP/2" nil :http1-response-version "HTTP/2")
+                  ("HTTP/1.1" "gzip, chunked" :http1-response-transfer-encoding
+                   ("gzip" "chunked"))
+                  ("HTTP/1.1" "chunked, chunked" :http1-response-transfer-encoding
+                   ("chunked" "chunked"))))
+    (destructuring-bind (version encoding feature detail) case
+      (let ((condition
+              (handler-case
+                  (serialize-http-response
+                   (make-http-response
+                    :status 200 :protocol-version version
+                    :headers (when encoding (list (make-http-header "Transfer-Encoding" encoding)))))
+                (http-unsupported-feature (condition) condition))))
+        (ensure-true (typep condition 'http-unsupported-feature))
+        (ensure-equal :serialization (http-error-operation condition))
+        (ensure-equal feature (http-unsupported-feature-name condition))
+        (ensure-equal detail (http-protocol-error-detail condition))))))
+
+(deftest core-coverage-http1-response-option-and-trailer-errors
+  (dolist (option '(:head-p :request-method))
+    (let ((condition
+            (handler-case
+                (apply #'serialize-http-response (make-http-response :status 200)
+                       (list option 7))
+              (http-protocol-error (condition) condition))))
+      (ensure-true (typep condition 'http-protocol-error))
+      (ensure-equal :serialization (http-error-operation condition))
+      (ensure-equal 7 (http-protocol-error-detail condition))))
+  (dolist (case '((200 "HEAD") (204 nil) (200 "CONNECT")))
+    (destructuring-bind (status method) case
+      (let ((condition
+              (handler-case
+                  (serialize-http-response
+                   (make-http-response :status status
+                                       :headers (list (make-http-header "Trailer" "X-Checksum")))
+                   :request-method method)
+                (http-protocol-error (condition) condition))))
+        (ensure-true (typep condition 'http-protocol-error))
+        (ensure-equal :serialization (http-error-operation condition))
+        (ensure-equal status (http-protocol-error-detail condition))))))
+
 (deftest http1-response-serialization-boundaries
   (ensure-serialization-cases
    serialize-http-response

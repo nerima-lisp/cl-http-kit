@@ -1,7 +1,8 @@
 # Migration guide
 
 This guide describes migration from the 0.3.x API to the 0.4.0 integration.
-The current ASDF systems report version 0.4.0.
+The current ASDF systems report version 0.4.1; see the
+[changelog](changelog.md) for its security and protocol fixes.
 
 ## Earlier 0.3.x boundary
 
@@ -54,8 +55,8 @@ optional cl-quic-kit adapter provides explicit client connection setup.
 
 ## Migration checklist
 
-1. Keep custom transport code on the complete callback keyword contract until
-   the native client path is available.
+1. Preserve the complete callback keyword contract when retaining custom
+   transport code.
 2. Replace direct legacy TLS/compression setup with the four-kit systems when
    updating dependencies; do not mix the old wrappers with the new default
    path.

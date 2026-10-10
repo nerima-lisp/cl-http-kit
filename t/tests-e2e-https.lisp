@@ -55,7 +55,7 @@
              (sb-thread:make-thread
               (lambda ()
                 (handler-case
-                    (loop repeat 10
+                    (loop repeat 11
                           for request = (%https-e2e-read-headers output)
                           for request-text = (octets-as-string request)
                           for path = (second (uiop:split-string
@@ -96,8 +96,12 @@
                   (error server-error))))))
 
   (deftest e2e-https-openssl-client
-    (let* ((directory (merge-pathnames "cl-http-kit-https-e2e/"
-                                      (uiop:temporary-directory)))
+    (let* ((directory
+             (uiop:ensure-directory-pathname
+              (string-trim '(#\Return #\Linefeed)
+                           (uiop:run-program '("mktemp" "-d")
+                                             :output :string
+                                             :error-output :string))))
            (certificate (namestring (merge-pathnames "server.crt" directory)))
            (key (namestring (merge-pathnames "server.key" directory)))
            (openssl (or (uiop:getenv "OPENSSL") "openssl"))
@@ -173,6 +177,52 @@
                    (ensure-equal 200 (http-response-status response))
                    (ensure-equal "cookie-ok"
                                  (octets-as-string (http-response-body response))))
+                 (let ((unverified-client
+                         (make-http-client
+                          :open-stream (make-http-network-stream-opener)
+                          :close-stream #'close-http-tcp-stream
+                          :tls-upgrade (make-http-tls-upgrader
+                                        :verify nil
+                                        :alpn-protocols '("http/1.1"))
+                          :strict-transport-store nil
+                          :alternative-service-store nil)))
+                   (multiple-value-bind (response ignored)
+                       (http-client-send
+                        unverified-client "GET"
+                        (format nil "https://localhost:~D/ok" port)
+                        :timeout 5)
+                     (declare (ignore ignored))
+                     (ensure-equal 200 (http-response-status response))
+                     (ensure-equal "https-ok"
+                                   (octets-as-string (http-response-body response)))))
+                 (dolist (verify '(:optional :required))
+                   (let* ((verified-client
+                            (make-http-client
+                             :open-stream (make-http-network-stream-opener)
+                             :close-stream #'close-http-tcp-stream
+                             :tls-upgrade (make-http-tls-upgrader
+                                           :verify verify
+                                           :trust-anchors (list trust-anchor)
+                                           :alpn-protocols '("http/1.1"))
+                             :strict-transport-store nil
+                             :alternative-service-store nil))
+                          (condition
+                            (handler-case
+                                (progn
+                                  (http-client-send
+                                   verified-client "GET"
+                                   (format nil "https://localhost:~D/ok" port)
+                                   :timeout 5)
+                                  nil)
+                              (http-protocol-error (condition) condition))))
+                     (ensure-true condition)
+                     (ensure-equal
+                      :certificate-verification-failed
+                      (first (http-protocol-error-detail condition)))
+                     (ensure-true
+                      (typep (getf (rest (http-protocol-error-detail condition))
+                                   :condition)
+                             'cl-tls-kit:certificate-hostname-mismatch))))
                  (let ((previous-certificate-file (uiop:getenv "SSL_CERT_FILE")))
                    (sb-posix:setenv "SSL_CERT_FILE" certificate 1)
                    (unwind-protect
@@ -224,4 +274,8 @@
             (ignore-errors (uiop:terminate-process process))
             (ignore-errors (uiop:wait-process process)))
           (when server-thread
-            (ignore-errors (sb-thread:join-thread server-thread))))))))
+            (ignore-errors (sb-thread:join-thread server-thread)))
+          (dolist (file (list certificate key))
+            (when (probe-file file)
+              (delete-file file)))
+          (uiop:delete-directory-tree directory :validate t))))))

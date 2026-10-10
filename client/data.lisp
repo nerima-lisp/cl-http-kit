@@ -102,14 +102,13 @@ character in that range is a decimal digit, apart from an optional sign when
                      (setf value (+ (* value 10) digit))
                      (incf digits)
                      (incf index))
-            (when (and (plusp digits) (= index end))
-              (* sign value)))))))))
+            (* sign value))))))))
 
 (defstruct (http-redirect-policy
              (:constructor %make-http-redirect-policy)
              (:conc-name http-redirect-policy-))
   (max-redirects 10)
-  (statuses (copy-list *default-redirect-statuses*))
+  statuses
   (allow-downgrade-p nil)
   (preserve-authorization-p nil))
 
@@ -137,8 +136,8 @@ character in that range is a decimal digit, apart from an optional sign when
              (:constructor %make-http-retry-policy)
              (:conc-name http-retry-policy-))
   (max-attempts 1)
-  (methods (copy-list *default-retry-methods*))
-  (statuses (copy-list *default-retry-statuses*))
+  methods
+  statuses
   (base-delay 0.25)
   (max-delay 30.0)
   (jitter-ratio 0.0)
@@ -237,7 +236,7 @@ character in that range is a decimal digit, apart from an optional sign when
              (:conc-name %http-cookie-jar-))
   (cookies nil)
   lock
-  (clock-function #'get-universal-time)
+  clock-function
   public-suffix-p-function
   (max-cookies 3000)
   (max-cookies-per-domain 180)
@@ -282,7 +281,7 @@ character in that range is a decimal digit, apart from an optional sign when
              (:conc-name %http-cache-))
   (entries nil)
   (max-entries 256)
-  (clock-function #'get-universal-time)
+  clock-function
   status-identifier)
 
 (defstruct (http-strict-transport-policy
@@ -296,7 +295,7 @@ character in that range is a decimal digit, apart from an optional sign when
              (:constructor %make-http-strict-transport-store)
              (:conc-name %http-strict-transport-store-))
   (policies nil)
-  (clock-function #'get-universal-time))
+  clock-function)
 
 (defstruct (http-alternative-service
              (:constructor %make-http-alternative-service)
@@ -312,7 +311,7 @@ character in that range is a decimal digit, apart from an optional sign when
              (:constructor %make-http-alternative-service-store)
              (:conc-name %http-alternative-service-store-))
   (entries nil)
-  (clock-function #'get-universal-time))
+  clock-function)
 
 (defstruct (http-authentication-challenge
              (:constructor %make-http-authentication-challenge)

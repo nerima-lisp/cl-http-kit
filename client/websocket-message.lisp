@@ -17,8 +17,6 @@
          :detail detail))
 
 (defun %websocket-utf8-string (octets)
-  (unless (%websocket-octet-vector-p octets)
-    (%websocket-utf8-error "A WebSocket UTF-8 payload must be octets." octets))
   (with-output-to-string (result)
     (loop with index = 0
           while (< index (length octets))
@@ -197,7 +195,7 @@ otherwise consumed while the data message is assembled."
                      (%websocket-complete-message
                       message message-opcode compressed-p decompress-function
                       max-message-bytes))))
-                ((member opcode '(1 2) :test #'=)
+                (t
                  (when message-opcode
                    (%websocket-protocol-error
                     "A WebSocket data frame arrived before the prior message ended."
@@ -213,11 +211,7 @@ otherwise consumed while the data message is assembled."
                    (return
                      (%websocket-complete-message
                       message message-opcode compressed-p decompress-function
-                      max-message-bytes))))
-                (t
-                 (%websocket-protocol-error
-                 "A WebSocket message encountered an invalid data opcode."
-                  opcode))))))))
+                      max-message-bytes))))))))))
 
 (defun %websocket-message-octets (payload opcode)
   (cond ((%websocket-octet-vector-p payload)

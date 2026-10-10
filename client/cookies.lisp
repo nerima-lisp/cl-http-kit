@@ -475,7 +475,7 @@ interoperable browser behavior rather than making a response unusable."
          (and top-level-navigation-p (%cookie-safe-method-p method))))))
 
 (defun %cookie-request-applicable-p
-    (cookie uri now same-site-p top-level-navigation-p method partition-key)
+    (cookie uri same-site-p top-level-navigation-p method partition-key)
   (and (or (and (http-cookie-host-only-p cookie)
                (string-equal (http-uri-host uri) (http-cookie-domain cookie)))
            (and (not (http-cookie-host-only-p cookie))
@@ -487,8 +487,7 @@ interoperable browser behavior rather than making a response unusable."
        (%cookie-same-site-applicable-p
         cookie same-site-p top-level-navigation-p method)
        (or (null (http-cookie-partition-key cookie))
-           (equal (http-cookie-partition-key cookie) partition-key))
-       (not (%cookie-expired-p cookie now))))
+           (equal (http-cookie-partition-key cookie) partition-key))))
 
 (defun http-cookie-jar-cookie-header
     (jar request-uri
@@ -512,7 +511,7 @@ context.  Cross-site Lax cookies are sent only for safe top-level navigations."
            (cookies (remove-if-not
                      (lambda (cookie)
                        (%cookie-request-applicable-p
-                        cookie request-uri now same-site-p
+                        cookie request-uri same-site-p
                         top-level-navigation-p method partition-key))
                      stored-cookies)))
       (setf (%http-cookie-jar-cookies jar) stored-cookies)

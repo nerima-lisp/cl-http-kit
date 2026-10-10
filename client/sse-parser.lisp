@@ -162,7 +162,7 @@
   state)
 
 (defun %sse-state-append-byte (state byte)
-  (unless (and (integerp byte) (<= 0 byte #xff))
+  (unless (<= 0 byte #xff)
     (%sse-protocol-error "An SSE input byte is outside the octet range." byte))
   (when (and (%sse-state-max-line-bytes state)
              (>= (length (%sse-state-line state))

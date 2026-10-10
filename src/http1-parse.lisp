@@ -65,7 +65,11 @@ REQUEST-METHOD as \"HEAD\" for the bodyless response semantics of HEAD."
                                       header-limit field-limit header-used)
             (setf header-used final-header-bytes)
             (let ((transfer-encoding (%response-transfer-encoding headers))
-                  (content-length (%response-content-length headers body-limit)))
+                  ;; HEAD and 304 lengths describe representation metadata,
+                  ;; not octets that this response parser will consume.
+                  (content-length (%response-content-length
+                                   headers (unless (or head-response-p (= status 304))
+                                             body-limit))))
               (%validate-http-response-framing
                protocol-version status transfer-encoding content-length)
               (when (= status 101)
@@ -74,12 +78,6 @@ REQUEST-METHOD as \"HEAD\" for the bodyless response semantics of HEAD."
                          :message "A 101 Switching Protocols response cannot declare Content-Length."
                          :operation :response-parse
                          :name "content-length"
-                         :reason :forbidden))
-                (when transfer-encoding
-                  (error 'http-invalid-header
-                         :message "A 101 Switching Protocols response cannot declare Transfer-Encoding."
-                         :operation :response-parse
-                         :name "transfer-encoding"
                          :reason :forbidden))
                 (return
                   (%make-header-only-http-response
@@ -112,7 +110,7 @@ REQUEST-METHOD as \"HEAD\" for the bodyless response semantics of HEAD."
                   (let ((body (%empty-octets))
                         (trailers '()))
                     (cond
-                      ((and (= status 205) transfer-encoding)
+                      ((and (not head-response-p) (= status 205) transfer-encoding)
                        (multiple-value-bind (decoded-body decoded-trailers decoded-length)
                            (%read-chunked-body source absolute-deadline clock-function
                                                header-limit field-limit body-limit header-used

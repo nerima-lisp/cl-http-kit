@@ -288,3 +288,135 @@
        :open-stream (lambda (request &key timeout deadline)
                       (declare (ignore request timeout deadline))
                       (error "synthetic open failure"))))))
+
+#+sbcl
+(progn
+  (deftest stream-producer-boundary-invalid-options
+    (dolist (case '((:invalid nil nil)
+                    (:producer -1 nil)
+                    (:producer 1/2 nil)
+                    (:absent 0 nil)
+                    (:producer nil t)))
+      (destructuring-bind (kind length body-p) case
+        (let* ((request (make-http-request
+                         :method "POST" :uri "http://127.0.0.1/"
+                         :body (if body-p
+                                   (make-array 1 :element-type '(unsigned-byte 8)
+                                                 :initial-element 90)
+                                   (octets))))
+               (stream (make-instance 'binary-test-stream
+                                      :input (ascii "HTTP/1.1 204 No Content|CRLF||CRLF|")))
+               (opened 0)
+               (produced 0)
+               (closed 0)
+               (producer (case kind
+                           (:invalid :not-a-function)
+                           (:absent nil)
+                           (otherwise
+                            (lambda (maximum-size)
+                              (declare (ignore maximum-size))
+                              (incf produced)
+                              nil))))
+               (condition
+                 (handler-case
+                     (send-http-request-over-stream
+                      request
+                      :request-body-function producer
+                      :request-body-length length
+                      :open-stream (lambda (received &key timeout deadline)
+                                     (declare (ignore received timeout deadline))
+                                     (incf opened)
+                                     stream)
+                      :close-stream (lambda (owned)
+                                      (incf closed)
+                                      (close owned)))
+                   (http-protocol-error (condition) condition))))
+          (ensure-true (typep condition 'http-protocol-error))
+          (ensure-equal :body (http-error-operation condition))
+          (ensure-equal 0 opened)
+          (ensure-equal 0 produced)
+          (ensure-equal 0 closed)
+          (ensure-equal 0 (binary-test-input-position stream))
+          (ensure-equal (octets) (binary-test-output stream))
+          (ensure-true (open-stream-p stream))))))
+
+  (deftest stream-producer-boundary-invalid-chunks-and-control
+    (dolist (chunk (list (make-array '(1 1) :element-type '(unsigned-byte 8)
+                                          :initial-element 90)
+                        "Z"
+                        (vector 256)
+                        (octets)
+                        (make-array 65537 :element-type '(unsigned-byte 8)
+                                          :initial-element 90)))
+      (let* ((request (make-http-request :method "POST" :uri "http://127.0.0.1/"))
+             (stream (make-instance 'binary-test-stream
+                                    :input (ascii "HTTP/1.1 204 No Content|CRLF||CRLF|")))
+             (opened 0)
+             (produced 0)
+             (closed 0)
+             (condition
+               (handler-case
+                   (send-http-request-over-stream
+                    request
+                    :request-body-function (lambda (maximum-size)
+                                             (ensure-equal 65536 maximum-size)
+                                             (incf produced)
+                                             chunk)
+                    :open-stream (lambda (received &key timeout deadline)
+                                   (declare (ignore timeout deadline))
+                                   (ensure-true (eq request received))
+                                   (incf opened)
+                                   stream)
+                    :close-stream (lambda (owned)
+                                    (ensure-true (eq stream owned))
+                                    (incf closed)
+                                    (close owned)))
+                 (http-protocol-error (condition) condition))))
+        (ensure-true (typep condition 'http-protocol-error))
+        (ensure-equal :body (http-error-operation condition))
+        (ensure-equal 1 opened)
+        (ensure-equal 1 produced)
+        (ensure-equal 1 closed)
+        (ensure-equal 0 (binary-test-input-position stream))
+        (ensure-equal
+         (ascii "POST / HTTP/1.1|CRLF|Host: 127.0.0.1|CRLF|Transfer-Encoding: chunked|CRLF||CRLF|")
+         (binary-test-output stream))
+        (ensure-false (open-stream-p stream))))
+    (let* ((request (make-http-request :method "POST" :uri "http://127.0.0.1/"))
+           (payload (make-array 3 :element-type '(unsigned-byte 8)
+                                 :initial-contents '(90 0 255)))
+           (input (ascii "HTTP/1.1 204 No Content|CRLF||CRLF|"))
+           (stream (make-instance 'binary-test-stream :input input))
+           (chunks (list payload nil))
+           (opened 0)
+           (produced 0)
+           (closed 0)
+           (response
+             (send-http-request-over-stream
+              request
+              :request-body-length 3
+              :request-body-function (lambda (maximum-size)
+                                       (ensure-equal 65536 maximum-size)
+                                       (incf produced)
+                                       (pop chunks))
+              :open-stream (lambda (received &key timeout deadline)
+                             (declare (ignore timeout deadline))
+                             (ensure-true (eq request received))
+                             (incf opened)
+                             stream)
+              :close-stream (lambda (owned)
+                              (ensure-true (eq stream owned))
+                              (incf closed)
+                              (close owned)))))
+      (ensure-equal 204 (http-response-status response))
+      (ensure-equal 1 opened)
+      (ensure-equal 2 produced)
+      (ensure-equal 1 closed)
+      (ensure-true (null chunks))
+      (ensure-equal (length input) (binary-test-input-position stream))
+      (ensure-equal
+       (concatenate-octets
+        (ascii "POST / HTTP/1.1|CRLF|Host: 127.0.0.1|CRLF|Content-Length: 3|CRLF||CRLF|")
+        payload)
+       (binary-test-output stream))
+      (ensure-false (open-stream-p stream)))))

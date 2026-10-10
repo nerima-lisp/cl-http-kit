@@ -620,9 +620,8 @@ critical stream becomes readable again."
 (defun attach-http3-peer-control-stream (client stream)
   "Attach the peer's incoming HTTP/3 control stream to CLIENT.
 
-The stream is read with READ-HTTP3-CONTROL-STREAM.  A client may attach at
-most one peer control stream, and attaching after reading has started is an
-error."
+The stream is read with READ-HTTP3-CONTROL-STREAM.  Only an open client may
+attach a stream; its single attachment is retained after closing."
   (unless (http3-client-p client)
     (%h3-transport-error
      "ATTACH-HTTP3-PEER-CONTROL-STREAM requires an HTTP/3 client."
@@ -633,9 +632,10 @@ error."
   (when (http3-client-peer-control-stream client)
     (%h3-transport-error
      "An HTTP/3 client can have only one peer control stream."))
-  (when (http3-client-peer-control-prefix-seen-p client)
+  (unless (http3-client-open-p client)
     (%h3-transport-error
-     "The HTTP/3 peer control stream cannot be attached after reading starts."))
+     "Cannot attach an HTTP/3 control stream after client close."))
+  ;; Reading requires this attachment, and closing retains it.
   (setf (http3-client-peer-control-stream client) stream)
   client)
 
@@ -727,8 +727,6 @@ HTTP3-CLIENT-PEER-CONTROL-STATE."
    (lambda ()
      (let ((stream (http3-client-qpack-encoder-stream client))
            (table (http3-client-qpack-encoder-table client)))
-       (unless stream
-         (%h3-transport-error "The local QPACK encoder stream is not open."))
        (qpack-dynamic-table-set-capacity
         (copy-qpack-dynamic-table table) capacity)
        (let ((instruction (qpack-encode-set-dynamic-table-capacity capacity)))
@@ -748,8 +746,6 @@ HTTP3-CLIENT-PEER-CONTROL-STATE."
    (lambda ()
      (let ((stream (http3-client-qpack-encoder-stream client))
            (table (http3-client-qpack-encoder-table client)))
-       (unless stream
-         (%h3-transport-error "The local QPACK encoder stream is not open."))
        (qpack-dynamic-table-insert
         (copy-qpack-dynamic-table table) name value)
        (let ((instruction (qpack-encode-insert-with-literal-name name value)))
@@ -1058,6 +1054,11 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
 (defun %h3-header-values (header)
   (list (http-kit:http-header-content header)))
 
+(defun %h3-copy-field-section (fields)
+  (mapcar (lambda (field)
+            (cons (copy-seq (car field)) (copy-seq (cdr field))))
+          fields))
+
 (defun %h3-field-sections-equal-p (left right)
   (and (= (length left) (length right))
        (every (lambda (left-field right-field)
@@ -1251,10 +1252,7 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
                  name "HTTP/3 TE is permitted only in request header sections."))
               (push (http-kit:make-http-header name value) headers)))))
     (if trailers-p
-        (progn
-          (when status
-            (%h3-transport-error "HTTP/3 trailers cannot contain :status."))
-          (values nil (nreverse headers)))
+        (values nil (nreverse headers))
         (progn
           (unless status
             (%h3-transport-error "An HTTP/3 response HEADERS block lacks :status."))
@@ -1301,20 +1299,12 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
 (defun %h3-decode-dynamic-field-section
     (payload context stream-id await-qpack serialize
      max-header-bytes max-fields)
-  (unless (and (integerp stream-id) (>= stream-id 0))
-    (%h3-transport-error
-     "Dynamic QPACK decoding requires a numeric stream ID." stream-id))
-  (unless (functionp await-qpack)
-    (%h3-transport-error
-     "Dynamic QPACK decoding requires an await-qpack callback." await-qpack))
   (let ((decoded nil)
-        (decoded-count 0))
+        (decoded-p nil))
     (flet ((section-decoded (fields)
-             (incf decoded-count)
-             (unless (= decoded-count 1)
-               (%h3-transport-error
-                "A QPACK field section was decoded more than once." stream-id))
-             (setf decoded fields)))
+             ;; QPACK consumes a ready token before invoking its decode callback.
+             (setf decoded fields
+                   decoded-p t)))
       (let ((result
               (decode-http3-qpack-field-section
                payload context stream-id
@@ -1324,7 +1314,7 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
                :max-fields max-fields)))
         (when (http3-qpack-blocked-stream-p result)
           (funcall await-qpack result))
-        (unless (= decoded-count 1)
+        (unless decoded-p
           (%h3-transport-error
            "The QPACK await callback returned before decoding completed."
            stream-id))
@@ -1463,6 +1453,7 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
                              :max-fields max-fields)))
                       (multiple-value-call #'list
                         (%h3-server-parse-request-fields fields))
+                      (setf fields (%h3-copy-field-section fields))
                       (%call-http3-serialized
                        client
                        (lambda ()
@@ -1482,10 +1473,11 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
                                push-id
                                (http3-client-promised-push-ids client)
                                :test #'=)
-                              (push (cons push-id (copy-tree fields))
+                              (push (cons push-id fields)
                                     (http3-client-push-promises client)))))))
                       (when on-push-promise
-                        (funcall on-push-promise push-id (copy-tree fields)))))))
+                        (funcall on-push-promise push-id
+                                 (%h3-copy-field-section fields)))))))
                ((member type (list +http3-settings-type+
                                    +http3-cancel-push-type+
                                    +http3-goaway-type+
@@ -2210,10 +2202,6 @@ can be consumed only once."
   (let ((fields (list (cons ":status" (princ-to-string status))))
         (regular '()))
     (dolist (header headers)
-      (unless (http-kit:http-header-p header)
-        (%h3-transport-error
-         "HTTP/3 response headers must be HTTP-HEADER values."
-         (type-of header)))
       (let ((name (%h3-header-name header))
             (value (http-kit:http-header-content header)))
         (when (%h3-connection-specific-name-p name)
@@ -2228,10 +2216,6 @@ can be consumed only once."
 (defun %h3-server-response-trailer-fields (headers)
   (let ((fields '()))
     (dolist (header headers (nreverse fields))
-      (unless (http-kit:http-header-p header)
-        (%h3-transport-error
-         "HTTP/3 response trailers must be HTTP-HEADER values."
-         (type-of header)))
       (let ((name (%h3-header-name header))
             (value (http-kit:http-header-content header)))
         (when (http-kit::%forbidden-trailer-field-name-p name)
@@ -2481,7 +2465,7 @@ an opened push stream.  Returns the push ID and RESPONSE."
       (%h3-transport-error
        "An HTTP/3 handler must return an HTTP response or response stream."
        (type-of response)))
-    (unless (and (integerp status) (<= 200 status 599))
+    (unless (<= 200 status 599)
       (%h3-transport-error
        "HTTP/3 handlers must return a final status from 200 through 599."
        status))
@@ -2528,13 +2512,9 @@ an opened push stream.  Returns the push ID and RESPONSE."
                nil
                (if stream-response-p
                    (loop
-                     (when body-done-p
-                       (return nil))
                      (let ((chunk (funcall body-function)))
                        (cond
-                         ((null chunk)
-                          (setf body-done-p t)
-                          (return nil))
+                         ((null chunk) (return nil))
                          ((not (%http3-octet-vector-p chunk))
                           (%h3-transport-error
                            "HTTP/3 response body functions must return octet vectors or NIL."
@@ -3011,10 +2991,22 @@ owner-thread and non-reentrant."
        await-qpack (huffman-p nil) on-stream-open on-push-promise
        timeout deadline)
   "Send REQUEST through a reusable HTTP/3 connection manager."
-  (declare (ignore proxy-plan))
-  (when proxy
+  (when (or proxy
+            (and proxy-plan
+                 (not
+                  (or (eq proxy-plan :direct)
+                      (let ((length
+                              (handler-case (list-length proxy-plan)
+                                (type-error () nil))))
+                        (and length
+                             (evenp length)
+                             (loop for tail on proxy-plan by #'cddr
+                                   always (keywordp (car tail)))
+                             (eq (getf proxy-plan :mode) :direct)
+                             (null (getf proxy-plan :proxy))))))))
     (%h3-transport-error
-     "HTTP/3 proxy routing is not supported by this transport." proxy))
+     "HTTP/3 proxy routing is not supported by this transport."
+     (or proxy proxy-plan)))
   (when (and max-header-bytes
              (not (%h3-positive-limit-p max-header-bytes)))
     (%h3-transport-error

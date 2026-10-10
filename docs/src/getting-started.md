@@ -2,7 +2,7 @@
 
 cl-http-kit is loaded through ASDF. The core system has no built-in socket
 dependency: an application supplies the binary stream or exchange boundary.
-The instructions on this page describe the checked-in 0.4.0 API. The
+The instructions on this page describe the checked-in 0.4.1 API. The
 migration notes are documented in the
 [migration guide](project/migration.md).
 
@@ -42,19 +42,16 @@ tests:
                  :body #(79 75))))))
   (let ((response (http-kit:send-recorded-http-request session request)))
     (list (http-kit:http-response-status response)
-          (http-kit:http-response-body response))))
-;; => (200 #(79 75))
+          (http-kit:http-response-body response)
+          (length (http-kit:recording-session-requests session)))))
+;; => (200 #(79 75) 1)
 ```
 
 The response body is a one-dimensional octet vector. Requests and responses are
 copied at the model boundary, so later mutation of a caller-owned sequence does
 not alter the stored message.
 
-The recording session keeps the requests it accepted:
-
-```lisp
-(http-kit:recording-session-requests session)
-```
+The third list element counts the requests retained by the recording session.
 
 ## Connect a real transport
 
@@ -95,7 +92,7 @@ The same optional system exposes a native listening boundary for servers:
            :status 200
            :body #(79 75)))
         :max-connections 1
-        :session-options (list :max-requests 1)))
+        :session-options (list :max-requests 1))
     (http-kit/network:close-http-tcp-listener listener)))
 ```
 
@@ -137,8 +134,8 @@ requests advertise those codings with `Accept-Encoding`; pass
 `:automatic-decompression-p nil` to `make-http-client` to retain the encoded
 body. The body-size limit is enforced while decoding, so compressed responses
 cannot allocate an unbounded expanded body. Streaming body callbacks
-receive transport bytes and are not automatically decoded. The client still
-receives an application-provided transport function or stream callback.
+receive transport bytes and are not automatically decoded. Custom clients
+can supply a transport function or stream callback.
 
 Load HTTP/3 request-stream support when the application supplies QUIC stream
 callbacks with ASDF system cl-http-kit/http3.

@@ -32,11 +32,10 @@
   value)
 
 (defun %sse-no-line-breaks-p (value)
-  (and (stringp value)
-       (not (find-if (lambda (character)
-                       (or (char= character #\Return)
-                           (char= character #\Linefeed)))
-                     value))))
+  (not (find-if (lambda (character)
+                  (or (char= character #\Return)
+                      (char= character #\Linefeed)))
+                value)))
 
 (defun %sse-normalize-comments (comments)
   (let ((normalized
@@ -44,7 +43,8 @@
                 ((stringp comments) (list comments))
                 ((listp comments)
                  (handler-case
-                     (and (every #'stringp comments)
+                     (and (list-length comments)
+                          (every #'stringp comments)
                           (copy-list comments))
                    (type-error () nil)))
                 (t nil))))
@@ -98,8 +98,6 @@ string or a list of strings and is emitted as SSE comment lines."
   (<= #x80 byte #xbf))
 
 (defun %sse-utf8-string (octets)
-  (unless (%client-octet-vector-p octets)
-    (%sse-protocol-error "SSE input lines must contain octets." octets))
   (with-output-to-string (result)
     (loop with index = 0
           with length = (length octets)

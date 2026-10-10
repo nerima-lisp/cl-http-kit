@@ -55,14 +55,14 @@
     };
 
     cl-tls-kit = {
-      url = "github:nerima-lisp/cl-tls-kit/main";
+      url = "github:nerima-lisp/cl-tls-kit/v0.1.2";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.cl-weave.follows = "cl-weave";
       inputs.cl-crypto-kit.follows = "cl-crypto-kit";
     };
 
     cl-quic-kit = {
-      url = "github:nerima-lisp/cl-quic-kit/main";
+      url = "github:nerima-lisp/cl-quic-kit/v0.1.1";
       flake = false;
     };
 
@@ -79,6 +79,7 @@
 
   outputs =
     {
+      self,
       nixpkgs,
       cl-weave,
       cl-observability-kit,
@@ -103,8 +104,29 @@
       forEachSystem =
         function:
         nixpkgs.lib.genAttrs systems (system: function system (import nixpkgs { inherit system; }));
+      quicPeer =
+        pkgs:
+        pkgs.buildGoModule {
+          pname = "cl-http-kit-quic-peer";
+          version = "0.1.0";
+          src = ./t/fixtures/quic-peer;
+          vendorHash = "sha256-lqos9WjFCedcUHa1Y6lWVxaggTrS4fwlbn352OqLTfw=";
+        };
+      patchedParedit =
+        system:
+        paredit-cli.packages.${system}.default.overrideAttrs (old: {
+          patches = (old.patches or [ ]) ++ [ ./nix/patches/paredit-digit-char-radix.patch ];
+          doCheck = true;
+          checkPhase = ''
+            runHook preCheck
+            cargoWithProfile test --locked -p paredit-feature-lint-string-char char_op_string::domain::tests
+            runHook postCheck
+          '';
+        });
     in
     {
+      packages = forEachSystem (system: pkgs: { quic-peer = quicPeer pkgs; });
+
       formatter = forEachSystem (
         system: pkgs:
         (treefmt-nix.lib.evalModule pkgs {
@@ -127,7 +149,7 @@
           tls = cl-tls-kit.packages.${system}.default;
           crypto = cl-crypto-kit;
           quic = cl-quic-kit;
-          paredit = paredit-cli.packages.${system}.default;
+          paredit = patchedParedit system;
         in
         {
           default = pkgs.mkShell {
@@ -143,6 +165,8 @@
               tls
               pkgs.openssl
               pkgs.nghttp2
+              pkgs.caddy
+              (quicPeer pkgs)
               paredit
               pkgs.sbcl
               pkgs.coreutils
@@ -153,6 +177,7 @@
               pkgs.python3Packages.pymdown-extensions
             ];
             shellHook = ''
+              export HTTP_QUIC_PEER="${quicPeer pkgs}/bin/quic-peer"
               export CL_SOURCE_REGISTRY="''${CL_SOURCE_REGISTRY:-$PWD//:${
                 pkgs.lib.concatStringsSep ":" [
                   "${clWeave}/share/common-lisp/source//"
@@ -187,7 +212,7 @@
           tls = cl-tls-kit.packages.${system}.default;
           crypto = cl-crypto-kit;
           quic = cl-quic-kit;
-          paredit = paredit-cli.packages.${system}.default;
+          paredit = patchedParedit system;
           sourceRegistry = pkgs.lib.concatStringsSep ":" [
             "${clWeave}/share/common-lisp/source//"
             "${observability}//"
@@ -209,6 +234,7 @@
             name = "cl-http-kit-test-core";
             runtimeInputs = [
               clWeave
+              pkgs.sbcl
               observability
               concurrent
               boundary
@@ -217,14 +243,17 @@
               codec
             ];
             text = ''
-              test_home="''${TMPDIR:-/tmp}/cl-http-kit-test-core-$$"
-              mkdir -p "$test_home"
-              export HOME="$test_home"
-              export XDG_CACHE_HOME="$test_home/.cache"
+              test_cache="$(mktemp -d "''${TMPDIR:-/tmp}/cl-http-kit-test-core.XXXXXXXX")"
+              export XDG_CACHE_HOME="$test_cache"
+              export ASDF_OUTPUT_TRANSLATIONS="(:output-translations (t (\"$test_cache/\" :implementation)) :ignore-inherited-configuration)"
               export CL_SOURCE_REGISTRY="''${CL_SOURCE_REGISTRY:-$PWD//:${sourceRegistry}}"
               test_timeout_ms="''${CL_WEAVE_TEST_TIMEOUT_MS:-30000}"
               max_workers="''${CL_WEAVE_MAX_WORKERS:-1}"
-              exec cl-weave run cl-http-kit/test-core \
+              exec sbcl --noinform --no-userinit --no-sysinit --non-interactive \
+                --eval '(require :asdf)' \
+                --eval '(asdf:load-system "cl-weave")' \
+                --eval '(cl-weave/cli:main)' \
+                -- run cl-http-kit/test-core \
                 --test-timeout-ms "$test_timeout_ms" \
                 --max-workers "$max_workers" \
                 --bail true \
@@ -236,6 +265,7 @@
             name = "cl-http-kit-test";
             runtimeInputs = [
               clWeave
+              pkgs.sbcl
               observability
               concurrent
               boundary
@@ -245,16 +275,23 @@
               deflate
               tls
               pkgs.nghttp2
+              pkgs.caddy
+              pkgs.openssl
+              (quicPeer pkgs)
             ];
             text = ''
-              test_home="''${TMPDIR:-/tmp}/cl-http-kit-test-$$"
-              mkdir -p "$test_home"
-              export HOME="$test_home"
-              export XDG_CACHE_HOME="$test_home/.cache"
+              test_cache="$(mktemp -d "''${TMPDIR:-/tmp}/cl-http-kit-test.XXXXXXXX")"
+              export HTTP_QUIC_PEER="${quicPeer pkgs}/bin/quic-peer"
+              export XDG_CACHE_HOME="$test_cache"
+              export ASDF_OUTPUT_TRANSLATIONS="(:output-translations (t (\"$test_cache/\" :implementation)) :ignore-inherited-configuration)"
               export CL_SOURCE_REGISTRY="''${CL_SOURCE_REGISTRY:-$PWD//:${sourceRegistry}}"
               test_timeout_ms="''${CL_WEAVE_TEST_TIMEOUT_MS:-30000}"
               max_workers="''${CL_WEAVE_MAX_WORKERS:-1}"
-              exec cl-weave run cl-http-kit/test \
+              exec sbcl --noinform --no-userinit --no-sysinit --non-interactive \
+                --eval '(require :asdf)' \
+                --eval '(asdf:load-system "cl-weave")' \
+                --eval '(cl-weave/cli:main)' \
+                -- run cl-http-kit/test \
                 --test-timeout-ms "$test_timeout_ms" \
                 --max-workers "$max_workers" \
                 --bail true \
@@ -266,6 +303,7 @@
             name = "cl-http-kit-coverage";
             runtimeInputs = [
               clWeave
+              pkgs.sbcl
               observability
               concurrent
               boundary
@@ -276,12 +314,16 @@
               pkgs.coreutils
               pkgs.findutils
               pkgs.perl
+              pkgs.nghttp2
+              pkgs.openssl
+              pkgs.caddy
+              (quicPeer pkgs)
             ];
             text = ''
-              coverage_home="''${TMPDIR:-/tmp}/cl-http-kit-coverage-$$"
-              mkdir -p "$coverage_home"
-              export HOME="$coverage_home"
-              export XDG_CACHE_HOME="$coverage_home/.cache"
+              coverage_cache="$(mktemp -d "''${TMPDIR:-/tmp}/cl-http-kit-coverage.XXXXXXXX")"
+              export HTTP_QUIC_PEER="${quicPeer pkgs}/bin/quic-peer"
+              export XDG_CACHE_HOME="$coverage_cache"
+              export ASDF_OUTPUT_TRANSLATIONS="(:output-translations (t (\"$coverage_cache/\" :implementation)) :ignore-inherited-configuration)"
               export CL_SOURCE_REGISTRY="''${CL_SOURCE_REGISTRY:-$PWD//:${sourceRegistry}}"
               coverage_root="$(realpath -m -- "$PWD")"
               coverage_report_directory="$(realpath -m -- "''${CL_HTTP_KIT_COVERAGE_DIR:-coverage}")"
@@ -308,13 +350,17 @@
                 -delete
               CL_HTTP_KIT_COVERAGE_TIMEOUT_SECONDS="$coverage_timeout_seconds" \
                 perl -e 'alarm $ENV{CL_HTTP_KIT_COVERAGE_TIMEOUT_SECONDS}; exec @ARGV' \
-                cl-weave run cl-http-kit/test \
+                sbcl --noinform --no-userinit --no-sysinit --non-interactive \
+                --load scripts/coverage.lisp \
+                -- run cl-http-kit/test \
                 --coverage \
                 --coverage-system cl-http-kit \
                 --coverage-system cl-http-kit/http2 \
                 --coverage-system cl-http-kit/http3 \
                 --coverage-system cl-http-kit/observability \
                 --coverage-system cl-http-kit/client \
+                --coverage-system cl-http-kit/network \
+                --coverage-system cl-http-kit/tls \
                 --coverage-exclude src/package.lisp \
                 --coverage-exclude src/conditions.lisp \
                 --coverage-exclude src/model-declarations.lisp \
@@ -329,24 +375,22 @@
                 --coverage-exclude src/header-data.lisp \
                 --coverage-exclude src/recording-data.lisp \
                 --coverage-exclude src/transport-declarations.lisp \
-                --coverage-exclude http2/frame-data.lisp \
                 --coverage-exclude http2/hpack-huffman-data.lisp \
                 --coverage-exclude http2/transport-data.lisp \
                 --coverage-exclude http2/transport-declarations.lisp \
                 --coverage-exclude client/package.lisp \
                 --coverage-exclude client/conditions.lisp \
-                --coverage-exclude client/data.lisp \
                 --coverage-min-expression 100 \
                 --coverage-min-branch 100 \
                 --test-timeout-ms "$test_timeout_ms" \
                 --max-workers "$max_workers" \
                 --bail true \
-                --coverage-report-directory "$coverage_report_directory" \
+                --coverage-report-directory "$coverage_report_directory/" \
                 --fail-with-no-tests "$@"
               perl scripts/check-coverage.pl "$coverage_report_directory"
               html_count=$(find "$coverage_report_directory" -maxdepth 1 -type f -name '*.html' | wc -l)
-              if [ "$html_count" -eq 0 ] || [ ! -s "''${coverage_report_directory}cover-index.html" ]; then
-                echo "Coverage report is missing or empty: ''${coverage_report_directory}cover-index.html" >&2
+              if [ "$html_count" -eq 0 ] || [ ! -s "''${coverage_report_directory}/cover-index.html" ]; then
+                echo "Coverage report is missing or empty: ''${coverage_report_directory}/cover-index.html" >&2
                 exit 1
               fi
             '';
@@ -358,21 +402,9 @@
               paredit
               pkgs.coreutils
               pkgs.ripgrep
+              pkgs.jq
             ];
-            text = ''
-              mapfile -t lisp_files < <(rg --files -g '*.lisp' | sort)
-              if (( ''${#lisp_files[@]} == 0 )); then
-                echo "No Common Lisp files found." >&2
-                exit 1
-              fi
-              exec paredit inspect lint \
-                --output json \
-                --stats \
-                --fail-on error \
-                --require-suppression-reason \
-                --timeout-ms "''${PAREDIT_TIMEOUT_MS:-30000}" \
-                "''${lisp_files[@]}"
-            '';
+            text = builtins.readFile ./scripts/lint.sh;
           };
         in
         {
@@ -418,7 +450,7 @@
           tls = cl-tls-kit.packages.${system}.default;
           crypto = cl-crypto-kit;
           quic = cl-quic-kit;
-          paredit = paredit-cli.packages.${system}.default;
+          paredit = patchedParedit system;
           source = pkgs.lib.cleanSource ./.;
           sourceRegistry = pkgs.lib.concatStringsSep ":" [
             "${clWeave}/share/common-lisp/source//"
@@ -450,16 +482,20 @@
                 ];
               }
               ''
-                export HOME="$TMPDIR/home"
-                export XDG_CACHE_HOME="$HOME/.cache"
-                mkdir -p "$HOME"
+                export XDG_CACHE_HOME="$TMPDIR/cache"
+                mkdir -p "$XDG_CACHE_HOME"
+                export ASDF_OUTPUT_TRANSLATIONS="(:output-translations (t (\"$XDG_CACHE_HOME/\" :implementation)) :ignore-inherited-configuration)"
                 work="$TMPDIR/cl-http-kit"
                 mkdir -p "$work"
                 cp -R ${source}/. "$work/"
                 cd "$work"
                 export SBCL_HOME="${pkgs.sbcl}/lib/sbcl"
                 export CL_SOURCE_REGISTRY="$PWD//:${sourceRegistry}"
-                cl-weave run cl-http-kit/test-core \
+                sbcl --noinform --no-userinit --no-sysinit --non-interactive \
+                  --eval '(require :asdf)' \
+                  --eval '(asdf:load-system "cl-weave")' \
+                  --eval '(cl-weave/cli:main)' \
+                  -- run cl-http-kit/test-core \
                   --test-timeout-ms "''${CL_WEAVE_TEST_TIMEOUT_MS:-30000}" \
                   --max-workers "''${CL_WEAVE_MAX_WORKERS:-1}" \
                   --bail true \
@@ -483,25 +519,31 @@
                   pkgs.openssl
                   pkgs.nghttp2
                   pkgs.caddy
+                  (quicPeer pkgs)
                 ];
               }
               ''
-                export HOME="$TMPDIR/home"
-                export XDG_CACHE_HOME="$HOME/.cache"
-                mkdir -p "$HOME"
+                export HTTP_QUIC_PEER="${quicPeer pkgs}/bin/quic-peer"
+                export XDG_CACHE_HOME="$TMPDIR/cache"
+                mkdir -p "$XDG_CACHE_HOME"
+                export ASDF_OUTPUT_TRANSLATIONS="(:output-translations (t (\"$XDG_CACHE_HOME/\" :implementation)) :ignore-inherited-configuration)"
                 work="$TMPDIR/cl-http-kit"
                 mkdir -p "$work"
                 cp -R ${source}/. "$work/"
                 cd "$work"
                 export SBCL_HOME="${pkgs.sbcl}/lib/sbcl"
                 export CL_SOURCE_REGISTRY="$PWD//:${sourceRegistry}"
-                cl-weave run cl-http-kit/test \
+                sbcl --noinform --no-userinit --no-sysinit --non-interactive \
+                  --eval '(require :asdf)' \
+                  --eval '(asdf:load-system "cl-weave")' \
+                  --eval '(cl-weave/cli:main)' \
+                  -- run cl-http-kit/test \
                   --test-timeout-ms "''${CL_WEAVE_TEST_TIMEOUT_MS:-30000}" \
                   --max-workers "''${CL_WEAVE_MAX_WORKERS:-1}" \
                   --bail true \
                   --fail-with-no-tests
                 read -r caddy_port receiver_port < <(
-                  sbcl --non-interactive \
+                  sbcl --no-userinit --no-sysinit --non-interactive \
                     --eval '(require :sb-bsd-sockets)' \
                     --eval "(let ((caddy (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)) \
                                   (receiver (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp))) \
@@ -551,7 +593,8 @@
                   HTTP3_LOOPBACK_MODE="$mode" CADDY_PORT="$caddy_port" \
                     RECEIVER_PORT="$receiver_port" \
                     CADDY_ROOT="$TMPDIR/self.crt" \
-                    sbcl --non-interactive --load t/http3-loopback.lisp
+                    sbcl --no-userinit --no-sysinit --non-interactive \
+                      --load t/http3-loopback.lisp
                 done
                 touch "$out"
               '';
@@ -563,23 +606,66 @@
                   paredit
                   pkgs.coreutils
                   pkgs.ripgrep
+                  pkgs.jq
                 ];
               }
               ''
                 cd ${source}
-                mapfile -t lisp_files < <(rg --files -g '*.lisp' | sort)
-                if (( ''${#lisp_files[@]} == 0 )); then
-                  echo "No Common Lisp files found." >&2
-                  exit 1
-                fi
-                paredit inspect lint \
-                  --output json \
-                  --stats \
-                  --fail-on error \
-                  --require-suppression-reason \
-                  --timeout-ms 30000 \
-                  "''${lisp_files[@]}"
+                PAREDIT_TIMEOUT_MS=30000 ${pkgs.bash}/bin/bash ${./scripts/lint.sh}
                 touch "$out"
+              '';
+
+          coverage = pkgs.runCommand "cl-http-kit-coverage" { } ''
+            work="$TMPDIR/cl-http-kit"
+            mkdir -p "$work"
+            cp -R ${source}/. "$work/"
+            chmod -R u+w "$work"
+            cd "$work"
+            ${self.apps.${system}.coverage.program}
+            mkdir -p "$out"
+            cp -R coverage "$out/"
+          '';
+
+          coverage-auditor =
+            pkgs.runCommand "cl-http-kit-coverage-auditor"
+              {
+                nativeBuildInputs = [
+                  pkgs.perl
+                  pkgs.sbcl
+                ];
+              }
+              ''
+                cd ${source}
+                perl -c scripts/check-coverage.pl
+                prove -v t/check-coverage.t
+                mkdir -p "$TMPDIR/normalization"
+                sbcl --noinform --no-sysinit --no-userinit --disable-debugger \
+                  --script t/coverage-normalization.lisp "$TMPDIR/normalization/" --identity-only
+                mkdir -p "$TMPDIR/normalization-ci" "$TMPDIR/normalization-cache"
+                export ASDF_OUTPUT_TRANSLATIONS="(:output-translations (t (\"$TMPDIR/normalization-cache/\" :implementation)) :ignore-inherited-configuration)"
+                XDG_CACHE_HOME="$TMPDIR/normalization-cache" \
+                  sbcl --noinform --no-sysinit --no-userinit --disable-debugger \
+                  --script t/coverage-normalization.lisp "$TMPDIR/normalization-ci/" --ci
+                touch "$out"
+              '';
+
+          docs =
+            pkgs.runCommand "cl-http-kit-docs"
+              {
+                nativeBuildInputs = [
+                  (pkgs.python3.withPackages (pythonPackages: [
+                    pythonPackages.mkdocs
+                    pythonPackages.mkdocs-material
+                    pythonPackages.pymdown-extensions
+                  ]))
+                ];
+              }
+              ''
+                export XDG_CACHE_HOME="$TMPDIR/cache"
+                mkdir -p "$XDG_CACHE_HOME"
+                cd ${source}
+                mkdocs build --strict --config-file docs/mkdocs.yml --site-dir "$out"
+                test -s "$out/index.html"
               '';
         }
       );

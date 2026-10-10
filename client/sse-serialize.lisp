@@ -11,6 +11,11 @@
 (defun %sse-emit-line (result prefix value)
   (%sse-append-string result prefix)
   (when value
+    ;; Parsing removes one space after a field colon, but not a comment colon.
+    (when (and (not (string= prefix ":"))
+               (plusp (length value))
+               (char= (char value 0) #\Space))
+      (%sse-append-string result " "))
     (%sse-append-string result value))
   (%sse-append-octets result #(13 10)))
 

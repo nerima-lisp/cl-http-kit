@@ -314,3 +314,73 @@
                           :trailers trailers)
        16384 1000 1000
        :include-session-p nil))))
+
+#+sbcl
+(deftest http2-public-peer-trailer-header-limit
+  (dolist (limit '(255 256))
+    (let* ((value (make-string 214 :initial-element #\x))
+           (initial-input (concatenate-octets
+                           (h2-frame 4 0 0 (octets 0 6 0 0 (floor limit 256) (mod limit 256)))
+                           (h2-frame 1 5 1 (octets #x88))))
+           (input (concatenate-octets initial-input (h2-frame 1 5 3 (octets #x88))))
+           (stream (make-instance 'binary-session-stream :input input))
+           (closes 0)
+           (opened nil)
+           (seen nil)
+           (connection
+             (http-kit/http2:make-http2-connection
+              :stream stream
+              :close-stream (lambda (actual)
+                              (ensure-true (eq actual stream))
+                              (incf closes)
+                              (close actual)))))
+      (unwind-protect
+           (let* ((first-response
+                    (http-kit/http2:send-http2-request-over-connection
+                     connection (make-http-request :method "GET" :uri "https://example.test/")))
+                  (before (copy-seq (binary-session-output stream)))
+                  (result
+                    (handler-case
+                        (handler-bind ((http-error (lambda (condition) (setf seen condition))))
+                          (http-kit/http2:send-http2-request-over-connection
+                           connection
+                           (make-http-request
+                            :method "POST" :uri "https://example.test/"
+                            :body (octets 65)
+                            :trailers (list (make-http-header "x-checksum" value)))
+                           :on-stream-open (lambda (id cancel)
+                                             (ensure-true (functionp cancel))
+                                             (push id opened))))
+                      (http-error (condition) condition))))
+             (ensure-equal 200 (http-response-status first-response))
+             (ensure-equal (octets) (http-response-body first-response))
+             (ensure-equal limit (http-kit/http2:http2-connection-peer-max-header-list-size connection))
+             (if (= limit 255)
+                 (progn
+                   (ensure-true (typep result 'http-size-limit-exceeded))
+                   (ensure-true (eq seen result))
+                   (ensure-equal :response-parse (http-error-operation result))
+                   (ensure-equal :headers (http-kit:http-size-limit-exceeded-kind result))
+                   (ensure-equal 255 (http-kit:http-size-limit-exceeded-limit result))
+                   (ensure-equal 256 (http-kit:http-size-limit-exceeded-observed result))
+                   (ensure-equal before (binary-session-output stream))
+                   (ensure-equal (length initial-input) (binary-session-input-position stream))
+                   (ensure-false opened)
+                   (ensure-equal 1 closes))
+                 (progn
+                   (ensure-equal 200 (http-response-status result))
+                   (ensure-equal (octets) (http-response-body result))
+                   (ensure-false seen)
+                   (ensure-equal '(3) opened)
+                   (ensure-equal (length input) (binary-session-input-position stream))
+                   (ensure-equal 0 closes)
+                   (let ((frames (nthcdr 3 (h2-output-frames stream))))
+                     (ensure-equal '(1 0 1) (mapcar #'http-kit/http2::%h2-frame-type frames))
+                     (ensure-equal '(4 0 5) (mapcar #'http-kit/http2::%h2-frame-flags frames))
+                     (ensure-equal '(3 3 3) (mapcar #'http-kit/http2::%h2-frame-stream-id frames))
+                     (ensure-equal (octets 65) (http-kit/http2::%h2-frame-payload (second frames)))
+                     (ensure-equal (list (cons "x-checksum" value))
+                                   (server-response-fields (third frames)))))))
+        (http-kit/http2:close-http2-connection connection))
+      (ensure-equal 1 closes)
+      (ensure-false (open-stream-p stream)))))

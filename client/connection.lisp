@@ -69,10 +69,10 @@
              (>= (- now (%http-pooled-connection-opened-at entry))
                  max-age)))))
 
-(defun %pool-purge-expired (pool &optional now)
+(defun %pool-purge-expired (pool)
   (when (or (%http-connection-pool-idle-timeout pool)
             (%http-connection-pool-max-connection-age pool))
-    (let ((now (if now now (%pool-now pool)))
+    (let ((now (%pool-now pool))
           (retained nil))
       (dolist (entry (%http-connection-pool-entries pool))
         (if (%pool-expired-p pool entry now)
@@ -213,19 +213,12 @@ be used concurrently from multiple threads."
 
 (defun %pool-open (pool request &key timeout deadline proxy-plan proxy)
   (handler-case
-      (let ((stream
-              (funcall (%http-connection-pool-open-stream pool)
-                       request
-                       :timeout timeout
-                       :deadline deadline
-                       :proxy-plan proxy-plan
-                       :proxy proxy)))
-        (unless (streamp stream)
-          (error 'http-connection-error
-                 :message "The connection pool opener did not return a stream."
-                 :operation :connect
-                 :cause stream))
-        stream)
+      (funcall (%http-connection-pool-open-stream pool)
+               request
+               :timeout timeout
+               :deadline deadline
+               :proxy-plan proxy-plan
+               :proxy proxy)
     (http-error (condition)
       (error condition))
     (error (condition)

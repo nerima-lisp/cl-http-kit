@@ -309,3 +309,232 @@
 (deftest native-network-unavailable
   (signals http-unsupported-feature
     (http-network-resolve-host "127.0.0.1")))
+
+#+sbcl
+(progn
+  (defclass tls-lifecycle-test-stream (binary-test-stream)
+    ((closed-p :initform nil :accessor tls-lifecycle-test-stream-closed-p)))
+
+  (defmethod open-stream-p ((stream tls-lifecycle-test-stream))
+    (not (tls-lifecycle-test-stream-closed-p stream)))
+
+  (defmethod close ((stream tls-lifecycle-test-stream) &key abort)
+    (declare (ignore abort))
+    (setf (tls-lifecycle-test-stream-closed-p stream) t))
+
+  (defun tls-record-bound-test-wire (type length)
+    (let ((wire (make-array (+ 5 length) :element-type '(unsigned-byte 8)
+                                          :initial-element 0)))
+      (replace wire (octets type 3 3 (ldb (byte 8 8) length)
+                           (ldb (byte 8 0) length)))
+      wire))
+
+  (defun tls-record-bound-test-driver (raw state handshake-key-p application-key-p)
+    (let* ((provider (cl-tls-kit:make-cl-crypto-kit-provider))
+           (driver (cl-tls-kit:make-tls13-client-driver
+                    :provider provider
+                    :transport (http-kit/tls::%tls-transport raw)))
+           (read-state
+             (when (or handshake-key-p application-key-p)
+               (cl-tls-kit:make-tls13-traffic-state
+                provider :sha256 :aes-128-gcm
+                (make-array 32 :element-type '(unsigned-byte 8)
+                               :initial-element 1)
+                16 12))))
+      (setf (cl-tls-kit::tls13-client-driver-state driver) state
+            (cl-tls-kit::tls13-client-driver-handshake-read-state driver)
+            (and handshake-key-p read-state)
+            (cl-tls-kit::tls13-client-driver-application-read-state driver)
+            (and application-key-p read-state))
+      driver))
+
+  (defun tls-record-read-bound-cases ()
+    ;; Fixed RFC 8446 limits, independent of the implementation's calculation.
+    '((:awaiting-server-hello nil nil 22 16384)
+      (:awaiting-server-hello nil nil 23 16384)
+      (:awaiting-finished t nil 23 16640)
+      (:connected t t 23 16640)
+      (:connected t nil 23 16384)
+      (:awaiting-server-hello nil t 23 16384)
+      (:connected t t 20 16384)
+      (:connected t t 21 16384)
+      (:connected t t 22 16384)))
+
+  (deftest native-tls-record-read-bound-maximum
+    (dolist (case (tls-record-read-bound-cases))
+      (destructuring-bind (state handshake-key-p application-key-p type limit) case
+        (let* ((wire (tls-record-bound-test-wire type limit))
+               (raw (make-instance 'binary-test-stream :input wire))
+               (driver (tls-record-bound-test-driver
+                        raw state handshake-key-p application-key-p)))
+          (ensure-octets-equal
+           wire (funcall (getf (http-kit/tls::%tls-transport raw) :read) driver))
+          (ensure-equal (+ 5 limit)
+                        (http-kit/test-core::binary-test-input-position raw))))))
+
+  (deftest native-tls-record-read-bound-overflow
+    (dolist (case (tls-record-read-bound-cases))
+      (destructuring-bind (state handshake-key-p application-key-p type limit) case
+        (dolist (length (list (1+ limit) 65535))
+          (let* ((raw (make-instance 'binary-test-stream
+                                    :input (tls-record-bound-test-wire type length)))
+                 (driver (tls-record-bound-test-driver
+                          raw state handshake-key-p application-key-p))
+                 (condition
+                   (handler-case
+                       (progn
+                         (funcall (getf (http-kit/tls::%tls-transport raw) :read)
+                                  driver)
+                         nil)
+                     (http-protocol-error (condition) condition))))
+            (ensure-true condition)
+            (when condition
+              (ensure-equal :record-overflow
+                            (http-kit:http-protocol-error-detail condition)))
+            (ensure-equal 5
+                          (http-kit/test-core::binary-test-input-position raw)))))))
+
+  (deftest native-tls-record-truncation
+    (dolist (wire (list (octets 23)
+                       (octets 23 3)
+                       (octets 23 3 3)
+                       (octets 23 3 3 0)
+                       (octets 23 3 3 0 2)
+                       (octets 23 3 3 0 2 1)))
+      (signals http-protocol-error
+        (http-kit/tls::%tls-read-record
+         (make-instance 'binary-test-stream :input wire))))
+    (ensure-equal nil
+                  (http-kit/tls::%tls-read-record
+                   (make-instance 'binary-test-stream :input (octets))))
+    (ensure-octets-equal
+     (octets 23 3 3 0 2 1 2)
+     (http-kit/tls::%tls-read-record
+      (make-instance 'binary-test-stream :input (octets 23 3 3 0 2 1 2))))
+    (ensure-octets-equal
+     (octets 23 3 3 0 0)
+     (http-kit/tls::%tls-read-record
+      (make-instance 'binary-test-stream :input (octets 23 3 3 0 0)))))
+
+  (deftest native-tls-close-notify-eof
+    (let* ((provider (cl-tls-kit:make-cl-crypto-kit-provider))
+           (secret (make-array 32 :element-type '(unsigned-byte 8)
+                                 :initial-element 1))
+           (write-state (cl-tls-kit:make-tls13-traffic-state
+                         provider :sha256 :aes-128-gcm secret 16 12))
+           (read-state (cl-tls-kit:make-tls13-traffic-state
+                        provider :sha256 :aes-128-gcm secret 16 12))
+           (wire (cl-tls-kit:encrypt-tls13-traffic-record
+                  (cl-tls-kit:make-tls-plaintext
+                   cl-tls-kit:+tls-content-type-alert+ (octets 1 0))
+                  write-state))
+           (reads 0)
+           (raw (make-instance 'tls-lifecycle-test-stream :input (octets)))
+           (driver
+             (cl-tls-kit:make-tls13-client-driver
+              :provider provider
+              :transport-read
+              (lambda (driver)
+                (declare (ignore driver))
+                (incf reads)
+                (if (= reads 1) wire (error "Read after close_notify.")))))
+           (stream (http-kit/tls::%make-http-tls-stream driver raw)))
+      (setf (cl-tls-kit::tls13-client-driver-state driver) :connected
+            (cl-tls-kit::tls13-client-driver-application-read-state driver)
+            read-state)
+      (unwind-protect
+           (progn
+             (ensure-equal :eof (read-byte stream nil :eof))
+             (ensure-equal :eof (read-byte stream nil :eof))
+             (ensure-equal 1 reads))
+        (close stream :abort t))))
+
+  (deftest native-tls-unauthenticated-eof-rejected
+    (let* ((raw (make-instance 'tls-lifecycle-test-stream :input (octets)))
+           (driver (cl-tls-kit:make-tls13-client-driver
+                    :provider (cl-tls-kit:make-cl-crypto-kit-provider)
+                    :transport (http-kit/tls::%tls-transport raw)))
+           (stream (http-kit/tls::%make-http-tls-stream driver raw)))
+      (setf (cl-tls-kit::tls13-client-driver-state driver) :connected)
+      (unwind-protect
+           (signals http-protocol-error
+             (read-byte stream nil :eof))
+        (close stream :abort t))))
+
+  (deftest native-tls-close-releases-peer-closed-transport
+    (let* ((raw (make-instance 'tls-lifecycle-test-stream :input (octets)))
+           (driver (cl-tls-kit:make-tls13-client-driver
+                    :provider (cl-tls-kit:make-cl-crypto-kit-provider)
+                    :transport (http-kit/tls::%tls-transport raw)))
+           (stream (http-kit/tls::%make-http-tls-stream driver raw)))
+      (setf (cl-tls-kit::tls13-client-driver-state driver) :closed
+            (cl-tls-kit::tls13-client-driver-close-notify-received driver) t)
+      (close stream)
+      (ensure-false (open-stream-p raw))
+      (ensure-false (open-stream-p stream))))
+
+  (deftest native-tls-setup-failure-releases-transport
+    (let ((raw (make-instance 'tls-lifecycle-test-stream :input (octets)))
+          (upgrade (make-http-tls-upgrader :trust-anchors (list t))))
+      (signals type-error
+        (funcall upgrade raw nil))
+      (ensure-false (open-stream-p raw))))
+
+  (deftest native-tls-close-write-failure-releases-transport
+    (let* ((raw (make-instance 'tls-lifecycle-test-stream :input (octets)))
+           (failure (make-condition 'simple-error
+                                    :format-control "close_notify write failed"))
+           (driver (cl-tls-kit:make-tls13-client-driver
+                    :provider (cl-tls-kit:make-cl-crypto-kit-provider)
+                    :transport-read (lambda (driver)
+                                      (declare (ignore driver))
+                                      nil)
+                    :transport-write (lambda (driver wire)
+                                       (declare (ignore driver wire))
+                                       (error failure))))
+           (stream (http-kit/tls::%make-http-tls-stream driver raw)))
+      (setf (cl-tls-kit::tls13-client-driver-state driver) :connected)
+      (ensure-true
+       (eq failure (handler-case (close stream)
+                     (error (condition) condition))))
+      (ensure-false (open-stream-p raw))
+      (ensure-false (open-stream-p stream)))))
+
+#+sbcl
+(deftest network-public-listener-defaults-contract
+  (let* ((seams (list '(setf sb-bsd-sockets:sockopt-reuse-address)
+                      'sb-bsd-sockets:socket-bind 'sb-bsd-sockets:socket-listen))
+         (originals (mapcar #'fdefinition seams))
+         (events nil)
+         (listener nil))
+    (unwind-protect
+         (progn
+           (setf (fdefinition (first seams))
+                 (lambda (value socket)
+                   (push (list :reuse value) events)
+                   (funcall (first originals) value socket))
+                 (fdefinition (second seams))
+                 (lambda (socket address port)
+                   (push (list :bind port) events)
+                   (funcall (second originals) socket address port))
+                 (fdefinition (third seams))
+                 (lambda (socket backlog)
+                   (push (list :listen backlog) events)
+                   (funcall (third originals) socket backlog)))
+           (setf listener (open-http-tcp-listener :host "127.0.0.1"))
+           (ensure-equal '((:reuse t) (:bind 0) (:listen 128)) (reverse events))
+           (ensure-equal "127.0.0.1" (http-network-listener-address listener))
+           (ensure-equal :ipv4 (http-network-listener-address-family listener))
+           (ensure-true (< 0 (http-network-listener-port listener) 65536))
+           (ensure-equal nil (close-http-tcp-listener listener))
+           (ensure-equal nil (close-http-tcp-listener listener))
+           (let ((caught (handler-case (accept-http-tcp-stream listener :timeout 0)
+                           (http-protocol-error (condition) condition))))
+             (ensure-true (typep caught 'http-protocol-error))
+             (ensure-equal :accept (http-error-operation caught))
+             (ensure-equal :closed-listener (http-protocol-error-detail caught))))
+      (loop for seam in seams for original in originals
+            do (setf (fdefinition seam) original))
+      (close-http-tcp-listener listener))
+    (loop for seam in seams for original in originals
+          do (ensure-true (eq original (fdefinition seam))))))

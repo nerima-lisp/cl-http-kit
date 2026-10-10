@@ -18,7 +18,7 @@
   (intern (string-upcase scheme) :keyword))
 
 (defun %proxy-environment-hex-value (character)
-  (position character "0123456789abcdefABCDEF" :test #'char=))
+  (digit-char-p character 16))
 
 (defun %proxy-environment-unescape (value variable)
   (with-output-to-string (stream)
@@ -98,8 +98,7 @@
                  (values (subseq hostport 1 close)
                          (if (string= rest "")
                              nil
-                             (if (and (plusp (length rest))
-                                      (char= (char rest 0) #\:))
+                             (if (char= (char rest 0) #\:)
                                  (%proxy-environment-port
                                   (subseq rest 1) variable)
                                  (%client-protocol-error
@@ -194,8 +193,7 @@
   (position character "0123456789abcdefABCDEF" :test #'char=))
 
 (defun %proxy-hex-word (token)
-  (when (and (stringp token)
-             (plusp (length token))
+  (when (and (plusp (length token))
              (<= (length token) 4)
              (every (lambda (character)
                       (%proxy-hex-value character))
@@ -239,8 +237,7 @@
            (word-groups nil)
            (valid-p (null second-double)))
       (when (and (not double)
-                 (or (some (lambda (part) (zerop (length part))) left)
-                     (some (lambda (part) (zerop (length part))) right)))
+                 (some (lambda (part) (zerop (length part))) left))
         (setf valid-p nil))
       (loop for part in parts
             for index from 0
@@ -328,22 +325,24 @@
              (cond
                ((string= rest "")
                 (values (subseq token 1 close) nil))
-               ((and (char= (char rest 0) #\:)
-                     (> (length rest) 1))
-                (values (subseq token 1 close)
-                        (%client-parse-integer rest
-                                               :start 1
-                                               :allow-sign-p nil)))
+               ((char= (char rest 0) #\:)
+                (let ((port (%client-parse-integer rest
+                                                   :start 1
+                                                   :allow-sign-p nil)))
+                  (if (and port (<= 1 port 65535))
+                      (values (subseq token 1 close) port)
+                      (values nil nil))))
                (t (values nil nil)))))))
       (t
        (let ((colon (position #\: token :from-end t)))
          (if (and colon
-                  (not (position #\: token :end colon))
-                  (< (1+ colon) length))
-             (values (subseq token 0 colon)
-                     (%client-parse-integer token
-                                            :start (1+ colon)
-                                            :allow-sign-p nil))
+                  (not (position #\: token :end colon)))
+             (let ((port (%client-parse-integer token
+                                              :start (1+ colon)
+                                              :allow-sign-p nil)))
+               (if (and port (<= 1 port 65535))
+                   (values (subseq token 0 colon) port)
+                   (values nil nil)))
              (values token nil)))))))
 
 (defun %proxy-host-token-match-p (host port token)

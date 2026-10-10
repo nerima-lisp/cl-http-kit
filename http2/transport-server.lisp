@@ -60,6 +60,13 @@
          :operation :http2-server
          :message "Invalid HTTP/2 header"))
 
+(defun %h2-server-response-header-valid-p (name value)
+  (when (and (plusp (length name))
+             (char= (char name 0) #\:))
+    (%h2-server-invalid-header
+     name "Response pseudo-fields are forbidden"))
+  (%h2-regular-header-valid-p name value))
+
 (defun %h2-server-invalid-stream-id (stream-id)
   (unless (and (integerp stream-id)
                (plusp stream-id)
@@ -105,15 +112,9 @@ pseudo-fields are kept separate because they are not ordinary HTTP headers.
         (seen-pseudo (make-hash-table :test #'equal))
         (regular-seen-p nil))
     (dolist (field fields)
-      (unless (and (consp field)
-                   (stringp (car field))
-                   (stringp (cdr field)))
-        (%h2-server-error "Decoded HPACK field is not a name/value pair"
-                          field))
       (let ((name (car field))
             (value (cdr field)))
-        (if (and (string/= name "")
-                 (char= (char name 0) #\:))
+        (if (char= (char name 0) #\:)
             (progn
               (when regular-seen-p
                 (%h2-server-invalid-header name
@@ -130,8 +131,7 @@ pseudo-fields are kept separate because they are not ordinary HTTP headers.
                 (t (%h2-server-invalid-header name "Unknown request pseudo-field"))))
             (progn
               (setf regular-seen-p t)
-              (unless (%h2-regular-header-valid-p name value :allow-te-p t)
-                (%h2-server-invalid-header name "Forbidden HTTP/2 header field"))
+              (%h2-regular-header-valid-p name value :allow-te-p t)
               (push (http-kit:make-http-header name value) regular)))))
     (setf regular (nreverse regular))
     (unless (and method (string/= method "")
@@ -239,10 +239,6 @@ pseudo-fields are kept separate because they are not ordinary HTTP headers.
                         (list kind current increment)))
     next))
 
-(defun %h2-server-frame-flags-valid-p (frame mask)
-  (declare (ignore frame mask))
-  t)
-
 (defun %h2-server-materialize-response (response request
                                         &key informational-p)
   (let ((status nil)
@@ -274,11 +270,6 @@ pseudo-fields are kept separate because they are not ordinary HTTP headers.
               :message "HTTP/2 handler must return an HTTP response"
               :operation :http2-server
               :detail response)))
-    (unless (and (integerp status) (<= 100 status 599))
-      (error 'http-kit:http-invalid-status
-             :code status
-             :operation :http2-server
-             :message "Invalid HTTP/2 response status"))
     (if informational-p
         (unless (and (< status 200) (/= status 101))
           (error 'http-kit:http-protocol-error
@@ -440,6 +431,7 @@ values.
                                           clock-function)))
                       (streams (make-hash-table :test #'eql))
                       (pending-frames '())
+                      (wire-header-stream-id nil)
                       (peer-max-concurrent-streams nil)
                       (reset-stream-count 0)
                       (reset-times '())
@@ -537,8 +529,59 @@ values.
                       (next-frame ()
                         (if pending-frames
                             (pop pending-frames)
-                            (%h2-read-frame reader max-frame-size
-                                            absolute-deadline clock-function)))
+                            (read-wire-frame)))
+                      (read-wire-frame ()
+                        (let ((frame (%h2-read-frame reader max-frame-size
+                                                     absolute-deadline clock-function)))
+                          ;; Validate the wire sequence before controls can bypass
+                          ;; the queued header block while a response is blocked.
+                          (unless (eq frame :eof)
+                            (when wire-header-stream-id
+                              (unless (and (= (%h2-frame-type frame)
+                                              +http2-continuation-type+)
+                                           (= (%h2-frame-stream-id frame)
+                                              wire-header-stream-id))
+                                (error 'http-kit:http-protocol-error
+                                       :message "HTTP/2 HEADERS must be followed by same-stream CONTINUATION frames."
+                                       :operation :http2-headers
+                                       :detail (list (%h2-frame-type frame)
+                                                     (%h2-frame-stream-id frame)))))
+                            (when (or wire-header-stream-id
+                                      (= (%h2-frame-type frame) +http2-headers-type+))
+                              (setf wire-header-stream-id
+                                    (when (zerop (logand (%h2-frame-flags frame)
+                                                        +http2-end-headers-flag+))
+                                      (%h2-frame-stream-id frame)))))
+                          frame))
+                      (stream-window-control-p (frame stream-id)
+                        (and (= (%h2-frame-stream-id frame) stream-id)
+                             (member (%h2-frame-type frame)
+                                     (list +http2-window-update-type+
+                                           +http2-rst-stream-type+))))
+                      (pending-stream-control-p (frame)
+                        (let ((stream-id (%h2-frame-stream-id frame)))
+                          (and (stream-window-control-p frame stream-id)
+                               (not (gethash stream-id streams))
+                               (some (lambda (pending)
+                                       (and (= (%h2-frame-type pending)
+                                               +http2-headers-type+)
+                                            (= (%h2-frame-stream-id pending) stream-id)))
+                                     pending-frames))))
+                      (next-send-window-frame (state)
+                        ;; Once queued HEADERS has opened this stream, its deferred
+                        ;; controls must remain reachable without replaying other
+                        ;; streams' pending requests during this response.
+                        (let ((frame (find-if
+                                      (lambda (pending)
+                                        (stream-window-control-p
+                                         pending (%h2-server-stream-id state)))
+                                      pending-frames)))
+                          (if frame
+                              (progn
+                                (setf pending-frames
+                                      (delete frame pending-frames :test #'eq :count 1))
+                                frame)
+                              (read-wire-frame))))
                      (apply-peer-settings (payload)
                           (multiple-value-bind
                                 (new-max-frame-size new-table-size
@@ -614,10 +657,6 @@ values.
                                  (%h2-server-error
                                   "HTTP/2 SETTINGS must use stream zero"
                                   stream-id))
-                               (unless (%h2-server-frame-flags-valid-p
-                                        frame +http2-ack-flag+)
-                                 (%h2-server-error
-                                  "Invalid HTTP/2 SETTINGS flags" flags))
                                (if (plusp (logand flags +http2-ack-flag+))
                                    (unless (zerop (length payload))
                                      (%h2-server-error
@@ -636,10 +675,6 @@ values.
                                  (%h2-server-error
                                   "HTTP/2 PING must use stream zero"
                                   stream-id))
-                               (unless (%h2-server-frame-flags-valid-p
-                                        frame +http2-ack-flag+)
-                                 (%h2-server-error
-                                  "Invalid HTTP/2 PING flags" flags))
                                (unless (= (length payload) 8)
                                  (%h2-server-error
                                   "HTTP/2 PING payload must be eight octets"
@@ -673,12 +708,7 @@ values.
                                                 (%h2-server-window-add
                                                  (%h2-server-stream-send-window state)
                                                  increment
-                                                 :stream))
-                                          (when (and interested-state
-                                                     (eq state interested-state)
-                                                     (%h2-server-stream-reset-p state))
-                                            (return-from process-control-frame
-                                              :reset)))
+                                                 :stream)))
                                          ((> stream-id last-client-stream-id)
                                           (%h2-server-error
                                            "HTTP/2 WINDOW_UPDATE targeted an idle stream"
@@ -747,7 +777,7 @@ values.
                                   "HTTP/2 stream cannot depend on itself"
                                   stream-id))
                                nil)
-                              ((= type +http2-priority-update-type+)
+                              (t
                                (unless (and (zerop stream-id)
                                             (zerop flags)
                                             (>= (length payload) 4))
@@ -763,26 +793,24 @@ values.
                                  (%h2-server-error
                                   "HTTP/2 PRIORITY_UPDATE contains non-ASCII field data"
                                   frame))
-                               nil)
-                              (t nil)))))
+                               nil)))))
                       (await-send-window (state)
                         (loop
-                          (when (%h2-server-stream-reset-p state)
-                            (return :reset))
                           (when (and (plusp peer-connection-window)
                                      (plusp (%h2-server-stream-send-window state)))
                             (return :ready))
-                          (let ((frame (next-frame)))
+                          (let ((frame (next-send-window-frame state)))
                             (when (eq frame :eof)
                               (return :eof))
-                            (if (member (%h2-frame-type frame)
+                            (if (and (not (pending-stream-control-p frame))
+                                     (member (%h2-frame-type frame)
                                         (list +http2-settings-type+
                                               +http2-ping-type+
                                               +http2-window-update-type+
                                               +http2-rst-stream-type+
                                               +http2-goaway-type+
                                               +http2-priority-type+
-                                              +http2-priority-update-type+))
+                                              +http2-priority-update-type+)))
                                 (let ((result
                                         (process-control-frame frame state)))
                                   (when (member result '(:goaway :reset))
@@ -794,13 +822,7 @@ values.
                           (dolist (header headers)
                             (let ((name (http-kit:http-header-name header))
                                   (value (http-kit:http-header-content header)))
-                              (when (and (plusp (length name))
-                                         (char= (char name 0) #\:))
-                                (%h2-server-invalid-header
-                                 name "Response pseudo-fields are forbidden"))
-                              (unless (%h2-regular-header-valid-p name value)
-                                (%h2-server-invalid-header
-                                 name "Forbidden HTTP/2 response header field"))
+                              (%h2-server-response-header-valid-p name value)
                               (setf fields
                                     (nconc fields (list (cons name value))))))
                           fields))
@@ -809,9 +831,7 @@ values.
                           (dolist (header trailers)
                             (let ((name (http-kit:http-header-name header))
                                   (value (http-kit:http-header-content header)))
-                              (unless (%h2-trailers (list (cons name value)))
-                                (%h2-server-invalid-header
-                                 name "Forbidden HTTP/2 trailer field"))
+                              (%h2-trailers (list (cons name value)))
                               (setf fields
                                     (nconc fields (list (cons name value))))))
                           fields))
@@ -890,10 +910,6 @@ values.
                                                            peer-connection-window
                                                            (%h2-server-stream-send-window
                                                             state))))
-                                                (when (zerop chunk-length)
-                                                  (%h2-server-error
-                                                   "HTTP/2 response body made no flow-control progress"
-                                                   state))
                                                 (let ((chunk
                                                         (make-array chunk-length
                                                                     :element-type
@@ -941,13 +957,6 @@ values.
                                   (funcall writer wire))))))))
                       (finish-request (state)
                         (block finish-request
-                          (when (or (%h2-server-stream-reset-p state)
-                                    (%h2-server-stream-responded-p state))
-                            (return-from finish-request nil))
-                          (unless (%h2-server-stream-end-stream-p state)
-                            (%h2-server-error
-                             "HTTP/2 request was finalized before END_STREAM"
-                             state))
                           (%h2-content-length
                            (%h2-server-stream-headers state)
                            (%h2-server-stream-body-length-seen state)
@@ -986,39 +995,20 @@ values.
                         (let ((stream-id (%h2-frame-stream-id frame))
                               (flags (%h2-frame-flags frame)))
                           (%h2-server-invalid-stream-id stream-id)
-                          (unless (%h2-server-frame-flags-valid-p
-                                   frame
-                                   (logior +http2-end-stream-flag+
-                                           +http2-end-headers-flag+
-                                           +http2-padded-flag+
-                                           +http2-priority-flag+))
-                            (%h2-server-error
-                             "Invalid HTTP/2 HEADERS flags" flags))
                           (let ((state (gethash stream-id streams)))
                             (if state
                                 (progn
-                                  (when (or (not (%h2-server-stream-headers-complete-p
-                                                 state))
-                                            (%h2-server-stream-responded-p state)
-                                            (%h2-server-stream-reset-p state))
-                                    (%h2-server-error
-                                     "Unexpected HTTP/2 request header block"
-                                     stream-id))
                                   (when (zerop (logand flags
                                                       +http2-end-stream-flag+))
                                     (%h2-server-error
                                      "HTTP/2 request trailers must end the stream"
                                      stream-id))
-                                  (multiple-value-bind (block end-stream-p)
-                                      (%h2-read-header-block
-                                      frame reader max-frame-size
-                                      absolute-deadline clock-function
-                                       max-header-bytes stream-id
-                                       #'next-frame)
-                                    (unless end-stream-p
-                                      (%h2-server-error
-                                       "HTTP/2 trailer block must have END_STREAM"
-                                       stream-id))
+                                  (let ((block
+                                          (%h2-read-header-block
+                                           frame reader max-frame-size
+                                           absolute-deadline clock-function
+                                           max-header-bytes stream-id
+                                           #'next-frame)))
                                     (let ((fields
                                             (%h2-server-decode-headers
                                              block decoder-context
@@ -1074,6 +1064,7 @@ values.
                                                  :authority authority
                                                  :target target
                                                  :headers headers
+                                                 :send-window peer-initial-window-size
                                                  :expected-body-length
                                                  (%h2-content-length
                                                   headers nil
@@ -1089,34 +1080,15 @@ values.
                                (payload (%h2-frame-payload frame))
                                (state (gethash stream-id streams)))
                           (%h2-server-invalid-stream-id stream-id)
-                          (unless (%h2-server-frame-flags-valid-p
-                                   frame
-                                   (logior +http2-end-stream-flag+
-                                           +http2-padded-flag+))
-                            (%h2-server-error
-                             "Invalid HTTP/2 DATA flags" flags))
                           (unless state
                             (%h2-server-error
                              "HTTP/2 DATA frame references an unknown stream"
-                             stream-id))
-                          (when (or (not (%h2-server-stream-headers-complete-p
-                                          state))
-                                    (%h2-server-stream-end-stream-p state)
-                                    (%h2-server-stream-responded-p state)
-                                    (%h2-server-stream-reset-p state))
-                            (%h2-server-error
-                             "HTTP/2 DATA frame is not valid for this stream"
                              stream-id))
                           (let* ((frame-length (length payload))
                                  (body (%h2-data-payload frame)))
                             (when (> frame-length receive-connection-window)
                               (%h2-server-error
                                "HTTP/2 connection receive window was exceeded"
-                               frame-length))
-                            (when (> frame-length
-                                     (%h2-server-stream-receive-window state))
-                              (%h2-server-error
-                               "HTTP/2 stream receive window was exceeded"
                                frame-length))
                             (let ((next-body-length
                                     (+ (%h2-server-stream-body-length-seen state)

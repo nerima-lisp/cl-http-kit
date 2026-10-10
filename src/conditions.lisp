@@ -23,7 +23,10 @@
    (code :initarg :code :initform nil :reader http-invalid-status-code)))
 
 (define-condition http-connection-error (http-error)
-  ((cause :initarg :cause :initform nil :reader http-connection-error-cause)))
+  ((cause :initarg :cause :initform nil :reader http-connection-error-cause)
+   ;; Unknown send state must not authorize replay through another transport.
+   (request-sent-p :initarg :request-sent-p :initform t
+                   :reader http-connection-error-request-sent-p)))
 
 (define-condition http-timeout (http-error)
   ((kind :initarg :kind :initform :deadline :reader http-timeout-kind)))
