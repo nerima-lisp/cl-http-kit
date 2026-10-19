@@ -257,3 +257,6 @@
        (make-array 0 :element-type '(unsigned-byte 8)
                    :adjustable t :fill-pointer 0)
        "GET" 10))))
+(deftest bounded-diagnostic-preserves-short-input
+  (ensure-equal "ab" (http-kit::%bounded-diagnostic "ab" 3))
+  (ensure-equal "abc" (http-kit::%bounded-diagnostic "abc" 3)))
