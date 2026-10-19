@@ -685,3 +685,71 @@
                              (http-kit/http3:qpack-decode-field-section
                               (http-kit/http3:http3-frame-payload (first frames)))
                              :test #'string=))))))))))
+
+(deftest http3-server-coverage-final-bodyless-status-rejects-content
+  (dolist (method (list "GET" "HEAD"))
+    (dolist (status (list 204 304))
+      (dolist (stream-p (list nil t))
+        (dolist (content-kind (list :body :trailers))
+          (let* ((body-p (eq content-kind :body))
+                 (pulls 0)
+                 (trailers (unless body-p (list (cons "x-end" "yes"))))
+                 (reply
+                   (if stream-p
+                       (make-http-response-stream
+                        :status status :trailers trailers
+                        :body-length (if body-p 1 0)
+                        :body-function
+                        (lambda ()
+                          (incf pulls)
+                          (when (and body-p (= pulls 1)) (ascii "x"))))
+                       (make-http-response
+                        :status status :body (if body-p (ascii "x") (octets))
+                        :trailers trailers))))
+            (multiple-value-bind (failure response writes)
+                (http3-server-coverage-serve
+                 (lambda (request) (declare (ignore request)) reply)
+                 :method method)
+              (http3-public-error-check
+               failure
+               (if body-p
+                   "This HTTP/3 response cannot contain a body."
+                   "This HTTP/3 response cannot contain trailers.")
+               nil)
+              (ensure-equal nil response)
+              (ensure-equal nil writes)
+              (ensure-equal 0 pulls))))))))
+
+(deftest http3-server-coverage-informational-response-rejects-content
+  (dolist (stream-p (list nil t))
+    (dolist (content-kind (list :body :trailers))
+      (let* ((body-p (eq content-kind :body))
+             (pulls 0)
+             (trailers (unless body-p (list (cons "x-end" "yes"))))
+             (information
+               (if stream-p
+                   (make-http-response-stream
+                    :status 103 :trailers trailers
+                    :body-length (if body-p 1 0)
+                    :body-function
+                    (lambda ()
+                      (incf pulls)
+                      (when (and body-p (= pulls 1)) (ascii "x"))))
+                   (make-http-response
+                    :status 103 :body (if body-p (ascii "x") (octets))
+                    :trailers trailers)))
+             (final (make-http-response :status 204)))
+        (multiple-value-bind (failure response writes)
+            (http3-server-coverage-serve
+             (lambda (request)
+               (declare (ignore request))
+               (values final (list information))))
+          (http3-public-error-check
+           failure
+           (if body-p
+               "An HTTP/3 informational response cannot contain a body."
+               "An HTTP/3 informational response cannot contain trailers.")
+           nil)
+          (ensure-equal nil response)
+          (ensure-equal nil writes)
+          (ensure-equal 0 pulls))))))

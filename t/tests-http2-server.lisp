@@ -2938,3 +2938,46 @@
         (ensure-equal name (http-invalid-header-name observed))
         (ensure-equal reason (http-invalid-header-reason observed))
         (ensure-equal message (http-error-message observed))))))
+
+#+sbcl
+(deftest http2-server-response-boundary-rejects-forbidden-content
+  (dolist (status (list 204 304))
+    (dolist (stream-p (list nil t))
+      (dolist (content-kind (list :body :trailers))
+        (let* ((body-p (eq content-kind :body))
+               (chunks (if body-p (list (octets 90) nil) (list nil)))
+               (trailers (unless body-p (list (make-http-header "x-end" "yes"))))
+               (response
+                 (if stream-p
+                     (make-http-response-stream
+                      :status status :trailers trailers
+                      :body-length (if body-p 1 0)
+                      :body-function (lambda () (pop chunks)))
+                     (make-http-response
+                      :status status :body (if body-p (octets 90) (octets))
+                      :trailers trailers))))
+          (check-public-server-boundary
+           (concatenate-octets (h2-frame 4 0 0 (octets))
+                               (public-server-request-frame))
+           :handled 1 :error-p t :detail status :statuses nil
+           :response response)))))
+  (dolist (stream-p (list nil t))
+    (dolist (content-kind (list :body :trailers))
+      (let* ((body-p (eq content-kind :body))
+             (chunks (if body-p (list (octets 90) nil) (list nil)))
+             (trailers (unless body-p (list (make-http-header "x-end" "yes"))))
+             (information
+               (if stream-p
+                   (make-http-response-stream
+                    :status 103 :trailers trailers
+                    :body-length (if body-p 1 0)
+                    :body-function (lambda () (pop chunks)))
+                   (make-http-response
+                    :status 103 :body (if body-p (octets 90) (octets))
+                    :trailers trailers))))
+        (check-public-server-boundary
+         (concatenate-octets (h2-frame 4 0 0 (octets))
+                             (public-server-request-frame))
+         :handled 1 :error-p t :detail 103 :statuses nil
+         :response (make-http-response :status 200)
+         :information (list information))))))

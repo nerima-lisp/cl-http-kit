@@ -2469,12 +2469,18 @@ an opened push stream.  Returns the push ID and RESPONSE."
       (%h3-transport-error
        "HTTP/3 handlers must return a final status from 200 through 599."
        status))
-    (when (and body-suppressed-p
-               (or (and body (plusp (length body)))
-                   (and declared-body-length (plusp declared-body-length))))
-      (unless (string= method "HEAD")
+    (progn
+      (when (and (or (= status 204) (= status 304)) trailers)
         (%h3-transport-error
-         "This HTTP/3 response cannot contain a body.")))
+         "This HTTP/3 response cannot contain trailers."))
+      (when (and body-suppressed-p
+                 (or (and body (plusp (length body)))
+                     (and declared-body-length (plusp declared-body-length))))
+        (unless (and (string= method "HEAD")
+                     (/= status 204)
+                     (/= status 304))
+          (%h3-transport-error
+           "This HTTP/3 response cannot contain a body."))))
     (cond
       (ordinary-response-p
        (%h3-response-content-length

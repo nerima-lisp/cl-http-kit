@@ -9,6 +9,19 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
+    cl-hpack-codec-kit = {
+      url = "github:nerima-lisp/cl-hpack-codec-kit/v1.1.1";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.cl-weave.follows = "cl-weave";
+    };
+
+    cl-http-message-kit = {
+      url = "github:nerima-lisp/cl-http-message-kit/1805e700d33216e01f766c88af7c41e5dd1793f6";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.cl-weave.follows = "cl-weave";
+      inputs.cl-hpack-codec-kit.follows = "cl-hpack-codec-kit";
+    };
+
     cl-observability-kit = {
       url = "github:nerima-lisp/cl-observability-kit/v0.1.0";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -82,6 +95,7 @@
       self,
       nixpkgs,
       cl-weave,
+      cl-http-message-kit,
       cl-observability-kit,
       cl-concurrent-kit,
       cl-boundary-kit,
@@ -139,6 +153,7 @@
         system: pkgs:
         let
           clWeave = cl-weave.packages.${system}.default;
+          clHttpMessageKit = cl-http-message-kit.packages.${system}.default;
           observability = cl-observability-kit.packages.${system}.default;
           concurrent = cl-concurrent-kit.packages.${system}.default;
           boundary = cl-boundary-kit.packages.${system}.default;
@@ -155,6 +170,7 @@
           default = pkgs.mkShell {
             packages = [
               clWeave
+              clHttpMessageKit
               observability
               concurrent
               boundary
@@ -181,6 +197,7 @@
               export CL_SOURCE_REGISTRY="''${CL_SOURCE_REGISTRY:-$PWD//:${
                 pkgs.lib.concatStringsSep ":" [
                   "${clWeave}/share/common-lisp/source//"
+                  "${clHttpMessageKit}/share/common-lisp/source//"
                   "${observability}//"
                   "${concurrent}//"
                   "${boundary}//"
@@ -202,6 +219,7 @@
         system: pkgs:
         let
           clWeave = cl-weave.packages.${system}.default;
+          clHttpMessageKit = cl-http-message-kit.packages.${system}.default;
           observability = cl-observability-kit.packages.${system}.default;
           concurrent = cl-concurrent-kit.packages.${system}.default;
           boundary = cl-boundary-kit.packages.${system}.default;
@@ -215,6 +233,7 @@
           paredit = patchedParedit system;
           sourceRegistry = pkgs.lib.concatStringsSep ":" [
             "${clWeave}/share/common-lisp/source//"
+            "${clHttpMessageKit}/share/common-lisp/source//"
             "${observability}//"
             "${concurrent}//"
             "${boundary}//"
@@ -234,6 +253,7 @@
             name = "cl-http-kit-test-core";
             runtimeInputs = [
               clWeave
+              clHttpMessageKit
               pkgs.sbcl
               observability
               concurrent
@@ -265,6 +285,7 @@
             name = "cl-http-kit-test";
             runtimeInputs = [
               clWeave
+              clHttpMessageKit
               pkgs.sbcl
               observability
               concurrent
@@ -303,6 +324,7 @@
             name = "cl-http-kit-coverage";
             runtimeInputs = [
               clWeave
+              clHttpMessageKit
               pkgs.sbcl
               observability
               concurrent
@@ -440,6 +462,7 @@
         system: pkgs:
         let
           clWeave = cl-weave.packages.${system}.default;
+          clHttpMessageKit = cl-http-message-kit.packages.${system}.default;
           observability = cl-observability-kit.packages.${system}.default;
           concurrent = cl-concurrent-kit.packages.${system}.default;
           boundary = cl-boundary-kit.packages.${system}.default;
@@ -454,6 +477,7 @@
           source = pkgs.lib.cleanSource ./.;
           sourceRegistry = pkgs.lib.concatStringsSep ":" [
             "${clWeave}/share/common-lisp/source//"
+            "${clHttpMessageKit}/share/common-lisp/source//"
             "${observability}//"
             "${concurrent}//"
             "${boundary}//"
@@ -473,6 +497,7 @@
                 nativeBuildInputs = [
                   pkgs.sbcl
                   clWeave
+                  clHttpMessageKit
                   observability
                   concurrent
                   boundary
@@ -510,6 +535,7 @@
                   pkgs.sbcl
                   pkgs.perl
                   clWeave
+                  clHttpMessageKit
                 ];
               }
               ''
@@ -528,7 +554,7 @@
           coverage-tools-asdf =
             pkgs.runCommand "cl-http-kit-coverage-tools-asdf"
               {
-                nativeBuildInputs = [ pkgs.sbcl ];
+                nativeBuildInputs = [ pkgs.sbcl clHttpMessageKit ];
               }
               ''
                 export XDG_CACHE_HOME="$TMPDIR/cache"
@@ -552,6 +578,7 @@
                 nativeBuildInputs = [
                   pkgs.sbcl
                   clWeave
+                  clHttpMessageKit
                   observability
                   concurrent
                   boundary
