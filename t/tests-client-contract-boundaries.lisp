@@ -2001,8 +2001,7 @@
 #+sbcl
 (defun client-contract-partial-result (form &key network)
   ;; A fresh process proves optional-system absence without changing loaded functions.
-  (let ((arguments (list "perl" "-e" "alarm 20; exec @ARGV"
-                         (namestring sb-ext:*runtime-pathname*)
+  (let ((arguments (list (namestring sb-ext:*runtime-pathname*)
                          "--core" (namestring (truename sb-ext:*core-pathname*))
                          "--noinform" "--no-userinit" "--no-sysinit" "--non-interactive"
                          "--eval" "(require :asdf)"))
@@ -2028,17 +2027,32 @@
                           (prin1-to-string
                            `(format t "~&CLIENT-PARTIAL-RESULT ~S~%" ,form)))
                     finish)))
-    (multiple-value-bind (output errors exit)
-        (uiop:run-program arguments :output :string :error-output :string :ignore-error-status t)
-      (when (and ticket (not (eql 0 exit)))
-        (write-string errors *error-output*))
-      (ensure-equal 0 exit)
-      (when ticket (funcall (find-symbol "ACCEPT-CHILD" bridge) ticket exit))
-      (let* ((marker "CLIENT-PARTIAL-RESULT ")
-             (position (search marker output :from-end t)))
-        (ensure-true position)
-        (let ((*read-eval* nil))
-          (read-from-string output nil nil :start (+ position (length marker))))))))
+    ;; Files rather than pipes: output is read only after the child exits, so a
+    ;; pipe left unread could fill and block the child until the timeout.
+    (uiop:with-temporary-file (:pathname output-file)
+      (uiop:with-temporary-file (:pathname error-file)
+        (let* ((process (uiop:launch-program arguments
+                                             :output output-file
+                                             :if-output-exists :supersede
+                                             :error-output error-file
+                                             :if-error-output-exists :supersede))
+               (exit (handler-case (sb-ext:with-timeout 20 (uiop:wait-process process))
+                       (sb-ext:timeout ()
+                         (uiop:terminate-process process :urgent t)
+                         (sb-ext:with-timeout 5 (uiop:wait-process process))
+                         (error "The partial-system child process did not exit within 20 seconds:~%~A"
+                                (uiop:read-file-string error-file)))))
+               (output (uiop:read-file-string output-file))
+               (errors (uiop:read-file-string error-file)))
+          (when (and ticket (not (eql 0 exit)))
+            (write-string errors *error-output*))
+          (ensure-equal 0 exit)
+          (when ticket (funcall (find-symbol "ACCEPT-CHILD" bridge) ticket exit))
+          (let* ((marker "CLIENT-PARTIAL-RESULT ")
+                 (position (search marker output :from-end t)))
+            (ensure-true position)
+            (let ((*read-eval* nil))
+              (read-from-string output nil nil :start (+ position (length marker))))))))))
 
 #+sbcl
 (deftest client-contract-partial-missing-tcp
