@@ -1,16 +1,48 @@
 name: Nix checks
 
 on:
-  pull_request:
   push:
+    branches:
+      - p4a-pr5-coverage-diagnostic-62d35c57
 
 jobs:
   nix-flake-check:
     runs-on: ubuntu-24.04
+    env:
+      DIAGNOSTIC_COVERAGE_DIR: coverage-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+      DIAGNOSTIC_LOG_DIR: ${{ runner.temp }}/cl-http-kit-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@v20
-      # One build at a time: the HTTP/3 loopback in checks.test sends a 1 MiB
-      # upload under a 10 s timeout, and other check builds running beside it
-      # slowed the upload past that timeout.
-      - run: nix flake check --max-jobs 1
+      - name: Run test, test-core, and coverage without bail
+        shell: bash
+        run: |
+          set +e
+          mkdir -p "$DIAGNOSTIC_LOG_DIR" "$DIAGNOSTIC_COVERAGE_DIR"
+          nix run --max-jobs 1 --print-build-logs .#test >"$DIAGNOSTIC_LOG_DIR/test.log" 2>&1
+          test_status=$?
+          nix run --max-jobs 1 --print-build-logs .#test-core >"$DIAGNOSTIC_LOG_DIR/test-core.log" 2>&1
+          test_core_status=$?
+          CL_HTTP_KIT_COVERAGE_DIR="$GITHUB_WORKSPACE/$DIAGNOSTIC_COVERAGE_DIR" \
+            nix run --max-jobs 1 --print-build-logs .#coverage >"$DIAGNOSTIC_LOG_DIR/coverage.log" 2>&1
+          coverage_status=$?
+          printf 'test=%s\ntest-core=%s\ncoverage=%s\n' \
+            "$test_status" "$test_core_status" "$coverage_status" \
+            >"$DIAGNOSTIC_LOG_DIR/status.txt"
+          printf 'test exit: %s; test-core exit: %s; coverage exit: %s\n' \
+            "$test_status" "$test_core_status" "$coverage_status"
+          if [ "$test_status" -ne 0 ]; then
+            exit "$test_status"
+          fi
+          if [ "$test_core_status" -ne 0 ]; then
+            exit "$test_core_status"
+          fi
+          exit "$coverage_status"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cl-http-kit-coverage-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/cl-http-kit-${{ github.run_id }}-${{ github.run_attempt }}/
+            coverage-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}/
+          if-no-files-found: warn
