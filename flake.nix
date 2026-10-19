@@ -615,23 +615,16 @@
                 touch "$out"
               '';
 
-          # Coverage waits for the test check: sharing the CPU with the coverage
-          # build slowed the HTTP/3 loopback's 1 MiB upload past its 10 s timeout.
-          coverage =
-            pkgs.runCommand "cl-http-kit-coverage"
-              {
-                afterTestCheck = self.checks.${system}.test;
-              }
-              ''
-                work="$TMPDIR/cl-http-kit"
-                mkdir -p "$work"
-                cp -R ${source}/. "$work/"
-                chmod -R u+w "$work"
-                cd "$work"
-                ${self.apps.${system}.coverage.program}
-                mkdir -p "$out"
-                cp -R coverage "$out/"
-              '';
+          coverage = pkgs.runCommand "cl-http-kit-coverage" { } ''
+            work="$TMPDIR/cl-http-kit"
+            mkdir -p "$work"
+            cp -R ${source}/. "$work/"
+            chmod -R u+w "$work"
+            cd "$work"
+            ${self.apps.${system}.coverage.program}
+            mkdir -p "$out"
+            cp -R coverage "$out/"
+          '';
 
           coverage-auditor =
             pkgs.runCommand "cl-http-kit-coverage-auditor"
