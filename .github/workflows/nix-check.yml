@@ -3,19 +3,20 @@ name: Nix checks
 on:
   push:
     branches:
-      - p4a-pr5-coverage-diagnostic-62d35c57-retry
+      - p4a-pr5-coverage-diagnostic-62d35c57-run3
 
 jobs:
   nix-flake-check:
     runs-on: ubuntu-24.04
     env:
       DIAGNOSTIC_COVERAGE_DIR: coverage-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
-      DIAGNOSTIC_LOG_DIR: ${{ runner.temp }}/cl-http-kit-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@v20
       - name: Run test, test-core, and coverage without bail
         shell: bash
+        env:
+          DIAGNOSTIC_LOG_DIR: ${{ runner.temp }}/cl-http-kit-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set +e
           mkdir -p "$DIAGNOSTIC_LOG_DIR" "$DIAGNOSTIC_COVERAGE_DIR"
