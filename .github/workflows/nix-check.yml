@@ -1,8 +1,9 @@
 name: Nix checks
 
 on:
-  pull_request:
   push:
+    branches:
+      - p4a-pr5-coverage-diagnostic-3ec1dcd-run1
 
 jobs:
   nix-flake-check:
@@ -10,7 +11,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@v20
-      # One build at a time: the HTTP/3 loopback in checks.test sends a 1 MiB
-      # upload under a 10 s timeout, and other check builds running beside it
-      # slowed the upload past that timeout.
-      - run: nix flake check --max-jobs 1
+      - name: Run coverage without bail
+        shell: bash
+        env:
+          DIAGNOSTIC_LOG_DIR: ${{ runner.temp }}/cl-http-kit-coverage-${{ github.run_id }}-${{ github.run_attempt }}
+          DIAGNOSTIC_COVERAGE_DIR: coverage-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          mkdir -p "$DIAGNOSTIC_LOG_DIR"
+          set +e
+          CL_HTTP_KIT_COVERAGE_DIR="$GITHUB_WORKSPACE/$DIAGNOSTIC_COVERAGE_DIR" \
+            nix run --max-jobs 1 --print-build-logs .#coverage 2>&1 \
+            | tee "$DIAGNOSTIC_LOG_DIR/coverage.log"
+          pipeline_status=("${PIPESTATUS[@]}")
+          coverage_status=${pipeline_status[0]}
+          tee_status=${pipeline_status[1]}
+          if [ "$coverage_status" -eq 0 ] && [ "$tee_status" -ne 0 ]; then
+            coverage_status=$tee_status
+          fi
+          set -e
+          printf 'coverage=%s\n' "$coverage_status" > "$DIAGNOSTIC_LOG_DIR/status.txt"
+          exit "$coverage_status"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cl-http-kit-coverage-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/cl-http-kit-coverage-${{ github.run_id }}-${{ github.run_attempt }}/
+            coverage-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}/
+          if-no-files-found: warn

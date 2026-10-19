@@ -370,7 +370,7 @@
                 -type f \
                 -name '*.html' \
                 -delete
-              CL_HTTP_KIT_COVERAGE_TIMEOUT_SECONDS="$coverage_timeout_seconds" \
+              if CL_HTTP_KIT_COVERAGE_TIMEOUT_SECONDS="$coverage_timeout_seconds" \
                 perl -e 'alarm $ENV{CL_HTTP_KIT_COVERAGE_TIMEOUT_SECONDS}; exec @ARGV' \
                 sbcl --noinform --no-userinit --no-sysinit --non-interactive \
                 --load scripts/coverage.lisp \
@@ -406,10 +406,25 @@
                 --coverage-min-branch 100 \
                 --test-timeout-ms "$test_timeout_ms" \
                 --max-workers "$max_workers" \
-                --bail true \
+                --bail false \
+                --coverage-output "$coverage_report_directory/sb-cover.sexp" \
                 --coverage-report-directory "$coverage_report_directory/" \
-                --fail-with-no-tests "$@"
-              perl scripts/check-coverage.pl "$coverage_report_directory"
+                --fail-with-no-tests "$@"; then
+                coverage_status=0
+              else
+                coverage_status=$?
+              fi
+              if perl scripts/check-coverage.pl "$coverage_report_directory"; then
+                coverage_audit_status=0
+              else
+                coverage_audit_status=$?
+              fi
+              if [ "$coverage_status" -ne 0 ]; then
+                exit "$coverage_status"
+              fi
+              if [ "$coverage_audit_status" -ne 0 ]; then
+                exit "$coverage_audit_status"
+              fi
               html_count=$(find "$coverage_report_directory" -maxdepth 1 -type f -name '*.html' | wc -l)
               if [ "$html_count" -eq 0 ] || [ ! -s "''${coverage_report_directory}/cover-index.html" ]; then
                 echo "Coverage report is missing or empty: ''${coverage_report_directory}/cover-index.html" >&2
