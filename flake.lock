@@ -657,17 +657,17 @@
         "paredit-cli": "paredit-cli_7"
       },
       "locked": {
-        "lastModified": 1792422570,
-        "narHash": "sha256-06KiDTfpH0Z1M6G/90Sn2DxckuYuMLFLy739vdDYVXM=",
+        "lastModified": 1792429429,
+        "narHash": "sha256-m4Xmf/TI8rB8JlOjPwE2k8qOjz1CPPj1702jnjM5OgE=",
         "owner": "nerima-lisp",
         "repo": "cl-http-message-kit",
-        "rev": "1805e700d33216e01f766c88af7c41e5dd1793f6",
+        "rev": "a35e26eb8c53a9578065195d032ad59a85c9659e",
         "type": "github"
       },
       "original": {
         "owner": "nerima-lisp",
         "repo": "cl-http-message-kit",
-        "rev": "1805e700d33216e01f766c88af7c41e5dd1793f6",
+        "rev": "a35e26eb8c53a9578065195d032ad59a85c9659e",
         "type": "github"
       }
     },
