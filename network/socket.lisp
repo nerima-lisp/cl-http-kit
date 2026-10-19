@@ -7,6 +7,7 @@
   (/ (float (get-internal-real-time))
      (float internal-time-units-per-second)))
 
+#-sbcl
 (defun %network-unsupported ()
   (error 'http-unsupported-feature
          :message "The native TCP network boundary is only available on SBCL."
@@ -134,8 +135,6 @@
                              :element-type '(unsigned-byte 8)
                              :initial-element 0)
                  #(0 0 0 0))))
-      ((not (stringp host))
-       (%network-connection-error host 0 :listen-resolve))
       (t
        (let* ((entries (%network-resolve-entries
                         host deadline clock-function))
@@ -227,8 +226,7 @@ and the peer port.  TIMEOUT and DEADLINE apply to accept and become the
 stream's read timeout after a connection is accepted."
     (unless (http-network-listener-p listener)
       (%network-listener-error :accept listener))
-    (when (or (http-network-listener-closed-p listener)
-              (null (http-network-listener-socket listener)))
+    (when (http-network-listener-closed-p listener)
       (%network-listener-error :accept :closed-listener))
     (unless (functionp clock-function)
       (%network-listener-error :accept :clock-function))
@@ -300,7 +298,6 @@ stream's read timeout after a connection is accepted."
       (address-entry port deadline clock-function)
     (destructuring-bind (address-type address) address-entry
       (let ((socket nil)
-            (stream nil)
             (retained-p nil))
         (unwind-protect
              (progn
@@ -311,23 +308,21 @@ stream's read timeout after a connection is accepted."
                (%network-connect-socket socket address port
                                         deadline clock-function)
                (%network-check-deadline deadline clock-function :connect)
-               (setf stream
-                     (sb-bsd-sockets:socket-make-stream
-                      socket
-                      :input t
-                      :output t
-                      :element-type '(unsigned-byte 8)
-                      :buffering :full))
-               (setf retained-p t)
-               stream)
+               ;; The returned stream takes socket ownership; no setup follows.
+               (prog1
+                   (sb-bsd-sockets:socket-make-stream
+                    socket
+                    :input t
+                    :output t
+                    :element-type '(unsigned-byte 8)
+                    :buffering :full)
+                 (setf retained-p t)))
           (unless retained-p
-            (when stream
-              (http-kit::%with-http-cleanup
-                (close stream :abort t)))
             (when socket
               (http-kit::%with-http-cleanup
                 (sb-bsd-sockets:socket-close socket)))))))))
 
+#+sbcl
   (defun %network-resolve-entries (host deadline clock-function)
     (%network-check-deadline deadline clock-function :resolve)
     (handler-case
@@ -339,6 +334,7 @@ stream's read timeout after a connection is accepted."
       (error (condition)
         (%network-connection-error host 0 :resolve condition))))
 
+#+sbcl
   (defun http-network-resolve-host
       (host &key timeout deadline (clock-function #'%network-monotonic-time))
     "Resolve HOST to a numeric address string for SOCKS5 local resolution."
@@ -352,6 +348,7 @@ stream's read timeout after a connection is accepted."
           (%network-connection-error host 0 :resolve))
         (%network-address-text (first entry) (second entry)))))
 
+#+sbcl
   (defun open-http-tcp-stream
       (request &key timeout deadline proxy-plan
                  (clock-function #'%network-monotonic-time))
@@ -454,28 +451,16 @@ perform TLS or proxy negotiation."
 #+sbcl
 (progn
   (defun %network-keyword-plist-p (plist)
-    (loop
-      (cond
-        ((null plist) (return t))
-        ((or (not (consp plist))
-             (not (consp (cdr plist))))
-         (return nil))
-        ((not (keywordp (car plist)))
-         (return nil))
-        (t
-         (setf plist (cddr plist))))))
+    (let ((length (handler-case (list-length plist)
+                    (type-error () nil))))
+      (and length
+           (evenp length)
+           (loop for tail on plist by #'cddr
+                 always (keywordp (car tail))))))
 
   (defun %network-plist-key-p (key plist)
-    (loop
-      (cond
-        ((null plist) (return nil))
-        ((or (not (consp plist))
-             (not (consp (cdr plist))))
-         (return nil))
-        ((eq key (car plist))
-         (return t))
-        (t
-         (setf plist (cddr plist))))))
+    (loop for tail on plist by #'cddr
+          thereis (eq key (car tail))))
 
   (defun serve-http1-listener
       (listener handler &key max-connections accept-timeout accept-deadline
@@ -489,9 +474,10 @@ each accepted connection.  SESSION-OPTIONS may contain any session keyword;
 unless it contains :CLOSE-STREAM, the accepted stream is closed by the
 session boundary.  ON-ACCEPT receives STREAM, PEER-ADDRESS, and PEER-PORT.
 STREAM-WRAPPER, when supplied, receives STREAM, :TIMEOUT, and :DEADLINE and
-must return the stream passed to the HTTP session.  ON-ERROR receives CONDITION, PEER-ADDRESS, and PEER-PORT; session errors are
-reported and the listener continues accepting, while accept errors are
-re-signaled after the callback.  ACCEPT-TIMEOUT is applied to each accept.
+must return the stream passed to the HTTP session.  ON-ERROR receives
+CONDITION, PEER-ADDRESS, and PEER-PORT; session errors are reported and the
+listener continues accepting, while accept errors are re-signaled after the
+callback.  ACCEPT-TIMEOUT is applied to each accept.
 
 Returns the number of accepted connections and either :MAX-CONNECTIONS or
 :TIMEOUT.  MAX-CONNECTIONS of zero returns without accepting a connection."
@@ -528,45 +514,52 @@ Returns the number of accepted connections and either :MAX-CONNECTIONS or
                        (>= count max-connections))
                   (setf termination :max-connections))
                  (t
-                  (handler-case
-                      (multiple-value-bind (stream peer-address peer-port)
+                  (multiple-value-bind (stream peer-address peer-port)
+                      (handler-case
                           (accept-http-tcp-stream
                            listener
                            :timeout accept-timeout
                            :deadline accept-deadline
                            :clock-function clock-function)
-                        (incf count)
+                        (http-timeout (condition)
+                          (when on-error
+                            (funcall on-error condition nil nil))
+                          (setf termination :timeout))
+                        (error (condition)
+                          (when on-error
+                            (funcall on-error condition nil nil))
+                          (error condition)))
+                    (when (eq termination :running)
+                      (incf count)
+                      (let ((ownership-marker (list nil)))
                         (handler-case
-                            (progn
-                              (when stream-wrapper
-                                (setf stream
-                                      (funcall stream-wrapper
-                                               stream
-                                               :timeout accept-timeout
-                                               :deadline accept-deadline)))
-                              (unless (streamp stream)
-                                (%network-listener-error :serve
-                                                         (list :stream-wrapper stream)))
-                              (when on-accept
-                                (funcall on-accept
-                                         stream peer-address peer-port))
-                              (apply #'serve-http1-session
-                                     stream
-                                     handler
-                                     effective-session-options))
+                            (unwind-protect
+                                 (let ((session-stream
+                                         (if stream-wrapper
+                                             (funcall stream-wrapper
+                                                      stream
+                                                      :timeout accept-timeout
+                                                      :deadline accept-deadline)
+                                             stream)))
+                                   (unless (streamp session-stream)
+                                     (%network-listener-error :serve
+                                                              (list :stream-wrapper session-stream)))
+                                   (setf stream session-stream)
+                                   (when on-accept
+                                     (funcall on-accept
+                                              stream peer-address peer-port))
+                                   (let ((http-kit::*http1-session-ownership-marker*
+                                           ownership-marker))
+                                     (apply #'serve-http1-session
+                                            stream
+                                            handler
+                                            effective-session-options)))
+                              (unless (car ownership-marker)
+                                (close-http-tcp-stream stream)))
                           (error (condition)
-                            (close-http-tcp-stream stream)
                             (when on-error
                               (funcall on-error
-                                       condition peer-address peer-port)))
-                    (http-timeout (condition)
-                      (when on-error
-                        (funcall on-error condition nil nil))
-                      (setf termination :timeout))
-                    (error (condition)
-                      (when on-error
-                        (funcall on-error condition nil nil))
-                      (error condition))))))))
+                                       condition peer-address peer-port))))))))))
       (values count termination))))
 
 (defun make-http-network-stream-opener

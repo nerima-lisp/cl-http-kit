@@ -4,11 +4,11 @@ cl-http-kit is a portable, binary-safe Common Lisp HTTP substrate. It
 separates HTTP message semantics and wire processing from the application-owned
 network boundary.
 
-The checked-in systems are version 0.4.0. The integration includes native
+The checked-in systems are version 0.4.1. The integration includes native
 default client wiring, the four-kit dependency declarations, and a URL-and-
-method client entry point. HTTP/3 client connection setup is available through
-the optional cl-quic-kit adapter; native QUIC sockets and server acceptance
-remain outside the library boundary. Read the
+method client entry point. The optional cl-quic-kit adapter supports native
+IPv4 HTTP/3 client connections. Native QUIC server acceptance is not provided;
+HTTP/3 server sessions use injected streams. Read the
 [migration guide](project/migration.md) for the compatibility boundary and the
 [changelog](project/changelog.md) for the release scope.
 
@@ -44,7 +44,7 @@ The core system handles validation, serialization, parsing, bounded body
 materialization, HTTP/1.x server sessions, and deterministic transport
 composition. The client system adds reusable request policies, cookie
 partitioning and SameSite request context, content-coding and ALPN helper
-APIs, cache request-directive handling, and an owner-thread HTTP/1.1
+APIs, cache request-directive handling, and a thread-safe HTTP/1.1
 connection pool. It also includes RFC 6455 frame,
 message, close-payload, HTTP upgrade, and upgraded server-session helpers in
 the `http-kit/websocket` package. The optional HTTP/2 system adds client and
@@ -56,9 +56,10 @@ system supplies native SBCL TCP, DNS, and HTTP/1 listener service. The
 optional TLS system supplies the native TLS 1.3 client wrapper; server-side TLS
 is not supported because the current cl-tls-kit integration does not expose a
 server driver. For HTTPS servers, terminate TLS in a reverse proxy or load
-balancer and forward HTTP to the listener. The adapter uses caller-supplied
-QUIC/TLS setup; QUIC implementation, UDP sockets, certificate policy, server
-accept loops, and proxy negotiation remain outside the library boundary.
+balancer and forward HTTP to the listener. The HTTP/3 adapter delegates QUIC
+and native IPv4 UDP sockets to cl-quic-kit. QUIC/TLS options, certificate
+policy, and shutdown policy remain caller-owned; native QUIC server accept
+loops and proxy negotiation are not provided by this adapter.
 
 See [Architecture](reference/architecture.md) for the layer boundaries and
 [Compatibility](reference/compatibility.md) for protocol behavior.

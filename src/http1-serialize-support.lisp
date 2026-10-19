@@ -62,35 +62,6 @@
               :reason :mismatch))
       (t (%parse-decimal (first values))))))
 
-(defparameter +http1-forbidden-trailer-name-set+
-  (let ((table (make-hash-table :test #'equal)))
-    (dolist (name '("connection" "content-length" "host" "keep-alive"
-                    "proxy-authenticate" "proxy-authorization"
-                    "proxy-connection" "te" "trailer"
-                    "transfer-encoding" "upgrade")
-             table)
-      (setf (gethash name table) t))))
-
-(defun %http1-normalize-name (name)
-  (string-downcase name))
-
-(defun %make-http1-name-set ()
-  (make-hash-table :test #'equal))
-
-(defun %http1-name-set-add (name names)
-  (setf (gethash (%http1-normalize-name name) names) t))
-
-(defun %http1-name-set-contains-p (name names)
-  (nth-value 1 (gethash (%http1-normalize-name name) names)))
-
-(defun %http1-unique-names (names)
-  (let ((seen (%make-http1-name-set))
-        (unique '()))
-    (dolist (name names (nreverse unique))
-      (unless (%http1-name-set-contains-p name seen)
-        (%http1-name-set-add name seen)
-        (push name unique)))))
-
 (defun %do-http1-comma-separated-items (values operation field-name receiver)
   (dolist (value values)
     (loop with start = 0
@@ -108,91 +79,6 @@
                           :reason :empty-item))
                  (funcall receiver item)
                  (setf start (1+ index))))))
-
-(defun %http1-header-token-p (headers name token &key operation)
-  (let ((matched nil))
-    (%do-http1-comma-separated-items
-     (http-header-values headers name)
-     operation
-     name
-     (lambda (item)
-       (when (string-equal item token)
-         (setf matched t))))
-    matched))
-
-(defun %http1-forbidden-trailer-name-p (name)
-  (%http1-name-set-contains-p name +http1-forbidden-trailer-name-set+))
-
-(defun %validate-http1-trailers (trailers operation)
-  (dolist (trailer trailers)
-    (when (%http1-forbidden-trailer-name-p (http-header-name trailer))
-      (error 'http-invalid-header
-             :message "A trailer field is forbidden by HTTP/1 framing rules."
-             :operation operation
-             :name (http-header-name trailer)
-             :reason :forbidden-trailer))))
-
-(defun %http1-trailer-names (trailers)
-  (%http1-unique-names (mapcar #'http-header-name trailers)))
-
-(defun %parse-http1-trailer-declaration (values operation)
-  (let ((names '())
-        (seen (%make-http1-name-set)))
-    (%do-http1-comma-separated-items
-     values operation "trailer"
-     (lambda (name)
-       (unless (%header-name-p name)
-         (error 'http-invalid-header
-                :message "Trailer field names must be ASCII tokens."
-                :operation operation
-                :name "trailer"
-                :reason :value))
-       (when (%http1-forbidden-trailer-name-p name)
-         (error 'http-invalid-header
-                :message "A Trailer declaration contains a forbidden field name."
-                :operation operation
-                :name name
-                :reason :forbidden-trailer))
-       (unless (%http1-name-set-contains-p name seen)
-         (%http1-name-set-add name seen)
-         (push name names))))
-    (nreverse names)))
-
-(defun %http1-ensure-trailer-declaration
-    (headers trailers transfer-mode operation)
-  (let* ((declared-values (http-header-values headers "trailer"))
-         (declared-names (and declared-values
-                              (%parse-http1-trailer-declaration
-                               declared-values operation)))
-         (declared-name-set (and declared-names
-                                 (%make-http1-name-set)))
-         (actual-names (%http1-trailer-names trailers)))
-    (dolist (name declared-names)
-      (%http1-name-set-add name declared-name-set))
-    (when (and (null transfer-mode)
-               (or declared-values actual-names))
-      (error 'http-invalid-header
-             :message "HTTP trailers require chunked transfer encoding."
-             :operation operation
-             :name "trailer"
-             :reason :framing))
-    (when (and declared-names
-               (not (every (lambda (name)
-                             (%http1-name-set-contains-p name
-                                                         declared-name-set))
-                           actual-names)))
-      (error 'http-invalid-header
-             :message "Every emitted HTTP trailer must be declared by Trailer."
-             :operation operation
-             :name "trailer"
-             :reason :undeclared-trailer
-             :detail (list :declared declared-names :actual actual-names)))
-    (if (or declared-values (null actual-names))
-        headers
-        (append headers
-                (list (make-http-header
-                       "Trailer"
-                       (format nil "~{~A~^, ~}" actual-names)))))))
 
 (defun %parse-http1-transfer-codings (values operation field-name)
   (when values
@@ -214,3 +100,83 @@
              :detail codings
              :feature feature))
     :chunked))
+
+(defun %validate-http1-trailers (trailers operation)
+  (dolist (trailer trailers)
+    (when (%forbidden-trailer-field-name-p (http-header-name trailer))
+      (error 'http-invalid-header
+             :message "The field definition does not permit this HTTP trailer."
+             :operation operation
+             :name (http-header-name trailer)
+             :reason :forbidden-trailer))))
+
+(defun %http1-trailer-names (trailers)
+  (let ((names '()))
+    (dolist (trailer trailers (nreverse names))
+      (let ((name (http-header-name trailer)))
+        (unless (member name names :test #'string-equal)
+          (push name names))))))
+
+(defun %parse-http1-trailer-declaration (values operation)
+  (let ((names '()))
+    (dolist (value values (nreverse names))
+      (let ((start 0))
+        (loop
+          for comma = (position #\, value :start start)
+          for end = (or comma (length value))
+          for name = (%trim-ows (subseq value start end))
+          do (when (zerop (length name))
+               (error 'http-invalid-header
+                      :message "A comma-separated Trailer field contains an empty item."
+                      :operation operation
+                      :name "trailer"
+                      :reason :empty-item))
+             (unless (%header-name-p name)
+               (error 'http-invalid-header
+                      :message "Trailer field names must be ASCII tokens."
+                      :operation operation
+                      :name "trailer"
+                      :reason :value))
+             (when (%forbidden-trailer-field-name-p name)
+               (error 'http-invalid-header
+                      :message "A Trailer declaration contains a forbidden field name."
+                      :operation operation
+                      :name name
+                      :reason :forbidden-trailer))
+             (unless (member name names :test #'string-equal)
+               (push name names))
+             (if comma
+                 (setf start (1+ comma))
+                 (return)))))))
+
+(defun %http1-ensure-trailer-declaration
+    (headers trailers transfer-mode operation)
+  (%validate-http1-trailers trailers operation)
+  (let* ((declared-values (http-header-values headers "trailer"))
+         (declared-names (and declared-values
+                              (%parse-http1-trailer-declaration
+                               declared-values operation)))
+         (actual-names (%http1-trailer-names trailers)))
+    (when (and (null transfer-mode)
+               (or declared-values actual-names))
+      (error 'http-invalid-header
+             :message "HTTP trailers require chunked transfer encoding."
+             :operation operation
+             :name "trailer"
+             :reason :framing))
+    (when (and declared-names
+               (not (every (lambda (name)
+                             (member name declared-names :test #'string-equal))
+                           actual-names)))
+      (error 'http-invalid-header
+             :message "Every emitted HTTP trailer must be declared by Trailer."
+             :operation operation
+             :name "trailer"
+             :reason :undeclared-trailer
+             :detail (list :declared declared-names :actual actual-names)))
+    (if (or declared-values (null actual-names))
+        headers
+        (append headers
+                (list (make-http-header
+                       "Trailer"
+                       (format nil "~{~A~^, ~}" actual-names)))))))

@@ -45,6 +45,51 @@
     (signals http-protocol-error
       (http-content-digest content :algorithm :md5))))
 
+(deftest client-form-utf8-scalar-boundaries
+  (dolist (case '((#x00 #x00) (#x7f #x7f) (#x80 #xc2 #x80)
+                  (#x7ff #xdf #xbf) (#x800 #xe0 #xa0 #x80)
+                  (#xd7ff #xed #x9f #xbf) (#xe000 #xee #x80 #x80)
+                  (#xffff #xef #xbf #xbf) (#x10000 #xf0 #x90 #x80 #x80)
+                  (#x10ffff #xf4 #x8f #xbf #xbf)))
+    (ensure-equal (apply #'octets (rest case))
+                  (http-utf8-octets (string (code-char (first case))))))
+  (ensure-equal (octets) (http-utf8-octets ""))
+  (signals http-protocol-error (http-utf8-octets '(#\a)))
+  (dolist (code '(#xd800 #xdfff #x110000))
+    (signals http-protocol-error
+      (http-kit/client::%push-utf8-code-point
+       code (make-array 0 :element-type '(unsigned-byte 8)
+                          :adjustable t :fill-pointer 0)))))
+
+(deftest client-form-percent-encoding-boundaries
+  (ensure-equal "AZaz09-._~%20%2B%2F%25"
+                (http-percent-encode "AZaz09-._~ +/%"))
+  (ensure-equal "%2D%2E%5F%7E%20%2B"
+                (http-percent-encode "-._~ +" :safe nil))
+  (ensure-equal "a+b%2Bc"
+                (http-percent-encode "a b+c" :space-as-plus-p t))
+  (ensure-equal "a/b%20c"
+                (http-percent-encode "a/b c" :safe "/"))
+  (ensure-equal "%C3%A9%E3%81%82%F0%9F%98%80"
+                (http-percent-encode "éあ😀"))
+  (ensure-equal "%C3%A9"
+                (http-percent-encode "é" :safe "Ã©"))
+  (ensure-equal "" (http-percent-encode "" :safe ""))
+  (signals http-protocol-error (http-percent-encode 42))
+  (signals http-protocol-error (http-percent-encode "a" :safe 42)))
+
+(deftest client-form-field-boundaries
+  (ensure-equal "" (http-form-urlencode nil))
+  (ensure-equal "a=one&b=&c=%C3%A9&d=-._*%7E"
+                (http-form-urlencode '(("a" . "one") ("b" nil)
+                                       ("c" "é") ("d" "-._*~"))))
+  (ensure-equal (ascii "q=a+b%26c%3Dd")
+                (http-form-urlencoded-octets '(("q" "a b&c=d"))))
+  (signals http-protocol-error (http-form-urlencode #("a" "b")))
+  (dolist (field '(nil "a" (42 "b") ("a") ("a" "b" "c")
+                   ("a" . 42) ("a" 42)))
+    (signals http-protocol-error (http-form-urlencode (list field)))))
+
 (deftest client-uri-encoding-and-authentication
   (let ((resolved (resolve-http-uri
                    "http://example.test/a/b"
@@ -1242,9 +1287,8 @@
      (client-test-response
       200 :headers (list (make-http-header
                           "Strict-Transport-Security" "max-age=\"60\""))))
-    (ensure-equal nil
-                  (http-strict-transport-store-known-host-p
-                   store "quoted.test"))
+    (ensure-true (http-strict-transport-store-known-host-p
+                  store "quoted.test"))
     (http-strict-transport-store-note-response
      store "https://first-header.test/"
      (client-test-response
@@ -1306,6 +1350,42 @@
          "https://example.test/redirect"
          "https://api.example.test:8080/final")
        (reverse seen-uris)))))
+
+(deftest client-default-port-origin-normalization
+  (dolist (case '(("http://example.test/path" "http://example.test:80/other"
+                  "http://example.test" "http://example.test:8080")
+                 ("https://example.test/path" "https://example.test:443/other"
+                  "https://example.test" "https://example.test:8443")
+                 ("https://[::1]/path" "https://[::1]:443/other"
+                  "https://[::1]" "https://[::1]:8443")))
+    (destructuring-bind (implicit explicit origin nondefault) case
+      (ensure-equal origin (http-uri-origin implicit))
+      (ensure-equal origin (http-uri-origin explicit))
+      (ensure-true (http-same-origin-p implicit explicit))
+      (ensure-false (http-same-origin-p implicit nondefault))
+      (ensure-equal nondefault (http-uri-origin nondefault)))))
+
+(deftest client-alternative-service-default-port-origin
+  (dolist (origins '(("https://example.test/resource" "https://example.test:443/other")
+                    ("https://example.test:443/resource" "https://example.test/other")))
+    (destructuring-bind (noted-origin equivalent-origin) origins
+      (let ((store (make-http-alternative-service-store)))
+        (http-alternative-service-store-note-response
+         store noted-origin
+         (client-test-response
+          200 :headers (list (make-http-header "Alt-Svc" "h3=\":443\""))))
+        (ensure-equal 1 (length (http-alternative-service-store-services
+                                 store noted-origin)))
+        (ensure-equal 1 (length (http-alternative-service-store-services
+                                 store equivalent-origin)))
+        (ensure-equal nil (http-alternative-service-store-services
+                           store "https://example.test:8443/"))
+        (http-alternative-service-store-note-response
+         store equivalent-origin
+         (client-test-response
+          200 :headers (list (make-http-header "Alt-Svc" "clear"))))
+        (ensure-equal nil (http-alternative-service-store-services
+                           store noted-origin))))))
 
 (deftest client-alternative-service-store-policy
   (let* ((now 1000)
@@ -1433,6 +1513,7 @@
                  (error 'http-connection-error
                         :message "synthetic HTTP/3 connection failure."
                         :operation :http3
+                        :request-sent-p nil
                         :cause :unreachable)
                  (client-test-response 200
                                        :protocol-version "HTTP/3"
@@ -1470,6 +1551,367 @@
       (ensure-octets-equal (ascii "h3") (http-response-body response)))
     (ensure-equal 2 http3-calls)
     (ensure-equal 2 tcp-calls)))
+
+(deftest client-alt-svc-does-not-replay-uncertain-failures
+  (dolist (condition
+           (list (make-condition 'simple-error
+                                 :format-control "synthetic transport failure")
+                 (make-condition 'http-connection-error
+                                 :message "unknown send state")
+                 (make-condition 'http-timeout
+                                 :message "Ordinary transport timeout.")
+                 (make-condition 'http-connection-error
+                                 :message "request already sent"
+                                 :request-sent-p t)))
+    (let ((tcp-calls 0)
+          (http3-calls 0)
+          (caught nil))
+      (let ((client
+              (make-http-client
+               :cache nil
+               :transport-function
+               (lambda (request &key &allow-other-keys)
+                 (declare (ignore request))
+                 (incf tcp-calls)
+                 (client-test-response 200))
+               :http3-transport-function
+               (lambda (request &key &allow-other-keys)
+                 (declare (ignore request))
+                 (incf http3-calls)
+                 (error condition)))))
+        (http-alternative-service-store-note-response
+         (http-client-alternative-service-store client)
+         "https://example.test/"
+         (client-test-response
+          200 :headers (list (make-http-header "Alt-Svc" "h3=\":443\"; ma=60"))))
+        (handler-case
+            (http-client-send
+             client (http-client-request client "POST" "https://example.test/"))
+          (error (failure) (setf caught failure))))
+      (ensure-true (eq condition caught))
+      (ensure-equal 1 http3-calls)
+      (ensure-equal 0 tcp-calls))))
+
+(deftest client-alt-svc-does-not-replay-producers-or-callbacks
+  (dolist (event '(:producer :producer-failure :body :information))
+    (let* ((condition (make-condition 'http-connection-error
+                                     :message "synthetic pre-send failure"
+                                     :request-sent-p nil))
+           (tcp-calls 0)
+           (http3-calls 0)
+           (observations 0)
+           (caught nil)
+           (producer
+             (lambda (limit)
+               (declare (ignore limit))
+               (incf observations)
+               (when (eq event :producer-failure)
+                 (error condition))
+               (ascii "body")))
+           (callback
+             (lambda (value)
+               (declare (ignore value))
+               (incf observations)
+               (error condition)))
+           (client
+             (make-http-client
+              :cache nil
+              :transport-function
+              (lambda (request &key &allow-other-keys)
+                (declare (ignore request))
+                (incf tcp-calls)
+                (client-test-response 200))
+              :http3-transport-function
+              (lambda (request &key request-body-function on-body-chunk
+                                 on-information &allow-other-keys)
+                (declare (ignore request))
+                (incf http3-calls)
+                (ecase event
+                  ((:producer :producer-failure)
+                   (funcall request-body-function 65536))
+                  (:body (funcall on-body-chunk (ascii "body")))
+                  (:information
+                   (funcall on-information (client-test-response 103))))
+                (error condition)))))
+      (http-alternative-service-store-note-response
+       (http-client-alternative-service-store client)
+       "https://example.test/"
+       (client-test-response
+        200 :headers (list (make-http-header "Alt-Svc" "h3=\":443\"; ma=60"))))
+      (handler-case
+          (apply #'http-client-send
+                 client (http-client-request client "POST" "https://example.test/")
+                 (ecase event
+                   ((:producer :producer-failure)
+                    (list :request-body-function producer :request-body-length 4))
+                   (:body (list :on-body-chunk callback))
+                   (:information (list :on-information callback))))
+        (error (failure) (setf caught failure)))
+      (ensure-true (eq condition caught))
+      (ensure-equal 1 http3-calls)
+      (ensure-equal 1 observations)
+      (ensure-equal 0 tcp-calls))))
+
+(deftest client-alt-svc-pre-send-fallback-preserves-stream
+  (dolist (body-kind '(:producer :factory))
+    (let* ((tcp-calls 0)
+           (http3-calls 0)
+           (producer-calls 0)
+           (factory-calls 0)
+           (producer
+             (lambda (limit)
+               (declare (ignore limit))
+               (incf producer-calls)
+               (ascii "body")))
+           (client
+             (make-http-client
+              :cache nil
+              :transport-function
+              (lambda (request &key request-body-function &allow-other-keys)
+                (declare (ignore request))
+                (incf tcp-calls)
+                (ensure-octets-equal (ascii "body")
+                                     (funcall request-body-function 65536))
+                (client-test-response 200))
+              :http3-transport-function
+              (lambda (request &key &allow-other-keys)
+                (declare (ignore request))
+                (incf http3-calls)
+                (error 'http-connection-error
+                       :message "synthetic pre-send failure"
+                       :request-sent-p nil)))))
+      (http-alternative-service-store-note-response
+       (http-client-alternative-service-store client)
+       "https://example.test/"
+       (client-test-response
+        200 :headers (list (make-http-header "Alt-Svc" "h3=\":443\"; ma=60"))))
+      (ensure-equal
+       200
+       (http-response-status
+        (apply #'http-client-send
+               client (http-client-request client "POST" "https://example.test/")
+               :request-body-length 4
+               (ecase body-kind
+                 (:producer (list :request-body-function producer))
+                 (:factory
+                  (list :request-body-factory
+                        (lambda ()
+                          (incf factory-calls)
+                          producer)))))))
+      (ensure-equal 1 tcp-calls)
+      (ensure-equal 1 http3-calls)
+      (ensure-equal 1 producer-calls)
+      (ensure-equal (if (eq body-kind :factory) 1 0) factory-calls))))
+
+(deftest client-alt-svc-connect-timeout-preserves-producer-and-deadline
+  (dolist (body-kind '(:producer :factory))
+    (let* ((tcp-calls 0)
+           (http3-calls 0)
+           (producer-calls 0)
+           (factory-calls 0)
+           (original (make-condition 'http-timeout :message "Connect expired."
+                                     :operation :connect :kind :deadline))
+           (producer (lambda (limit)
+                       (declare (ignore limit))
+                       (incf producer-calls)
+                       (ascii "body")))
+           (client
+             (make-http-client
+              :cache nil :clock-function (constantly 100)
+              :wall-clock-function (constantly 100)
+              :transport-function
+              (lambda (request &key request-body-function deadline timeout
+                                 &allow-other-keys)
+                (declare (ignore request))
+                (incf tcp-calls)
+                (ensure-equal 110 deadline)
+                (ensure-equal 10 timeout)
+                (ensure-octets-equal (ascii "body")
+                                     (funcall request-body-function 65536))
+                (client-test-response 200))
+              :http3-transport-function
+              (lambda (request &key deadline timeout &allow-other-keys)
+                (declare (ignore request))
+                (incf http3-calls)
+                (ensure-equal 109 deadline)
+                (ensure-equal 10 timeout)
+                (ensure-equal 0 producer-calls)
+                (http-kit/http3::%http3-quic-adapter-connect
+                 (lambda () (error original)))))))
+      (http-alternative-service-store-note-response
+       (http-client-alternative-service-store client)
+       "https://example.test/"
+       (client-test-response
+        200 :headers (list (make-http-header "Alt-Svc" "h3=\":443\"; ma=60"))))
+      (ensure-equal
+       1 (length (http-alternative-service-store-services
+                  (http-client-alternative-service-store client)
+                  "https://example.test/")))
+      (ensure-equal
+       200 (http-response-status
+            (apply #'http-client-send
+                   client (http-client-request client "POST" "https://example.test/")
+                   :timeout 10 :deadline 110 :request-body-length 4
+                   (ecase body-kind
+                     (:producer (list :request-body-function producer))
+                     (:factory
+                      (list :request-body-factory
+                            (lambda () (incf factory-calls) producer)))))))
+      (ensure-equal 1 tcp-calls)
+      (ensure-equal 1 http3-calls)
+      (ensure-equal 1 producer-calls)
+      (ensure-equal (if (eq body-kind :factory) 1 0) factory-calls))))
+
+(deftest client-alt-svc-quic-operation-timeouts-do-not-fallback
+  (dolist (phase '(:read :write :control :settings))
+    (let* ((quic (make-http3-quic-adapter-test-client))
+           (stream (cl-quic-kit:client-open-stream quic nil))
+           (http3 (http-kit/http3::%make-http3-client
+                   :peer-control-state
+                   (http-kit/http3:make-http3-control-state :peer-role :server)))
+           (tcp-calls 0)
+           (http3-calls 0)
+           (caught nil)
+           (client
+             (make-http-client
+              :cache nil
+              :transport-function
+              (lambda (request &key &allow-other-keys)
+                (declare (ignore request))
+                (incf tcp-calls)
+                (client-test-response 200))
+              :http3-transport-function
+              (lambda (request &key &allow-other-keys)
+                (declare (ignore request))
+                (incf http3-calls)
+                (ecase phase
+                  (:read
+                   (http-kit/http3::%http3-quic-adapter-read
+                    quic nil stream :deadline 0 :poll-interval 0))
+                  (:write
+                   (setf (cl-quic-kit::flow-control-state-connection-max-data
+                          (cl-quic-kit::quic-client-flow-control quic)) 0)
+                   (cl-quic-kit:client-write-stream quic stream (octets 1))
+                   (ensure-true (cl-quic-kit:client-stream-write-pending-p quic stream))
+                   (http-kit/http3::%http3-quic-adapter-await-stream-write
+                    quic stream :deadline 0))
+                  (:control
+                   (http-kit/http3::%http3-quic-adapter-await-peer-control-data
+                    quic :deadline 0))
+                  (:settings
+                   (http-kit/http3::%http3-quic-adapter-await-peer-settings
+                    quic http3 :deadline 0)))))))
+      (unwind-protect
+           (progn
+             (http-alternative-service-store-note-response
+              (http-client-alternative-service-store client)
+              "https://example.test/"
+              (client-test-response
+               200 :headers (list (make-http-header "Alt-Svc" "h3=\":443\"; ma=60"))))
+             (handler-case
+                 (http-client-send
+                  client (http-client-request client "POST" "https://example.test/"))
+               (http-timeout (condition) (setf caught condition)))
+             (ensure-true (typep caught 'http-timeout))
+             (ensure-false (typep caught 'http-connection-error))
+             (ensure-equal :deadline (http-timeout-kind caught))
+             (ensure-equal :http3-quic-adapter (http-error-operation caught))
+             (ensure-equal 1 http3-calls)
+             (ensure-equal 0 tcp-calls))
+        (http-kit/http3:close-http3-client http3)
+        (cl-quic-kit:client-close quic)))))
+
+(deftest client-connect-timeout-retry-policy-precedence
+  (dolist (flags '((nil nil) (nil t) (t nil) (t t)))
+    (destructuring-bind (timeout-p connection-p) flags
+      (let* ((original (make-condition 'http-timeout :message "Connect expired."))
+             (failure
+               (handler-case
+                   (http-kit/http3::%http3-quic-adapter-connect
+                    (lambda () (error original)))
+                 (http-timeout (condition) condition)))
+             (policy (make-http-retry-policy
+                      :max-attempts 2 :base-delay 0 :max-delay 0
+                      :retry-on-timeout-p timeout-p
+                      :retry-on-connection-error-p connection-p))
+             (calls 0)
+             (caught nil)
+             (response nil)
+             (client
+               (make-http-client
+                :cache nil :retry-policy policy
+                :transport-function
+                (lambda (request &key &allow-other-keys)
+                  (declare (ignore request))
+                  (incf calls)
+                  (if (= calls 1) (error failure) (client-test-response 200))))))
+        (ensure-true (typep failure 'http-connection-error))
+        (ensure-equal timeout-p
+                      (http-kit/client::%client-retryable-condition-p policy failure))
+        (handler-case
+            (setf response
+                  (http-client-send
+                   client (http-client-request client "GET" "http://example.test/")))
+          (http-timeout (condition) (setf caught condition)))
+        (ensure-equal (if timeout-p 2 1) calls)
+        (if timeout-p
+            (progn (ensure-false caught)
+                   (ensure-equal 200 (http-response-status response)))
+            (progn (ensure-true (eq failure caught))
+                   (ensure-false response)))))))
+
+(deftest client-explicit-http3-connect-timeout-does-not-fallback
+  (let ((tcp-calls 0)
+        (http3-calls 0)
+        (original (make-condition 'http-timeout :message "Connect expired."))
+        (caught nil))
+    (let ((client
+            (make-http-client
+             :cache nil
+             :transport-function
+             (lambda (request &key &allow-other-keys)
+               (declare (ignore request))
+               (incf tcp-calls)
+               (client-test-response 200))
+             :http3-transport-function
+             (lambda (request &key &allow-other-keys)
+               (incf http3-calls)
+               (ensure-true (http-request-http3-p request))
+               (http-kit/http3::%http3-quic-adapter-connect
+                (lambda () (error original)))))))
+      (handler-case
+          (http-client-send
+           client (http-client-request client "POST" "https://example.test/"
+                                       :protocol-version "HTTP/3"))
+        (http-timeout (condition) (setf caught condition))))
+    (ensure-true (typep caught 'http-timeout))
+    (ensure-true (typep caught 'http-connection-error))
+    (ensure-true (eq original (http-connection-error-cause caught)))
+    (ensure-false (http-connection-error-request-sent-p caught))
+    (ensure-equal 1 http3-calls)
+    (ensure-equal 0 tcp-calls)))
+
+(deftest client-alt-svc-without-http3-uses-tcp
+  (let ((tcp-calls 0))
+    (let ((client
+            (make-http-client
+             :cache nil
+             :http3-transport-function nil
+             :transport-function
+             (lambda (request &key &allow-other-keys)
+               (ensure-false (http-request-http3-p request))
+               (incf tcp-calls)
+               (client-test-response 200)))))
+      (http-alternative-service-store-note-response
+       (http-client-alternative-service-store client)
+       "https://example.test/"
+       (client-test-response
+        200 :headers (list (make-http-header "Alt-Svc" "h3=\":443\"; ma=60"))))
+      (ensure-equal 200 (http-response-status
+                         (http-client-send
+                          client (http-client-request
+                                  client "GET" "https://example.test/")))))
+    (ensure-equal 1 tcp-calls)))
 
 (deftest client-explicit-http3-does-not-fallback
   (let ((tcp-calls 0)
@@ -2164,6 +2606,54 @@
                     (http-parse-date "Sunday, 06-Nov-77 08:49:37 GMT"
                                      :now now)
                     0)))))
+
+(deftest client-http-date-calendar-boundaries
+  (loop for month in '("Jan" "Feb" "Mar" "Apr" "May" "Jun"
+                      "Jul" "Aug" "Sep" "Oct" "Nov" "Dec")
+        for month-number from 1
+        for last-day in '(31 29 31 30 31 30 31 31 30 31 30 31)
+        do (ensure-equal
+            (encode-universal-time 59 59 23 last-day month-number 2000 0)
+            (http-parse-date
+             (format nil "Sun, ~2,'0D ~A 2000 23:59:59 GMT" last-day month)))
+           (ensure-equal
+            nil
+            (http-parse-date
+             (format nil "Sun, ~2,'0D ~A 2000 23:59:59 GMT"
+                     (1+ last-day) month))))
+  (dolist (year '(1900 1999 2100))
+    (ensure-equal
+     (encode-universal-time 0 0 0 28 2 year 0)
+     (http-parse-date (format nil "Sun, 28 Feb ~D 00:00:00 GMT" year)))
+    (ensure-equal
+     nil
+     (http-parse-date (format nil "Sun, 29 Feb ~D 00:00:00 GMT" year))))
+  (ensure-equal (encode-universal-time 0 0 0 29 2 1996 0)
+                (http-parse-date "Sun, 29 Feb 1996 00:00:00 GMT"))
+  (ensure-equal 0 (http-parse-date "Mon, 01 Jan 1900 00:00:00 GMT"))
+  (ensure-equal (encode-universal-time 59 59 23 31 12 9999 0)
+                (http-parse-date "Fri, 31 Dec 9999 23:59:59 GMT"))
+  (dolist (invalid '("Sun, 00 Jan 2000 00:00:00 GMT"
+                     "Sun, 01 Jan 1899 00:00:00 GMT"
+                     "Sun, 01 Jan 10000 00:00:00 GMT"
+                     "Sun, 01 Foo 2000 00:00:00 GMT"))
+    (ensure-equal nil (http-parse-date invalid))))
+
+(deftest client-http-date-time-boundaries
+  (ensure-equal (encode-universal-time 59 59 23 31 12 2016 0)
+                (http-parse-date "Sat, 31 Dec 2016 23:59:60 GMT"))
+  (dolist (invalid '("Sat, 31 Dec 2016 24:00:00 GMT"
+                     "Sat, 31 Dec 2016 23:60:00 GMT"
+                     "Sat, 31 Dec 2016 23:59:61 GMT"
+                     "Sat, 31 Dec 2016 3:59:59 GMT"
+                     "Sat, 31 Dec 2016 23-59:59 GMT"
+                     "Sat, 31 Dec 2016 23:59-59 GMT"
+                     "Sat, 31 Dec 2016 23:59:5X GMT"
+                     "Sat, 31 Dec 2016 23:59:59 GMT "
+                     " Sat, 31 Dec 2016 23:59:59 GMT"))
+    (ensure-equal nil (http-parse-date invalid)))
+  (dolist (value '(nil 0 #() #\A))
+    (ensure-equal nil (http-parse-date value))))
 
 (deftest client-cache-uses-corrected-response-age
   (let* ((cache (make-http-cache))
@@ -5149,6 +5639,45 @@
   (signals http-protocol-error
     (parse-http-sse-events
      (octets #x64 #x61 #x74 #x61 #x3a #xc3 #x28 #x0a #x0a))))
+(deftest client-sse-data-size-counts-utf8-and-joined-newlines
+  (let* ((input (format nil "data:é~%data:x~%~%"))
+         (events (parse-http-sse-events input :max-data-bytes 4)))
+    (ensure-equal 1 (length events))
+    (ensure-equal (format nil "é~%x")
+                  (http-sse-event-data (first events)))
+    (let ((caught nil))
+      (handler-case (parse-http-sse-events input :max-data-bytes 3)
+        (http-size-limit-exceeded (condition)
+          (setf caught condition)))
+      (ensure-true (typep caught 'http-size-limit-exceeded))
+      (ensure-equal :sse (http-error-operation caught))
+      (ensure-equal :data (http-kit:http-size-limit-exceeded-kind caught))
+      (ensure-equal 3 (http-kit:http-size-limit-exceeded-limit caught))
+      (ensure-equal 4 (http-kit:http-size-limit-exceeded-observed caught)))))
+
+(deftest client-sse-final-cr-requires-a-blank-line
+  (let* ((input (concatenate-octets (ascii "data:x") (octets 13 13)))
+         (events (parse-http-sse-events input)))
+    (ensure-equal 1 (length events))
+    (ensure-equal "x" (http-sse-event-data (first events))))
+  (ensure-equal nil
+                (parse-http-sse-events
+                 (concatenate-octets (ascii "data:x") (octets 13))))
+  (ensure-equal nil (parse-http-sse-events (ascii "data:x"))))
+
+(deftest client-sse-character-stream-callback-without-collection
+  (let ((seen nil))
+    (with-input-from-string
+        (stream (format nil "data:é日本😀~%~%data:second~%~%"))
+      (ensure-equal nil
+                    (read-http-sse-events
+                     stream
+                     :collect-events-p nil
+                     :on-event (lambda (event)
+                                 (push (http-sse-event-data event) seen))))
+      (ensure-equal :eof (read-char stream nil :eof)))
+    (ensure-equal '("é日本😀" "second") (nreverse seen))))
+
 (deftest client-cookie-jar-enforces-partitioning-and-prefixes
   (let* ((jar (make-http-cookie-jar :clock-function (lambda () 1000)))
          (partition-key "https://top.example")
@@ -5379,3 +5908,2616 @@
      ""
      t
      nil)))
+
+(deftest client-sse-constructor-and-utf8-boundaries
+  (let ((event (make-http-sse-event :comments "one")))
+    (ensure-equal '("one") (http-sse-event-comments event)))
+  (dolist (arguments (list (list :event 1)
+                          (list :data nil)
+                          (list :id 1)
+                          (list :retry -1)
+                          (list :comments '("x" . "y"))))
+    (signals http-protocol-error
+      (apply #'make-http-sse-event arguments)))
+  (signals http-protocol-error
+    (parse-http-sse-events "" :max-events -1))
+  (let* ((data "é日本😀")
+         (input (format nil "data:~A~%~%" data))
+         (events (parse-http-sse-events input)))
+    (ensure-equal 1 (length events))
+    (ensure-equal data (http-sse-event-data (first events))))
+  (dolist (bad (list '(#xc2)
+                    '(#xc2 #x20)
+                    '(#xe0 #x80 #x80)
+                    '(#xed #xa0 #x80)
+                    '(#xf0 #x80 #x80 #x80)
+                    '(#xf4 #x90 #x80 #x80)))
+    (let* ((prefix (map 'list #'char-code "data:"))
+           (input (make-array (+ (length prefix) (length bad) 2)
+                              :element-type '(unsigned-byte 8)
+                              :initial-contents (append prefix bad '(10 10)))))
+      (signals http-protocol-error
+        (parse-http-sse-events input)))))
+
+(deftest client-http-date-imf-lexical-boundaries
+  (ensure-equal (encode-universal-time 37 49 8 6 11 1994 0)
+                (http-parse-date "Sun, 06 Nov 1994 08:49:37 GMT"))
+  (dolist (invalid '("Funday, 06 Nov 1994 08:49:37 GMT"
+                     "Sun, /6 Nov 1994 08:49:37 GMT"
+                     "Sun, +6 Nov 1994 08:49:37 GMT"
+                     "Sun, 06 Nov 199/ 08:49:37 GMT"))
+    (ensure-equal nil (http-parse-date invalid)))
+  (ensure-equal
+   nil
+   (http-parse-date (format nil "Sun,~C06 Nov 1994 08:49:37 GMT" #\Tab))))
+
+(deftest client-http-date-rfc850-lexical-boundaries
+  (let ((now (encode-universal-time 0 0 0 1 1 2026 0)))
+    (ensure-equal (encode-universal-time 37 49 8 6 11 1994 0)
+                  (http-parse-date "Sunday, 06-Nov-94 08:49:37 GMT"
+                                   :now now))
+    (dolist (invalid '("Funday, 06-Nov-94 08:49:37 GMT"
+                       "Sunday, 06Nov94 08:49:37 GMT"
+                       "Sunday, 6-Nov-94 08:49:37 GMT"
+                       "Sunday, 06-No-94 08:49:37 GMT"
+                       "Sunday, 06-Nov94 08:49:37 GMT"
+                       "Sunday, 06-Nov-1994 08:49:37 GMT"
+                       "Sunday, 06-Nov-9/ 08:49:37 GMT"
+                       "Sunday, 06-Nov-XX 08:49:37 GMT"
+                       "Sunday, /6-Nov-94 08:49:37 GMT"
+                       "Sunday, 06-Foo-94 08:49:37 GMT"))
+      (ensure-equal nil (http-parse-date invalid :now now)))))
+
+(deftest client-http-date-asctime-lexical-boundaries
+  (ensure-equal (encode-universal-time 37 49 8 6 11 1994 0)
+                (http-parse-date "Sun Nov  6 08:49:37 1994"))
+  (ensure-equal (encode-universal-time 37 49 8 10 11 1994 0)
+                (http-parse-date "Thu Nov 10 08:49:37 1994"))
+  (dolist (invalid '("Sun Nov 006 08:49:37 1994"
+                     "Sun Nov  X 08:49:37 1994"
+                     "Sun Nov  / 08:49:37 1994"
+                     "Sun Nov 6X 08:49:37 1994"
+                     "Sun Nov   6 08:49:37 1994"))
+    (ensure-equal nil (http-parse-date invalid))))
+
+(deftest client-form-percent-encoding-keyword-defaults
+  (ensure-equal "-._~%20%2A%2B" (http-percent-encode "-._~ *+"))
+  (ensure-equal "-._~+%2A%2B"
+                (http-percent-encode "-._~ *+" :space-as-plus-p t))
+  (ensure-equal "%2D%2E%5F%7E%20*%2B"
+                (http-percent-encode "-._~ *+" :safe "*"))
+  (ensure-equal "+%2B"
+                (http-percent-encode " +" :safe " " :space-as-plus-p t)))
+
+(deftest client-http-date-empty-retry-after
+  (dolist (retry-after '("" "5"))
+    (let ((calls 0)
+          (sleeps nil))
+      (let ((client
+              (make-http-client
+               :cache nil
+               :sleep-function (lambda (seconds) (push seconds sleeps))
+               :retry-policy (make-http-retry-policy
+                              :max-attempts 2
+                              :base-delay 0.25
+                              :max-delay 10)
+               :transport-function
+               (lambda (request &key proxy-plan &allow-other-keys)
+                 (declare (ignore request proxy-plan))
+                 (incf calls)
+                 (if (= calls 1)
+                     (client-test-response
+                      503 :headers (list (make-http-header "Retry-After"
+                                                           retry-after)))
+                     (client-test-response 200))))))
+        (ensure-equal
+         200
+         (http-response-status
+          (http-client-send
+           client
+           (http-client-request client "GET"
+                                "http://example.test/retry-after-empty"))))
+        (ensure-equal 2 calls)
+        (ensure-equal (if (string= retry-after "") '(0.25) '(5.0))
+                      sleeps)))))
+
+(deftest websocket-frame-rejects-invalid-components
+  (dolist (payload (list "text" '(1 2) #(256) #(-1) #(nil)
+                        (make-array '(1 1) :initial-element 0)))
+    (signals http-protocol-error
+      (make-websocket-frame :payload payload)))
+  (dolist (opcode '(3 7 11 -1 "1"))
+    (signals http-protocol-error
+      (make-websocket-frame :opcode opcode)))
+  (dolist (key (list nil "abcd" (octets 1 2 3) (octets 1 2 3 4 5)))
+    (signals http-protocol-error
+      (make-websocket-frame :mask-p t :masking-key key)))
+  (signals http-protocol-error
+    (make-websocket-frame :masking-key (octets 1 2 3 4)))
+  (dolist (opcode '(8 9 10))
+    (signals http-protocol-error
+      (make-websocket-frame :opcode opcode :fin-p nil))
+    (signals http-protocol-error
+      (make-websocket-frame :opcode opcode
+                            :payload (make-array 126 :initial-element 0)))
+    (multiple-value-bind (frame consumed)
+        (parse-websocket-frame
+         (serialize-websocket-frame
+          (make-websocket-frame
+           :opcode opcode :payload (make-array 125 :initial-element 0))))
+      (ensure-equal opcode (websocket-frame-opcode frame))
+      (ensure-true (websocket-frame-fin-p frame))
+      (ensure-equal 125 (length (websocket-frame-payload frame)))
+      (ensure-equal 127 consumed)))
+  (signals http-protocol-error
+    (serialize-websocket-frame nil))
+  (let ((frame (make-websocket-frame :payload (octets 0))))
+    (setf (websocket-frame-payload frame) #(256))
+    (signals http-protocol-error
+      (serialize-websocket-frame frame))))
+
+(deftest websocket-frame-rejects-incomplete-and-invalid-wire
+  (dolist (wire (list "wire" '(129 0) #(129 256)))
+    (signals http-protocol-error
+      (parse-websocket-frame wire)))
+  (dolist (wire (list (octets) (octets #x81)
+                     (octets #xa1 0) (octets #x83 0)
+                     (octets #x81 #x7e) (octets #x81 #x7e 0)
+                     (octets #x81 #x7f 0 0 0 0 0 1 0)
+                     (octets #x81 #x7f #x80 0 0 0 0 0 0 0)
+                     (octets #x81 #x80 1 2 3)
+                     (octets #x81 1)))
+    (signals http-protocol-error
+      (parse-websocket-frame wire)))
+  (signals http-protocol-error
+    (parse-websocket-frame (octets #x81 0) :allow-unmasked-p nil))
+  (dolist (wire (list
+                (concatenate-octets
+                 (octets #x82 #x7e 0 125)
+                 (make-array 125 :element-type '(unsigned-byte 8)
+                                 :initial-element 0))
+                (concatenate-octets
+                 (octets #x82 #x7f 0 0 0 0 0 0 #xff #xff)
+                 (make-array 65535 :element-type '(unsigned-byte 8)
+                                   :initial-element 0))))
+    (signals http-protocol-error
+      (parse-websocket-frame wire)))
+  (dolist (opcode '(0 8 9 10))
+    (signals http-protocol-error
+      (parse-websocket-frame (octets (logior #xc0 opcode) 0)
+                             :allow-rsv1-p t)))
+  (dolist (limit '(-1 nil 0.5))
+    (signals http-protocol-error
+      (parse-websocket-frame (octets #x81 0) :max-payload-bytes limit)))
+  (dolist (wire (list (octets #x81 1 0) (octets #x81 1)))
+    (let ((caught nil))
+      (handler-case
+          (parse-websocket-frame wire :max-payload-bytes 0)
+        (http-size-limit-exceeded (condition)
+          (setf caught condition)))
+      (ensure-true caught)
+      (ensure-equal :websocket (http-kit:http-error-operation caught))
+      (ensure-equal :websocket
+                    (http-kit:http-size-limit-exceeded-kind caught))
+      (ensure-equal 0 (http-kit:http-size-limit-exceeded-limit caught))
+      (ensure-equal 1 (http-kit:http-size-limit-exceeded-observed caught)))))
+
+(deftest websocket-frame-extended-length-roundtrips
+  (dolist (case '((125 #x82 125) (126 #x82 126 0 126)
+                  (65535 #x82 126 #xff #xff)
+                  (65536 #x82 127 0 0 0 0 0 1 0 0)))
+    (let* ((length (first case))
+           (payload (make-array length :element-type '(unsigned-byte 8)
+                                       :initial-element 0))
+           (expected-header (apply #'octets (rest case))))
+      (loop for index below length
+            do (setf (aref payload index) (mod (* 37 index) 256)))
+      (let ((wire (serialize-websocket-frame
+                   (make-websocket-frame :opcode 2 :payload payload))))
+        (ensure-equal expected-header (subseq wire 0 (length expected-header)))
+        (ensure-equal payload (subseq wire (length expected-header)))
+        (multiple-value-bind (frame consumed)
+            (parse-websocket-frame (concatenate-octets wire (octets #xff)))
+          (ensure-equal (length wire) consumed)
+          (ensure-equal payload (websocket-frame-payload frame))))))
+  (multiple-value-bind (frame consumed)
+      (parse-websocket-frame (octets #x81 0) :max-payload-bytes 0)
+    (ensure-equal 2 consumed)
+    (ensure-equal 0 (length (websocket-frame-payload frame)))))
+
+#+sbcl
+(deftest websocket-text-unicode-scalar-boundaries
+  (flet ((read-text (payload)
+           (read-websocket-message
+            (make-instance
+             'binary-test-stream
+             :input (serialize-websocket-frame
+                     (make-websocket-frame :opcode 1 :payload payload))))))
+    (dolist (payload (list (octets #xed #xa0 #x80)
+                          (octets #xf4 #x90 #x80 #x80)))
+      (let ((caught nil))
+        (handler-case (read-text payload)
+          (http-protocol-error (condition) (setf caught condition)))
+        (ensure-true caught)
+        (ensure-equal :websocket-utf8 (http-kit:http-error-operation caught))))
+    (dolist (payload (list (octets #xed #x9f #xbf)
+                          (octets #xf4 #x8f #xbf #xbf)))
+      (multiple-value-bind (message opcode) (read-text payload)
+        (ensure-equal payload message)
+        (ensure-equal 1 opcode)))))
+
+#+sbcl
+(deftest websocket-close-reason-limit-counts-utf8-octets
+  (let* ((prefix (make-string 61 :initial-element #\é))
+         (reason (concatenate 'string prefix "a"))
+         (payload (make-websocket-close-payload :code 1000 :reason reason)))
+    (ensure-equal 123 (length (http-utf8-octets reason)))
+    (ensure-equal 125 (length payload))
+    (multiple-value-bind (code decoded) (parse-websocket-close-payload payload)
+      (ensure-equal 1000 code)
+      (ensure-equal reason decoded))
+    (let ((stream (make-instance 'binary-test-stream :input (octets)))
+          (caught nil))
+      (handler-case
+          (websocket-close stream :code 1000
+                           :reason (concatenate 'string prefix "ab"))
+        (http-size-limit-exceeded (condition) (setf caught condition)))
+      (ensure-true caught)
+      (ensure-equal :websocket (http-kit:http-error-operation caught))
+      (ensure-equal :websocket (http-kit:http-size-limit-exceeded-kind caught))
+      (ensure-equal 123 (http-kit:http-size-limit-exceeded-limit caught))
+      (ensure-equal 124 (http-kit:http-size-limit-exceeded-observed caught))
+      (ensure-equal (octets) (binary-test-output stream)))))
+
+#+sbcl
+(deftest websocket-decompressor-must-return-octets
+  (let* ((wire-payload (octets 1))
+         (wire (serialize-websocket-frame
+                (make-websocket-frame :opcode 2 :rsv1-p t
+                                      :payload wire-payload))))
+    (dolist (case (list (list "A" nil) (list #(256) nil)
+                       (list (octets 65) t)))
+      (let ((result (first case))
+            (valid-p (second case))
+            (calls 0)
+            (caught nil)
+            (message nil)
+            (opcode nil))
+        (handler-case
+            (multiple-value-setq (message opcode)
+              (read-websocket-message
+               (make-instance 'binary-test-stream :input wire)
+               :decompress-function
+               (lambda (value)
+                 (incf calls)
+                 (ensure-equal wire-payload value)
+                 result)))
+          (http-protocol-error (condition) (setf caught condition)))
+        (ensure-equal 1 calls)
+        (if valid-p
+            (progn
+              (ensure-false caught)
+              (ensure-equal (octets 65) message)
+              (ensure-equal 2 opcode))
+            (progn
+              (ensure-true caught)
+              (ensure-equal :websocket (http-kit:http-error-operation caught))))))))
+
+#+sbcl
+(deftest client-socks5-connect-reserved-byte-boundaries
+  (dolist (reserved '(0 1))
+    (let* ((stream
+             (make-instance
+              'binary-test-stream
+              :input
+              (concatenate-octets
+               (octets 5 0 5 0 reserved 1 0 0 0 0 0 0)
+               (ascii "HTTP/1.1 200 OK|CRLF|Content-Length: 2|CRLF||CRLF|ok"))))
+           (opened 0)
+           (closed 0)
+           (caught nil)
+           (response nil)
+           (client
+             (make-http-client
+              :cache nil
+              :proxy (make-http-proxy :scheme :socks5
+                                      :host "proxy.example" :port 1080)
+              :open-stream
+              (lambda (request &key proxy-plan &allow-other-keys)
+                (declare (ignore request))
+                (ensure-equal :socks5 (getf proxy-plan :mode))
+                (incf opened)
+                stream)
+              :close-stream
+              (lambda (closed-stream)
+                (ensure-true (eq stream closed-stream))
+                (incf closed)
+                (close closed-stream)))))
+      (handler-case
+          (setf response
+                (http-client-send
+                 client
+                 (http-client-request client "GET" "http://192.0.2.1/path")))
+        (http-proxy-error (condition) (setf caught condition)))
+      (ensure-equal 1 opened)
+      (ensure-equal 1 closed)
+      (let ((output (binary-test-output stream))
+            (negotiation (octets 5 1 0 5 1 0 1 192 0 2 1 0 80)))
+        (if (zerop reserved)
+            (progn
+              (ensure-false caught)
+              (ensure-equal 200 (http-response-status response))
+              (ensure-equal (ascii "ok") (http-response-body response))
+              (ensure-equal negotiation (subseq output 0 13))
+              (ensure-true
+               (search "GET /path HTTP/1.1"
+                       (octets-as-string (subseq output 13)))))
+            (progn
+              (ensure-false response)
+              (ensure-true (typep caught 'http-proxy-error))
+              (ensure-equal :proxy (http-kit:http-error-operation caught))
+              (ensure-equal '(:detail :reply :cause nil)
+                            (http-client-error-detail caught))
+              (ensure-equal negotiation output)))))))
+
+(deftest client-multipart-casefold-duplicate-boundary
+  (multiple-value-bind (body content-type)
+      (make-http-multipart-body
+       (list (make-http-multipart-part :name "field" :value "value"))
+       :boundary "boundary")
+    (dolist (header (list content-type "multipart/form-data; BOUNDARY=boundary"))
+      (let ((parts (parse-http-multipart-body body :content-type header)))
+        (ensure-equal 1 (length parts))
+        (ensure-equal "field" (http-multipart-part-name (first parts)))
+        (ensure-equal (ascii "value") (http-multipart-part-value (first parts)))))
+    (dolist (duplicate '("boundary" "other"))
+      (let ((caught nil))
+        (handler-case
+            (parse-http-multipart-body
+             body :content-type
+             (format nil "multipart/form-data; boundary=boundary; BOUNDARY=~A"
+                     duplicate))
+          (http-protocol-error (condition) (setf caught condition)))
+        (ensure-true (typep caught 'http-protocol-error))
+        (ensure-equal :client (http-kit:http-error-operation caught))
+        (ensure-equal "boundary" (http-kit:http-protocol-error-detail caught))))))
+
+(deftest client-multipart-explicit-boundary-conflict
+  (multiple-value-bind (body content-type)
+      (make-http-multipart-body
+       (list (make-http-multipart-part :name "field" :value "value"))
+       :boundary "boundary")
+    (dolist (header (list content-type nil))
+      (let ((parts (parse-http-multipart-body
+                    body :boundary "boundary" :content-type header)))
+        (ensure-equal 1 (length parts))
+        (ensure-equal "field" (http-multipart-part-name (first parts)))
+        (ensure-equal (ascii "value") (http-multipart-part-value (first parts)))))
+    (let ((caught nil))
+      (handler-case
+          (parse-http-multipart-body body :boundary "other"
+                                         :content-type content-type)
+        (http-protocol-error (condition) (setf caught condition)))
+      (ensure-true (typep caught 'http-protocol-error))
+      (ensure-equal :client (http-kit:http-error-operation caught))
+      (ensure-equal '("other" "boundary")
+                    (http-kit:http-protocol-error-detail caught)))))
+
+(deftest client-auth-cache-boundary-digest-auth-int
+  ;; Fixed independent hashlib/OpenSSL vectors; MD5 auth is RFC 2617's anchor.
+  (flet ((challenge (algorithm qop)
+           (first (http-parse-authentication-challenges
+                   (format nil "Digest realm=\"testrealm@host.com\", nonce=\"dcd98b7102dd2f0e8b11d0f600bfb0c093\", algorithm=~A, qop=\"~A\""
+                           algorithm qop))))
+         (expected (algorithm qop response)
+           (format nil "Digest username=\"Mufasa\", realm=\"testrealm@host.com\", uri=\"/dir/index.html\", algorithm=~A, nonce=\"dcd98b7102dd2f0e8b11d0f600bfb0c093\", nc=00000001, cnonce=\"0a4f113b\", qop=~A, response=\"~A\""
+                   algorithm qop response)))
+    (dolist (vector
+             '(("MD5" "de72ddd8b1d5f35e7ac00c2eb6a4fa55"
+                "5e6610ecf9ba3017a4870ad48e3ad30b"
+                "6629fae49393a05397450978507c4ef1")
+               ("SHA-256" "7212bb23545b99ab4cdb6e7e0f244cabab856de32cecc638c91d249244157cfd"
+                "73ef36480ea6a777c5d2f7cdcdb7882040806d8cd3340b7d5125792a82921f90"
+                "5abdd07184ba512a22c53f41470e5eea7dcaa3a93a59b630c13dfe0a5dc6e38b")
+               ("SHA-512-256" "20734492c5c36bea45b87c7e1013c706f0f77f2456129f1678a3feec1db0bb8c"
+                "26d9d345442cc35976069b5aba9960f5d8e66abc7453835fd11e14fba96f616f"
+                "f23c08ec7334a881f8286e68450ddbd9f0cd91c41481f0e1433604da8113c6dc")))
+      (destructuring-bind (algorithm binary empty auth) vector
+        (ensure-equal
+         (expected algorithm "auth-int" binary)
+         (http-digest-authorization
+          (challenge algorithm "auth, auth-int") "GET" "/dir/index.html"
+          "Mufasa" "Circle Of Life" "0a4f113b"
+          :qop "auth-int" :entity-body (octets 0 1 127 128 255)))
+        (ensure-equal
+         (expected algorithm "auth-int" binary)
+         (http-digest-authorization
+          (challenge algorithm "auth-int") "GET" "/dir/index.html"
+          "Mufasa" "Circle Of Life" "0a4f113b"
+          :entity-body (octets 0 1 127 128 255)))
+        (ensure-equal
+         (expected algorithm "auth-int" empty)
+         (http-digest-authorization
+          (challenge algorithm "auth-int") "GET" "/dir/index.html"
+          "Mufasa" "Circle Of Life" "0a4f113b" :qop "auth-int"))
+        (ensure-equal
+         (expected algorithm "auth" auth)
+         (http-digest-authorization
+          (challenge algorithm "auth, auth-int") "GET" "/dir/index.html"
+          "Mufasa" "Circle Of Life" "0a4f113b"
+          :entity-body (octets 0 1 127 128 255)))))))
+
+(deftest client-auth-cache-boundary-digest-session
+  (flet ((authorization (algorithm)
+           (http-digest-authorization
+            (first (http-parse-authentication-challenges
+                    (format nil "Digest realm=\"testrealm@host.com\", nonce=\"dcd98b7102dd2f0e8b11d0f600bfb0c093\", algorithm=~A, qop=auth"
+                            algorithm)))
+            "GET" "/dir/index.html" "Mufasa" "Circle Of Life" "0a4f113b"))
+         (expected (algorithm response)
+           (format nil "Digest username=\"Mufasa\", realm=\"testrealm@host.com\", uri=\"/dir/index.html\", algorithm=~A, nonce=\"dcd98b7102dd2f0e8b11d0f600bfb0c093\", nc=00000001, cnonce=\"0a4f113b\", qop=auth, response=\"~A\""
+                   algorithm response)))
+    (dolist (vector
+             '(("MD5" "8e3825c57e897f5a0dec6c2d4e5059d0"
+                "6629fae49393a05397450978507c4ef1")
+               ("SHA-256" "b8822e12417cb7750f4e2b8515f0dcf25b7dd26993e80bee1426201446a7f59b"
+                "5abdd07184ba512a22c53f41470e5eea7dcaa3a93a59b630c13dfe0a5dc6e38b")
+               ("SHA-512-256" "0d21f0db3ec5cda5b850c0afa3bc29b4a3c5a6191959ff1baf511d4b38eb6b1e"
+                "f23c08ec7334a881f8286e68450ddbd9f0cd91c41481f0e1433604da8113c6dc")))
+      (destructuring-bind (algorithm session plain) vector
+        (let ((session-algorithm (concatenate 'string algorithm "-sess")))
+          (ensure-equal (expected session-algorithm session)
+                        (authorization session-algorithm))
+          (ensure-equal (expected algorithm plain)
+                        (authorization algorithm)))))))
+
+(deftest client-auth-cache-boundary-digest-negotiation
+  (flet ((challenge (algorithm offered)
+           (first (http-parse-authentication-challenges
+                   (format nil "Digest realm=\"testrealm@host.com\", nonce=\"dcd98b7102dd2f0e8b11d0f600bfb0c093\", algorithm=~A, qop=\"~A\""
+                           algorithm offered)))))
+    (dolist (case '(("MD5" "auth" "auth-int" "auth-int")
+                    ("MD5" "auth-int" "auth" "auth")
+                    ("MD5" "unknown" nil "unknown")
+                    ("MD5" "auth-int" nil "auth-int")
+                    ("SHA-999" "auth" nil "SHA-999")))
+      (destructuring-bind (algorithm offered requested detail) case
+        (let ((caught nil))
+          (handler-case
+              (http-digest-authorization
+               (challenge algorithm offered) "GET" "/dir/index.html"
+               "Mufasa" "Circle Of Life" "0a4f113b" :qop requested)
+            (http-protocol-error (condition) (setf caught condition)))
+          (ensure-true (typep caught 'http-protocol-error))
+          (ensure-equal :client (http-kit:http-error-operation caught))
+          (ensure-equal detail (http-kit:http-protocol-error-detail caught)))))
+    (dolist (offered '("auth" "AUTH, auth-int"))
+      (ensure-equal
+       "Digest username=\"Mufasa\", realm=\"testrealm@host.com\", uri=\"/dir/index.html\", algorithm=MD5, nonce=\"dcd98b7102dd2f0e8b11d0f600bfb0c093\", nc=00000001, cnonce=\"0a4f113b\", qop=auth, response=\"6629fae49393a05397450978507c4ef1\""
+       (http-digest-authorization
+        (challenge "MD5" offered) "GET" "/dir/index.html"
+        "Mufasa" "Circle Of Life" "0a4f113b" :qop "AUTH")))))
+
+(deftest client-auth-cache-boundary-vary-star
+  (let ((english
+          (make-http-request
+           :method "GET" :uri "http://example.test/vary-star"
+           :headers (list (make-http-header "Accept-Language" "en"))))
+        (french
+          (make-http-request
+           :method "GET" :uri "http://example.test/vary-star"
+           :headers (list (make-http-header "Accept-Language" "fr")))))
+    (dolist (vary '("*" "Accept-Language, *"))
+      (let ((cache (make-http-cache :clock-function (lambda () 1000))))
+        (ensure-false
+         (http-cache-store
+          cache english
+          (client-test-response
+           200 :body (ascii "uncacheable")
+           :headers (list (make-http-header "Cache-Control" "max-age=60")
+                          (make-http-header "Vary" vary)))
+          :now 1000))
+        (ensure-equal nil (http-cache-entries cache))
+        (multiple-value-bind (response state entry reason)
+            (http-cache-lookup cache english :now 1001)
+          (ensure-false response)
+          (ensure-equal :miss state)
+          (ensure-false entry)
+          (ensure-equal :miss reason))
+        (ensure-true
+         (http-cache-store
+          cache english
+          (client-test-response
+           200 :body (ascii "English")
+           :headers (list (make-http-header "Cache-Control" "max-age=60")
+                          (make-http-header "Vary" "Accept-Language")))
+          :now 1000))
+        (multiple-value-bind (response state entry reason)
+            (http-cache-lookup cache english :now 1001)
+          (ensure-equal :fresh state)
+          (ensure-equal (ascii "English") (http-response-body response))
+          (ensure-true entry)
+          (ensure-false reason))
+        (multiple-value-bind (response state entry reason)
+            (http-cache-lookup cache french :now 1001)
+          (ensure-false response)
+          (ensure-equal :miss state)
+          (ensure-false entry)
+          (ensure-equal :miss reason))
+        (ensure-equal 1 (length (http-cache-entries cache)))))))
+
+(deftest client-auth-cache-boundary-lru
+  (let ((requests
+          (loop for name in '("a" "b" "c")
+                collect (make-http-request
+                         :method "GET"
+                         :uri (format nil "http://example.test/lru/~A" name)))))
+    (dolist (touch-a '(nil t))
+      (let ((cache (make-http-cache :max-entries 2
+                                    :clock-function (lambda () 1000))))
+        (loop for request in (subseq requests 0 2)
+              for body in '("a" "b")
+              do (ensure-true
+                  (http-cache-store
+                   cache request
+                   (client-test-response
+                    200 :body (ascii body)
+                    :headers (list (make-http-header "Cache-Control" "max-age=60")))
+                   :now 1000)))
+        (ensure-equal
+         (mapcar #'http-cache-key (list (second requests) (first requests)))
+         (mapcar #'http-cache-entry-key (http-cache-entries cache)))
+        (when touch-a
+          (multiple-value-bind (response state entry)
+              (http-cache-lookup cache (first requests) :now 1001)
+            (ensure-equal :fresh state)
+            (ensure-equal (ascii "a") (http-response-body response))
+            (ensure-equal 1001 (http-cache-entry-accessed-at entry)))
+          (ensure-equal
+           (mapcar #'http-cache-key (subseq requests 0 2))
+           (mapcar #'http-cache-entry-key (http-cache-entries cache))))
+        (ensure-true
+         (http-cache-store
+          cache (third requests)
+          (client-test-response
+           200 :body (ascii "c")
+           :headers (list (make-http-header "Cache-Control" "max-age=60")))
+          :now 1002))
+        (let ((retained (if touch-a (first requests) (second requests)))
+              (evicted (if touch-a (second requests) (first requests))))
+          (ensure-equal
+           (mapcar #'http-cache-key (list (third requests) retained))
+           (mapcar #'http-cache-entry-key (http-cache-entries cache)))
+          (ensure-equal 2 (length (http-cache-entries cache)))
+          (multiple-value-bind (response state entry reason)
+              (http-cache-lookup cache evicted :now 1003)
+            (ensure-false response)
+            (ensure-equal :miss state)
+            (ensure-false entry)
+            (ensure-equal :miss reason))
+          (dolist (request-and-body
+                    (list (cons retained (if touch-a "a" "b"))
+                          (cons (third requests) "c")))
+            (multiple-value-bind (response state entry reason)
+                (http-cache-lookup cache (car request-and-body) :now 1003)
+              (ensure-equal :fresh state)
+              (ensure-equal (ascii (cdr request-and-body))
+                            (http-response-body response))
+              (ensure-true entry)
+              (ensure-false reason))))))))
+
+(deftest client-auth-cache-boundary-freshness
+  (let* ((now (http-parse-date "Sun, 06 Nov 1994 08:49:57 GMT"))
+         (request (make-http-request :method "GET"
+                                     :uri "http://example.test/freshness")))
+    (dolist (fields
+              '((("Expires" "Sun, 06 Nov 1994 08:50:07 GMT"))
+                (("Last-Modified" "Sun, 06 Nov 1994 08:48:17 GMT"))
+                (("Expires" "Sun, 06 Nov 1994 08:50:07 GMT")
+                 ("Last-Modified" "Sun, 06 Nov 1994 08:33:17 GMT"))
+                (("Cache-Control" "max-age=10")
+                 ("Expires" "Sun, 06 Nov 1994 09:49:57 GMT"))))
+      (let* ((cache (make-http-cache :clock-function (lambda () now)))
+             (entry
+               (http-cache-store
+                cache request
+                (client-test-response
+                 200 :body (ascii "fresh")
+                 :headers (cons (make-http-header "Date"
+                                                  "Sun, 06 Nov 1994 08:49:57 GMT")
+                                (mapcar (lambda (field)
+                                          (apply #'make-http-header field))
+                                        fields)))
+                :now now)))
+        (ensure-true entry)
+        (ensure-equal (+ now 10) (http-cache-entry-expires-at entry))
+        (multiple-value-bind (response state snapshot reason)
+            (http-cache-lookup cache request :now (+ now 9))
+          (ensure-equal :fresh state)
+          (ensure-equal (ascii "fresh") (http-response-body response))
+          (ensure-equal "9" (http-header-value (http-response-headers response) "Age"))
+          (ensure-equal (+ now 10) (http-cache-entry-expires-at snapshot))
+          (ensure-false reason))
+        (multiple-value-bind (response state snapshot reason)
+            (http-cache-lookup cache request :now (+ now 10))
+          (ensure-false response)
+          (ensure-equal :stale state)
+          (ensure-equal (+ now 10) (http-cache-entry-expires-at snapshot))
+          (ensure-equal :stale reason))))
+    (dolist (last-modified '("Sun, 06 Nov 1994 08:49:57 GMT"
+                            "Sun, 06 Nov 1994 08:50:07 GMT"))
+      (let ((cache (make-http-cache :clock-function (lambda () now))))
+        (let ((entry
+                (http-cache-store
+                 cache request
+                 (client-test-response
+                  200 :body (ascii "stale")
+                  :headers (list (make-http-header "Date"
+                                                  "Sun, 06 Nov 1994 08:49:57 GMT")
+                                 (make-http-header "Last-Modified" last-modified)))
+                 :now now)))
+          (ensure-true entry)
+          (ensure-equal now (http-cache-entry-expires-at entry)))
+        (multiple-value-bind (response state entry reason)
+            (http-cache-lookup cache request :now now)
+          (ensure-false response)
+          (ensure-equal :stale state)
+          (ensure-true entry)
+          (ensure-equal :stale reason))))))
+
+(deftest client-auth-cache-completion-session-auth-int
+  ;; Fixed vectors are independently derived from RFC 7616 A1/A2 with hashlib
+  ;; and OpenSSL SHA-512/256, including embedded NUL and non-ASCII octets.
+  (flet ((authorization (algorithm)
+           (http-digest-authorization
+            (first (http-parse-authentication-challenges
+                    (format nil "Digest realm=\"testrealm@host.com\", nonce=\"dcd98b7102dd2f0e8b11d0f600bfb0c093\", algorithm=~A, qop=\"auth, auth-int\""
+                            algorithm)))
+            "GET" "/dir/index.html" "Mufasa" "Circle Of Life" "0a4f113b"
+            :qop "auth-int" :entity-body (octets 0 1 127 128 255)))
+         (expected (algorithm response)
+           (format nil "Digest username=\"Mufasa\", realm=\"testrealm@host.com\", uri=\"/dir/index.html\", algorithm=~A, nonce=\"dcd98b7102dd2f0e8b11d0f600bfb0c093\", nc=00000001, cnonce=\"0a4f113b\", qop=auth-int, response=\"~A\""
+                   algorithm response)))
+    (dolist (vector
+              '(("MD5" "f551a95d2094039c8e7c3611b11f48d1"
+                 "de72ddd8b1d5f35e7ac00c2eb6a4fa55")
+                ("SHA-256" "347eea880778d4ff72ab5026cacb72341c10cc813d7e9c0bdfe924958687c992"
+                 "7212bb23545b99ab4cdb6e7e0f244cabab856de32cecc638c91d249244157cfd")
+                ("SHA-512-256" "32b4618c0a4647f4b73c2575f9fdf9689c27379f9741e1e2bb762dba502e90b9"
+                 "20734492c5c36bea45b87c7e1013c706f0f77f2456129f1678a3feec1db0bb8c")))
+      (destructuring-bind (algorithm session plain) vector
+        (let ((session-algorithm (concatenate 'string algorithm "-sess")))
+          (ensure-equal (expected session-algorithm session)
+                        (authorization session-algorithm))
+          (ensure-equal (expected algorithm plain)
+                        (authorization algorithm)))))))
+
+(deftest client-auth-cache-completion-empty-octet-auth-int
+  (flet ((authorization (algorithm requested)
+           (http-digest-authorization
+            (first (http-parse-authentication-challenges
+                    (format nil "Digest realm=\"testrealm@host.com\", nonce=\"dcd98b7102dd2f0e8b11d0f600bfb0c093\", algorithm=~A, qop=auth-int"
+                            algorithm)))
+            "GET" "/dir/index.html" "Mufasa" "Circle Of Life" "0a4f113b"
+            :qop requested :entity-body (octets)))
+         (expected (algorithm response)
+           (format nil "Digest username=\"Mufasa\", realm=\"testrealm@host.com\", uri=\"/dir/index.html\", algorithm=~A, nonce=\"dcd98b7102dd2f0e8b11d0f600bfb0c093\", nc=00000001, cnonce=\"0a4f113b\", qop=auth-int, response=\"~A\""
+                   algorithm response)))
+    (dolist (vector
+              '(("MD5" "5e6610ecf9ba3017a4870ad48e3ad30b")
+                ("MD5-sess" "0c9976da714ad8905eb2720abe326a63")
+                ("SHA-256" "73ef36480ea6a777c5d2f7cdcdb7882040806d8cd3340b7d5125792a82921f90")
+                ("SHA-256-sess" "6d80a12b361a15d2f54b18e8db571f74a1d8c7cfa25cc3f04a34cb2e7575b0d8")
+                ("SHA-512-256" "26d9d345442cc35976069b5aba9960f5d8e66abc7453835fd11e14fba96f616f")
+                ("SHA-512-256-sess" "36b749873d2253a662d65946480206084ffd7ab8fcd88f6354ca1d33bf173923")))
+      (destructuring-bind (algorithm response) vector
+        ;; An empty octet vector supplies an entity even though its length is zero.
+        (ensure-equal (expected algorithm response) (authorization algorithm nil))
+        (ensure-equal (expected algorithm response)
+                      (authorization algorithm "auth-int"))))))
+
+(deftest client-auth-cache-completion-clock-callback
+  (let* ((base (http-parse-date "Sun, 06 Nov 1994 08:49:57 GMT"))
+         (request (make-http-request :method "GET"
+                                     :uri "http://example.test/clock-callback"))
+         (origin-response
+           (client-test-response
+            200 :body (ascii "clocked")
+            :headers (list (make-http-header "Date"
+                                            "Sun, 06 Nov 1994 08:49:57 GMT")
+                           (make-http-header "Cache-Control" "max-age=10")))))
+    (dolist (explicit-now '(nil t))
+      (let* ((clock-value (if explicit-now (+ base 1000) base))
+             (clock-calls 0)
+             (cache (make-http-cache
+                     :clock-function (lambda () (incf clock-calls) clock-value)))
+             (stored (if explicit-now
+                         (http-cache-store cache request origin-response :now base)
+                         (http-cache-store cache request origin-response))))
+        (ensure-true stored)
+        (ensure-equal (if explicit-now 0 1) clock-calls)
+        (ensure-equal base (http-cache-entry-stored-at stored))
+        (ensure-equal (+ base 10) (http-cache-entry-expires-at stored))
+        (loop for offset in '(0 9 10 11)
+              for lookup-number from 1
+              do (multiple-value-bind (response state entry reason)
+                     (if explicit-now
+                         (http-cache-lookup cache request :now (+ base offset))
+                         (progn
+                           (setf clock-value (+ base offset))
+                           (http-cache-lookup cache request)))
+                   (ensure-equal (if explicit-now 0 (1+ lookup-number)) clock-calls)
+                   (ensure-true entry)
+                   (ensure-equal (+ base 10) (http-cache-entry-expires-at entry))
+                   (if (< offset 10)
+                       (progn
+                         (ensure-equal :fresh state)
+                         (ensure-false reason)
+                         (ensure-equal (ascii "clocked") (http-response-body response))
+                         (ensure-equal (write-to-string offset)
+                                       (http-header-value
+                                        (http-response-headers response) "Age"))
+                         (ensure-equal (+ base offset)
+                                       (http-cache-entry-accessed-at entry)))
+                       (progn
+                         (ensure-false response)
+                         (ensure-equal :stale state)
+                         (ensure-equal :stale reason)))))))))
+
+(deftest client-protocol-boundary-aliases-and-offered-order
+  (dolist (case '(("http/1.1" "http/1.1")
+                  ("http1" "http/1.1")
+                  ("http-1.1" "http/1.1")
+                  ("http-1-1" "http/1.1")
+                  ("h2" "h2")
+                  ("http2" "h2")
+                  ("http-2" "h2")
+                  ("h3" "h3")
+                  ("http3" "h3")
+                  ("http-3" "h3")))
+    (destructuring-bind (alias expected) case
+      (let ((input (copy-seq alias)))
+        (ensure-equal expected (http-alpn-protocol-name input))
+        (ensure-equal alias input))
+      (ensure-equal expected (http-alpn-protocol-name (string-upcase alias)))
+      (ensure-equal expected
+                    (http-alpn-protocol-name
+                     (intern (string-upcase alias) :keyword)))))
+  (dolist (input '(nil t 42 #\h #("h2") ("h2") "spdy" :spdy "" :http4))
+    (ensure-false (http-alpn-protocol-name input)))
+  (dolist (case '((("h3" "h2" "http/1.1") (:http1 :http2 :http3) "h3")
+                  ((:http1 :http2 :http3) ("h3" "h2" "http/1.1") "http/1.1")
+                  (("SPDY" :http-2 :http-3) (42 :unknown "HTTP2" "h3") "h2")
+                  ((42 nil "unknown" "HTTP-3") (:http3) "h3")
+                  (("h2" "h2" "h3") (:http3 :http2 :http2) "h2")
+                  (("h3") (:http1 :http2) nil)
+                  (("h2") nil nil)
+                  (nil (:http2) nil)))
+    (destructuring-bind (offered supported expected) case
+      (ensure-equal expected (http-select-protocol offered supported)))))
+
+(deftest client-protocol-boundary-http3-request-predicate
+  (dolist (input (list nil t 42 "HTTP/3" (client-test-response 200)
+                      '(:protocol-version "HTTP/3") #()))
+    (ensure-false (http-request-http3-p input)))
+  (dolist (version '("HTTP/1.0" "HTTP/1.1" "HTTP/2" "HTTP/3"))
+    (let ((request (make-http-request :method "GET"
+                                      :uri "https://example.test/"
+                                      :protocol-version version)))
+      (if (string= version "HTTP/3")
+          (ensure-true (http-request-http3-p request))
+          (ensure-false (http-request-http3-p request))))))
+
+(deftest client-sse-boundary-invalid-inputs
+  (dolist (input (list nil 42 #\d '(100) #(256) #(-1) #(1.5)
+                      (make-array '(1 1) :initial-element 100)))
+    (let ((caught nil))
+      (handler-case (parse-http-sse-events input)
+        (http-protocol-error (condition) (setf caught condition)))
+      (ensure-true (typep caught 'http-protocol-error))
+      (ensure-equal :sse (http-error-operation caught))
+      (ensure-true (eq input (http-kit:http-protocol-error-detail caught)))))
+  (dolist (input (list nil 42 #\d "data:x" #(0) '(stream) :stream))
+    (let ((caught nil))
+      (handler-case (read-http-sse-events input)
+        (http-protocol-error (condition) (setf caught condition)))
+      (ensure-true (typep caught 'http-protocol-error))
+      (ensure-equal :sse (http-error-operation caught))
+      (ensure-true (eq input (http-kit:http-protocol-error-detail caught)))))
+  (ensure-equal nil (parse-http-sse-events ""))
+  (ensure-equal nil (parse-http-sse-events #())))
+
+(deftest client-sse-boundary-invalid-callback-before-reading
+  (dolist (callback (list t 42 :callback "callback" '(lambda (event) event)))
+    (with-input-from-string (stream (format nil "data:x~%~%"))
+      (let ((caught nil))
+        (handler-case (read-http-sse-events stream :on-event callback)
+          (http-protocol-error (condition) (setf caught condition)))
+        (ensure-true (typep caught 'http-protocol-error))
+        (ensure-equal :sse (http-error-operation caught))
+        (ensure-true (eq callback (http-kit:http-protocol-error-detail caught)))
+        (ensure-equal #\d (read-char stream))))))
+
+(deftest client-sse-boundary-callback-error-propagates
+  (let ((failure (make-condition 'simple-error))
+        (seen nil)
+        (caught nil))
+    (with-input-from-string (stream (format nil "data:first~%~%data:second~%~%"))
+      (handler-case
+          (read-http-sse-events
+           stream :on-event (lambda (event)
+                              (push (http-sse-event-data event) seen)
+                              (error failure)))
+        (simple-error (condition) (setf caught condition)))
+      (ensure-true (eq failure caught))
+      (ensure-equal '("first") seen)
+      (ensure-equal #\d (read-char stream)))))
+
+#+sbcl
+(deftest client-proxy-socks5-resolver-preserves-ipv6-hex-case
+  (dolist (address '("::a" "::A"))
+    (let* ((stream
+             (make-instance
+              'binary-test-stream
+              :input
+              (concatenate-octets
+               (octets 5 0 5 0 0 1 0 0 0 0 0 0)
+               (ascii "HTTP/1.1 204 No Content|CRLF||CRLF|"))))
+           (resolved-hosts nil)
+           (opened-plans nil)
+           (closed 0)
+           (pool
+             (make-http-connection-pool
+              :open-stream
+              (lambda (request &key timeout deadline proxy-plan proxy
+                                &allow-other-keys)
+                (declare (ignore request timeout deadline proxy))
+                (push proxy-plan opened-plans)
+                stream)
+              :close-stream
+              (lambda (closed-stream)
+                (ensure-equal stream closed-stream)
+                (incf closed))
+              :resolve-host
+              (lambda (host &key timeout deadline)
+                (declare (ignore timeout deadline))
+                (push host resolved-hosts)
+                address)))
+           (client
+             (make-http-client
+              :cache nil
+              :proxy (make-http-proxy :scheme :socks5
+                                      :host "proxy.test" :port 1080)
+              :connection-pool pool)))
+      (let ((response (http-client-send client "GET" "http://example.test/")))
+        (ensure-equal 204 (http-response-status response))
+        (ensure-equal #() (http-response-body response)))
+      (ensure-equal '("example.test") (reverse resolved-hosts))
+      (ensure-equal :socks5 (getf (first opened-plans) :mode))
+      (let ((output (binary-test-output stream)))
+        (ensure-equal
+         (concatenate-octets
+          (octets 5 1 0 5 1 0 4)
+          (make-array 15 :element-type '(unsigned-byte 8) :initial-element 0)
+          (octets 10 0 80))
+         (subseq output 0 25))
+        (ensure-equal
+         0 (search "GET / HTTP/1.1" (octets-as-string (subseq output 25)))))
+      (ensure-equal 1 (http-connection-pool-clear pool))
+      (ensure-equal 1 closed))))
+
+#+sbcl
+(progn
+  (defclass websocket-boundary-test-stream (binary-test-stream)
+    ((read-chunk :initarg :read-chunk :initform 1
+                 :reader websocket-boundary-read-chunk)
+     (signal-eof-p :initarg :signal-eof-p :initform nil
+                   :reader websocket-boundary-signal-eof-p)
+     (flushes :initform 0 :accessor websocket-boundary-flushes)))
+
+  (defmethod sb-gray:stream-read-sequence :around
+      ((stream websocket-boundary-test-stream) sequence &optional (start 0) end)
+    (when (and (websocket-boundary-signal-eof-p stream)
+               (= (http-kit/test-core::binary-test-input-position stream)
+                  (length (http-kit/test-core::binary-test-input stream))))
+      (error 'end-of-file :stream stream))
+    (call-next-method stream sequence start
+                      (min (or end (length sequence))
+                           (+ start (websocket-boundary-read-chunk stream)))))
+
+  (defmethod sb-gray:stream-finish-output :after
+      ((stream websocket-boundary-test-stream))
+    (incf (websocket-boundary-flushes stream))))
+
+#+sbcl
+(deftest websocket-boundary-size-limit-before-payload-read
+  (let* ((payload (make-array 126 :element-type '(unsigned-byte 8)
+                                 :initial-element 97))
+         (wire (concatenate-octets (octets #x82 #xfe 0 126 0 0 0 0)
+                                   payload (octets #xff)))
+         (normal (make-instance 'websocket-boundary-test-stream :input wire))
+         (rejected (make-instance 'websocket-boundary-test-stream :input wire)))
+    (multiple-value-bind (frame consumed)
+        (read-websocket-frame normal :max-payload-bytes 126)
+      (ensure-equal 134 consumed)
+      (ensure-equal 134 (http-kit/test-core::binary-test-input-position normal))
+      (ensure-equal 2 (websocket-frame-opcode frame))
+      (ensure-equal payload (websocket-frame-payload frame))
+      (ensure-equal #xff (read-byte normal)))
+    (let ((caught nil))
+      (handler-case (read-websocket-frame rejected :max-payload-bytes 125)
+        (http-size-limit-exceeded (condition) (setf caught condition)))
+      (ensure-true (typep caught 'http-size-limit-exceeded))
+      (ensure-equal :websocket (http-error-operation caught))
+      (ensure-equal :websocket (http-kit:http-size-limit-exceeded-kind caught))
+      (ensure-equal 125 (http-kit:http-size-limit-exceeded-limit caught))
+      (ensure-equal 126 (http-kit:http-size-limit-exceeded-observed caught))
+      (ensure-equal 4 (http-kit/test-core::binary-test-input-position rejected))
+      (ensure-equal 0 (read-byte rejected))
+      (ensure-equal 5 (http-kit/test-core::binary-test-input-position rejected)))))
+
+#+sbcl
+(deftest websocket-boundary-truncated-stream-is-protocol-error
+  (let ((normal (make-instance
+                 'websocket-boundary-test-stream
+                 :input (octets #x81 #x85 #x37 #xfa #x21 #x3d
+                                #x7f #x9f #x4d #x51 #x58 #xff))))
+    (multiple-value-bind (frame consumed)
+        (read-websocket-frame normal :require-mask-p t)
+      (ensure-equal 11 consumed)
+      (ensure-equal 11 (http-kit/test-core::binary-test-input-position normal))
+      (ensure-equal (octets 72 101 108 108 111) (websocket-frame-payload frame))
+      (ensure-equal #xff (read-byte normal))))
+  (dolist (wire (list (octets) (octets #x81) (octets #x82 #x7e 0)
+                     (octets #x82 #x7f 0 0 0 0 0 1 0)
+                     (octets #x81 #x80 1 2 3) (octets #x81 2 65)))
+    (dolist (signal-eof-p '(nil t))
+      (let ((stream (make-instance 'websocket-boundary-test-stream :input wire
+                                  :signal-eof-p signal-eof-p))
+            (caught nil))
+        (handler-case (read-websocket-frame stream)
+          (http-protocol-error (condition) (setf caught condition)))
+        (ensure-true (typep caught 'http-protocol-error))
+        (ensure-equal :websocket (http-error-operation caught))
+        (ensure-equal (length wire)
+                      (http-kit/test-core::binary-test-input-position stream))))))
+
+#+sbcl
+(deftest websocket-boundary-invalid-write-produces-no-output
+  (let ((frame (make-websocket-frame :opcode 1 :payload (octets 65))))
+    (dolist (finish-output-p '(nil t))
+      (let ((stream (make-instance 'websocket-boundary-test-stream
+                                   :input (octets))))
+        (ensure-true (eq frame (write-websocket-frame
+                               stream frame :finish-output-p finish-output-p)))
+        (ensure-equal (octets #x81 1 65) (binary-test-output stream))
+        (ensure-equal (if finish-output-p 1 0)
+                      (websocket-boundary-flushes stream))))
+    (dolist (stream (list nil 42 #()))
+      (let ((caught nil))
+        (handler-case (write-websocket-frame stream frame)
+          (http-protocol-error (condition) (setf caught condition)))
+        (ensure-true (typep caught 'http-protocol-error))
+        (ensure-equal :websocket (http-error-operation caught))))
+    (setf (websocket-frame-payload frame) #(256))
+    (dolist (invalid (list nil frame))
+      (let ((stream (make-instance 'websocket-boundary-test-stream
+                                   :input (octets)))
+            (caught nil))
+        (handler-case (write-websocket-frame stream invalid)
+          (http-protocol-error (condition) (setf caught condition)))
+        (ensure-true (typep caught 'http-protocol-error))
+        (ensure-equal :websocket (http-error-operation caught))
+        (ensure-equal 0 (length (binary-test-output stream)))
+        (ensure-equal 0 (websocket-boundary-flushes stream))))))
+
+(deftest client-sse-utf8-truncation-and-continuation-boundaries
+  (dolist (bytes '((#xe6) (#xe6 #x97)
+                   (#xe6 #x20 #xa5) (#xe6 #x97 #x20)
+                   (#xf0) (#xf0 #x9f) (#xf0 #x9f #x98)
+                   (#xf0 #x20 #x98 #x80) (#xf0 #x9f #x20 #x80)
+                   (#xf0 #x9f #x98 #x20)))
+    (let ((value (apply #'octets bytes))
+          (caught nil))
+      (handler-case
+          (parse-http-sse-events
+           (concatenate-octets (ascii "data:") value (octets 10 10)))
+        (http-protocol-error (condition) (setf caught condition)))
+      (ensure-true (typep caught 'http-protocol-error))
+      (ensure-equal :sse (http-error-operation caught))
+      (ensure-equal value (http-kit:http-protocol-error-detail caught))))
+  (dolist (case '(((#xe6 #x97 #xa5) "日")
+                  ((#xf0 #x9f #x98 #x80) "😀")))
+    (destructuring-bind (bytes expected) case
+      (let ((events
+              (parse-http-sse-events
+               (concatenate-octets (ascii "data:") (apply #'octets bytes)
+                                   (octets 10 10)))))
+        (ensure-equal 1 (length events))
+        (ensure-equal expected (http-sse-event-data (first events)))))))
+
+(deftest client-sse-utf8-invalid-leading-bytes
+  (dolist (byte '(#x80 #xc0 #xc1 #xf5 #xff))
+    (let ((value (octets byte))
+          (caught nil))
+      (handler-case
+          (parse-http-sse-events
+           (concatenate-octets (ascii "data:") value (octets 10 10)))
+        (http-protocol-error (condition) (setf caught condition)))
+      (ensure-true (typep caught 'http-protocol-error))
+      (ensure-equal :sse (http-error-operation caught))
+      (ensure-equal value (http-kit:http-protocol-error-detail caught))))
+  (let ((events
+          (parse-http-sse-events
+           (concatenate-octets (ascii "data:") (octets #x41)
+                               (octets 10 10)))))
+    (ensure-equal 1 (length events))
+    (ensure-equal "A" (http-sse-event-data (first events)))))
+
+(deftest client-sse-serialization-normalizes-line-endings
+  (dolist (case
+            (list
+             (list "" "data:|CRLF||CRLF|" "")
+             (list (string #\Return) "data:|CRLF|data:|CRLF||CRLF|"
+                   (string #\Linefeed))
+             (list (format nil "a~Cb" #\Return)
+                   "data:a|CRLF|data:b|CRLF||CRLF|"
+                   (format nil "a~Cb" #\Linefeed))
+             (list (format nil "a~C~Cb" #\Return #\Linefeed)
+                   "data:a|CRLF|data:b|CRLF||CRLF|"
+                   (format nil "a~Cb" #\Linefeed))
+             (list (format nil "a~C" #\Linefeed)
+                   "data:a|CRLF|data:|CRLF||CRLF|"
+                   (format nil "a~C" #\Linefeed))
+             (list (format nil "a~C~C" #\Return #\Linefeed)
+                   "data:a|CRLF|data:|CRLF||CRLF|"
+                   (format nil "a~C" #\Linefeed))
+             (list (format nil "a~C~C~Cb" #\Return #\Return #\Linefeed)
+                   "data:a|CRLF|data:|CRLF|data:b|CRLF||CRLF|"
+                   (format nil "a~C~Cb" #\Linefeed #\Linefeed))))
+    (destructuring-bind (data expected-wire expected-data) case
+      (let* ((original (copy-seq data))
+             (event (make-http-sse-event :data data))
+             (wire (serialize-http-sse-event event))
+             (parsed (parse-http-sse-events wire)))
+        (ensure-equal (ascii expected-wire) wire)
+        (ensure-equal 1 (length parsed))
+        (ensure-equal expected-data (http-sse-event-data (first parsed)))
+        (ensure-equal original (http-sse-event-data event))))))
+
+(deftest client-sse-serialization-preserves-leading-whitespace
+  (dolist (case (list (list " " "  ")
+                     (list " one" "  one")
+                     (list "  two" "   two")
+                     (list (format nil "~Cthree" #\Tab)
+                           (format nil "~Cthree" #\Tab))
+                     (list (format nil "~Cfour" (code-char #xa0))
+                           (format nil "~Cfour" (code-char #xa0)))
+                     (list "plain" "plain")
+                     (list "" "")))
+    (destructuring-bind (value encoded-value) case
+      (let* ((event-name (if (string= value "") "message" value))
+             (event (make-http-sse-event :event event-name :data value :id value
+                                         :retry 0 :comments (list value)))
+             (wire (serialize-http-sse-event event))
+             (expected (format nil ":~A~C~C~Aid:~A~C~Cretry:0~C~Cdata:~A~C~C~C~C"
+                               value #\Return #\Linefeed
+                               (if (string= event-name "message")
+                                   ""
+                                   (format nil "event:~A~C~C" encoded-value
+                                           #\Return #\Linefeed))
+                               encoded-value #\Return #\Linefeed
+                               #\Return #\Linefeed encoded-value
+                               #\Return #\Linefeed #\Return #\Linefeed))
+             (parsed (parse-http-sse-events wire)))
+        (ensure-equal (cl-codec-kit:string-to-octets expected :encoding :utf-8)
+                      wire)
+        (ensure-equal 1 (length parsed))
+        (let ((round-trip (first parsed)))
+          (ensure-equal event-name (http-sse-event-event round-trip))
+          (ensure-equal value (http-sse-event-data round-trip))
+          (ensure-equal value (http-sse-event-id round-trip))
+          (ensure-equal 0 (http-sse-event-retry round-trip))
+          (ensure-equal (list value) (http-sse-event-comments round-trip))))))
+  (let* ((data (format nil " first~C second" #\Linefeed))
+         (event (make-http-sse-event :data data))
+         (wire (serialize-http-sse-event event))
+         (parsed (parse-http-sse-events wire)))
+    (ensure-equal (ascii "data:  first|CRLF|data:  second|CRLF||CRLF|") wire)
+    (ensure-equal 1 (length parsed))
+    (ensure-equal data (http-sse-event-data (first parsed)))))
+
+(deftest client-strict-transport-quoted-extension-accepted
+  (dolist (extension '("extension=\"\""
+                       "extension=\"plain\""
+                       "extension=\"a\\\"b\\\\c\""))
+    (let* ((now 1000)
+           (store (make-http-strict-transport-store
+                   :clock-function (lambda () now))))
+      (ensure-true
+       (eq store
+           (http-strict-transport-store-note-response
+            store "https://example.test/learn"
+            (client-test-response
+             200 :headers
+             (list (make-http-header
+                    "Strict-Transport-Security"
+                    (format nil "max-age=60; ~A; includeSubDomains"
+                            extension)))))))
+      (let ((policies (http-strict-transport-store-policies store)))
+        (ensure-equal 1 (length policies))
+        (ensure-equal "example.test"
+                      (http-strict-transport-policy-host (first policies)))
+        (ensure-equal 1060
+                      (http-strict-transport-policy-expires-at (first policies)))
+        (ensure-true
+         (http-strict-transport-policy-include-subdomains-p (first policies))))
+      (ensure-equal
+       "https://api.example.test:443/path?q=1"
+       (http-uri-string
+        (http-strict-transport-store-upgrade-uri
+         store "http://api.example.test:80/path?q=1")))
+      (setf now 1059)
+      (ensure-true
+       (http-strict-transport-store-known-host-p store "api.example.test"))
+      (setf now 1060)
+      (ensure-true
+       (not (http-strict-transport-store-known-host-p store "example.test")))
+      (ensure-true
+       (not (http-strict-transport-store-known-host-p store "api.example.test"))))))
+
+(deftest client-strict-transport-quoted-extension-rejected-preserves-policy
+  (dolist (case '((0 "extension=")
+                  (600 "extension=\"open")
+                  (0 "extension=\"a\"b\"")
+                  (600 "extension=\"tail\\\"")))
+    (destructuring-bind (max-age extension) case
+      (let* ((now 1000)
+             (store (make-http-strict-transport-store
+                     :clock-function (lambda () now))))
+        (http-strict-transport-store-note-response
+         store "https://example.test/learn"
+         (client-test-response
+          200 :headers
+          (list (make-http-header "Strict-Transport-Security"
+                                  "max-age=60; includeSubDomains"))))
+        (ensure-true
+         (http-strict-transport-store-known-host-p store "api.example.test"))
+        (ensure-equal
+         1060 (http-strict-transport-policy-expires-at
+               (first (http-strict-transport-store-policies store))))
+        (setf now 1010)
+        (ensure-true
+         (eq store
+             (http-strict-transport-store-note-response
+              store "https://example.test/learn"
+              (client-test-response
+               200 :headers
+               (list (make-http-header
+                      "Strict-Transport-Security"
+                      (format nil "max-age=~D; ~A" max-age extension)))))))
+        (let ((policies (http-strict-transport-store-policies store)))
+          (ensure-equal 1 (length policies))
+          (ensure-equal
+           1060 (http-strict-transport-policy-expires-at (first policies)))
+          (ensure-true
+           (http-strict-transport-policy-include-subdomains-p (first policies))))
+        (ensure-equal
+         "https://api.example.test:443/path?q=1"
+         (http-uri-string
+          (http-strict-transport-store-upgrade-uri
+           store "http://api.example.test:80/path?q=1")))
+        (setf now 1059)
+        (ensure-true
+         (http-strict-transport-store-known-host-p store "api.example.test"))
+        (setf now 1060)
+        (ensure-true
+         (not (http-strict-transport-store-known-host-p store "example.test")))))))
+
+(deftest client-strict-transport-parser-quoted-semicolon-accepted
+  (dolist (extension '("extension=token"
+                       "extension=\"a;b\""
+                       "extension=\"a\\\";b\""))
+    (let ((store (make-http-strict-transport-store
+                  :clock-function (lambda () 1000))))
+      (http-strict-transport-store-note-response
+       store "https://example.test/"
+       (client-test-response
+        200 :headers (list (make-http-header
+                            "Strict-Transport-Security"
+                            (format nil "max-age=60; ~A; includeSubDomains"
+                                    extension)))))
+      (let ((policies (http-strict-transport-store-policies store)))
+        (ensure-equal 1 (length policies))
+        (ensure-equal 1060 (http-strict-transport-policy-expires-at (first policies)))
+        (ensure-true (http-strict-transport-policy-include-subdomains-p
+                      (first policies))))
+      (ensure-true (http-strict-transport-store-known-host-p store "api.example.test"))
+      (ensure-equal "https://api.example.test:443/path?q=1"
+                    (http-uri-string (http-strict-transport-store-upgrade-uri
+                                      store "http://api.example.test:80/path?q=1"))))))
+
+(deftest client-strict-transport-parser-malformed-quoted-semicolon
+  (dolist (extension '("extension=\"open;b"
+                       "extension=\"a\"b;c\""
+                       "extension=\"tail\\\";"))
+    (let* ((now 1000)
+           (store (make-http-strict-transport-store
+                   :clock-function (lambda () now))))
+      (http-strict-transport-store-note-response
+       store "https://example.test/"
+       (client-test-response
+        200 :headers (list (make-http-header "Strict-Transport-Security"
+                                            "max-age=60; includeSubDomains"))))
+      (ensure-true (http-strict-transport-store-known-host-p store "api.example.test"))
+      (ensure-equal 1060 (http-strict-transport-policy-expires-at
+                          (first (http-strict-transport-store-policies store))))
+      (setf now 1010)
+      (http-strict-transport-store-note-response
+       store "https://example.test/"
+       (client-test-response
+        200 :headers (list (make-http-header "Strict-Transport-Security"
+                                            (format nil "max-age=0; ~A" extension)))))
+      (let ((policies (http-strict-transport-store-policies store)))
+        (ensure-equal 1 (length policies))
+        (ensure-equal 1060 (http-strict-transport-policy-expires-at (first policies)))
+        (ensure-true (http-strict-transport-policy-include-subdomains-p
+                      (first policies))))
+      (ensure-true (http-strict-transport-store-known-host-p store "api.example.test")))))
+
+(deftest client-strict-transport-parser-empty-directives-accepted
+  (dolist (value '("max-age=60; includeSubDomains"
+                   "; max-age=60;; includeSubDomains;"
+                   " ; max-age=\"60\"; extension=\"a;b\";; includeSubDomains; "))
+    (let ((store (make-http-strict-transport-store
+                  :clock-function (lambda () 1000))))
+      (http-strict-transport-store-note-response
+       store "https://example.test/"
+       (client-test-response
+        200 :headers (list (make-http-header "Strict-Transport-Security" value))))
+      (let ((policies (http-strict-transport-store-policies store)))
+        (ensure-equal 1 (length policies))
+        (ensure-equal 1060 (http-strict-transport-policy-expires-at (first policies)))
+        (ensure-true (http-strict-transport-policy-include-subdomains-p
+                      (first policies))))
+      (ensure-true (http-strict-transport-store-known-host-p store "api.example.test"))
+      (ensure-equal "https://api.example.test:443/path"
+                    (http-uri-string (http-strict-transport-store-upgrade-uri
+                                      store "http://api.example.test:80/path"))))))
+
+(deftest client-strict-transport-parser-empty-directives-without-max-age
+  (dolist (value '("" ";" ";;;" " ; extension=token;; " "extension=\"a;b\""))
+    (let* ((now 1000)
+           (store (make-http-strict-transport-store
+                   :clock-function (lambda () now))))
+      (http-strict-transport-store-note-response
+       store "https://example.test/"
+       (client-test-response
+        200 :headers (list (make-http-header "Strict-Transport-Security" value))))
+      (ensure-equal nil (http-strict-transport-store-policies store))
+      (ensure-false (http-strict-transport-store-known-host-p store "example.test"))
+      (http-strict-transport-store-note-response
+       store "https://example.test/"
+       (client-test-response
+        200 :headers (list (make-http-header "Strict-Transport-Security"
+                                            "max-age=60; includeSubDomains"))))
+      (ensure-true (http-strict-transport-store-known-host-p store "api.example.test"))
+      (setf now 1010)
+      (http-strict-transport-store-note-response
+       store "https://example.test/"
+       (client-test-response
+        200 :headers (list (make-http-header "Strict-Transport-Security" value))))
+      (let ((policies (http-strict-transport-store-policies store)))
+        (ensure-equal 1 (length policies))
+        (ensure-equal 1060 (http-strict-transport-policy-expires-at (first policies)))
+        (ensure-true (http-strict-transport-policy-include-subdomains-p
+                      (first policies))))
+      (ensure-true (http-strict-transport-store-known-host-p store "api.example.test")))))
+
+(deftest client-strict-transport-parser-empty-directives-invalid-nonempty
+  (dolist (value '("; max-age=0;; max-age=60;"
+                   "; max-age=0;; MAX-AGE=60;"
+                   "; max-age=0;; =token;"
+                   "; max-age=0;; bad name=token;"
+                   "; max-age=0;; extension=;"
+                   "; max-age=0;; extension=\"open;b;"
+                   "; max-age=0;; includeSubDomains=token;"))
+    (let ((store (make-http-strict-transport-store
+                  :clock-function (lambda () 1000))))
+      (http-strict-transport-store-note-response
+       store "https://example.test/"
+       (client-test-response
+        200 :headers (list (make-http-header "Strict-Transport-Security"
+                                            "max-age=60; includeSubDomains"))))
+      (ensure-true (http-strict-transport-store-known-host-p store "api.example.test"))
+      (http-strict-transport-store-note-response
+       store "https://example.test/"
+       (client-test-response
+        200 :headers (list (make-http-header "Strict-Transport-Security" value))))
+      (let ((policies (http-strict-transport-store-policies store)))
+        (ensure-equal 1 (length policies))
+        (ensure-equal 1060 (http-strict-transport-policy-expires-at (first policies)))
+        (ensure-true (http-strict-transport-policy-include-subdomains-p
+                      (first policies))))
+      (ensure-true (http-strict-transport-store-known-host-p store "api.example.test")))))
+
+(deftest client-strict-transport-parser-quoted-max-age-accepted
+  (dolist (value '("60" "\"60\"" "\"\\6\\0\""))
+    (let* ((now 1000)
+           (store (make-http-strict-transport-store
+                   :clock-function (lambda () now))))
+      (http-strict-transport-store-note-response
+       store "https://example.test/"
+       (client-test-response
+        200 :headers (list (make-http-header
+                            "Strict-Transport-Security"
+                            (format nil "max-age=~A; includeSubDomains" value)))))
+      (ensure-true (http-strict-transport-store-known-host-p store "example.test"))
+      (ensure-equal 1060 (http-strict-transport-policy-expires-at
+                          (first (http-strict-transport-store-policies store))))
+      (ensure-true (http-strict-transport-store-known-host-p store "api.example.test"))
+      (setf now 1059)
+      (ensure-true (http-strict-transport-store-known-host-p store "example.test"))
+      (setf now 1060)
+      (ensure-false (http-strict-transport-store-known-host-p store "example.test"))))
+  (dolist (value '("0" "\"0\"" "\"\\0\""))
+    (let ((store (make-http-strict-transport-store
+                  :clock-function (lambda () 1000))))
+      (http-strict-transport-store-note-response
+       store "https://example.test/"
+       (client-test-response
+        200 :headers (list (make-http-header "Strict-Transport-Security"
+                                            "max-age=60; includeSubDomains"))))
+      (ensure-true (http-strict-transport-store-known-host-p store "api.example.test"))
+      (http-strict-transport-store-note-response
+       store "https://example.test/"
+       (client-test-response
+        200 :headers (list (make-http-header "Strict-Transport-Security"
+                                            (format nil "max-age=~A" value)))))
+      (ensure-equal nil (http-strict-transport-store-policies store))
+      (ensure-false (http-strict-transport-store-known-host-p store "example.test"))
+      (ensure-false (http-strict-transport-store-known-host-p store "api.example.test")))))
+
+(deftest client-strict-transport-parser-quoted-max-age-nondigits
+  (dolist (value '("\"sixty\"" "\"6x\"" "\"\"" "\"\\x\""))
+    (let* ((now 1000)
+           (store (make-http-strict-transport-store
+                   :clock-function (lambda () now))))
+      (http-strict-transport-store-note-response
+       store "https://example.test/"
+       (client-test-response
+        200 :headers (list (make-http-header "Strict-Transport-Security"
+                                            "max-age=60; includeSubDomains"))))
+      (ensure-true (http-strict-transport-store-known-host-p store "api.example.test"))
+      (setf now 1010)
+      (http-strict-transport-store-note-response
+       store "https://example.test/"
+       (client-test-response
+        200 :headers (list (make-http-header "Strict-Transport-Security"
+                                            (format nil "max-age=~A" value)))))
+      (let ((policies (http-strict-transport-store-policies store)))
+        (ensure-equal 1 (length policies))
+        (ensure-equal 1060 (http-strict-transport-policy-expires-at (first policies)))
+        (ensure-true (http-strict-transport-policy-include-subdomains-p
+                      (first policies))))
+      (ensure-true (http-strict-transport-store-known-host-p store "api.example.test")))))
+
+(deftest client-behavior-uri-empty-and-network-references
+  (let* ((original "https://base.example.test/a/b?old=1")
+         (base (parse-http-uri original)))
+    (dolist (case '(("" "https://base.example.test/a/b?old=1")
+                    ("#fragment" "https://base.example.test/a/b?old=1")
+                    ("?new=2" "https://base.example.test/a/b?new=2")
+                    ("?" "https://base.example.test/a/b?")
+                    ("." "https://base.example.test/a/")
+                    ("//other.example.test/p?q=3#fragment"
+                     "https://other.example.test/p?q=3")))
+      (let ((result (resolve-http-uri base (first case))))
+        (ensure-equal (second case) (http-uri-string result))
+        (ensure-false (eq base result))
+        (ensure-equal original (http-uri-string base))))))
+
+(deftest client-behavior-uri-typed-reference-and-rejections
+  (let* ((base (parse-http-uri "https://base.example.test/a/b"))
+         (reference (parse-http-uri "http://other.example.test/c?q=2"))
+         (result (resolve-http-uri base reference)))
+    (ensure-equal "http://other.example.test/c?q=2" (http-uri-string result))
+    (ensure-false (eq result base))
+    (ensure-false (eq result reference))
+    (ensure-equal "https://base.example.test/a/b" (http-uri-string base))
+    (ensure-equal "http://other.example.test/c?q=2" (http-uri-string reference))
+    (dolist (case '((42 "x" 42)
+                    ("https://base.example.test/" 42 42)
+                    ("https://base.example.test/" "custom+v1:x" "custom+v1:x")
+                    ("https://base.example.test/" "custom-v1:x" "custom-v1:x")
+                    ("https://base.example.test/" "custom.v1:x" "custom.v1:x")))
+      (let ((caught (handler-case
+                        (resolve-http-uri (first case) (second case))
+                      (http-protocol-error (condition) condition))))
+        (ensure-true (typep caught 'http-protocol-error))
+        (ensure-equal :client (http-error-operation caught))
+        (ensure-equal (third case) (http-protocol-error-detail caught))))))
+
+(deftest client-behavior-multipart-escaped-and-generated-boundaries
+  (multiple-value-bind (body content-type)
+      (make-http-multipart-body
+       (list (make-http-multipart-part :name "a\\b" :filename "c\\d"
+                                      :value "value"))
+       :boundary "b")
+    (ensure-equal "multipart/form-data; boundary=\"b\"" content-type)
+    (ensure-octets-equal
+     (ascii "--b|CRLF|Content-Disposition: form-data; name=\"a\\\\b\"; filename=\"c\\\\d\"|CRLF||CRLF|value|CRLF|--b--|CRLF|")
+     body)
+    (let ((parts (parse-http-multipart-body body :content-type content-type)))
+      (ensure-equal 1 (length parts))
+      (ensure-equal "a\\b" (http-multipart-part-name (first parts)))
+      (ensure-equal "c\\d" (http-multipart-part-filename (first parts)))
+      (ensure-octets-equal (ascii "value") (http-multipart-part-value (first parts)))))
+  (let ((payload (make-array 3 :element-type '(unsigned-byte 8)
+                               :initial-contents '(0 128 255))))
+    (multiple-value-bind (body content-type)
+        (make-http-multipart-body
+         (list (make-http-multipart-part :name "binary" :value payload)))
+      (ensure-true (plusp (length body)))
+      (ensure-true (plusp (length content-type)))
+      (let* ((parts (parse-http-multipart-body body :content-type content-type))
+             (value (http-multipart-part-value (first parts))))
+        (ensure-equal 1 (length parts))
+        (ensure-equal "binary" (http-multipart-part-name (first parts)))
+        (ensure-octets-equal #(0 128 255) value)
+        (ensure-false (eq payload value))
+        (setf (aref payload 0) 42)
+        (ensure-octets-equal #(0 128 255) value)))))
+
+(deftest client-behavior-multipart-content-type-parameter-errors
+  (let* ((body (ascii "--b|CRLF|Content-Disposition: form-data; name=\"a;b\"; filename=\"a\\\";b\"|CRLF||CRLF|value|CRLF|--b--|CRLF|"))
+         (parts (parse-http-multipart-body
+                 body :content-type "multipart/form-data; boundary=\"b\"")))
+    (ensure-equal 1 (length parts))
+    (ensure-equal "a;b" (http-multipart-part-name (first parts)))
+    (ensure-equal "a\";b" (http-multipart-part-filename (first parts)))
+    (ensure-octets-equal (ascii "value") (http-multipart-part-value (first parts)))
+    (dolist (case '((42 42)
+                    ("text/plain; boundary=b" "text/plain")
+                    ("multipart/form-data" "multipart/form-data")
+                    ("; boundary=b" "; boundary=b")
+                    ("multipart/form-data; boundary" "boundary")
+                    ("multipart/form-data; boundary=" "boundary=")
+                    ("multipart/form-data; boundary=\"b"
+                     "multipart/form-data; boundary=\"b")
+                    ("multipart/form-data; boundary=b\"x\""
+                     "boundary=b\"x\"")))
+      (let ((caught (handler-case
+                        (parse-http-multipart-body body :content-type (first case))
+                      (http-protocol-error (condition) condition))))
+        (ensure-true (typep caught 'http-protocol-error))
+        (ensure-equal :client (http-error-operation caught))
+        (ensure-equal (second case) (http-protocol-error-detail caught))))))
+
+(deftest client-behavior-multipart-malformed-part-metadata
+  (let ((parts (parse-http-multipart-body
+                (ascii "--b|CRLF|Content-Disposition: form-data; name=field|CRLF||CRLF|value|CRLF|--b--|CRLF|")
+                :boundary "b")))
+    (ensure-equal 1 (length parts))
+    (ensure-equal "field" (http-multipart-part-name (first parts)))
+    (ensure-octets-equal (ascii "value") (http-multipart-part-value (first parts))))
+  (dolist (case '(("Missing-Colon" "Missing-Colon")
+                  (": value" ": value")
+                  ("Content-Disposition: attachment; name=field" "attachment; name=field")
+                  ("Content-Disposition: form-data" "form-data")
+                  ("Content-Disposition: form-data; name=\"\"" "form-data; name=\"\"")))
+    (let* ((body (ascii (format nil "--b|CRLF|~A|CRLF||CRLF|value|CRLF|--b--|CRLF|"
+                               (first case))))
+           (caught (handler-case
+                       (parse-http-multipart-body body :boundary "b")
+                     (http-protocol-error (condition) condition))))
+      (ensure-true (typep caught 'http-protocol-error))
+      (ensure-equal :client (http-error-operation caught))
+      (ensure-equal (second case) (http-protocol-error-detail caught))))
+  (let* ((body (ascii "--b|CRLF|unfinished|CRLF|--b--|CRLF|"))
+         (caught (handler-case
+                     (parse-http-multipart-body body :boundary "b")
+                   (http-protocol-error (condition) condition))))
+    (ensure-true (typep caught 'http-protocol-error))
+    (ensure-equal :client (http-error-operation caught))
+    (ensure-equal (list :start 5 :end 15) (http-protocol-error-detail caught))))
+
+(deftest client-behavior-multipart-input-contracts
+  (flet ((rejects (thunk detail)
+           (let ((caught (handler-case (funcall thunk)
+                           (http-protocol-error (condition) condition))))
+             (ensure-true (typep caught 'http-protocol-error))
+             (ensure-equal :client (http-error-operation caught))
+             (ensure-equal detail (http-protocol-error-detail caught)))))
+    (let* ((body (ascii "--b|CRLF|Content-Disposition: form-data; name=field|CRLF||CRLF|value|CRLF|--b--|CRLF|"))
+           (original (copy-seq body)))
+      (ensure-equal 1 (length (parse-http-multipart-body body :boundary "b")))
+      (dolist (invalid (list "not octets" #(256) #(-1) #(1.5)
+                            (make-array '(1 1) :initial-element 0)))
+        (rejects (lambda () (parse-http-multipart-body invalid :boundary "b"))
+                 invalid))
+      (dolist (limit '(:max-input-bytes :max-parts :max-header-bytes :max-body-bytes))
+        (dolist (invalid '(-1 1/2 :invalid))
+          (rejects (lambda ()
+                     (apply #'parse-http-multipart-body body :boundary "b"
+                            (list limit invalid)))
+                   invalid)))
+      (dolist (boundary '(nil "" 42))
+        (rejects (lambda () (parse-http-multipart-body body :boundary boundary))
+                 boundary))
+      (ensure-octets-equal original body))
+    (rejects (lambda () (make-http-multipart-body 42 :boundary "b")) 42)
+    (rejects (lambda () (make-http-multipart-body '(42) :boundary "b")) 42)
+    (dolist (invalid '(#(256) #(-1) #(1.5)))
+      (rejects (lambda ()
+                 (make-http-multipart-body
+                  (list (make-http-multipart-part :name "field" :value invalid))
+                  :boundary "b"))
+               invalid))))
+
+(deftest client-public-boundary-retry-random-result
+  (let ((attempts 0) (random-calls 0) (sleeps nil))
+    (let* ((client
+             (make-http-client
+              :cache nil
+              :retry-policy (make-http-retry-policy :max-attempts 2
+                                                    :base-delay 4
+                                                    :jitter-ratio 0.5)
+              :random-function (lambda (limit)
+                                 (ensure-equal 1.0 limit)
+                                 (incf random-calls)
+                                 1.0)
+              :sleep-function (lambda (delay) (push delay sleeps))
+              :transport-function
+              (lambda (request &key &allow-other-keys)
+                (declare (ignore request))
+                (incf attempts)
+                (client-test-response 503))))
+           (caught
+             (handler-case
+                 (http-client-send
+                  client (http-client-request client "GET" "http://example.test/retry"))
+               (http-protocol-error (condition) condition))))
+      (ensure-true (typep caught 'http-protocol-error))
+      (ensure-equal :client (http-error-operation caught))
+      (ensure-equal 1.0 (http-protocol-error-detail caught))
+      (ensure-equal 1 attempts)
+      (ensure-equal 1 random-calls)
+      (ensure-equal nil sleeps))))
+
+(deftest client-public-boundary-auth-provider-result
+  (dolist (value (list 42 (make-http-header "Authorization" "Bearer fixture")))
+    (let ((provider-calls 0) (transport-calls 0))
+      (let* ((client
+               (make-http-client
+                :cache nil
+                :auth-provider (lambda (request)
+                                 (ensure-equal "GET" (http-request-method request))
+                                 (incf provider-calls)
+                                 value)
+                :transport-function
+                (lambda (request &key &allow-other-keys)
+                  (incf transport-calls)
+                  (ensure-equal "Bearer fixture"
+                                (http-header-value (http-request-headers request)
+                                                   "Authorization"))
+                  (client-test-response 204))))
+             (result
+               (handler-case
+                   (http-client-send
+                    client (http-client-request client "GET" "http://example.test/auth"))
+                 (http-protocol-error (condition) condition))))
+        (if (integerp value)
+            (progn
+              (ensure-true (typep result 'http-protocol-error))
+              (ensure-equal :client (http-error-operation result))
+              (ensure-equal value (http-protocol-error-detail result))
+              (ensure-equal 0 transport-calls))
+            (progn
+              (ensure-equal 204 (http-response-status result))
+              (ensure-equal 1 transport-calls)))
+        (ensure-equal 1 provider-calls)))))
+
+#+sbcl
+(deftest client-public-boundary-https-proxy-upgrade-order
+  (let* ((stream (make-instance 'binary-test-stream
+                               :input (ascii "HTTP/1.1 200 Connection Established|CRLF||CRLF|HTTP/1.1 204 No Content|CRLF||CRLF|")))
+         (opened 0) (closed 0) (upgrades nil)
+         (client
+           (make-http-client
+            :cache nil :automatic-decompression-p nil
+            :proxy (make-http-proxy :scheme :https :host "proxy.example" :port 8443)
+            :open-stream (lambda (request &key &allow-other-keys)
+                           (declare (ignore request))
+                           (incf opened)
+                           stream)
+            :close-stream (lambda (owned)
+                            (ensure-true (eq stream owned))
+                            (incf closed)
+                            (close owned))
+            :tls-upgrade (lambda (owned uri &key timeout deadline)
+                           (declare (ignore timeout deadline))
+                           (ensure-true (eq stream owned))
+                           (push (http-uri-string uri) upgrades)
+                           (if (= (length upgrades) 1)
+                               (ensure-equal 0 (length (binary-test-output stream)))
+                               (ensure-octets-equal
+                                (ascii "CONNECT example.test:443 HTTP/1.1|CRLF|Host: example.test:443|CRLF|Content-Length: 0|CRLF||CRLF|")
+                                (binary-test-output stream)))
+                           stream))))
+    (let ((response (http-client-send
+                     client (http-client-request client "GET" "https://example.test/path"))))
+      (ensure-equal 204 (http-response-status response))
+      (ensure-equal 0 (length (http-response-body response))))
+    (ensure-equal '("https://proxy.example:8443/" "https://example.test/path")
+                  (reverse upgrades))
+    (ensure-equal 1 opened)
+    (ensure-equal 1 closed)
+    (ensure-octets-equal
+     (ascii "CONNECT example.test:443 HTTP/1.1|CRLF|Host: example.test:443|CRLF|Content-Length: 0|CRLF||CRLF|GET /path HTTP/1.1|CRLF|Host: example.test|CRLF|Content-Length: 0|CRLF||CRLF|")
+     (binary-test-output stream))))
+
+#+sbcl
+(deftest client-public-boundary-connect-header-authentication
+  (let* ((first (make-instance 'binary-test-stream
+                              :input (ascii "HTTP/1.1 407 Proxy Authentication Required|CRLF|Proxy-Authenticate: Basic realm=\"fixture\"|CRLF|Content-Length: 0|CRLF||CRLF|")))
+         (second (make-instance 'binary-test-stream
+                               :input (ascii "HTTP/1.1 200 Connection Established|CRLF||CRLF|HTTP/1.1 204 No Content|CRLF||CRLF|")))
+         (streams (list first second)) (opened 0) (closed nil) (provider-calls 0)
+         (client
+           (make-http-client
+            :cache nil :automatic-decompression-p nil
+            :proxy (make-http-proxy :scheme :http :host "proxy.example" :port 8080)
+            :proxy-challenge-auth-provider
+            (lambda (request response plan challenges)
+              (incf provider-calls)
+              (ensure-equal "GET" (http-request-method request))
+              (ensure-equal 407 (http-response-status response))
+              (ensure-equal :connect (getf plan :mode))
+              (ensure-equal "Basic" (http-authentication-challenge-scheme (first challenges)))
+              (make-http-header "Proxy-Authorization" "Basic ZmFrZTpmYWtl"))
+            :open-stream (lambda (request &key &allow-other-keys)
+                           (declare (ignore request))
+                           (incf opened)
+                           (pop streams))
+            :close-stream (lambda (owned) (push owned closed) (close owned))
+            :tls-upgrade (lambda (owned uri &key timeout deadline)
+                           (declare (ignore uri timeout deadline))
+                           (ensure-true (eq second owned))
+                           owned))))
+    (let ((response (http-client-send
+                     client (http-client-request client "GET" "https://example.test/path"))))
+      (ensure-equal 204 (http-response-status response))
+      (ensure-equal 0 (length (http-response-body response))))
+    (ensure-equal 2 opened)
+    (ensure-equal 1 provider-calls)
+    (ensure-equal 1 (count first closed :test #'eq))
+    (ensure-equal 1 (count second closed :test #'eq))
+    (ensure-octets-equal
+     (ascii "CONNECT example.test:443 HTTP/1.1|CRLF|Host: example.test:443|CRLF|Content-Length: 0|CRLF||CRLF|")
+     (binary-test-output first))
+    (ensure-octets-equal
+     (ascii "CONNECT example.test:443 HTTP/1.1|CRLF|Host: example.test:443|CRLF|Proxy-Authorization: Basic ZmFrZTpmYWtl|CRLF|Content-Length: 0|CRLF||CRLF|GET /path HTTP/1.1|CRLF|Host: example.test|CRLF|Content-Length: 0|CRLF||CRLF|")
+     (binary-test-output second))))
+
+#+sbcl
+(deftest client-public-boundary-socks-method-rejection
+  (let* ((stream (make-instance 'binary-test-stream
+                               :input (make-array 2 :element-type '(unsigned-byte 8)
+                                                  :initial-contents '(5 255))))
+         (closed 0)
+         (client (make-http-client
+                  :cache nil
+                  :proxy (make-http-proxy :scheme :socks5 :host "proxy.example" :port 1080)
+                  :open-stream (lambda (request &key &allow-other-keys)
+                                 (declare (ignore request)) stream)
+                  :close-stream (lambda (owned)
+                                  (ensure-true (eq stream owned))
+                                  (incf closed) (close owned))))
+         (caught (handler-case
+                     (http-client-send
+                      client (http-client-request client "GET" "http://192.0.2.1/path"))
+                   (http-proxy-error (condition) condition))))
+    (ensure-true (typep caught 'http-proxy-error))
+    (ensure-equal :proxy (http-error-operation caught))
+    (ensure-equal '(:detail :authentication :cause nil) (http-client-error-detail caught))
+    (ensure-equal 2 (http-kit/test-core::binary-test-input-position stream))
+    (ensure-octets-equal #(5 1 0) (binary-test-output stream))
+    (ensure-equal 1 closed)))
+
+#+sbcl
+(deftest client-public-boundary-socks-password-rejection
+  (let* ((stream (make-instance 'binary-test-stream
+                               :input (make-array 4 :element-type '(unsigned-byte 8)
+                                                  :initial-contents '(5 2 1 1))))
+         (closed 0)
+         (client (make-http-client
+                  :cache nil
+                  :proxy (make-http-proxy :scheme :socks5 :host "proxy.example" :port 1080
+                                          :username "u" :password "p")
+                  :open-stream (lambda (request &key &allow-other-keys)
+                                 (declare (ignore request)) stream)
+                  :close-stream (lambda (owned)
+                                  (ensure-true (eq stream owned))
+                                  (incf closed) (close owned))))
+         (caught (handler-case
+                     (http-client-send
+                      client (http-client-request client "GET" "http://192.0.2.1/path"))
+                   (http-proxy-error (condition) condition))))
+    (ensure-true (typep caught 'http-proxy-error))
+    (ensure-equal :proxy (http-error-operation caught))
+    (ensure-equal '(:detail :authentication :cause nil) (http-client-error-detail caught))
+    (ensure-equal 4 (http-kit/test-core::binary-test-input-position stream))
+    (ensure-octets-equal #(5 1 2 1 1 117 1 112) (binary-test-output stream))
+    (ensure-equal 1 closed)))
+
+#+sbcl
+(deftest client-public-boundary-socks-domain-reply
+  (let* ((input (concatenate-octets
+                 (make-array 10 :element-type '(unsigned-byte 8)
+                                :initial-contents '(5 0 5 0 0 3 1 97 0 0))
+                 (ascii "HTTP/1.1 204 No Content|CRLF||CRLF|")))
+         (stream (make-instance 'binary-test-stream :input input))
+         (closed 0)
+         (client (make-http-client
+                  :cache nil :automatic-decompression-p nil
+                  :proxy (make-http-proxy :scheme :socks5 :host "proxy.example" :port 1080)
+                  :open-stream (lambda (request &key &allow-other-keys)
+                                 (declare (ignore request)) stream)
+                  :close-stream (lambda (owned)
+                                  (ensure-true (eq stream owned))
+                                  (incf closed) (close owned)))))
+    (let ((response (http-client-send
+                     client (http-client-request client "GET" "http://192.0.2.1/path"))))
+      (ensure-equal 204 (http-response-status response))
+      (ensure-equal 0 (length (http-response-body response))))
+    (ensure-equal (length input) (http-kit/test-core::binary-test-input-position stream))
+    (ensure-octets-equal #(5 1 0 5 1 0 1 192 0 2 1 0 80)
+                         (subseq (binary-test-output stream) 0 13))
+    (ensure-octets-equal
+     (ascii "GET /path HTTP/1.1|CRLF|Host: 192.0.2.1|CRLF|Content-Length: 0|CRLF||CRLF|")
+     (subseq (binary-test-output stream) 13))
+    (ensure-equal 1 closed)))
+
+#+sbcl
+(deftest client-public-boundary-pool-capacity-eviction
+  (let* ((reply (ascii "HTTP/1.1 204 No Content|CRLF||CRLF|"))
+         (first (make-instance 'binary-test-stream :input reply))
+         (second (make-instance 'binary-test-stream :input (concatenate-octets reply reply)))
+         (streams (list first second)) (opened 0) (closed nil) (now 1)
+         (pool (make-http-connection-pool
+                :max-idle 1
+                :clock-function (lambda () now)
+                :open-stream (lambda (request &key &allow-other-keys)
+                               (declare (ignore request))
+                               (incf opened) (pop streams))
+                :close-stream (lambda (owned) (push owned closed) (close owned))))
+         (client (make-http-client :cache nil :automatic-decompression-p nil :connection-pool pool)))
+    (unwind-protect
+         (progn
+           (let ((response (http-client-send
+                            client (http-client-request client "GET" "http://a.example/one"))))
+             (ensure-equal 204 (http-response-status response)))
+           (ensure-equal 1 opened)
+           (ensure-equal nil closed)
+           (ensure-equal 1 (getf (http-connection-pool-stats pool) :idle-count))
+           (setf now 2)
+           (let ((response (http-client-send
+                            client (http-client-request client "GET" "http://b.example/two"))))
+             (ensure-equal 204 (http-response-status response)))
+           (ensure-equal 2 opened)
+           (ensure-equal 1 (count first closed :test #'eq))
+           (ensure-equal 0 (count second closed :test #'eq))
+           (ensure-equal 1 (getf (http-connection-pool-stats pool) :idle-count))
+           (setf now 3)
+           (let ((response (http-client-send
+                            client (http-client-request client "GET" "http://b.example/three"))))
+             (ensure-equal 204 (http-response-status response)))
+           (ensure-equal 2 opened)
+           (ensure-equal 1 (count first closed :test #'eq))
+           (ensure-equal 0 (count second closed :test #'eq))
+           (ensure-equal 1 (http-connection-pool-clear pool))
+           (ensure-equal 1 (count second closed :test #'eq))
+           (ensure-equal 0 (getf (http-connection-pool-stats pool) :idle-count))
+           (ensure-octets-equal
+            (ascii "GET /one HTTP/1.1|CRLF|Host: a.example|CRLF|Content-Length: 0|CRLF||CRLF|")
+            (binary-test-output first))
+           (ensure-octets-equal
+            (ascii "GET /two HTTP/1.1|CRLF|Host: b.example|CRLF|Content-Length: 0|CRLF||CRLF|GET /three HTTP/1.1|CRLF|Host: b.example|CRLF|Content-Length: 0|CRLF||CRLF|")
+            (binary-test-output second)))
+      (http-connection-pool-clear pool))))
+
+
+(deftest client-public-boundary-wave2-digest-guards
+  (let ((challenge (first (http-parse-authentication-challenges
+                           "Digest realm=\"fixture\", nonce=\"n\", charset=UTF-8"))))
+    (dolist (nc '(0 -1 1/2 #x100000000))
+      (let ((caught (handler-case
+                        (http-digest-authorization challenge "GET" "/" "u" "p" "c"
+                                                   :nonce-count nc)
+                      (http-protocol-error (condition) condition))))
+        (ensure-true (typep caught 'http-protocol-error))
+        (ensure-equal :client (http-error-operation caught))
+        (ensure-equal nc (http-protocol-error-detail caught))))
+    (ensure-true (search "response=" (http-digest-authorization
+                                    challenge "GET" "/" "u" "p" "c" :nonce-count 1))))
+  (dolist (wire '("Digest realm=\"fixture\"" "Digest nonce=\"n\""))
+    (let* ((challenge (first (http-parse-authentication-challenges wire)))
+           (caught (handler-case
+                       (http-digest-authorization challenge "GET" "/" "u" "p" "c")
+                     (http-protocol-error (condition) condition))))
+      (ensure-true (typep caught 'http-protocol-error))
+      (ensure-equal :client (http-error-operation caught))
+      (ensure-true (eq challenge (http-protocol-error-detail caught)))))
+  (let* ((challenge (first (http-parse-authentication-challenges
+                            "Digest realm=\"fixture\", nonce=\"n\", charset=ISO-8859-1")))
+         (caught (handler-case
+                     (http-digest-authorization challenge "GET" "/" "u" "p" "c")
+                   (http-protocol-error (condition) condition))))
+    (ensure-true (typep caught 'http-protocol-error))
+    (ensure-equal :client (http-error-operation caught))
+    (ensure-equal "ISO-8859-1" (http-protocol-error-detail caught))))
+
+(deftest client-public-boundary-wave2-digest-no-qop
+  ;; Independent MD5 vectors use HA1=4945ecf42b1bb868634058a845bedde8
+  ;; and HA2=39aff3a2bab6126f332b942af96d3366, not the production hash helper.
+  (dolist (row '(("Digest realm=\"testrealm@host.com\", nonce=\"dcd98b7102dd2f0e8b11d0f600bfb0c093\""
+                 "Digest username=\"Mufasa\", realm=\"testrealm@host.com\", uri=\"/dir/index.html\", algorithm=MD5, nonce=\"dcd98b7102dd2f0e8b11d0f600bfb0c093\", response=\"1949323746fe6a43ef61f9606e7febea\"")
+                ("Digest realm=\"testrealm@host.com\", nonce=\"dcd98b7102dd2f0e8b11d0f600bfb0c093\", qop=\"auth\""
+                 "Digest username=\"Mufasa\", realm=\"testrealm@host.com\", uri=\"/dir/index.html\", algorithm=MD5, nonce=\"dcd98b7102dd2f0e8b11d0f600bfb0c093\", nc=00000001, cnonce=\"0a4f113b\", qop=auth, response=\"e31b30d5e407246518d94833d7f0deea\"")))
+    (destructuring-bind (challenge-wire expected) row
+      (ensure-equal expected
+                    (http-digest-authorization
+                     (first (http-parse-authentication-challenges challenge-wire))
+                     "GET" "/dir/index.html" "Mufasa" "CircleOfLife" "0a4f113b")))))
+
+#+sbcl
+(deftest client-public-boundary-wave2-pool-clock
+  (dolist (phase '(:before-open :after-response :normal))
+    (let* ((reply (ascii "HTTP/1.1 204 No Content|CRLF||CRLF|"))
+           (stream (make-instance 'binary-test-stream
+                                  :input (concatenate-octets reply reply)))
+           (opened 0) (closed 0) (clock-calls 0) (bad-p t)
+           (pool (make-http-connection-pool
+                  :clock-function
+                  (lambda ()
+                    (incf clock-calls)
+                    (if (and bad-p
+                             (or (eq phase :before-open)
+                                 (and (eq phase :after-response)
+                                      (plusp (http-kit/test-core::binary-test-input-position
+                                              stream)))))
+                        :bad-clock 10))
+                  :open-stream (lambda (request &key &allow-other-keys)
+                                 (declare (ignore request)) (incf opened) stream)
+                  :close-stream (lambda (owned)
+                                  (ensure-true (eq stream owned))
+                                  (incf closed) (close owned))))
+           (client (make-http-client :cache nil :automatic-decompression-p nil
+                                     :connection-pool pool)))
+      (unwind-protect
+           (let ((result (handler-case
+                             (http-client-send
+                              client (http-client-request client "GET" "http://example.test/"))
+                           (http-protocol-error (condition) condition))))
+             (if (eq phase :normal)
+                 (progn
+                   (ensure-equal 204 (http-response-status result))
+                   (ensure-equal 204 (http-response-status
+                                      (http-client-send
+                                       client (http-client-request client "GET"
+                                                                   "http://example.test/"))))
+                   (ensure-equal 1 opened)
+                   (ensure-equal 0 closed)
+                   (ensure-equal 1 (getf (http-connection-pool-stats pool) :idle-count)))
+                 (progn
+                   (ensure-true (typep result 'http-protocol-error))
+                   (ensure-equal :connection-pool (http-error-operation result))
+                   (ensure-equal :bad-clock (http-protocol-error-detail result))
+                   (ensure-equal (if (eq phase :before-open) 0 1) opened)
+                   (ensure-equal (if (eq phase :before-open) 0 1) closed)
+                   (ensure-equal (if (eq phase :before-open) 0 (length reply))
+                                 (http-kit/test-core::binary-test-input-position stream))
+                   (ensure-octets-equal
+                    (if (eq phase :before-open)
+                        #()
+                        (ascii "GET / HTTP/1.1|CRLF|Host: example.test|CRLF|Content-Length: 0|CRLF||CRLF|"))
+                    (binary-test-output stream))))
+             (ensure-true (plusp clock-calls))
+             (setf bad-p nil)
+             (ensure-equal (if (eq phase :normal) 1 0)
+                           (http-connection-pool-clear pool))
+             (ensure-equal (if (eq phase :before-open) 0 1) closed)
+             (ensure-equal 0 (getf (http-connection-pool-stats pool) :idle-count)))
+        (setf bad-p nil)
+        (http-connection-pool-clear pool)
+        (close stream)))))
+
+#+sbcl
+(deftest client-public-boundary-wave2-pool-options
+  (let* ((reply (ascii "HTTP/1.1 204 No Content|CRLF||CRLF|"))
+         (stream (make-instance 'binary-test-stream :input reply))
+         (opened 0) (closed 0)
+         (opener (lambda (request &key &allow-other-keys)
+                   (declare (ignore request)) (incf opened) stream))
+         (closer (lambda (owned) (ensure-true (eq stream owned))
+                   (incf closed) (close owned))))
+    (unwind-protect
+         (progn
+           (dolist (row '((:max-idle -1) (:max-idle 1/2)
+                          (:idle-timeout -1) (:idle-timeout "later")))
+             (let ((caught (handler-case
+                               (apply #'make-http-connection-pool
+                                      :open-stream opener :close-stream closer row)
+                             (http-protocol-error (condition) condition))))
+               (ensure-true (typep caught 'http-protocol-error))
+               (ensure-equal :connection-pool (http-error-operation caught))
+               (ensure-equal (second row) (http-protocol-error-detail caught))
+               (ensure-equal 0 opened)
+               (ensure-equal 0 closed)
+               (ensure-equal 0 (http-kit/test-core::binary-test-input-position stream))
+               (ensure-octets-equal #() (binary-test-output stream))))
+           (let* ((pool (make-http-connection-pool
+                         :open-stream opener :close-stream closer
+                         :max-idle 1 :idle-timeout 0 :clock-function (lambda () 10)))
+                  (client (make-http-client :cache nil :automatic-decompression-p nil
+                                            :connection-pool pool)))
+             (unwind-protect
+                  (progn
+                    (ensure-equal 204 (http-response-status
+                                       (http-client-send
+                                        client (http-client-request client "GET"
+                                                                    "http://example.test/"))))
+                    (ensure-equal 1 opened)
+                    (ensure-equal 0 closed)
+                    (ensure-equal 1 (http-connection-pool-clear pool))
+                    (ensure-equal 1 closed)
+                    (ensure-equal (length reply)
+                                  (http-kit/test-core::binary-test-input-position stream)))
+               (http-connection-pool-clear pool))))
+      (close stream))))
+
+#+sbcl
+(deftest client-public-boundary-wave2-pool-zero-capacity
+  (dolist (capacity '(0 1))
+    (let* ((reply (ascii "HTTP/1.1 204 No Content|CRLF||CRLF|"))
+           (first (make-instance 'binary-test-stream
+                                 :input (if (zerop capacity) reply
+                                            (concatenate-octets reply reply))))
+           (second (make-instance 'binary-test-stream :input reply))
+           (streams (list first second)) (opened 0) (closed nil)
+           (pool (make-http-connection-pool
+                  :max-idle capacity :clock-function (lambda () 10)
+                  :open-stream (lambda (request &key &allow-other-keys)
+                                 (declare (ignore request)) (incf opened) (pop streams))
+                  :close-stream (lambda (owned) (push owned closed) (close owned))))
+           (client (make-http-client :cache nil :automatic-decompression-p nil
+                                     :connection-pool pool)))
+      (unwind-protect
+           (progn
+             (dotimes (index 2)
+               (ensure-equal 204 (http-response-status
+                                  (http-client-send
+                                   client (http-client-request client "GET"
+                                                               "http://example.test/"))))
+               (ensure-equal capacity (getf (http-connection-pool-stats pool) :idle-count))
+               (ensure-equal (if (zerop capacity) (1+ index) 1) opened))
+             (ensure-equal (if (zerop capacity) 1 0) (count first closed :test #'eq))
+             (ensure-equal (if (zerop capacity) 1 0) (count second closed :test #'eq))
+             (ensure-equal capacity (http-connection-pool-clear pool))
+             (ensure-equal 1 (count first closed :test #'eq))
+             (ensure-equal (if (zerop capacity) 1 0) (count second closed :test #'eq))
+             (ensure-equal 0 (getf (http-connection-pool-stats pool) :idle-count))
+             (ensure-octets-equal
+              (ascii (if (zerop capacity)
+                         "GET / HTTP/1.1|CRLF|Host: example.test|CRLF|Content-Length: 0|CRLF||CRLF|"
+                         "GET / HTTP/1.1|CRLF|Host: example.test|CRLF|Content-Length: 0|CRLF||CRLF|GET / HTTP/1.1|CRLF|Host: example.test|CRLF|Content-Length: 0|CRLF||CRLF|"))
+              (binary-test-output first))
+             (ensure-octets-equal
+              (if (zerop capacity)
+                  (ascii "GET / HTTP/1.1|CRLF|Host: example.test|CRLF|Content-Length: 0|CRLF||CRLF|")
+                  #())
+              (binary-test-output second)))
+        (http-connection-pool-clear pool)
+        (close first) (close second)))))
+
+#+sbcl
+(deftest client-public-boundary-wave2-socks-wire-errors
+  (dolist (row '(((4 0) 1 :version nil)
+                ((5 2 2 0) 3 :authentication t)
+                ((5 0 4 0 0 1 0 0 0 0 0 0) 3 :reply nil)
+                ((5 0 5 1 0 1 0 0 0 0 0 0) 4 1 nil)
+                ((5 0 5 0 0 9 0 0) 6 9 nil)
+                ((5 0 5 0 0 4 0) 7 :eof nil)
+                ((5 0 5 0 0 4 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0)
+                 :success nil nil)))
+    (destructuring-bind (bytes consumed detail credentials-p) row
+      (let* ((success-p (eq consumed :success))
+             (input (concatenate-octets
+                     (make-array (length bytes) :element-type '(unsigned-byte 8)
+                                               :initial-contents bytes)
+                     (if success-p (ascii "HTTP/1.1 204 No Content|CRLF||CRLF|") #())))
+             (stream (make-instance 'binary-test-stream :input input))
+             (opened 0) (closed 0)
+             (client (make-http-client
+                      :cache nil :automatic-decompression-p nil
+                      :proxy (make-http-proxy :scheme :socks5 :host "proxy.example" :port 1080
+                                              :username (and credentials-p "u")
+                                              :password (and credentials-p "p"))
+                      :open-stream (lambda (request &key &allow-other-keys)
+                                     (declare (ignore request)) (incf opened) stream)
+                      :close-stream (lambda (owned)
+                                      (ensure-true (eq stream owned))
+                                      (incf closed) (close owned))))
+             (result (handler-case
+                         (http-client-send
+                          client (http-client-request client "GET" "http://192.0.2.1/path"))
+                       (http-proxy-error (condition) condition))))
+        (if success-p
+            (progn
+              (ensure-equal 204 (http-response-status result))
+              (ensure-equal 0 (length (http-response-body result))))
+            (progn
+              (ensure-true (typep result 'http-proxy-error))
+              (ensure-equal :proxy (http-error-operation result))
+              (ensure-equal (list :detail detail :cause nil) (http-client-error-detail result))))
+        (ensure-equal (if success-p (length input) consumed)
+                      (http-kit/test-core::binary-test-input-position stream))
+        (ensure-octets-equal
+         (cond (success-p
+                (concatenate-octets
+                 #(5 1 0 5 1 0 1 192 0 2 1 0 80)
+                 (ascii "GET /path HTTP/1.1|CRLF|Host: 192.0.2.1|CRLF|Content-Length: 0|CRLF||CRLF|")))
+               (credentials-p #(5 1 2 1 1 117 1 112))
+               ((eq detail :version) #(5 1 0))
+               (t #(5 1 0 5 1 0 1 192 0 2 1 0 80)))
+         (binary-test-output stream))
+        (ensure-equal 1 opened)
+        (ensure-equal 1 closed)))))
+
+#+sbcl
+(deftest client-public-boundary-wave2-proxy-tls-callback
+  (dolist (mode '(:missing :wrong-result :normal))
+    (let* ((reply (ascii "HTTP/1.1 204 No Content|CRLF||CRLF|"))
+           (stream (make-instance 'binary-test-stream :input reply))
+           (opened 0) (closed 0) (upgraded 0)
+           (client (make-http-client :cache nil))
+           (request (http-client-request client "GET" "https://example.test/path"))
+           (closer (lambda (owned)
+                     (ensure-true (eq stream owned)) (incf closed) (close owned)))
+           (opener (make-http-proxy-stream-opener
+                    (lambda (actual &key timeout deadline &allow-other-keys)
+                      (ensure-true (eq actual request))
+                      (ensure-equal nil timeout)
+                      (ensure-equal nil deadline)
+                      (incf opened) stream)
+                    closer
+                    :tls-upgrade
+                    (unless (eq mode :missing)
+                      (lambda (owned uri &key timeout deadline)
+                        (ensure-true (eq owned stream))
+                        (ensure-equal "https://example.test/path" (http-uri-string uri))
+                        (ensure-equal nil timeout)
+                        (ensure-equal nil deadline)
+                        (incf upgraded)
+                        (if (eq mode :wrong-result) 17 owned)))))
+           (result (handler-case (funcall opener request)
+                     (http-error (condition) condition))))
+      (if (eq mode :normal)
+          (unwind-protect
+               (progn
+                 (ensure-true (eq result stream))
+                 (ensure-equal 0 closed)
+                 (ensure-equal 204 (http-response-status
+                                    (send-http-request-over-open-stream request result)))
+                 (ensure-equal (length reply)
+                               (http-kit/test-core::binary-test-input-position stream))
+                 (ensure-octets-equal
+                  (ascii "GET /path HTTP/1.1|CRLF|Host: example.test|CRLF|Content-Length: 0|CRLF||CRLF|")
+                  (binary-test-output stream)))
+            (funcall closer result))
+          (progn
+            (ensure-equal :proxy (http-error-operation result))
+            (if (eq mode :missing)
+                (progn
+                  (ensure-true (typep result 'http-unsupported-feature))
+                  (ensure-equal :tls-upgrade (http-unsupported-feature-name result))
+                  (ensure-equal "https://example.test/path"
+                                (http-uri-string (http-protocol-error-detail result))))
+                (progn
+                  (ensure-true (typep result 'http-proxy-error))
+                  (ensure-equal '(:detail 17 :cause nil) (http-client-error-detail result))))
+            (ensure-equal 0 (http-kit/test-core::binary-test-input-position stream))
+            (ensure-octets-equal #() (binary-test-output stream))))
+      (ensure-equal 1 opened)
+      (ensure-equal (if (eq mode :missing) 0 1) upgraded)
+      (ensure-equal 1 closed))))
+
+(deftest client-public-boundary-wave2-alt-svc-quoted-ipv6
+  (let* ((now 0)
+         (store (make-http-alternative-service-store :clock-function (lambda () now))))
+    (dolist (origin '("https://[2001:db8::1]/" "https://example.test/"))
+      (http-alternative-service-store-note-response
+       store origin
+       (client-test-response
+        200 :headers (list (make-http-header "Alt-Svc" "h3=\":443\"; ma=\"6\\0\""))))
+      (let ((services (http-alternative-service-store-services store origin)))
+        (ensure-equal 1 (length services))
+        (let ((service (first services)))
+          (ensure-equal "h3" (http-alternative-service-protocol-id service))
+          (ensure-equal (if (search "[" origin) "2001:db8::1" "example.test")
+                        (http-alternative-service-host service))
+          (ensure-equal 443 (http-alternative-service-port service))
+          (ensure-equal 60 (http-alternative-service-expires-at service)))))
+    (setf now 59)
+    (ensure-equal 1 (length (http-alternative-service-store-services
+                            store "https://[2001:db8::1]/")))
+    (setf now 60)
+    (ensure-equal nil (http-alternative-service-store-services store "https://[2001:db8::1]/"))
+    (ensure-equal nil (http-alternative-service-store-services store "https://example.test/")))
+  (dolist (wire '("h3=\":bogus\"" "h3=\":443" "h3=\":443\\" "h3=\":443\"; ma=foo"))
+    (let ((store (make-http-alternative-service-store :clock-function (lambda () 0))))
+      (http-alternative-service-store-note-response
+       store "https://[2001:db8::1]/"
+       (client-test-response 200 :headers (list (make-http-header "Alt-Svc" wire))))
+      (ensure-equal nil (http-alternative-service-store-services store "https://[2001:db8::1]/")))))
+
+(deftest client-coding-boundary-callbacks-and-passthrough
+  (let* ((body (make-array 3 :element-type '(unsigned-byte 8)
+                            :initial-contents '(0 128 255)))
+         (encoded (make-array 3 :element-type '(unsigned-byte 8)
+                               :initial-contents '(255 128 0)))
+         (encodes 0)
+         (decodes 0)
+         (coding (make-http-content-coding
+                  :name "X-Test"
+                  :encoder (lambda (input)
+                             (incf encodes)
+                             (ensure-true (eq body input))
+                             encoded)
+                  :decoder (lambda (input)
+                             (incf decodes)
+                             (ensure-true (eq encoded input))
+                             body)))
+         (identity (make-http-content-coding :name "identity")))
+    (ensure-equal "x-test" (http-content-coding-name coding))
+    (ensure-true (eq encoded (http-content-coding-encode coding body)))
+    (ensure-true (eq body (http-content-coding-decode coding encoded)))
+    (ensure-equal 1 encodes)
+    (ensure-equal 1 decodes)
+    (ensure-true (eq body (http-content-coding-encode identity body)))
+    (ensure-true (eq body (http-content-coding-decode identity body)))))
+
+(deftest client-coding-boundary-invalid-configuration
+  (flet ((rejected (thunk input)
+           (let ((result (handler-case (funcall thunk)
+                           (http-protocol-error (condition) condition))))
+             (ensure-true (typep result 'http-protocol-error))
+             (ensure-equal :client (http-error-operation result))
+             (ensure-true (eq input (http-protocol-error-detail result))))))
+    (dolist (name '(nil 17 "" "two words"))
+      (rejected (lambda () (make-http-content-coding :name name)) name))
+    (dolist (callback '(17 identity))
+      (rejected (lambda () (make-http-content-coding :name "br" :encoder callback))
+                callback)
+      (rejected (lambda () (make-http-content-coding :name "br" :decoder callback))
+                callback))
+    (dolist (value '(nil 17))
+      (rejected (lambda () (parse-http-accept-encoding value)) value)))
+  (let ((coding (make-http-content-coding :name "BR")))
+    (ensure-equal "br" (http-content-coding-name coding))
+    (ensure-equal nil (http-content-coding-encoder coding))
+    (ensure-equal nil (http-content-coding-decoder coding)))
+  (ensure-equal '(("br" . 0.5) ("identity" . 0))
+                (parse-http-accept-encoding "BR; q=0.5, identity;q=0")))
+
+(deftest client-coding-boundary-response-validation-and-identity
+  (let* ((body (make-array 3 :element-type '(unsigned-byte 8)
+                            :initial-contents '(0 128 255)))
+         (trailers (list (make-http-header "X-End" "complete")))
+         (response (make-http-response
+                    :status 200 :reason "OK" :protocol-version "HTTP/1.1"
+                    :headers (list (make-http-header "Content-Encoding" "IDENTITY")
+                                   (make-http-header "content-length" "3")
+                                   (make-http-header "X-Retained" "yes"))
+                    :trailers trailers :body body)))
+    (flet ((rejected (thunk input)
+             (let ((result (handler-case (funcall thunk)
+                             (http-protocol-error (condition) condition))))
+               (ensure-true (typep result 'http-protocol-error))
+               (ensure-equal :client (http-error-operation result))
+               (ensure-true (eq input (http-protocol-error-detail result))))))
+      (dolist (input '(nil 17))
+        (rejected (lambda () (decode-http-response-content input)) input))
+      (dolist (limit '(-1 1/2 "3"))
+        (rejected (lambda () (decode-http-response-content response :max-body-bytes limit))
+                  limit)))
+    (dolist (limit '(nil 3))
+      (let ((decoded (decode-http-response-content response :max-body-bytes limit)))
+        (ensure-false (eq response decoded))
+        (ensure-octets-equal body (http-response-body decoded))
+        (ensure-equal "HTTP/1.1" (http-response-protocol-version decoded))
+        (ensure-equal 200 (http-response-status decoded))
+        (ensure-equal "OK" (http-response-reason decoded))
+        (ensure-equal 1 (length (http-response-trailers decoded)))
+        (ensure-equal "complete" (http-header-value (http-response-trailers decoded) "X-End"))
+        (ensure-equal "yes" (http-header-value (http-response-headers decoded) "X-Retained"))
+        (ensure-equal 1 (length (http-response-headers decoded)))
+        (ensure-false (http-header-present-p (http-response-headers decoded) "Content-Encoding"))
+        (ensure-false (http-header-present-p (http-response-headers decoded) "Content-Length"))))))
+
+(deftest client-coding-boundary-decoder-registration-replacement
+  (dolist (input (list nil 17 (cons 17 #'identity) (cons "br" 17)))
+    (let ((result (handler-case (make-http-content-decoders input)
+                    (http-protocol-error (condition) condition))))
+      (ensure-true (typep result 'http-protocol-error))
+      (ensure-equal :client (http-error-operation result))
+      (ensure-true (eq input (http-protocol-error-detail result)))))
+  (let* ((body (make-array 2 :element-type '(unsigned-byte 8)
+                            :initial-contents '(128 255)))
+         (decoded (make-array 2 :element-type '(unsigned-byte 8)
+                               :initial-contents '(255 128)))
+         (old-calls 0)
+         (new-calls 0)
+         (registry (make-http-content-decoders
+                    (cons "BR" (lambda (input limit)
+                                 (declare (ignore input limit))
+                                 (incf old-calls)
+                                 body))
+                    (cons "br" (lambda (input limit)
+                                 (incf new-calls)
+                                 (ensure-octets-equal body input)
+                                 (ensure-equal 2 limit)
+                                 decoded))))
+         (response (decode-http-response-content
+                    (client-test-response
+                     200 :body body :headers (list (make-http-header "Content-Encoding" "Br")))
+                    :max-body-bytes 2 :content-decoders registry)))
+    (ensure-equal '("gzip" "deflate" "br") (mapcar #'car registry))
+    (ensure-octets-equal decoded (http-response-body response))
+    (ensure-equal 0 old-calls)
+    (ensure-equal 1 new-calls)
+    (ensure-false (http-header-present-p (http-response-headers response) "Content-Encoding"))))
+
+(deftest client-auth-native-challenge-quoted-boundaries
+  (let* ((text (format nil "Digest, realm=\"a~C~Cb\", nonce=\"n\", qop=\"auth\", Basic realm=\"fallback\""
+                       #\\ (code-char 128)))
+         (challenges (http-parse-authentication-challenges text)))
+    (ensure-equal '("Digest" "Basic")
+                  (mapcar #'http-authentication-challenge-scheme challenges))
+    (ensure-equal (format nil "a~Cb" (code-char 128))
+                  (http-authentication-challenge-parameter (first challenges) "REALM"))
+    (ensure-equal "n" (http-authentication-challenge-parameter (first challenges) "nonce"))
+    (ensure-equal "fallback"
+                  (http-authentication-challenge-parameter (second challenges) "realm")))
+  (dolist (invalid (list (format nil "Digest realm=\"a~C~Cb\", nonce=\"n\""
+                                #\\ (code-char 1))
+                        "Digest realm=\"unfinished"
+                        "Digest realm=\"r\", realm=\"duplicate\", nonce=\"n\""))
+    (let ((challenges (http-parse-authentication-challenges
+                       (list invalid "Basic realm=\"fallback\""))))
+      (ensure-equal 1 (length challenges))
+      (ensure-equal "Basic" (http-authentication-challenge-scheme (first challenges)))
+      (ensure-equal "fallback"
+                    (http-authentication-challenge-parameter (first challenges) "realm")))))
+
+(deftest client-auth-native-parameter-lookup-contract
+  (let ((challenge (first (http-parse-authentication-challenges "Digest realm=\"r\", nonce=\"n\""))))
+    (ensure-equal "r" (http-authentication-challenge-parameter challenge "ReAlM"))
+    (ensure-false (http-authentication-challenge-parameter challenge "missing"))
+    (dolist (arguments (list (list nil "realm") (list challenge 17)))
+      (let ((condition (handler-case
+                           (apply #'http-authentication-challenge-parameter arguments)
+                         (http-protocol-error (condition) condition))))
+        (ensure-true (typep condition 'http-protocol-error))
+        (ensure-equal :client (http-error-operation condition))
+        (ensure-equal arguments (http-protocol-error-detail condition))))))
+
+(deftest client-auth-native-digest-input-contract
+  (let ((challenge (first (http-parse-authentication-challenges
+                          "Digest realm=\"r\", nonce=\"n\", qop=\"auth\""))))
+    (dolist (invalid (list nil (first (http-parse-authentication-challenges "Basic realm=\"r\""))))
+      (let ((condition (handler-case
+                           (http-digest-authorization invalid "GET" "/" "u" "p" "c")
+                         (http-protocol-error (condition) condition))))
+        (ensure-true (typep condition 'http-protocol-error))
+        (ensure-equal :client (http-error-operation condition))
+        (ensure-true (eq invalid (http-protocol-error-detail condition)))))
+    (loop for index from 0 below 5
+          for label in '(:method :request-target :username :password :cnonce)
+          do (dolist (invalid (list 17 (string (code-char 1)) (string (code-char 127))))
+               (let ((arguments (list "GET" "/" "u" "p" "c")))
+                 (setf (nth index arguments) invalid)
+                 (let ((condition (handler-case
+                                      (apply #'http-digest-authorization challenge arguments)
+                                    (http-protocol-error (condition) condition))))
+                   (ensure-true (typep condition 'http-protocol-error))
+                   (ensure-equal :client (http-error-operation condition))
+                   (ensure-equal label (http-protocol-error-detail condition))))))
+    (ensure-equal
+     "Digest username=\"u\", realm=\"r\", uri=\"/\", algorithm=MD5, nonce=\"n\", nc=00000001, cnonce=\"c\", qop=auth, response=\"490ab2d682267b3630d3509d981b982d\""
+     (http-digest-authorization challenge "GET" "/" "u" "p" "c"))))
+
+(deftest client-auth-native-digest-entity-body-contract
+  (let ((challenge (first (http-parse-authentication-challenges
+                          "Digest realm=\"r\", nonce=\"n\", qop=\"auth-int\""))))
+    (dolist (body (list "abc" '(0 128 255) #(0 256) #(-1)
+                       (make-array '(1 1) :initial-element 0)))
+      (let ((condition (handler-case
+                           (http-digest-authorization challenge "POST" "/" "u" "p" "c"
+                                                      :entity-body body)
+                         (http-protocol-error (condition) condition))))
+        (ensure-true (typep condition 'http-protocol-error))
+        (ensure-equal :client (http-error-operation condition))
+        (ensure-equal :entity-body (http-protocol-error-detail condition))))
+    (ensure-equal
+     "Digest username=\"u\", realm=\"r\", uri=\"/\", algorithm=MD5, nonce=\"n\", nc=00000001, cnonce=\"c\", qop=auth-int, response=\"d1df60970bfa697e4ccd0812574c2955\""
+     (http-digest-authorization challenge "POST" "/" "u" "p" "c"
+                                :entity-body #(0 128 255)))))
+
+(deftest client-auth-native-digest-nonce-count-and-algorithm
+  (dolist (row '(("mD5" 10 "0000000A" "9ae8f9b889f99ec3cf0b4edf1a4c3b37")
+                 ("mD5" 4294967295 "FFFFFFFF" "90ebb2b1a5f8dfefe3027b7b26eeadc6")
+                 ("sHa-256" 10 "0000000A" "f5616c32498d6414c775308bcc4145b4a5726bdf3894f2c8b050deb0e4802176")
+                 ("sHa-256" 4294967295 "FFFFFFFF" "d1898b9c16fb6af3cb7a9e28653eac873d64243d4e30a6a514de540505114162")))
+    (destructuring-bind (algorithm count nc response) row
+      (let ((challenge (first (http-parse-authentication-challenges
+                              (format nil "Digest realm=\"r\", nonce=\"n\", qop=\"auth\", algorithm=~A"
+                                      algorithm)))))
+        (ensure-equal
+         (format nil "Digest username=\"u\", realm=\"r\", uri=\"/\", algorithm=~A, nonce=\"n\", nc=~A, cnonce=\"c\", qop=auth, response=\"~A\""
+                 algorithm nc response)
+         (http-digest-authorization challenge "GET" "/" "u" "p" "c" :nonce-count count))))))
+
+(deftest client-auth-native-digest-header-escaping-and-extended-no-qop
+  (let* ((challenge (first (http-parse-authentication-challenges
+                           "Digest realm=\"r\\\"\\\\\", nonce=\"n\\\"\\\\\", qop=\"auth\", opaque=\"o\\\"\\\\\"")))
+         (header (http-digest-authorization challenge "GET" "/\"\\" "u\"\\" "p" "c\"\\")))
+    (ensure-equal
+     "Digest username=\"u\\\"\\\\\", realm=\"r\\\"\\\\\", uri=\"/\\\"\\\\\", algorithm=MD5, nonce=\"n\\\"\\\\\", nc=00000001, cnonce=\"c\\\"\\\\\", qop=auth, response=\"4e06dee5a9f21c045bdc29fe489341e7\", opaque=\"o\\\"\\\\\""
+     header)
+    (ensure-false (find #\Newline header))
+    (ensure-false (find #\Return header)))
+  (let ((challenge (first (http-parse-authentication-challenges
+                          "Digest realm=\"r\", nonce=\"n\", charset=UTF-8"))))
+    (ensure-equal
+     "Digest username*=UTF-8''%C3%A9, realm=\"r\", uri=\"/\", algorithm=MD5, nonce=\"n\", response=\"951a5c017b150a6fffc591bf61e99f6a\""
+     (http-digest-authorization challenge "GET" "/" (string (code-char 233)) "p" "c"))))
+
+(deftest client-auth-native-content-digest-structured-parameters
+  (let* ((body (make-array 0 :element-type '(unsigned-byte 8)))
+         (field (http-content-digest body)))
+    (dolist (parameters '(";*ext=-999999999999.999" ";decimal=0.001"
+                          ";text=\"a;\\\"b\\\\c\"" ";flag;yes=?1;no=?0"
+                          ";bytes=::" ";bytes=:AA==:" ";token=*value/path"))
+      (ensure-true (http-content-digest-valid-p
+                    body (concatenate 'string field parameters))))
+    (dolist (parameters '(";decimal=1000000000000.1" ";decimal=1.0000"
+                          ";decimal=.1" ";decimal=1." ";text=\"a\\q\""
+                          ";bool=?2" ";bytes=:AB==:" ";=1" ";x=1;x=2"))
+      (let ((condition (handler-case
+                           (http-content-digest-valid-p
+                            body (concatenate 'string field parameters))
+                         (http-protocol-error (condition) condition))))
+        (ensure-true (typep condition 'http-protocol-error))
+        (ensure-equal :client (http-error-operation condition))
+        (ensure-equal :field (http-protocol-error-detail condition))))
+    (dolist (input (list nil 17 '("sha-256=:AA==:" 17)))
+      (let ((condition (handler-case (http-content-digest-valid-p body input)
+                         (http-protocol-error (condition) condition))))
+        (ensure-true (typep condition 'http-protocol-error))
+        (ensure-equal :client (http-error-operation condition))
+        (ensure-equal :field (http-protocol-error-detail condition))))
+    (ensure-true (http-content-digest-valid-p body (list field)))
+    (ensure-false (http-content-digest-valid-p
+                   (make-array 1 :element-type '(unsigned-byte 8) :initial-element 0) field))))
+
+(deftest client-auth-native-real-wire-fallback-and-provider-failure
+  (dolist (fail-provider-p '(nil t))
+    (let* ((first (make-instance 'binary-test-stream
+                                :input (ascii "HTTP/1.1 401 Unauthorized|CRLF|Content-Length: 0|CRLF|Connection: close|CRLF|WWW-Authenticate: Digest realm=\"bad\", realm=\"duplicate\", nonce=\"n\"|CRLF|WWW-Authenticate: Basic realm=\"fallback\"|CRLF||CRLF|")))
+           (second (make-instance 'binary-test-stream
+                                 :input (ascii "HTTP/1.1 204 No Content|CRLF|Connection: close|CRLF||CRLF|")))
+           (streams (list first second))
+           (opened 0)
+           (closed nil)
+           (provider-calls 0)
+           (original (handler-case (http-authentication-challenge-parameter nil "realm")
+                       (http-protocol-error (condition) condition)))
+           (client (make-http-client
+                    :cache nil :automatic-decompression-p nil
+                    :open-stream (lambda (request &key &allow-other-keys)
+                                   (declare (ignore request))
+                                   (incf opened)
+                                   (pop streams))
+                    :close-stream (lambda (owned) (push owned closed) (close owned))
+                    :challenge-auth-provider
+                    (lambda (request response challenges)
+                      (incf provider-calls)
+                      (ensure-equal 401 (http-response-status response))
+                      (ensure-false (http-header-present-p (http-request-headers request) "Authorization"))
+                      (ensure-equal 1 (length challenges))
+                      (ensure-equal "Basic" (http-authentication-challenge-scheme (first challenges)))
+                      (ensure-equal "fallback"
+                                    (http-authentication-challenge-parameter (first challenges) "realm"))
+                      (ensure-equal 1 (count first closed :test #'eq))
+                      (if fail-provider-p (error original) (http-basic-authorization "u" "p")))))
+           (result (handler-case
+                       (http-client-send client (http-client-request client "GET" "http://example.test/private"))
+                     (http-protocol-error (condition) condition))))
+      (ensure-equal 1 provider-calls)
+      (ensure-false (search (ascii "Authorization:") (binary-test-output first)))
+      (ensure-equal 0 (search (ascii "GET /private HTTP/1.1|CRLF|") (binary-test-output first)))
+      (ensure-equal 1 (count first closed :test #'eq))
+      (if fail-provider-p
+          (progn
+            (ensure-true (eq original result))
+            (ensure-equal :client (http-error-operation result))
+            (ensure-equal 1 opened)
+            (ensure-equal 0 (length (binary-test-output second)))
+            (ensure-equal 0 (count second closed :test #'eq))
+            (close second))
+          (progn
+            (ensure-equal 204 (http-response-status result))
+            (ensure-equal 2 opened)
+            (ensure-equal 1 (count second closed :test #'eq))
+            (ensure-equal 0 (search (ascii "GET /private HTTP/1.1|CRLF|") (binary-test-output second)))
+            (ensure-true (search (ascii "Authorization: Basic dTpw|CRLF|") (binary-test-output second)))
+            (ensure-equal 2 (length closed)))))))
+(deftest client-auth-independent-bearer-padding-only
+  (let ((condition (handler-case (http-bearer-authorization "=")
+                     (http-protocol-error (condition) condition))))
+    (ensure-true (typep condition 'http-protocol-error))
+    (ensure-equal :client (http-error-operation condition))
+    (ensure-equal :token (http-protocol-error-detail condition)))
+  (ensure-equal "Bearer A=" (http-bearer-authorization "A=")))
+
+(deftest client-auth-independent-challenge-token-boundaries
+  (dolist (field '("Digest realm=a/b" "Ba/sic realm=r"
+                   "Bearer abc, realm=r"))
+    (ensure-false (http-parse-authentication-challenges field)))
+  (dolist (entry '(("Digest realm=r" "Digest")
+                   ("Basic realm=r" "Basic") ("Bearer abc" "Bearer")))
+    (let ((challenges (http-parse-authentication-challenges (first entry))))
+      (ensure-equal 1 (length challenges))
+      (ensure-equal (second entry)
+                    (http-authentication-challenge-scheme (first challenges)))))
+  (ensure-equal "abc" (http-authentication-challenge-token68
+                       (first (http-parse-authentication-challenges "Bearer abc")))))
+
+(deftest client-auth-independent-challenge-input-types
+  (dolist (input '(42 ("Basic realm=r" 42)))
+    (let ((condition (handler-case (http-parse-authentication-challenges input)
+                       (http-protocol-error (condition) condition))))
+      (ensure-true (typep condition 'http-protocol-error))
+      (ensure-equal :client (http-error-operation condition))
+      (ensure-equal input (http-protocol-error-detail condition))))
+  (ensure-false (http-parse-authentication-challenges nil))
+  (ensure-equal 1 (length (http-parse-authentication-challenges
+                          '("Basic realm=r")))))
+
+(deftest client-auth-independent-content-digest-field-shapes
+  (let* ((body (make-array 0 :element-type '(unsigned-byte 8)))
+         (field (http-content-digest body)))
+    (dolist (input '("sha@256=:AA==:" "Bad=:AA==:"
+                     "sha-256=:" "sha-256=AA:"))
+      (let ((condition (handler-case (http-content-digest-valid-p body input)
+                         (http-protocol-error (condition) condition))))
+        (ensure-true (typep condition 'http-protocol-error))
+        (ensure-equal :client (http-error-operation condition))
+        (ensure-equal :field (http-protocol-error-detail condition))))
+    (ensure-true (http-content-digest-valid-p body field))))
+
+(deftest client-auth-independent-content-digest-unpadded-bytes
+  (let* ((body (make-array 0 :element-type '(unsigned-byte 8)))
+         (field (http-content-digest body)))
+    (ensure-false (http-content-digest-valid-p body "example=:AAAA:"))
+    (ensure-false (http-content-digest-valid-p body "example=:AA==:"))
+    (ensure-true (http-content-digest-valid-p
+                  body (concatenate 'string field ";bytes=:AAAA:")))
+    (let ((condition (handler-case
+                         (http-content-digest-valid-p body "example=:AA=A:")
+                       (http-protocol-error (condition) condition))))
+      (ensure-true (typep condition 'http-protocol-error))
+      (ensure-equal :client (http-error-operation condition))
+      (ensure-equal "example" (http-protocol-error-detail condition)))))
+
+(deftest client-auth-independent-content-digest-token-delimiters
+  (let* ((body (make-array 0 :element-type '(unsigned-byte 8)))
+         (field (http-content-digest body))
+         (condition (handler-case
+                        (http-content-digest-valid-p
+                         body (concatenate 'string field ";token=a["))
+                      (http-protocol-error (condition) condition))))
+    (ensure-true (typep condition 'http-protocol-error))
+    (ensure-equal :client (http-error-operation condition))
+    (ensure-equal :field (http-protocol-error-detail condition))
+    (ensure-true (http-content-digest-valid-p
+                  body (concatenate 'string field ";token=a/path")))))
+
+(deftest client-auth-independent-content-digest-parameter-quote-state
+  (let* ((body (make-array 0 :element-type '(unsigned-byte 8)))
+         (field (http-content-digest body))
+         (condition (handler-case
+                        (http-content-digest-valid-p
+                         body "example=:AA\"AA:;x=\"a")
+                      (http-protocol-error (condition) condition))))
+    (ensure-true (typep condition 'http-protocol-error))
+    (ensure-equal :client (http-error-operation condition))
+    (ensure-equal :field (http-protocol-error-detail condition))
+    (ensure-true (http-content-digest-valid-p
+                  body (concatenate 'string field ";x=\"a\"")))))
+
+(deftest client-auth-independent-digest-quoted-tab-values
+  (dolist (key '("realm" "nonce" "opaque"))
+    (let* ((value (format nil "a~Cb" #\Tab))
+           (field (cond ((string= key "realm")
+                         (format nil "Digest realm=~S, nonce=\"n\"" value))
+                        ((string= key "nonce")
+                         (format nil "Digest realm=\"r\", nonce=~S" value))
+                        (t (format nil "Digest realm=\"r\", nonce=\"n\", opaque=~S"
+                                   value))))
+           (challenges (http-parse-authentication-challenges field)))
+      (ensure-equal 1 (length challenges))
+      (ensure-equal value (http-authentication-challenge-parameter
+                           (first challenges) key))
+      (let ((condition (handler-case
+                           (http-digest-authorization
+                            (first challenges) "GET" "/" "u" "p" "c")
+                         (http-protocol-error (condition) condition))))
+        (ensure-true (typep condition 'http-protocol-error))
+        (ensure-equal :client (http-error-operation condition))
+        (ensure-equal value (http-protocol-error-detail condition)))))
+  (let* ((challenge (first (http-parse-authentication-challenges
+                           "Digest realm=\"r\", nonce=\"n\", opaque=\"o\"")))
+         (header (http-digest-authorization challenge "GET" "/" "u" "p" "c")))
+    (ensure-equal 0 (search "Digest " header))
+    (ensure-true (search "realm=\"r\"" header))
+    (ensure-true (search "nonce=\"n\"" header))
+    (ensure-true (search "opaque=\"o\"" header))
+    (ensure-false (find #\Tab header))))
+
+
+(deftest client-uri-independent-scheme-like-relative-paths
+  (let* ((original "https://base.example.test/a/b?old=1")
+         (base (parse-http-uri original)))
+    (dolist (case '((":x" "https://base.example.test/a/:x")
+                    ("1x:y" "https://base.example.test/a/1x:y")
+                    ("a/b:c" "https://base.example.test/a/a/b:c")
+                    ("a@b:c" "https://base.example.test/a/a@b:c")))
+      (let ((result (resolve-http-uri base (first case))))
+        (ensure-equal (second case) (http-uri-string result))
+        (ensure-false (eq base result))
+        (ensure-equal original (http-uri-string base))))))
+
+(deftest client-uri-independent-alphanumeric-scheme-rejection
+  (let* ((original "https://base.example.test/a/b")
+         (base (parse-http-uri original)))
+    (dolist (reference '("a1:x" "a:x"))
+      (let ((condition (handler-case (resolve-http-uri base reference)
+                         (http-protocol-error (condition) condition))))
+        (ensure-true (typep condition 'http-protocol-error))
+        (ensure-equal :client (http-error-operation condition))
+        (ensure-equal reference (http-protocol-error-detail condition))))
+    (let ((result (resolve-http-uri base "HTTP://other.example.test/c")))
+      (ensure-equal "http://other.example.test/c" (http-uri-string result))
+      (ensure-false (eq base result))
+      (ensure-equal original (http-uri-string base)))))
+
+(deftest client-uri-independent-origin-identity-boundaries
+  (dolist (case '(("http://base.example.test:443/a"
+                  "https://base.example.test:443/b"
+                  "http://base.example.test:443" "https://base.example.test" nil)
+                 ("https://base.example.test/a"
+                  "https://other.example.test:443/b"
+                  "https://base.example.test" "https://other.example.test" nil)
+                 ("HTTPS://BASE.EXAMPLE.TEST/a"
+                  "https://base.example.test:443/b"
+                  "https://base.example.test" "https://base.example.test" t)
+                 ("https://[2001:db8::1]/a"
+                  "https://[2001:db8::2]:443/b"
+                  "https://[2001:db8::1]" "https://[2001:db8::2]" nil)))
+    (destructuring-bind (left right left-origin right-origin same-p) case
+      (ensure-equal left-origin (http-uri-origin left))
+      (ensure-equal right-origin (http-uri-origin right))
+      (ensure-equal same-p (not (null (http-same-origin-p left right)))))))

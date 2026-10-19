@@ -151,14 +151,14 @@ explicit at the client boundary."
                            (aref masking-key (mod index 4)))))
     result))
 
-(defun %websocket-extended-width (payload-length)
-  (when (>= payload-length (ash 1 63))
-    (%websocket-protocol-error
-     "A WebSocket payload length exceeds the 63-bit wire limit."
-     payload-length))
+(defun %websocket-payload-length-width (payload-length)
   (cond ((<= payload-length 125) 0)
         ((<= payload-length #xffff) 2)
-        (t 8)))
+        ((< payload-length (ash 1 63)) 8)
+        (t
+         (%websocket-protocol-error
+          "A WebSocket payload length exceeds the 63-bit wire limit."
+          payload-length))))
 
 (defun serialize-websocket-frame (frame)
   "Serialize FRAME to its wire representation as an octet vector."
@@ -173,13 +173,7 @@ explicit at the client boundary."
     (%websocket-validate-frame-components
      fin-p rsv1-p opcode mask-p masking-key payload)
     (let* ((payload-length (length payload))
-           (extended-width (cond ((<= payload-length 125) 0)
-                                 ((<= payload-length #xffff) 2)
-                                 ((< payload-length (ash 1 63)) 8)
-                                 (t
-                                  (%websocket-protocol-error
-                                   "A WebSocket payload length exceeds the 63-bit wire limit."
-                                   payload-length))))
+           (extended-width (%websocket-payload-length-width payload-length))
            (header-length (+ 2 extended-width (if mask-p 4 0)))
            (wire (make-array (+ header-length payload-length)
                              :element-type '(unsigned-byte 8)))
@@ -297,10 +291,6 @@ left for the caller, which makes this function suitable for buffered input."
                   frame-end))))))
 
 (defun %websocket-read-exact (stream count)
-  (unless (and (integerp count) (<= 0 count))
-    (%websocket-protocol-error
-     "A WebSocket read requested an invalid octet count."
-     count))
   (let ((result (make-array count :element-type '(unsigned-byte 8)))
         (position 0))
     (loop while (< position count)

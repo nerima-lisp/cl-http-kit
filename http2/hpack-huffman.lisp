@@ -44,11 +44,7 @@
                    do (let ((next (if (zerop bit)
                                       (%hpack-huffman-node-zero node)
                                       (%hpack-huffman-node-one node))))
-                        (unless next
-                          (error 'http-protocol-error
-                                 :message "An HPACK Huffman string has an invalid code."
-                                 :operation :hpack
-                                 :detail :huffman-code))
+                        ;; The fixed RFC tree is complete; data leaves reset NODE to its root.
                         (setf node next)
                         (incf padding-bits)
                         (setf padding-value

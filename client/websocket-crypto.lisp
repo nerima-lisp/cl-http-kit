@@ -7,8 +7,6 @@
   "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
 
 (defun %websocket-base64-encode (octets)
-  (unless (%websocket-octet-vector-p octets)
-    (%websocket-protocol-error "Base64 input must be a vector of octets." octets))
   (let* ((length (length octets))
          (result (make-string (* 4 (ceiling length 3)))))
     (loop for input from 0 below length by 3
@@ -37,7 +35,7 @@
   (position character +websocket-base64-alphabet+ :test #'char=))
 
 (defun %websocket-base64-decode (string)
-  (unless (and (stringp string) (zerop (mod (length string) 4)))
+  (unless (zerop (mod (length string) 4))
     (%websocket-protocol-error
      "A WebSocket Sec-WebSocket-Key must be valid Base64." string))
   (let ((result (make-array 0

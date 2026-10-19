@@ -117,11 +117,6 @@
   "Return the normalized URI key used by the private response cache."
   (http-uri-string (%cache-request-uri request-or-uri)))
 
-(defun %cache-request-method (request-or-uri)
-  (if (http-request-p request-or-uri)
-      (http-request-method request-or-uri)
-      "GET"))
-
 (defun %cache-trim (value)
   (string-trim '(#\Space #\Tab) value))
 
@@ -214,43 +209,6 @@
         directives
         (list (cons "no-cache" nil)))))
 
-(defun %cache-nonnegative-seconds (value)
-  (let ((number (%client-parse-integer value :allow-sign-p nil)))
-    (and number (>= number 0) number)))
-
-(defun %cache-request-no-store-p (request)
-  (%cache-directive-present-p
-   (%cache-request-directives (http-request-headers request))
-   "no-store"))
-
-(defun %cache-request-no-cache-p (request)
-  (let ((directives (%cache-request-directives (http-request-headers request))))
-    (or (%cache-directive-present-p directives "no-cache")
-        (let ((max-age (%cache-nonnegative-seconds
-                        (%cache-directive directives "max-age"))))
-          (and max-age (zerop max-age))))))
-
-(defun %cache-request-min-fresh (request)
-  (%cache-nonnegative-seconds
-   (%cache-directive
-    (%cache-request-directives (http-request-headers request))
-    "min-fresh")))
-
-(defun %cache-request-max-stale (request)
-  (let* ((directives (%cache-request-directives (http-request-headers request)))
-         (name "max-stale"))
-    (when (%cache-directive-present-p directives name)
-      (let ((value (%cache-directive directives name)))
-        (if value (%cache-nonnegative-seconds value) :unbounded)))))
-
-(defun %cache-response-must-revalidate-p (headers)
-  (let ((directives (%cache-control-directives headers)))
-    (or (%cache-directive-present-p directives "must-revalidate")
-        (%cache-directive-present-p directives "proxy-revalidate"))))
-
-(defun %cache-directive (directives name)
-  (cdr (assoc name directives :test #'string=)))
-
 (defun %cache-directive-values (directives name)
   (loop for (directive-name . value) in directives
         when (string= directive-name name)
@@ -328,14 +286,10 @@
     (remove-duplicates (nreverse fields) :test #'string=)))
 
 (defun %cache-request-vary-values (request fields)
-  (when fields
-    (mapcar (lambda (field)
-              (cons field
-                    (if (http-request-p request)
-                        (http-header-values (http-request-headers request)
-                                            field)
-                        nil)))
-            fields)))
+  (mapcar (lambda (field)
+            (cons field
+                  (http-header-values (http-request-headers request) field)))
+          fields))
 
 (defun %cache-effective-vary-fields (fields)
   (let ((result (copy-list fields)))
@@ -380,16 +334,11 @@
                   (min 86400
                        (max 0 (floor (- date last-modified) 10))))
                  (t 0))))
-    (cond
-      ((%cache-response-no-store-p (http-response-status response) directives)
-       (values nil nil nil))
-      (t
-       (values t
-               (if (%cache-directive-present-p directives "no-cache")
-                   response-time
-                   (+ response-time
-                      (max 0 (- freshness-lifetime corrected-age))))
-               corrected-age)))))
+    (values (if (%cache-directive-present-p directives "no-cache")
+                response-time
+                (+ response-time
+                   (max 0 (- freshness-lifetime corrected-age))))
+            corrected-age)))
 
 (defun %cache-copy-entry (entry)
   (%make-http-cache-entry
@@ -603,13 +552,10 @@ RFC 9211 reason token when the request must be forwarded."
          (values nil :stale (%cache-copy-entry entry)
                  (if (> remaining 0) :request :stale)))))))
 
-(defun %cache-remove-key (cache key &optional method)
+(defun %cache-remove-key (cache key)
   (setf (%http-cache-entries cache)
         (delete-if (lambda (entry)
-                     (and (string= key (http-cache-entry-key entry))
-                          (or (null method)
-                              (string= method
-                                       (http-cache-entry-method entry)))))
+                     (string= key (http-cache-entry-key entry)))
                    (%http-cache-entries cache))))
 
 (defun %cache-remove-variant (cache entry)
@@ -657,10 +603,8 @@ RFC 9211 reason token when the request must be forwarded."
                        (http-response-status response)
                        response-directives)))
       (return-from http-cache-store nil))
-    (multiple-value-bind (cacheable-p expires-at age-at-store)
+    (multiple-value-bind (expires-at age-at-store)
         (%cache-freshness response request-time response-time)
-      (unless cacheable-p
-        (return-from http-cache-store nil))
       (let* ((effective-vary (%cache-effective-vary-fields (or vary '())))
              (key (http-cache-key request))
              (entry (%make-http-cache-entry

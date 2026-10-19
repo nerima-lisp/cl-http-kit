@@ -101,6 +101,71 @@
                         :uri "http://example.test/"
                         :request-target "ftp://example.test/resource"))))
 
+(deftest http1-serialization-request-target-override-boundaries
+  (let ((request (http1-request-for-test)))
+    (dolist (target (list "" 42 "/with space"
+                         (format nil "/with~Ctab" #\Tab)
+                         (format nil "/with~Cline" #\Newline)
+                         (format nil "/with~Cdelete" (code-char 127))))
+      (handler-case
+          (progn
+            (serialize-http-request request :request-target target)
+            (ensure-true nil "invalid request-target override was serialized"))
+        (http-protocol-error (condition)
+          (ensure-equal :serialization (http-error-operation condition))
+          (ensure-equal target (http-protocol-error-detail condition)))))
+    (ensure-octets-equal
+     (ascii "POST /upload HTTP/1.1|CRLF|Host: 127.0.0.1|CRLF|Content-Length: 0|CRLF||CRLF|")
+     (serialize-http-request request :request-target nil))
+    (ensure-octets-equal
+     (ascii "POST /replacement HTTP/1.1|CRLF|Host: 127.0.0.1|CRLF|Content-Length: 0|CRLF||CRLF|")
+     (serialize-http-request request :request-target "/replacement"))))
+
+(deftest http1-serialization-rejects-versioned-protocols
+  (dolist (version '("HTTP/2" "HTTP/3"))
+    (let ((request (make-http-request :method "POST"
+                                      :uri "http://127.0.0.1/upload"
+                                      :protocol-version version)))
+      (handler-case
+          (progn
+            (serialize-http-request request)
+            (ensure-true nil "versioned protocol was serialized as HTTP/1"))
+        (http-unsupported-feature (condition)
+          (ensure-equal :serialization (http-error-operation condition))
+          (ensure-equal :http1-request-version
+                        (http-unsupported-feature-name condition))
+          (ensure-equal version (http-protocol-error-detail condition))))))
+  (ensure-octets-equal
+   (ascii "POST /upload HTTP/1.0|CRLF|Host: 127.0.0.1|CRLF|Content-Length: 0|CRLF||CRLF|")
+   (serialize-http-request
+    (make-http-request :method "POST"
+                       :uri "http://127.0.0.1/upload"
+                       :protocol-version "HTTP/1.0"))))
+
+(deftest http1-serialization-rejects-http10-transfer-coding
+  (handler-case
+      (progn
+        (serialize-http-request
+         (make-http-request :method "POST"
+                            :uri "http://127.0.0.1/upload"
+                            :protocol-version "HTTP/1.0"
+                            :headers (list (make-http-header "Transfer-Encoding"
+                                                            "chunked"))
+                            :body (octets 97 98)))
+        (ensure-true nil "HTTP/1.0 transfer coding was serialized"))
+    (http-unsupported-feature (condition)
+      (ensure-equal :serialization (http-error-operation condition))
+      (ensure-equal :http1-request-transfer-encoding
+                    (http-unsupported-feature-name condition))
+      (ensure-equal :chunked (http-protocol-error-detail condition))))
+  (ensure-octets-equal
+   (ascii "POST /upload HTTP/1.0|CRLF|Host: 127.0.0.1|CRLF|Content-Length: 2|CRLF||CRLF|ab")
+   (serialize-http-request
+    (make-http-request :method "POST"
+                       :uri "http://127.0.0.1/upload"
+                       :protocol-version "HTTP/1.0"
+                       :body (octets 97 98)))))
+
 (deftest http1-request-framing-boundaries
   (let* ((body (octets 1 2))
          (wire (serialize-http-request
@@ -202,3 +267,531 @@
      (http1-request-for-test
       :headers (list (make-http-header "Host" "127.0.0.1")
                      (make-http-header "host" "127.0.0.1"))))))
+
+(deftest core-coverage-http1-trailer-declaration-errors
+  (dolist (case '(("" "trailer" :empty-item)
+                  ("X-One, " "trailer" :empty-item)
+                  ("bad name" "trailer" :value)
+                  ("Content-Length" "Content-Length" :forbidden-trailer)))
+    (destructuring-bind (value name reason) case
+      (let ((condition
+              (handler-case
+                  (serialize-http-request
+                   (http1-request-for-test
+                    :headers (list (make-http-header "Transfer-Encoding" "chunked")
+                                   (make-http-header "Trailer" value))))
+                (http-invalid-header (condition) condition))))
+        (ensure-true (typep condition 'http-invalid-header))
+        (ensure-equal :serialization (http-error-operation condition))
+        (ensure-equal name (http-invalid-header-name condition))
+        (ensure-equal reason (http-invalid-header-reason condition)))))
+  (let ((condition
+          (handler-case
+              (serialize-http-request
+               (http1-request-for-test
+                :headers (list (make-http-header "Content-Length" "0")
+                               (make-http-header "Trailer" "X-Checksum"))))
+            (http-invalid-header (condition) condition))))
+    (ensure-true (typep condition 'http-invalid-header))
+    (ensure-equal :serialization (http-error-operation condition))
+    (ensure-equal "trailer" (http-invalid-header-name condition))
+    (ensure-equal :framing (http-invalid-header-reason condition))))
+
+(deftest core-coverage-http1-trailer-declaration-membership
+  (let ((condition
+          (handler-case
+              (serialize-http-request
+               (http1-request-for-test
+                :headers (list (make-http-header "Trailer" "X-One"))
+                :trailers (list (make-http-header "X-Checksum" "done"))))
+            (http-invalid-header (condition) condition))))
+    (ensure-true (typep condition 'http-invalid-header))
+    (ensure-equal :serialization (http-error-operation condition))
+    (ensure-equal "trailer" (http-invalid-header-name condition))
+    (ensure-equal :undeclared-trailer (http-invalid-header-reason condition))
+    (ensure-equal '(:declared ("X-One") :actual ("X-Checksum"))
+                  (http-protocol-error-detail condition)))
+  (ensure-equal
+   (ascii "POST /upload HTTP/1.1|CRLF|Trailer: X-Checksum, x-checksum|CRLF|Host: 127.0.0.1|CRLF|Transfer-Encoding: chunked|CRLF||CRLF|0|CRLF|X-Checksum: done|CRLF||CRLF|")
+   (serialize-http-request
+    (http1-request-for-test
+     :headers (list (make-http-header "Trailer" "X-Checksum, x-checksum"))
+     :trailers (list (make-http-header "X-Checksum" "done"))))))
+
+(defun %ensure-http1-quoted-extension-octet (byte escaped-p)
+  (let* ((extension (concatenate-octets
+                     (ascii ";name=\"")
+                     (if escaped-p (octets #x5c) (octets))
+                     (octets byte)
+                     (ascii "\"")))
+         (body (concatenate-octets
+                (ascii "2") extension (ascii "|CRLF|ab|CRLF|1|CRLF|c|CRLF|0")
+                extension (ascii "|CRLF|X-Checksum: done|CRLF||CRLF|"))))
+    (dolist (request-p '(nil t))
+      (let* ((header (if request-p
+                         (ascii "POST /upload HTTP/1.1|CRLF|Host: example.com|CRLF|Transfer-Encoding: chunked|CRLF|Trailer: X-Checksum|CRLF||CRLF|")
+                         (ascii "HTTP/1.1 200 OK|CRLF|Transfer-Encoding: chunked|CRLF|Trailer: X-Checksum|CRLF||CRLF|")))
+             (wire (concatenate-octets header body))
+             (input (concatenate-octets wire (ascii "NEXT"))))
+        (dolist (collect-body-p '(nil t))
+          (dolist (stream-p '(nil #+sbcl t))
+            (let* ((source (if stream-p
+                               #+sbcl (make-instance 'binary-test-stream :input input)
+                               #-sbcl input
+                               input))
+                   (chunks nil)
+                   (message (funcall (if request-p
+                                         #'parse-http-request
+                                         #'parse-http-response)
+                                     source
+                                     :collect-body-p collect-body-p
+                                     :on-body-chunk
+                                     (lambda (chunk)
+                                       (push (octets-as-string chunk) chunks))))
+                   (payload (if request-p
+                                (http-request-body message)
+                                (http-response-body message)))
+                   (trailers (if request-p
+                                 (http-request-trailers message)
+                                 (http-response-trailers message))))
+              (ensure-equal (if collect-body-p "abc" "")
+                            (octets-as-string payload))
+              (ensure-equal '("ab" "c") (nreverse chunks))
+              (ensure-equal 1 (length trailers))
+              (ensure-equal "done" (http-header-value trailers "x-checksum"))
+              (if request-p
+                  (progn
+                    (ensure-equal "POST" (http-request-method message))
+                    (ensure-equal "/upload" (http-request-target message))
+                    (ensure-equal "HTTP/1.1" (http-request-protocol-version message)))
+                  (progn
+                    (ensure-equal 200 (http-response-status message))
+                    (ensure-equal "HTTP/1.1" (http-response-protocol-version message))))
+              #+sbcl
+              (when stream-p
+                (ensure-equal (length wire) (binary-test-input-position source))
+                (ensure-equal (char-code #\N) (read-byte source))))))))))
+
+(deftest http1-public-boundary-quoted-extension-80-unescaped
+  (%ensure-http1-quoted-extension-octet #x80 nil))
+
+(deftest http1-public-boundary-quoted-extension-ff-unescaped
+  (%ensure-http1-quoted-extension-octet #xff nil))
+
+(deftest http1-public-boundary-quoted-extension-80-escaped
+  (%ensure-http1-quoted-extension-octet #x80 t))
+
+(deftest http1-public-boundary-quoted-extension-ff-escaped
+  (%ensure-http1-quoted-extension-octet #xff t))
+
+(defun %ensure-http1-quoted-extension-line-controls (parser operation header)
+  (dolist (byte '(0 1 #x7f))
+    (dolist (escaped-p '(nil t))
+      (let* ((prefix (concatenate-octets
+                      header (ascii "1;name=\"")
+                      (if escaped-p (octets #x5c) (octets))))
+             (wire (concatenate-octets
+                    prefix (octets byte)
+                    (ascii "\"|CRLF|a|CRLF|0|CRLF||CRLF|"))))
+        (dolist (stream-p '(nil #+sbcl t))
+          (let* ((source (if stream-p
+                             #+sbcl (make-instance 'binary-test-stream :input wire)
+                             #-sbcl wire
+                             wire))
+                 (body-calls 0)
+                 (condition
+                   (handler-case
+                       (funcall parser source
+                                :on-body-chunk
+                                (lambda (chunk)
+                                  (declare (ignore chunk))
+                                  (incf body-calls)))
+                     (http-protocol-error (condition) condition))))
+            (ensure-true (typep condition 'http-protocol-error))
+            (ensure-equal operation (http-error-operation condition))
+            (ensure-equal (list :line-control byte)
+                          (http-protocol-error-detail condition))
+            (ensure-equal 0 body-calls)
+            #+sbcl
+            (when stream-p
+              (ensure-equal (1+ (length prefix))
+                            (binary-test-input-position source))
+              (ensure-equal (char-code #\") (read-byte source)))))))))
+
+(deftest http1-public-boundary-request-extension-line-controls
+  (%ensure-http1-quoted-extension-line-controls
+   #'parse-http-request :request-parse
+   (ascii "POST /upload HTTP/1.1|CRLF|Host: example.com|CRLF|Transfer-Encoding: chunked|CRLF||CRLF|")))
+
+(deftest http1-public-boundary-response-extension-line-controls
+  (%ensure-http1-quoted-extension-line-controls
+   #'parse-http-response :response-parse
+   (ascii "HTTP/1.1 200 OK|CRLF|Transfer-Encoding: chunked|CRLF||CRLF|")))
+
+(deftest http1-second-wave-informational-transfer-encoding-metadata
+  (dolist (stream-p '(nil #+sbcl t))
+    (let* ((wire (ascii "HTTP/1.1 103 Early Hints|CRLF|Transfer-Encoding: chunked|CRLF||CRLF|HTTP/1.1 200 OK|CRLF|Content-Length: 3|CRLF||CRLF|abc"))
+           (source (if stream-p
+                       #+sbcl (make-instance 'binary-test-stream :input wire)
+                       #-sbcl wire
+                       wire))
+           (information-count 0)
+           (body-count 0)
+           (failure
+             (handler-case
+                 (parse-http-response
+                  source
+                  :on-information (lambda (response)
+                                    (declare (ignore response))
+                                    (incf information-count))
+                  :on-body-chunk (lambda (chunk)
+                                   (declare (ignore chunk))
+                                   (incf body-count)))
+               (http-invalid-header (condition) condition))))
+      (ensure-true (typep failure 'http-invalid-header))
+      (ensure-equal :response-parse (http-error-operation failure))
+      (ensure-equal "transfer-encoding" (http-invalid-header-name failure))
+      (ensure-equal :forbidden (http-invalid-header-reason failure))
+      (ensure-equal 0 information-count)
+      (ensure-equal 0 body-count)
+      #+sbcl
+      (when stream-p
+        (ensure-equal
+         (length (ascii "HTTP/1.1 103 Early Hints|CRLF|Transfer-Encoding: chunked|CRLF||CRLF|"))
+         (binary-test-input-position source))))
+    (let* ((wire (ascii "HTTP/1.1 103 Early Hints|CRLF|Link: </style.css>; rel=preload|CRLF||CRLF|HTTP/1.1 200 OK|CRLF|Content-Length: 3|CRLF||CRLF|abc"))
+           (source (if stream-p
+                       #+sbcl (make-instance 'binary-test-stream :input wire)
+                       #-sbcl wire
+                       wire))
+           (information '())
+           (chunks '())
+           (response
+             (parse-http-response
+              source
+              :on-information (lambda (interim) (push interim information))
+              :on-body-chunk (lambda (chunk) (push chunk chunks)))))
+      (ensure-equal 1 (length information))
+      (ensure-equal 103 (http-response-status (first information)))
+      (ensure-equal "</style.css>; rel=preload"
+                    (http-header-value (http-response-headers (first information))
+                                       "link"))
+      (ensure-octets-equal (octets) (http-response-body (first information)))
+      (ensure-equal 200 (http-response-status response))
+      (ensure-octets-equal (ascii "abc") (http-response-body response))
+      (ensure-equal 1 (length chunks))
+      (ensure-octets-equal (ascii "abc") (first chunks))
+      #+sbcl
+      (when stream-p
+        (ensure-equal (length wire) (binary-test-input-position source))))))
+
+#+sbcl
+(deftest http1-second-wave-expect-body-copy-independence
+  (let* ((original (ascii "abc"))
+         (request (make-http-request
+                   :method "POST" :uri "http://127.0.0.1/"
+                   :headers (list (make-http-header "Expect" "100-continue"))
+                   :body original))
+         (head (ascii "POST / HTTP/1.1|CRLF|Expect: 100-continue|CRLF|Host: 127.0.0.1|CRLF|Content-Length: 3|CRLF||CRLF|"))
+         (wire (ascii "HTTP/1.1 100 Continue|CRLF||CRLF|HTTP/1.1 200 OK|CRLF|Content-Length: 0|CRLF||CRLF|"))
+         (stream (make-instance 'binary-test-stream :input wire))
+         (information-count 0))
+    (multiple-value-bind (response reusable)
+        (send-http-request-over-open-stream
+         request stream
+         :on-information
+         (lambda (information)
+           (incf information-count)
+           (ensure-equal 100 (http-response-status information))
+           (ensure-octets-equal head (binary-test-output stream))
+           (let ((copy (http-request-body request)))
+             (replace original (ascii "def"))
+             (replace copy (ascii "xyz"))
+             (ensure-octets-equal (ascii "def") original)
+             (ensure-octets-equal (ascii "xyz") copy)
+             (ensure-octets-equal (ascii "abc") (http-request-body request)))))
+      (ensure-equal 1 information-count)
+      (ensure-equal 200 (http-response-status response))
+      (ensure-octets-equal (octets) (http-response-body response))
+      (ensure-true reusable)
+      (ensure-octets-equal (concatenate-octets head (ascii "abc"))
+                          (binary-test-output stream))
+      (ensure-octets-equal (ascii "abc") (http-request-body request))
+      (ensure-equal (length wire) (binary-test-input-position stream)))))
+
+(deftest http1-second-wave-close-body-chunk-boundary
+  (let* ((body (make-array 4097 :element-type '(unsigned-byte 8)))
+         (wire nil))
+    (dotimes (index (length body))
+      (setf (aref body index) (mod index 256)))
+    (setf wire
+          (concatenate-octets
+           (ascii "HTTP/1.1 200 OK|CRLF|Connection: close|CRLF||CRLF|")
+           body))
+    (dolist (stream-p '(nil #+sbcl t))
+      (dolist (collect-p '(t nil))
+        (let* ((source (if stream-p
+                           #+sbcl (make-instance 'binary-test-stream :input wire)
+                           #-sbcl wire
+                           wire))
+               (chunks '())
+               (response
+                 (parse-http-response
+                  source :collect-body-p collect-p
+                  :on-body-chunk (lambda (chunk) (push chunk chunks)))))
+          (setf chunks (nreverse chunks))
+          (ensure-equal 200 (http-response-status response))
+          (ensure-equal '(4096 1) (mapcar #'length chunks))
+          (ensure-octets-equal body (apply #'concatenate-octets chunks))
+          (ensure-octets-equal (if collect-p body (octets))
+                              (http-response-body response))
+          (ensure-equal '() (http-response-trailers response))
+          #+sbcl
+          (when stream-p
+            (ensure-equal (length wire) (binary-test-input-position source))
+            (ensure-equal :eof (read-byte source nil :eof))))))))
+
+#+sbcl
+(deftest http1-public-status-line-short-boundaries
+  (dolist (line '("HTTP" "HTTP/1.1 20"))
+    (let* ((wire (concatenate-octets (ascii line) (ascii "|CRLF|!")))
+           (stream (make-instance 'binary-test-stream :input wire))
+           (callback-count 0))
+      (unwind-protect
+           (let ((caught
+                   (handler-case
+                       (progn
+                         (parse-http-response
+                          stream
+                          :on-body-chunk (lambda (chunk)
+                                           (declare (ignore chunk))
+                                           (incf callback-count))
+                          :on-information (lambda (response)
+                                            (declare (ignore response))
+                                            (incf callback-count)))
+                         nil)
+                     (http-invalid-status (condition) condition))))
+             (ensure-true (typep caught 'http-invalid-status))
+             (ensure-equal :response-parse (http-error-operation caught))
+             (ensure-equal line (http-invalid-status-line caught))
+             (ensure-equal nil (http-invalid-status-code caught))
+             (ensure-equal 0 callback-count)
+             (ensure-equal (+ (length line) 2)
+                           (binary-test-input-position stream))
+             (ensure-equal (char-code #\!) (read-byte stream))
+             (ensure-octets-equal (octets) (binary-test-output stream)))
+        (close stream))))
+  (let* ((wire (ascii "HTTP/1.1 204|CRLF||CRLF|!"))
+         (stream (make-instance 'binary-test-stream :input wire)))
+    (unwind-protect
+         (let ((response (parse-http-response stream)))
+           (ensure-equal 204 (http-response-status response))
+           (ensure-equal "" (http-response-reason response))
+           (ensure-octets-equal (octets) (http-response-body response))
+           (ensure-equal (1- (length wire)) (binary-test-input-position stream))
+           (ensure-equal (char-code #\!) (read-byte stream)))
+      (close stream))))
+
+#+sbcl
+(deftest http1-public-noninteger-parser-limits
+  (dolist (request-p '(t nil))
+    (let ((wire
+            (ascii (if request-p
+                       "POST / HTTP/1.1|CRLF|Host: example.test|CRLF|Content-Length: 3|CRLF||CRLF|abc!"
+                       "HTTP/1.1 200 OK|CRLF|Content-Length: 3|CRLF||CRLF|abc!")))
+          (parser (if request-p #'parse-http-request #'parse-http-response))
+          (operation (if request-p :request-parse :response-parse)))
+      (dolist (option (if request-p
+                          '(:max-header-bytes :max-fields :max-body-bytes)
+                          '(:max-fields)))
+        (dolist (invalid '("1" 1/2))
+          (let ((stream (make-instance 'binary-test-stream :input wire))
+                (callback-count 0))
+            (unwind-protect
+                 (let ((caught
+                         (handler-case
+                             (progn
+                               (apply parser stream
+                                      :on-body-chunk
+                                      (lambda (chunk)
+                                        (declare (ignore chunk))
+                                        (incf callback-count))
+                                      (list option invalid))
+                               nil)
+                           (http-protocol-error (condition) condition))))
+                   (ensure-true (typep caught 'http-protocol-error))
+                   (ensure-equal operation (http-error-operation caught))
+                   (ensure-equal invalid (http-protocol-error-detail caught))
+                   (ensure-equal 0 callback-count)
+                   (ensure-equal 0 (binary-test-input-position stream))
+                   (ensure-octets-equal (octets) (binary-test-output stream)))
+              (close stream)))))
+      (let ((stream (make-instance 'binary-test-stream :input wire))
+            (chunks nil))
+        (unwind-protect
+             (let ((message
+                     (funcall parser stream :max-header-bytes 1024
+                                            :max-fields 2 :max-body-bytes 3
+                                            :on-body-chunk
+                                            (lambda (chunk) (push chunk chunks)))))
+               (ensure-octets-equal (ascii "abc")
+                                   (if request-p (http-request-body message)
+                                       (http-response-body message)))
+               (ensure-equal 1 (length chunks))
+               (ensure-octets-equal (ascii "abc") (first chunks))
+               (ensure-equal (1- (length wire)) (binary-test-input-position stream))
+               (ensure-equal (char-code #\!) (read-byte stream))
+               (ensure-octets-equal (octets) (binary-test-output stream)))
+          (close stream))))))
+
+(deftest http1-public-short-request-target
+  (dolist (override-p '(nil t))
+    (let* ((request
+             (make-http-request :method "GET" :uri "http://example.test/"
+                                :request-target (if override-p "/" "abc")))
+           (caught
+             (handler-case
+                 (progn
+                   (if override-p
+                       (serialize-http-request request :request-target "abc")
+                       (serialize-http-request request))
+                   nil)
+               (http-protocol-error (condition) condition))))
+      (ensure-true (typep caught 'http-protocol-error))
+      (ensure-equal :serialization (http-error-operation caught))
+      (ensure-equal "abc" (http-protocol-error-detail caught)))
+    (dolist (target '("/" "http://example.test/"))
+      (let* ((request
+               (make-http-request :method "GET" :uri "http://example.test/"
+                                  :request-target (if override-p "/" target)))
+             (wire
+               (if override-p
+                   (serialize-http-request request :request-target target)
+                   (serialize-http-request request)))
+             (parsed (parse-http-request wire)))
+        (ensure-octets-equal
+         (concatenate-octets
+          (ascii (format nil "GET ~A HTTP/1.1|CRLF|" target))
+          (ascii "Host: example.test|CRLF|Content-Length: 0|CRLF||CRLF|"))
+         wire)
+        (ensure-equal target (http-request-target parsed))
+        (ensure-equal "GET" (http-request-method parsed))
+        (ensure-equal '("example.test")
+                      (http-header-values (http-request-headers parsed) "host"))
+        (ensure-octets-equal (octets) (http-request-body parsed))))))
+
+#+sbcl
+(deftest http1-public-case-insensitive-actual-trailers
+  (dolist (request-p '(t nil))
+    (dolist (duplicate-p '(nil t))
+      (let* ((trailers
+               (append (list (make-http-header "X-Checksum" "one"))
+                       (when duplicate-p
+                         (list (make-http-header "x-checksum" "two")))))
+             (expected-values (if duplicate-p '("one" "two") '("one")))
+             (expected-names
+               (if duplicate-p '("X-Checksum" "x-checksum") '("X-Checksum")))
+             (wire
+               (if request-p
+                   (serialize-http-request
+                    (make-http-request :method "POST"
+                                       :uri "http://example.test/upload"
+                                       :body (ascii "abc") :trailers trailers))
+                   (serialize-http-response
+                    (make-http-response :status 200 :body (ascii "abc")
+                                        :trailers trailers))))
+             (parser (if request-p #'parse-http-request #'parse-http-response)))
+        (ensure-octets-equal
+         (concatenate-octets
+          (ascii (if request-p
+                     "POST /upload HTTP/1.1|CRLF|Host: example.test|CRLF|"
+                     "HTTP/1.1 200 OK|CRLF|"))
+          (ascii "Transfer-Encoding: chunked|CRLF|Trailer: X-Checksum|CRLF||CRLF|3|CRLF|abc|CRLF|0|CRLF|X-Checksum: one|CRLF|")
+          (if duplicate-p (ascii "x-checksum: two|CRLF|") (octets))
+          (ascii "|CRLF|"))
+         wire)
+        (dolist (stream-p '(nil t))
+          (let ((source
+                  (if stream-p
+                      (make-instance 'binary-test-stream
+                                     :input (concatenate-octets wire (ascii "!")))
+                      wire))
+                (chunks nil))
+            (unwind-protect
+                 (let* ((parsed
+                          (funcall parser source :on-body-chunk
+                                   (lambda (chunk) (push chunk chunks))))
+                        (headers
+                          (if request-p (http-request-headers parsed)
+                              (http-response-headers parsed)))
+                        (parsed-trailers
+                          (if request-p (http-request-trailers parsed)
+                              (http-response-trailers parsed))))
+                   (ensure-equal '("X-Checksum")
+                                 (http-header-values headers "trailer"))
+                   (ensure-equal '("chunked")
+                                 (http-header-values headers "transfer-encoding"))
+                   (ensure-equal expected-values
+                                 (http-header-values parsed-trailers "X-CHECKSUM"))
+                   (ensure-equal expected-names
+                                 (mapcar #'http-header-name parsed-trailers))
+                   (ensure-octets-equal
+                    (ascii "abc")
+                    (if request-p (http-request-body parsed)
+                        (http-response-body parsed)))
+                   (ensure-equal 1 (length chunks))
+                   (ensure-octets-equal (ascii "abc") (first chunks))
+                   (when stream-p
+                     (ensure-equal (length wire)
+                                   (binary-test-input-position source))
+                     (ensure-equal (char-code #\!) (read-byte source))
+                     (ensure-equal :eof (read-byte source nil :eof))
+                     (ensure-octets-equal (octets) (binary-test-output source))))
+              (when stream-p (close source)))))))))
+
+#+sbcl
+(deftest http1-public-empty-chunked-response
+  (dolist (text '("" "abc"))
+    (let* ((body (ascii text))
+           (wire
+             (serialize-http-response
+              (make-http-response
+               :status 200 :body body
+               :headers (list (make-http-header "Transfer-Encoding" "chunked"))))))
+      (ensure-octets-equal
+       (concatenate-octets
+        (ascii "HTTP/1.1 200 OK|CRLF|Transfer-Encoding: chunked|CRLF||CRLF|")
+        (if (string= text "") (octets) (ascii "3|CRLF|abc|CRLF|"))
+        (ascii "0|CRLF||CRLF|"))
+       wire)
+      (dolist (stream-p '(nil t))
+        (dolist (collect-p '(t nil))
+          (let ((source
+                  (if stream-p
+                      (make-instance 'binary-test-stream
+                                     :input (concatenate-octets wire (ascii "!")))
+                      wire))
+                (chunks nil))
+            (unwind-protect
+                 (let ((response
+                         (parse-http-response
+                          source :collect-body-p collect-p
+                          :on-body-chunk (lambda (chunk) (push chunk chunks)))))
+                   (ensure-equal 200 (http-response-status response))
+                   (ensure-equal '("chunked")
+                                 (http-header-values
+                                  (http-response-headers response)
+                                  "transfer-encoding"))
+                   (ensure-equal '() (http-response-trailers response))
+                   (ensure-octets-equal (if collect-p body (octets))
+                                       (http-response-body response))
+                   (ensure-equal (if (string= text "") 0 1) (length chunks))
+                   (ensure-octets-equal body
+                                       (apply #'concatenate-octets chunks))
+                   (when stream-p
+                     (ensure-equal (length wire)
+                                   (binary-test-input-position source))
+                     (ensure-equal (char-code #\!) (read-byte source))
+                     (ensure-equal :eof (read-byte source nil :eof))
+                     (ensure-octets-equal (octets) (binary-test-output source))))
+              (when stream-p (close source)))))))))

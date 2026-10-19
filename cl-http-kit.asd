@@ -4,7 +4,7 @@
   :description "A portable, binary-safe HTTP client substrate."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.4.0"
+  :version "0.4.1"
   :depends-on ()
   :pathname "src"
   :serial t
@@ -41,7 +41,7 @@
   :description "Optional cl-observability-kit metrics for cl-http-kit."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.4.0"
+  :version "0.4.1"
   :depends-on ("cl-http-kit" "cl-observability-kit")
   :pathname "src"
   :serial t
@@ -53,7 +53,7 @@
   :description "The optional HTTP/2 transport for cl-http-kit."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.4.0"
+  :version "0.4.1"
   :depends-on ("cl-http-kit")
   :pathname "http2"
   :serial t
@@ -83,7 +83,7 @@
   :description "The high-level HTTP client policies and request orchestration layer."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.4.0"
+  :version "0.4.1"
   :depends-on ("cl-http-kit" "cl-codec-kit" "cl-deflate-kit")
   :pathname "client"
   :serial t
@@ -115,7 +115,7 @@
   :description "Optional native TCP and DNS boundary for cl-http-kit."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.4.0"
+  :version "0.4.1"
   :depends-on ("cl-http-kit")
   :pathname "network"
   :serial t
@@ -126,8 +126,9 @@
   :description "Optional cl-tls-kit TLS integration for cl-http-kit network streams."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.4.0"
-  :depends-on ("cl-http-kit/network" "cl-tls-kit" "cl-crypto-kit")
+  :version "0.4.1"
+  :depends-on ("cl-http-kit/network" (:version "cl-tls-kit" "0.1.2")
+               "cl-crypto-kit")
   :pathname "network"
   :serial t
   :components ((:file "tls")))
@@ -136,7 +137,7 @@
   :description "Optional HTTP/3 framing, QPACK, and injected QUIC transport boundary."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.4.0"
+  :version "0.4.1"
   :depends-on ("cl-http-kit" "cl-http-kit/http2" "cl-quic-kit")
   :pathname "http3"
   :serial t
@@ -149,7 +150,7 @@
 
 (asdf:defsystem "cl-http-kit/test-core"
   :description "Core tests for cl-http-kit without optional transport or client subsystems."
-  :version "0.4.0"
+  :version "0.4.1"
   :depends-on ("cl-http-kit"
                "cl-weave")
   :pathname "t"
@@ -178,7 +179,7 @@
 
 (asdf:defsystem "cl-http-kit/test"
   :description "Tests for cl-http-kit and its optional protocol and network systems."
-  :version "0.4.0"
+  :version "0.4.1"
   :depends-on ("cl-http-kit/test-core"
                "cl-http-kit/client"
                "cl-http-kit/http2"
@@ -191,17 +192,10 @@
   :serial t
   :components ((:file "package")
                (:file "support")
-               (:file "tests-utilities-boundaries")
-               (:file "tests-model-header-boundaries")
-               (:file "tests-model-contracts")
-               (:file "tests-stream-transport")
                (:file "tests-transport-cps")
                (:file "tests-observability")
-               (:file "tests-core")
-               (:file "tests-uri-boundaries")
-               (:file "tests-http1-boundaries")
-               (:file "tests-http1-parse-boundaries")
                (:file "tests-http1-server-boundaries")
+               (:file "tests-core-runtime-contract-boundaries")
                (:file "tests-hpack-boundaries")
                (:file "tests-boundaries")
                (:file "tests-http2-control-frame-boundaries")
@@ -217,16 +211,32 @@
                (:file "tests-http2-failure-boundaries")
                (:file "tests-http2-manager")
                (:file "tests-http2-server")
+               (:file "tests-http2-coverage-boundaries")
+               (:file "tests-http2-public-contract-boundaries")
                (:file "tests-http3")
-               (:file "tests-properties")
+               (:file "tests-http3-coverage-boundaries")
+               (:file "tests-http3-server-coverage-boundaries")
+               (:file "tests-http3-codec-coverage-boundaries")
+               (:file "tests-http3-adapter-contract-boundaries")
+               (:file "tests-http3-quic-adapter-contract")
+               (:file "tests-http3-peer-settings")
                (:file "tests-client")
+               (:file "tests-client-contract-boundaries")
+               (:file "tests-multipart-boundaries")
+               (:file "tests-cache-boundaries")
+               (:file "tests-cookie-boundaries")
                (:file "tests-client-content-coding")
+               (:file "tests-sse-boundaries")
+               (:file "tests-websocket-boundaries")
+               (:file "tests-websocket-public-contract-boundaries")
                (:file "tests-e2e-https")
                (:file "tests-e2e-http2")
                (:file "tests-e2e-auth")
                (:file "tests-e2e-proxy")
                (:file "tests-client-p6")
+               (:file "tests-runtime-coverage-boundaries")
                (:file "tests-network")
+               (:file "tests-network-tls-contract-boundaries")
                (:file "runner"))
   :perform (asdf:test-op (op c)
              (declare (ignore op c))

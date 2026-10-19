@@ -121,7 +121,7 @@
             (http-kit/http3:send-http3-request
              (http-kit/http3:http3-quic-adapter-http3-client adapter)
              request :timeout timeout :deadline deadline)
-      (ignore-errors
+      (ignore-errors ; paredit:ignore handler-case-swallows-error -- adapter cleanup must preserve the original request failure.
         (http-kit/http3:close-http3-quic-adapter adapter))))))
 
 (defun %make-loopback-client (port trust-anchor mode)

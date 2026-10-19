@@ -1,5 +1,27 @@
 (in-package #:http-kit/test-core)
 
+(deftest core-coverage-http1-stream-implicit-chunking
+  (let ((chunks (list (ascii "ab") (octets) (ascii "c") nil))
+        (calls 0))
+    (let ((wire
+            (ensure-http1-session-run
+             (ascii "GET /stream HTTP/1.1|CRLF|Host: example.test|CRLF||CRLF|")
+             (lambda (request)
+               (declare (ignore request))
+               (make-http-response-stream
+                :status 200
+                :body-function (lambda () (incf calls) (pop chunks))))
+             1 :eof :close-stream nil)))
+      (ensure-equal 4 calls)
+      (ensure-equal nil chunks)
+      (ensure-equal
+       (ascii "HTTP/1.1 200 OK|CRLF|Transfer-Encoding: chunked|CRLF||CRLF|2|CRLF|ab|CRLF|1|CRLF|c|CRLF|0|CRLF||CRLF|")
+       wire)
+      (let ((response (parse-http-response wire)))
+        (ensure-equal 200 (http-response-status response))
+        (ensure-equal "abc" (octets-as-string (http-response-body response)))
+        (ensure-equal nil (http-response-trailers response))))))
+
 (deftest http1-session-response-stream-known-length
   (let ((chunks (list (ascii "ab") (ascii "cd") nil)))
     (let ((wire

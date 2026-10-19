@@ -10,4 +10,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@v20
-      - run: nix flake check
+      # One build at a time: the HTTP/3 loopback in checks.test sends a 1 MiB
+      # upload under a 10 s timeout, and other check builds running beside it
+      # slowed the upload past that timeout.
+      - run: nix flake check --max-jobs 1

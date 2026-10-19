@@ -4,8 +4,8 @@ cl-http-kit is organized around a small protocol core and explicit integration
 boundaries. The registered ASDF systems share the HTTP-KIT message model where
 appropriate, while application-owned I/O remains outside the package.
 
-This describes the checked-in 0.4.0 architecture plus the current integration
-work. The high-level client can now assemble native TCP/TLS and a connection
+This describes the checked-in 0.4.1 architecture.
+The high-level client can assemble native TCP/TLS and a connection
 pool when no transport is supplied, and `http-client-send` accepts the
 URL-and-method convenience form.
 
@@ -78,13 +78,14 @@ table insertion plus encoder- and decoder-stream codecs, but does not
 synchronize those instruction streams automatically; callers must keep the
 peer tables synchronized before using dynamic references.
 
-The HTTP/3 system does not implement QUIC packet handling, TLS, ALPN, native
-socket setup, automatic peer unidirectional-stream acceptance, connection-level
-stream dispatch, or a native HTTP/3 listener. It provides APIs for callers to
-classify and process peer unidirectional streams. The cl-quic-kit adapter
-supplies the client connection and bidirectional stream lifecycle at this
-boundary; the surrounding application still supplies socket and certificate
-policy.
+The framing boundary does not implement QUIC packet handling, TLS, ALPN,
+native socket setup, or a native HTTP/3 listener. It provides APIs for callers
+to classify and process peer unidirectional streams. The cl-quic-kit adapter
+supplies the client connection and bidirectional stream lifecycle. During
+construction it also classifies available peer unidirectional streams and
+reads the peer control stream until SETTINGS arrive. This initialization does
+not provide ongoing connection-level stream dispatch or server acceptance;
+the surrounding application still supplies socket and certificate policy.
 
 The implementation is split by responsibility: `transport.lisp` owns shared
 control-stream, frame, settings, and header helpers; `transport.lisp` also owns
@@ -113,8 +114,10 @@ can still keep socket creation, DNS, TLS, and ALPN at the application boundary.
 The URL-and-method convenience path runs over these layers. `make-http-client`
 and `http-client-send` stay as compatibility entry points. If the client
 receives an Alt-Svc `h3` alternative and the caller supplies
-`:http3-transport-function`, it attempts HTTP/3 and falls back to TCP when the
-QUIC attempt fails. Explicit HTTP/3 requests do not fall back. The HTTP/3
+`:http3-transport-function`, it attempts HTTP/3. TCP fallback requires an
+`http-connection-error` with `http-connection-error-request-sent-p` false,
+before any request-body producer or response callback has run. Other failures
+propagate. Explicit HTTP/3 requests do not fall back. The HTTP/3
 layer remains an injected QUIC stream boundary so applications retain socket,
 TLS, and certificate policy.
 

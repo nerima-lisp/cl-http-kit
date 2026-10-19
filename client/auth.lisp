@@ -97,8 +97,7 @@
                             (<= 35 code 91) (<= 93 code 126)
                             (>= code 128))
                         (write-char character output))
-                       (t (return-from %auth-unquote nil)))
-              finally (when escaped-p (return-from %auth-unquote nil))))
+                       (t (return-from %auth-unquote nil)))))
       (and (http-kit::%token-p value) value)))
 
 (defun %auth-parameter (part)
@@ -107,7 +106,7 @@
       (let ((name (%auth-trim (subseq part 0 equals)))
             (value (%auth-trim (subseq part (1+ equals)))))
         (let ((decoded (%auth-unquote value)))
-          (when (and (http-kit::%token-p name) decoded)
+          (when decoded
             (cons name decoded)))))))
 
 (defun %auth-parse-challenge (parts)
@@ -376,8 +375,7 @@
     (unless (zerop (mod length 4))
       (return-from %base64-decode-octets nil))
     (let* ((padding (cond ((char= (char value (1- length)) #\=)
-                           (if (and (> length 1)
-                                    (char= (char value (- length 2)) #\=))
+                           (if (char= (char value (- length 2)) #\=)
                                2 1))
                           (t 0)))
            (result (make-array (- (* (/ length 4) 3) padding)
@@ -404,10 +402,9 @@
                  (return-from %base64-decode-octets nil))
                (let ((combined (+ (ash a 18) (ash b 12)
                                   (ash (or c 0) 6) (or d 0))))
-                 (when (< output-index (length result))
-                   (setf (aref result output-index)
-                         (ldb (byte 8 16) combined))
-                   (incf output-index))
+                 (setf (aref result output-index)
+                       (ldb (byte 8 16) combined))
+                 (incf output-index)
                  (when (< output-index (length result))
                    (setf (aref result output-index)
                          (ldb (byte 8 8) combined))
@@ -477,9 +474,7 @@
         (length (length value))
         (keys nil))
     (loop while (< index length)
-          do (unless (char= (char value index) #\;)
-               (return-from %structured-field-parameters-p nil))
-             (incf index)
+          do (incf index)
              (let ((start index))
                (loop while (and (< index length)
                                 (not (find (char value index) "=;"
@@ -547,12 +542,13 @@
     (nreverse members)))
 
 (defun %constant-time-octets= (left right)
+  ;; The sole caller validates the member's length against the digest algorithm.
   (let ((difference (logxor (length left) (length right))))
-    (dotimes (index (max (length left) (length right)) (zerop difference))
+    (dotimes (index (length left) (zerop difference))
       (setf difference
             (logior difference
-                    (logxor (if (< index (length left)) (aref left index) 0)
-                            (if (< index (length right)) (aref right index) 0)))))))
+                    (logxor (aref left index)
+                            (aref right index)))))))
 
 (defun http-content-digest (content &key (algorithm :sha-256))
   "Return an RFC 9530 Content-Digest field value for CONTENT."

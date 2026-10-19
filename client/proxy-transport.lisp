@@ -32,8 +32,6 @@
     byte))
 
 (defun %proxy-read-exact (stream count deadline clock-function)
-  (unless (and (integerp count) (>= count 0))
-    (%proxy-error "The proxy read length must be a non-negative integer." count))
   (let ((result (make-array count :element-type '(unsigned-byte 8))))
     (dotimes (index count result)
       (setf (aref result index)
@@ -53,8 +51,6 @@
               :fill-pointer 0))
 
 (defun %proxy-builder-byte (builder byte)
-  (unless (and (integerp byte) (<= 0 byte 255))
-    (%proxy-error "A proxy negotiation byte is outside the octet range." byte))
   (vector-push-extend byte builder)
   builder)
 
@@ -101,25 +97,16 @@
           (%proxy-builder-byte builder (length octets))
           (%proxy-builder-octets builder octets)
           builder))
-        (let ((address (%proxy-resolved-address host resolve-host
-                                                timeout deadline resolve-host-style)))
+      (let ((address (%proxy-resolved-address host resolve-host
+                                              timeout deadline resolve-host-style)))
         (unless address
           (%proxy-error
            "A numeric address or a local resolver is required for SOCKS5."
            host))
-        (cond
-          ((= (length address) 4)
-           (let ((builder (%proxy-byte-builder)))
-             (%proxy-builder-byte builder 1)
-             (%proxy-builder-octets builder address)
-             builder))
-          ((= (length address) 16)
-           (let ((builder (%proxy-byte-builder)))
-             (%proxy-builder-byte builder 4)
-             (%proxy-builder-octets builder address)
-             builder))
-          (t (%proxy-error "The SOCKS5 address has an unsupported length.
-"                            (length address)))))))
+        (let ((builder (%proxy-byte-builder)))
+          (%proxy-builder-byte builder (if (= (length address) 4) 1 4))
+          (%proxy-builder-octets builder address)
+          builder))))
 
 (defun %proxy-socks-negotiate
     (stream proxy-plan timeout deadline clock-function resolve-host
@@ -414,25 +401,14 @@ SOCKS5H) proxy is selected."
                    :detail resolve-host-style
                    :operation :proxy))
   (lambda (request &key timeout deadline proxy-plan proxy)
-    (let ((stream nil)
-          (retained-p nil))
-      (handler-case
-          (unwind-protect
-               (progn
-                 (setf stream
-                       (%proxy-open-plan
-                        open-stream close-stream request proxy-plan proxy tls-upgrade
-                        resolve-host resolve-host-style timeout deadline
-                        clock-function))
-                 (setf retained-p t)
-                 stream)
-            (unless retained-p
-              (when stream
-                (http-kit::%with-http-cleanup
-                  (funcall close-stream stream)))))
-        (http-error (condition)
-          (error condition))
-        (error (condition)
-          (%proxy-error "Proxy negotiation signaled an error."
-                        (%proxy-public-plan proxy-plan)
-                        condition))))))
+    ;; Each attempt owns its stream until negotiation succeeds.
+    (handler-case
+        (%proxy-open-plan
+         open-stream close-stream request proxy-plan proxy tls-upgrade
+         resolve-host resolve-host-style timeout deadline clock-function)
+      (http-error (condition)
+        (error condition))
+      (error (condition)
+        (%proxy-error "Proxy negotiation signaled an error."
+                      (%proxy-public-plan proxy-plan)
+                      condition)))))

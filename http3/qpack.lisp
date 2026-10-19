@@ -21,11 +21,12 @@
   (latest-streams (make-hash-table :test #'eql) :type hash-table))
 
 (defstruct (http3-qpack-blocked-stream
-             (:constructor %make-http3-qpack-blocked-stream))
+             (:constructor %make-http3-qpack-blocked-stream
+                 (stream-id required-insert-count resume-function serialize context)))
   (stream-id 0 :type integer)
   (required-insert-count 0 :type integer)
   (resume-function nil :type function)
-  (serialize (lambda (thunk) (funcall thunk)) :type function)
+  (serialize nil :type function)
   (context nil :type http3-qpack-decoder-context)
   (state :blocked :type symbol))
 
@@ -56,11 +57,8 @@
     (when existing-latest
       (setf (http3-qpack-blocked-stream-state existing-latest) :invalid))
     (let ((blocked (%make-http3-qpack-blocked-stream
-                    :stream-id stream-id
-                    :required-insert-count required-insert-count
-                    :resume-function resume-function
-                    :serialize serialize
-                    :context context)))
+                    stream-id required-insert-count resume-function serialize
+                    context)))
       (setf (gethash stream-id streams) blocked
             (gethash stream-id latest-streams) blocked)
       blocked)))
@@ -344,14 +342,15 @@ present in this table."
   (let* ((sections (qpack-decoder-stream-state-outstanding-sections state))
          (outstanding (gethash stream-id sections))
          (references (remove-duplicates referenced-indices))
+         (section (cons required-insert-count references))
          (protected
            (qpack-dynamic-table-protected-indices
             (qpack-decoder-stream-state-dynamic-table state))))
     (dolist (index references)
-      (incf (gethash index protected 0)))
+      ;; Track section identity so releasing one owner preserves shared entries.
+      (push section (gethash index protected)))
     (setf (gethash stream-id sections)
-          (append outstanding
-                  (list (cons required-insert-count references)))))
+          (append outstanding (list section))))
   state)
 
 (defun %qpack-release-section (state section)
@@ -359,12 +358,10 @@ present in this table."
           (qpack-dynamic-table-protected-indices
            (qpack-decoder-stream-state-dynamic-table state))))
     (dolist (index (cdr section))
-      (let ((count (gethash index protected)))
-        (unless (plusp count)
-          (%qpack-error "QPACK dynamic-reference state is invalid." index))
-        (if (= count 1)
-            (remhash index protected)
-            (setf (gethash index protected) (1- count)))))))
+      (let ((owners (remove section (gethash index protected) :test #'eq)))
+        (if owners
+            (setf (gethash index protected) owners)
+            (remhash index protected))))))
 
 (defun %qpack-evict-oldest (table)
   (let* ((entries (qpack-dynamic-table-entries table))
@@ -480,18 +477,16 @@ current capacity, as required by RFC 9204."
                    field))))
 
 (defun %qpack-valid-name-p (name)
-  (and (stringp name)
-       (plusp (length name))
-       (loop for character across name
-             for code = (char-code character)
-             for valid = (or (and (>= code (char-code #\a))
-                                  (<= code (char-code #\z)))
-                             (and (>= code (char-code #\0))
-                                  (<= code (char-code #\9)))
-                             (member character '(#\! #\# #\$ #\% #\& #\' #\* #\+
-                                                   #\- #\. #\^ #\_ #\` #\| #\~)
-                                     :test #'char=))
-             always valid)))
+  (loop for character across name
+        for code = (char-code character)
+        for valid = (or (and (>= code (char-code #\a))
+                             (<= code (char-code #\z)))
+                        (and (>= code (char-code #\0))
+                             (<= code (char-code #\9)))
+                        (member character '(#\! #\# #\$ #\% #\& #\' #\* #\+
+                                              #\- #\. #\^ #\_ #\` #\| #\~)
+                                :test #'char=))
+        always valid))
 
 (defun %qpack-normalize-name (name)
   (unless (stringp name)
@@ -527,9 +522,7 @@ current capacity, as required by RFC 9204."
         (push (cons name value) result)))))
 
 (defun %qpack-static-entry (index)
-  (when (and (integerp index)
-             (<= 0 index)
-             (< index (length +qpack-static-table+)))
+  (when (< index (length +qpack-static-table+))
     (aref +qpack-static-table+ index)))
 
 (defun %qpack-static-index (name value)
@@ -550,11 +543,6 @@ current capacity, as required by RFC 9204."
           :test #'string=))
 
 (defun %qpack-dynamic-entry-at-relative (table index)
-  (unless (and (qpack-dynamic-table-p table)
-               (integerp index)
-               (>= index 0))
-    (%qpack-error "QPACK dynamic-table relative indexes must be non-negative integers."
-                  index))
   (or (nth index (qpack-dynamic-table-entries table))
       (%qpack-error "QPACK dynamic-table relative index is unavailable." index)))
 
@@ -950,13 +938,12 @@ coding."
           (%qpack-error
            "QPACK field section references an entry at or after its required count."
            absolute-index))
-        (let ((entry (%qpack-dynamic-entry-at-absolute
-                      dynamic-table absolute-index)))
-          (unless (< absolute-index
-                     (qpack-dynamic-table-insert-count dynamic-table))
-            (%qpack-error "QPACK dynamic-table entry is not yet inserted."
-                          absolute-index))
-          entry))))
+        (when (and dynamic-table
+                   (>= absolute-index
+                       (qpack-dynamic-table-insert-count dynamic-table)))
+          (%qpack-error "QPACK dynamic-table entry is not yet inserted."
+                        absolute-index))
+        (%qpack-dynamic-entry-at-absolute dynamic-table absolute-index))))
 
 (defun qpack-decode-field-section
     (octets &key dynamic-table max-table-capacity
@@ -1082,7 +1069,7 @@ QPACK-BLOCKED-FIELD-SECTION."
                        (%qpack-field-entry
                         dynamic-table nil index base required-insert-count t))
                       (setf position next)))
-                   ((= (logand first #xf0) 0)
+                   (t
                     (multiple-value-bind (index next)
                         (http-kit/http2::%hpack-read-integer octets position 3)
                       (let ((entry
@@ -1091,11 +1078,7 @@ QPACK-BLOCKED-FIELD-SECTION."
                         (multiple-value-bind (value after-value)
                             (%qpack-decode-string octets next 7 #x80)
                           (append-field (qpack-dynamic-entry-name entry) value)
-                          (setf position after-value)))))
-                   (t
-                    (%qpack-error
-                     "QPACK field representation has an invalid prefix."
-                     first)))
+                          (setf position after-value))))))
                  (check-limits)))
     (nreverse fields))))
 
@@ -1105,10 +1088,6 @@ QPACK-BLOCKED-FIELD-SECTION."
 Returns two values: an event list and the consumed position.  The parser is
 intentionally strict and signals when OCTETS ends in the middle of an
 instruction; stream buffering belongs to the HTTP/3 transport."
-  (unless (qpack-dynamic-table-p table)
-    (%qpack-error "A QPACK dynamic table object is required." table))
-  (unless (%http3-octet-vector-p octets)
-    (%qpack-error "QPACK encoder streams must be octet vectors." (type-of octets)))
   (let ((position 0)
         (events '()))
     (loop while (< position (length octets))
@@ -1187,9 +1166,8 @@ instruction; stream buffering belongs to the HTTP/3 transport."
                   (http-kit/http2::%hpack-read-integer octets position 5))))))
 
 (defun %qpack-truncated-error-p (condition)
-  (and (typep condition 'http-protocol-error)
-       (search "truncated" (http-kit:http-error-message condition)
-               :test #'char-equal)))
+  (search "truncated" (http-kit:http-error-message condition)
+          :test #'char-equal))
 
 (defun qpack-process-encoder-stream
     (table octets &key allow-incomplete-p
@@ -1225,12 +1203,9 @@ partial instruction is left unconsumed so transports can buffer it."
                (when (> (- end position) max-instruction-bytes)
                  (%qpack-error "QPACK encoder instruction exceeds its configured limit."
                                (- end position)))
-               (multiple-value-bind (instruction-events consumed)
-                   (%qpack-process-complete-encoder-stream
-                    table (subseq octets position end))
-                 (unless (= consumed (- end position))
-                   (%qpack-error "QPACK encoder instruction was not fully consumed."
-                                 consumed))
+               (let ((instruction-events
+                       (%qpack-process-complete-encoder-stream
+                        table (subseq octets position end))))
                  (setf events (nconc events instruction-events)
                        position end))))
     (when (and allow-incomplete-p

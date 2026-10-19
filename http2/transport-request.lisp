@@ -93,13 +93,6 @@
    (lambda (header)
      (let* ((name (string-downcase (http-kit:http-header-name header)))
             (value (http-kit:http-header-content header)))
-       (when (or (string= name "")
-                 (char= (char name 0) #\:))
-         (error 'http-kit:http-invalid-header
-                :message "HTTP/2 request trailers cannot contain pseudo-header fields."
-                :operation :http2-trailers
-                :name name
-                :reason :pseudo-field))
        (when (http-kit::%forbidden-trailer-field-name-p name)
          (error 'http-kit:http-invalid-header
                 :message "The field definition does not permit this HTTP/2 request trailer."

@@ -452,6 +452,116 @@
         (ensure-equal :eof reason)
         (ensure-equal '("/first" "/second") (nreverse targets)))))
 
+  (deftest http2-server-pending-control-preserves-stream-order
+    (flet ((headers (id target flags)
+             (h2-frame 1 flags id
+                       (h2-header-block (cons ":method" "GET")
+                                        (cons ":scheme" "https")
+                                        (cons ":authority" "example.com")
+                                        (cons ":path" target)))))
+      (dolist (case '((nil nil) (t nil) (nil t) (nil :after-update)))
+        (destructuring-bind (end-stream reset) case
+          (dolist (read-ahead '(nil t))
+            (let* ((first-update (h2-frame 8 0 1 (octets 0 0 0 1)))
+                   (second-control
+                     (if reset
+                         (concatenate-octets
+                          (if (eq reset :after-update)
+                              (h2-frame 8 0 3 (octets 0 0 0 1))
+                              (octets))
+                          (h2-frame 3 0 3 (octets 0 0 0 8)))
+                         (h2-frame 8 0 3 (octets 0 0 0 1))))
+                   (input
+                     (concatenate-octets
+                      (h2-preface)
+                      (h2-frame 4 0 0 (octets 0 4 0 0 0 1))
+                      (headers 1 "/first" 5)
+                      (if read-ahead (octets) first-update)
+                      (headers 3 "/second" (if end-stream 5 4))
+                      second-control
+                      (if read-ahead first-update (octets))
+                      (if (or end-stream reset)
+                          (octets)
+                          (h2-frame 0 1 3 (octets)))))
+                   (stream (make-instance 'binary-session-stream :input input))
+                   (targets '())
+                   (closed 0))
+              (multiple-value-bind (count reason)
+                  (http-kit/http2:serve-http2-session
+                   stream
+                   (lambda (request)
+                     (push (http-request-target request) targets)
+                     (make-http-response :status 200 :body (ascii "xy")))
+                   :close-stream (lambda (closed-stream)
+                                   (ensure-equal stream closed-stream)
+                                   (incf closed)))
+                (ensure-equal (if reset 1 2) count)
+                (ensure-equal :eof reason))
+              (ensure-equal 1 closed)
+              (ensure-equal (if reset '("/first") '("/first" "/second"))
+                            (nreverse targets))
+              (let* ((frames (server-output-frames (binary-session-output stream)))
+                     (data (remove-if-not
+                            (lambda (frame)
+                              (= 0 (http-kit/http2::%h2-frame-type frame)))
+                            frames)))
+                (ensure-false (find 7 frames :key #'http-kit/http2::%h2-frame-type))
+                (ensure-equal (cond (reset '((1 "x") (1 "y")))
+                                    (end-stream '((1 "x") (1 "y") (3 "x") (3 "y")))
+                                    (t '((1 "x") (1 "y") (3 "xy"))))
+                              (mapcar
+                               (lambda (frame)
+                                 (list (http-kit/http2::%h2-frame-stream-id frame)
+                                       (octets-as-string
+                                        (http-kit/http2::%h2-frame-payload frame))))
+                               data)))))))))
+
+  (deftest http2-server-pending-control-rejects-header-interleaving
+    (let ((block (h2-header-block (cons ":method" "GET")
+                                 (cons ":scheme" "https")
+                                 (cons ":authority" "example.com")
+                                 (cons ":path" "/second"))))
+      (dolist (control (list (h2-frame 4 0 0 (octets 0 4 0 0 0 2))
+                            (h2-frame 6 0 0 (ascii "12345678"))
+                            (h2-frame 8 0 1 (octets 0 0 0 1))
+                            (h2-frame 3 0 1 (octets 0 0 0 8))
+                            (h2-frame 7 0 0 (octets 0 0 0 1 0 0 0 0))))
+        (dolist (blocked '(nil t))
+          (let* ((input
+                   (concatenate-octets
+                    (server-peer-window-request 1)
+                    (h2-frame 1 1 3 (subseq block 0 1))
+                    control
+                    (h2-frame 9 4 3 (subseq block 1))
+                    (h2-frame 8 0 1 (octets 0 0 0 1))))
+                 (stream (make-instance 'binary-session-stream :input input))
+                 (targets '())
+                 (observed nil)
+                 (closed 0))
+            (handler-case
+                (http-kit/http2:serve-http2-session
+                 stream
+                 (lambda (request)
+                   (push (http-request-target request) targets)
+                   (if blocked
+                       (make-http-response :status 200 :body (ascii "xy"))
+                       (make-http-response :status 204)))
+                 :close-stream (lambda (closed-stream)
+                                 (ensure-equal stream closed-stream)
+                                 (incf closed)))
+              (http-protocol-error (condition) (setf observed condition)))
+            (ensure-true (typep observed 'http-protocol-error))
+            (ensure-equal "HTTP/2 HEADERS must be followed by same-stream CONTINUATION frames."
+                          (http-kit:http-error-message observed))
+            (ensure-equal 1 closed)
+            (ensure-equal '("/") (nreverse targets))
+            (let* ((frames (server-output-frames (binary-session-output stream)))
+                   (goaway (find 7 frames :key #'http-kit/http2::%h2-frame-type)))
+              (ensure-true goaway)
+              (ensure-equal 1 (http-kit/http2::%h2-u32
+                               (http-kit/http2::%h2-frame-payload goaway) 4))
+              (ensure-false (find 6 frames :key #'http-kit/http2::%h2-frame-type))))))))
+
   (deftest http2-server-sends-goaway-at-max-requests
     (let* ((input (concatenate-octets
                    (h2-preface)
@@ -734,6 +844,488 @@
                       (http-kit/http2::%h2-u32
                        (http-kit/http2::%h2-frame-payload goaway) 4)))))
 
+#+sbcl
+(deftest http2-server-response-stream-materializes-chunks-before-end-stream
+  (let* ((input (concatenate-octets
+                 (h2-preface)
+                 (h2-frame 4 0 0 (octets))
+                 (h2-frame 1 5 1
+                           (h2-header-block
+                            (cons ":method" "GET")
+                            (cons ":scheme" "https")
+                            (cons ":authority" "example.com")
+                            (cons ":path" "/stream")))))
+         (stream (make-instance 'binary-session-stream :input input))
+         (chunks (list (octets 97 98) (octets 99) nil))
+         (producer-calls 0)
+         (handled 0)
+         (closed 0)
+         (errors 0))
+    (ensure-true (open-stream-p stream))
+    (multiple-value-bind (count reason)
+        (http-kit/http2:serve-http2-session
+         stream
+         (lambda (request)
+           (incf handled)
+           (ensure-equal "GET" (http-request-method request))
+           (ensure-equal "/stream" (http-request-target request))
+           (make-http-response-stream
+            :status 200 :body-length 3
+            :body-function (lambda ()
+                             (incf producer-calls)
+                             (pop chunks))))
+         :on-error (lambda (condition request)
+                     (declare (ignore condition request))
+                     (incf errors))
+         :close-stream (lambda (closed-stream)
+                         (ensure-true (eq stream closed-stream))
+                         (incf closed)
+                         (close closed-stream)))
+      (ensure-equal 1 count)
+      (ensure-equal :eof reason))
+    (ensure-equal 1 handled)
+    (ensure-equal 3 producer-calls)
+    (ensure-false chunks)
+    (ensure-equal 0 errors)
+    (ensure-equal 1 closed)
+    (ensure-false (open-stream-p stream))
+    (ensure-equal (length input) (binary-session-input-position stream))
+    (let* ((frames (server-output-frames (binary-session-output stream)))
+           (headers (remove-if-not
+                     (lambda (frame) (= 1 (http-kit/http2::%h2-frame-type frame)))
+                     frames))
+           (data (remove-if-not
+                  (lambda (frame) (= 0 (http-kit/http2::%h2-frame-type frame)))
+                  frames)))
+      (ensure-equal 1 (length headers))
+      (ensure-equal 1 (length data))
+      (ensure-equal 1 (http-kit/http2::%h2-frame-stream-id (first headers)))
+      (ensure-equal 4 (http-kit/http2::%h2-frame-flags (first headers)))
+      (ensure-equal "200"
+                    (cdr (assoc ":status" (server-response-fields (first headers))
+                                :test #'string=)))
+      (ensure-equal 1 (http-kit/http2::%h2-frame-stream-id (first data)))
+      (ensure-equal "abc"
+                    (octets-as-string
+                     (http-kit/http2::%h2-frame-payload (first data))))
+      (ensure-equal 1 (http-kit/http2::%h2-frame-flags (first data)))
+      (ensure-false (find 7 frames :key #'http-kit/http2::%h2-frame-type)))))
+
+#+sbcl
+(deftest http2-server-response-stream-length-mismatch-precedes-response-wire
+  (let* ((input (concatenate-octets
+                 (h2-preface)
+                 (h2-frame 4 0 0 (octets))
+                 (h2-frame 1 5 1
+                           (h2-header-block
+                            (cons ":method" "GET")
+                            (cons ":scheme" "https")
+                            (cons ":authority" "example.com")
+                            (cons ":path" "/stream")))))
+         (stream (make-instance 'binary-session-stream :input input))
+         (chunks (list (octets 97 98) (octets 99) nil))
+         (producer-calls 0)
+         (handled 0)
+         (closed 0)
+         (error-calls 0)
+         (seen-request nil)
+         (notified nil)
+         (observed nil))
+    (ensure-true (open-stream-p stream))
+    (signals http-protocol-error
+      (handler-bind ((http-protocol-error
+                       (lambda (condition) (setf observed condition))))
+        (http-kit/http2:serve-http2-session
+         stream
+         (lambda (request)
+           (incf handled)
+           (setf seen-request request)
+           (make-http-response-stream
+            :status 200 :body-length 2
+            :body-function (lambda ()
+                             (incf producer-calls)
+                             (pop chunks))))
+         :on-error (lambda (condition request)
+                     (incf error-calls)
+                     (setf notified condition)
+                     (ensure-true (eq seen-request request)))
+         :close-stream (lambda (closed-stream)
+                         (ensure-true (eq stream closed-stream))
+                         (incf closed)
+                         (close closed-stream)))))
+    (ensure-equal 1 handled)
+    (ensure-equal "GET" (http-request-method seen-request))
+    (ensure-equal "/stream" (http-request-target seen-request))
+    (ensure-equal 3 producer-calls)
+    (ensure-false chunks)
+    (ensure-equal 1 error-calls)
+    (ensure-true (typep observed 'http-protocol-error))
+    (ensure-true (eq observed notified))
+    (ensure-equal :http2-server (http-kit:http-error-operation observed))
+    (ensure-equal '(2 3) (http-kit:http-protocol-error-detail observed))
+    (ensure-equal 1 closed)
+    (ensure-false (open-stream-p stream))
+    (ensure-equal (length input) (binary-session-input-position stream))
+    (let* ((frames (server-output-frames (binary-session-output stream)))
+           (goaways (remove-if-not
+                     (lambda (frame) (= 7 (http-kit/http2::%h2-frame-type frame)))
+                     frames)))
+      (ensure-false (find 1 frames :key #'http-kit/http2::%h2-frame-type))
+      (ensure-false (find 0 frames :key #'http-kit/http2::%h2-frame-type))
+      (ensure-equal 1 (length goaways))
+      (ensure-equal 0 (http-kit/http2::%h2-frame-stream-id (first goaways)))
+      (ensure-equal 1 (http-kit/http2::%h2-u32
+                       (http-kit/http2::%h2-frame-payload (first goaways)) 0))
+      (ensure-equal 1 (http-kit/http2::%h2-u32
+                       (http-kit/http2::%h2-frame-payload (first goaways)) 4)))))
+
+#+sbcl
+(deftest http2-server-preflight-rejects-options-before-session-ownership
+  (let ((input (concatenate-octets
+                (h2-preface)
+                (h2-frame 4 0 0 (octets))
+                (h2-frame 1 5 1
+                          (h2-header-block
+                           (cons ":method" "GET")
+                           (cons ":scheme" "https")
+                           (cons ":authority" "example.com")
+                           (cons ":path" "/"))))))
+    (dolist (case '((:handler :invalid)
+                    (:close-stream :invalid)
+                    (:on-error :invalid)
+                    (:on-body-chunk :invalid)
+                    (:default-authority 42)
+                    (:max-requests -1)
+                    (:max-requests 1/2)
+                    (:collect-body-p :invalid)
+                    (:enable-connect-p :invalid)))
+      (destructuring-bind (option invalid) case
+        (let* ((stream (make-instance 'binary-session-stream :input input))
+               (handler-calls 0)
+               (body-calls 0)
+               (error-calls 0)
+               (close-calls 0)
+               (observed nil)
+               (handler (lambda (request)
+                          (declare (ignore request))
+                          (incf handler-calls)
+                          (make-http-response :status 200 :body (ascii "ok"))))
+               (options
+                 (list :close-stream (lambda (closed-stream)
+                                       (incf close-calls)
+                                       (close closed-stream))
+                       :on-error (lambda (condition request)
+                                   (declare (ignore condition request))
+                                   (incf error-calls))
+                       :on-body-chunk (lambda (state chunk)
+                                        (declare (ignore state chunk))
+                                        (incf body-calls))
+                       :default-authority "example.com"
+                       :max-requests nil
+                       :collect-body-p t
+                       :enable-connect-p nil)))
+          (if (eq option :handler)
+              (setf handler invalid)
+              (setf (getf options option) invalid))
+          (unwind-protect
+               (progn
+                 (handler-case
+                     (apply #'http-kit/http2:serve-http2-session
+                            stream handler options)
+                   (http-protocol-error (condition)
+                     (setf observed condition)))
+                 (ensure-true (typep observed 'http-protocol-error))
+                 (ensure-equal :http2-server
+                               (http-kit:http-error-operation observed))
+                 (ensure-equal invalid
+                               (http-kit:http-protocol-error-detail observed))
+                 (ensure-equal 0 handler-calls)
+                 (ensure-equal 0 body-calls)
+                 (ensure-equal 0 error-calls)
+                 (ensure-equal 0 close-calls)
+                 (ensure-equal 0 (binary-session-input-position stream))
+                 (ensure-equal 0 (length (binary-session-output stream)))
+                 (ensure-true (open-stream-p stream)))
+            (when (open-stream-p stream)
+              (close stream)))
+          (ensure-false (open-stream-p stream)))))
+    (let ((stream (make-instance 'binary-session-stream :input input))
+          (handler-calls 0)
+          (body-calls 0)
+          (error-calls 0)
+          (close-calls 0)
+          (seen-request nil))
+      (unwind-protect
+           (multiple-value-bind (count reason)
+               (http-kit/http2:serve-http2-session
+                stream
+                (lambda (request)
+                  (incf handler-calls)
+                  (setf seen-request request)
+                  (make-http-response :status 200 :body (ascii "ok")))
+                :default-authority "example.com"
+                :max-requests nil
+                :collect-body-p t
+                :enable-connect-p nil
+                :on-body-chunk (lambda (state chunk)
+                                 (declare (ignore state chunk))
+                                 (incf body-calls))
+                :on-error (lambda (condition request)
+                            (declare (ignore condition request))
+                            (incf error-calls))
+                :close-stream (lambda (closed-stream)
+                                (incf close-calls)
+                                (ensure-true (eq stream closed-stream))
+                                (close closed-stream)))
+             (ensure-equal 1 count)
+             (ensure-equal :eof reason)
+             (ensure-equal 1 handler-calls)
+             (ensure-equal 0 body-calls)
+             (ensure-equal 0 error-calls)
+             (ensure-equal 1 close-calls)
+             (ensure-false (open-stream-p stream))
+             (ensure-equal (length input)
+                           (binary-session-input-position stream))
+             (ensure-equal "GET" (http-request-method seen-request))
+             (ensure-equal "/" (http-request-target seen-request))
+             (let* ((frames (server-output-frames
+                             (binary-session-output stream)))
+                    (settings (remove-if-not
+                               (lambda (frame)
+                                 (= 4 (http-kit/http2::%h2-frame-type frame)))
+                               frames))
+                    (headers (find 1 frames
+                                   :key #'http-kit/http2::%h2-frame-type))
+                    (data (find 0 frames
+                                :key #'http-kit/http2::%h2-frame-type)))
+               (ensure-equal 2 (length settings))
+               (ensure-equal '(0 1)
+                             (mapcar #'http-kit/http2::%h2-frame-flags settings))
+               (ensure-true headers)
+               (ensure-true data)
+               (ensure-equal "200"
+                             (cdr (assoc ":status" (server-response-fields headers)
+                                         :test #'string=)))
+               (ensure-equal 1 (http-kit/http2::%h2-frame-stream-id headers))
+               (ensure-equal 1 (http-kit/http2::%h2-frame-stream-id data))
+               (ensure-equal "ok"
+                             (octets-as-string
+                              (http-kit/http2::%h2-frame-payload data)))
+               (ensure-equal 1 (logand 1 (http-kit/http2::%h2-frame-flags data)))))
+        (when (open-stream-p stream)
+          (close stream)))
+      (ensure-false (open-stream-p stream)))))
+
+#+sbcl
+(progn
+  (defclass server-credit-observer-stream (binary-session-stream)
+    ((boundary :initarg :boundary :reader server-credit-boundary)
+     (before-credit-output :initform nil :accessor server-before-credit-output)
+     (boundary-reads :initform 0 :accessor server-credit-boundary-reads)))
+
+  (defmethod sb-gray:stream-read-sequence :before
+      ((stream server-credit-observer-stream) sequence &optional (start 0) end)
+    (declare (ignore sequence start end))
+    (when (= (binary-session-input-position stream)
+             (server-credit-boundary stream))
+      (incf (server-credit-boundary-reads stream))
+      (setf (server-before-credit-output stream)
+            (copy-seq (binary-session-output stream)))))
+
+  (defun server-peer-window-request (window)
+    (concatenate-octets
+     (h2-preface)
+     (h2-frame 4 0 0 (octets 0 4 0 0 0 window))
+     (h2-frame 1 5 1
+               (h2-header-block (cons ":method" "GET")
+                                (cons ":scheme" "https")
+                                (cons ":authority" "example.com")
+                                (cons ":path" "/")))))
+
+  (deftest http2-server-peer-window-zero-blocks-data-at-eof
+    (let ((stream (make-instance 'binary-session-stream
+                                 :input (server-peer-window-request 0)))
+          (observed nil)
+          (handled 0)
+          (closed 0))
+      (signals http-protocol-error
+        (handler-bind ((http-protocol-error
+                         (lambda (condition) (setf observed condition))))
+          (http-kit/http2:serve-http2-session
+           stream
+           (lambda (request)
+             (declare (ignore request))
+             (incf handled)
+             (make-http-response :status 200 :body (ascii "ok")))
+           :close-stream (lambda (closed-stream)
+                           (ensure-equal stream closed-stream)
+                           (incf closed)))))
+      (ensure-equal 1 handled)
+      (ensure-equal 1 closed)
+      (ensure-true (typep observed 'http-protocol-error))
+      (ensure-equal :http2-server (http-kit:http-error-operation observed))
+      (ensure-equal "HTTP/2 peer closed while response was flow-control blocked"
+                    (http-kit:http-error-message observed))
+      (let ((state (http-kit:http-protocol-error-detail observed)))
+        (ensure-equal 1 (http-kit/http2::%h2-server-stream-id state))
+        (ensure-equal 0 (http-kit/http2::%h2-server-stream-send-window state))
+        (ensure-false (http-kit/http2::%h2-server-stream-responded-p state)))
+      (let* ((frames (server-output-frames (binary-session-output stream)))
+             (headers (find 1 frames :key #'http-kit/http2::%h2-frame-type))
+             (goaway (find 7 frames :key #'http-kit/http2::%h2-frame-type)))
+        (ensure-false (find 0 frames :key #'http-kit/http2::%h2-frame-type))
+        (ensure-true headers)
+        (ensure-equal 4 (http-kit/http2::%h2-frame-flags headers))
+        (ensure-equal "200" (cdr (assoc ":status" (server-response-fields headers)
+                                         :test #'string=)))
+        (ensure-true goaway)
+        (ensure-equal 1 (http-kit/http2::%h2-u32
+                         (http-kit/http2::%h2-frame-payload goaway) 0))
+        (ensure-equal 1 (http-kit/http2::%h2-u32
+                         (http-kit/http2::%h2-frame-payload goaway) 4)))))
+
+  (defun check-server-peer-window-resume (initial-window)
+    (let* ((prefix (server-peer-window-request initial-window))
+           (stream (make-instance
+                    'server-credit-observer-stream
+                    :boundary (length prefix)
+                    :input (concatenate-octets
+                            prefix
+                            (h2-frame 8 0 1 (octets 0 0 0 (- 2 initial-window))))))
+           (handled 0)
+           (closed 0))
+      (multiple-value-bind (count reason)
+          (http-kit/http2:serve-http2-session
+           stream
+           (lambda (request)
+             (declare (ignore request))
+             (incf handled)
+             (make-http-response :status 200 :body (ascii "ok")))
+           :close-stream (lambda (closed-stream)
+                           (ensure-equal stream closed-stream)
+                           (incf closed)))
+        (ensure-equal 1 count)
+        (ensure-equal :eof reason))
+      (ensure-equal 1 handled)
+      (ensure-equal 1 closed)
+      (ensure-equal 1 (server-credit-boundary-reads stream))
+      (let* ((before (server-output-frames (server-before-credit-output stream)))
+             (headers (find 1 before :key #'http-kit/http2::%h2-frame-type))
+             (early-data (remove-if-not
+                          (lambda (frame)
+                            (= 0 (http-kit/http2::%h2-frame-type frame)))
+                          before)))
+        (ensure-true headers)
+        (ensure-equal 4 (http-kit/http2::%h2-frame-flags headers))
+        (ensure-equal "200" (cdr (assoc ":status" (server-response-fields headers)
+                                         :test #'string=)))
+        (if (zerop initial-window)
+            (ensure-false early-data)
+            (progn
+              (ensure-equal 1 (length early-data))
+              (ensure-equal "o" (octets-as-string
+                                 (http-kit/http2::%h2-frame-payload
+                                  (first early-data))))
+              (ensure-equal 0 (http-kit/http2::%h2-frame-flags
+                               (first early-data))))))
+      (let* ((frames (server-output-frames (binary-session-output stream)))
+             (data (remove-if-not
+                    (lambda (frame) (= 0 (http-kit/http2::%h2-frame-type frame)))
+                    frames)))
+        (ensure-equal (1+ initial-window) (length data))
+        (ensure-true (every (lambda (frame)
+                             (= 1 (http-kit/http2::%h2-frame-stream-id frame)))
+                           data))
+        (ensure-equal "ok" (octets-as-string
+                            (apply #'concatenate-octets
+                                   (mapcar #'http-kit/http2::%h2-frame-payload
+                                           data))))
+        (ensure-equal 1 (http-kit/http2::%h2-frame-flags (car (last data))))
+        (ensure-false (find 7 frames :key #'http-kit/http2::%h2-frame-type)))))
+
+  (deftest http2-server-peer-window-zero-resumes-after-update
+    (check-server-peer-window-resume 0))
+
+  (deftest http2-server-peer-window-one-sends-only-granted-credit
+    (check-server-peer-window-resume 1)))
+
+#+sbcl
+(progn
+  (defun check-server-partial-response-control (control)
+    (let* ((prefix (server-peer-window-request 1))
+           (input (concatenate-octets
+                   prefix
+                   (public-server-request-frame 3)
+                   (ecase control
+                     (:reset (h2-frame 3 0 1 (octets 0 0 0 8)))
+                     (:credit (h2-frame 8 0 1 (octets 0 0 0 1))))))
+           (stream (make-instance 'server-credit-observer-stream
+                                  :boundary (length prefix) :input input))
+           (calls 0)
+           (closed 0)
+           (notified nil))
+      (multiple-value-bind (count reason)
+          (http-kit/http2:serve-http2-session
+           stream
+           (lambda (request)
+             (ensure-equal "GET" (http-request-method request))
+             (incf calls)
+             (if (= calls 1)
+                 (make-http-response :status 200 :body (ascii "xy"))
+                 (make-http-response :status 204)))
+           :on-error (lambda (condition request)
+                       (declare (ignore request)) (setf notified condition))
+           :close-stream (lambda (s)
+                           (ensure-true (eq s stream))
+                           (incf closed)
+                           (close s)))
+        (ensure-equal (ecase control (:reset 1) (:credit 2)) count)
+        (ensure-equal :eof reason))
+      (ensure-equal 2 calls)
+      (ensure-equal 1 closed)
+      (ensure-false (open-stream-p stream))
+      (ensure-false notified)
+      (ensure-equal (length input) (binary-session-input-position stream))
+      (ensure-equal 1 (server-credit-boundary-reads stream))
+      (let ((before (server-output-frames (server-before-credit-output stream))))
+        (ensure-equal '(4 4 1 0) (mapcar #'http-kit/http2::%h2-frame-type before))
+        (ensure-equal '(0 0 1 1) (mapcar #'http-kit/http2::%h2-frame-stream-id before))
+        (ensure-equal '(0 1 4 0) (mapcar #'http-kit/http2::%h2-frame-flags before))
+        (ensure-equal (ascii "x")
+                      (http-kit/http2::%h2-frame-payload (car (last before)))))
+      (let* ((frames (server-output-frames (binary-session-output stream)))
+             (headers (remove-if-not
+                       (lambda (frame) (= 1 (http-kit/http2::%h2-frame-type frame)))
+                       frames))
+             (data (remove-if-not
+                    (lambda (frame) (= 0 (http-kit/http2::%h2-frame-type frame)))
+                    frames)))
+        (ensure-equal (ecase control (:reset '(4 4 1 0 1)) (:credit '(4 4 1 0 0 1)))
+                      (mapcar #'http-kit/http2::%h2-frame-type frames))
+        (ensure-equal (ecase control (:reset '(0 0 1 1 3)) (:credit '(0 0 1 1 1 3)))
+                      (mapcar #'http-kit/http2::%h2-frame-stream-id frames))
+        (ensure-equal (ecase control (:reset '(0 1 4 0 5)) (:credit '(0 1 4 0 1 5)))
+                      (mapcar #'http-kit/http2::%h2-frame-flags frames))
+        (ensure-equal '("200" "204")
+                      (mapcar (lambda (frame)
+                                (cdr (assoc ":status" (server-response-fields frame)
+                                            :test #'string=)))
+                              headers))
+        (ensure-equal (ecase control (:reset '("x")) (:credit '("x" "y")))
+                      (mapcar (lambda (frame)
+                                (octets-as-string (http-kit/http2::%h2-frame-payload frame)))
+                              data))
+        (ensure-equal (ascii (ecase control (:reset "x") (:credit "xy")))
+                      (apply #'concatenate-octets
+                             (mapcar #'http-kit/http2::%h2-frame-payload data)))
+        (ensure-false (find 7 frames :key #'http-kit/http2::%h2-frame-type)))))
+
+  (deftest http2-server-public-partial-response-reset
+    (check-server-partial-response-control :reset))
+
+  (deftest http2-server-public-partial-response-window-update
+    (check-server-partial-response-control :credit)))
+
   (deftest http2-server-clamps-peer-hpack-table-size
     (let* ((input (concatenate-octets
                    (h2-preface)
@@ -790,3 +1382,1559 @@
         (ensure-equal 11
                       (http-kit/http2::%h2-u32
                        (http-kit/http2::%h2-frame-payload goaway) 4)))))
+
+#+sbcl
+(progn
+  (defun check-server-public-request-validation
+      (fields &key name reason method (target "/") enable-connect-p
+                   (operation :http2-server))
+    (let* ((input (concatenate-octets
+                   (h2-preface)
+                   (h2-frame 4 0 0 (octets))
+                   (h2-frame 1 5 1 (apply #'h2-header-block fields))))
+           (stream (make-instance 'binary-session-stream :input input))
+           (handled 0)
+           (closed 0)
+           (notified nil)
+           (observed nil)
+           (seen-request nil))
+      (handler-case
+          (multiple-value-bind (count termination)
+              (http-kit/http2:serve-http2-session
+               stream
+               (lambda (request)
+                 (incf handled)
+                 (setf seen-request request)
+                 (make-http-response :status 204))
+               :enable-connect-p enable-connect-p
+               :on-error (lambda (condition request)
+                           (setf notified condition)
+                           (ensure-false request))
+               :close-stream (lambda (closed-stream)
+                               (ensure-true (eq stream closed-stream))
+                               (incf closed)
+                               (close closed-stream)))
+            (ensure-equal 1 count)
+            (ensure-equal :eof termination))
+        (http-invalid-header (condition) (setf observed condition)))
+      (ensure-equal 1 closed)
+      (ensure-false (open-stream-p stream))
+      (let* ((frames (server-output-frames (binary-session-output stream)))
+             (headers (remove-if-not
+                       (lambda (frame) (= 1 (http-kit/http2::%h2-frame-type frame)))
+                       frames))
+             (goaway (find 7 frames :key #'http-kit/http2::%h2-frame-type)))
+        (if name
+            (progn
+              (ensure-true (typep observed 'http-invalid-header))
+              (ensure-equal operation (http-error-operation observed))
+              (ensure-equal name (http-invalid-header-name observed))
+              (ensure-equal reason (http-invalid-header-reason observed))
+              (ensure-false (http-protocol-error-detail observed))
+              (ensure-true (eq observed notified))
+              (ensure-equal 0 handled)
+              (ensure-false headers)
+              (ensure-true goaway)
+              (ensure-equal 1 (http-kit/http2::%h2-u32
+                               (http-kit/http2::%h2-frame-payload goaway) 0))
+              (ensure-equal 1 (http-kit/http2::%h2-u32
+                               (http-kit/http2::%h2-frame-payload goaway) 4)))
+            (progn
+              (ensure-false observed)
+              (ensure-false notified)
+              (ensure-equal 1 handled)
+              (ensure-equal method (http-request-method seen-request))
+              (ensure-equal target (http-request-target seen-request))
+              (ensure-equal 1 (length headers))
+              (ensure-equal "204"
+                            (cdr (assoc ":status"
+                                        (server-response-fields (first headers))
+                                        :test #'string=)))
+              (ensure-false goaway))))))
+
+  (deftest http2-server-public-pseudo-header-validation
+    (let ((fields '((":method" . "GET") (":scheme" . "https")
+                    (":authority" . "example.com") (":path" . "/"))))
+      (check-server-public-request-validation fields :method "GET")
+      (dolist (case
+               (list
+                (list (cons '("x-check" . "ok") fields) ":method"
+                      "Pseudo-fields must precede regular fields")
+                (list (append fields '((":method" . "GET"))) ":method"
+                      "Duplicate pseudo-field")
+                (list (append fields '((":unknown" . "value"))) ":unknown"
+                      "Unknown request pseudo-field")
+                (list (append fields '(("connection" . "close"))) "connection"
+                      :connection-specific :http2-headers)
+                (list (cdr fields) ":method" "Missing or invalid method")
+                (list (cons '(":method" . "G ET") (cdr fields)) ":method"
+                      "Missing or invalid method")))
+        (destructuring-bind (invalid name reason &optional (operation :http2-server)) case
+          (check-server-public-request-validation
+           invalid :name name :reason reason :operation operation)))))
+
+  (deftest http2-server-public-target-validation
+    (let ((fields '((":method" . "GET") (":scheme" . "https")
+                    (":authority" . "example.com") (":path" . "/"))))
+      (check-server-public-request-validation fields :method "GET")
+      (dolist (case
+               '((":authority" nil "Missing authority")
+                 (":scheme" nil "Missing scheme")
+                 (":path" nil "Missing path")
+                 (":path" "relative" "Path must be origin-form")
+                 (":authority" "[broken" "Invalid authority")))
+        (destructuring-bind (name value reason) case
+          (check-server-public-request-validation
+           (loop for field in fields
+                 for replacement = (if (string= name (car field))
+                                       (and value (cons name value))
+                                       field)
+                 when replacement collect replacement)
+           :name name :reason reason)))))
+
+  (deftest http2-server-public-connect-validation
+    (check-server-public-request-validation
+     '((":method" . "CONNECT") (":authority" . "example.com:443"))
+     :method "CONNECT" :target "example.com:443")
+    (dolist (case
+             '((((":method" . "CONNECT") (":authority" . "example.com:443")
+                 (":path" . "/"))
+                ":path" "CONNECT must use authority-form")
+               (((":method" . "GET") (":scheme" . "https")
+                 (":authority" . "example.com") (":path" . "/")
+                 (":protocol" . "websocket"))
+                ":protocol" "Only CONNECT may carry a valid :protocol")
+               (((":method" . "CONNECT") (":authority" . "example.com")
+                 (":protocol" . "bad protocol"))
+                ":protocol" "Only CONNECT may carry a valid :protocol")
+               (((":method" . "CONNECT") (":authority" . "example.com")
+                 (":path" . "/") (":protocol" . "websocket"))
+                ":scheme" "Extended CONNECT requires :scheme")))
+      (destructuring-bind (fields name reason) case
+        (check-server-public-request-validation
+         fields :name name :reason reason :enable-connect-p t))))
+
+  (defun check-server-public-response-validation
+      (response information &key detail message)
+    (let* ((input (concatenate-octets
+                   (h2-preface)
+                   (h2-frame 4 0 0 (octets))
+                   (h2-frame 1 5 1
+                             (h2-header-block
+                              (cons ":method" "GET") (cons ":scheme" "https")
+                              (cons ":authority" "example.com")
+                              (cons ":path" "/")))))
+           (stream (make-instance 'binary-session-stream :input input))
+           (handled 0)
+           (closed 0)
+           (seen-request nil)
+           (notified nil)
+           (observed nil))
+      (handler-case
+          (multiple-value-bind (count termination)
+              (http-kit/http2:serve-http2-session
+               stream
+               (lambda (request)
+                 (incf handled)
+                 (setf seen-request request)
+                 (values response information))
+               :on-error (lambda (condition request)
+                           (ensure-true (eq request seen-request))
+                           (setf notified condition))
+               :close-stream (lambda (closed-stream)
+                               (ensure-true (eq stream closed-stream))
+                               (incf closed)
+                               (close closed-stream)))
+            (ensure-equal 1 count)
+            (ensure-equal :eof termination))
+        (http-protocol-error (condition) (setf observed condition)))
+      (ensure-equal 1 handled)
+      (ensure-equal 1 closed)
+      (ensure-false (open-stream-p stream))
+      (let* ((frames (server-output-frames (binary-session-output stream)))
+             (headers (remove-if-not
+                       (lambda (frame) (= 1 (http-kit/http2::%h2-frame-type frame)))
+                       frames))
+             (goaway (find 7 frames :key #'http-kit/http2::%h2-frame-type)))
+        (if message
+            (progn
+              (ensure-true (typep observed 'http-protocol-error))
+              (ensure-equal :http2-server (http-error-operation observed))
+              (ensure-equal message (http-error-message observed))
+              (ensure-true (eq detail (http-protocol-error-detail observed)))
+              (ensure-true (eq observed notified))
+              (ensure-false headers)
+              (ensure-false (find 0 frames :key #'http-kit/http2::%h2-frame-type))
+              (ensure-true goaway)
+              (ensure-equal 1 (http-kit/http2::%h2-u32
+                               (http-kit/http2::%h2-frame-payload goaway) 0))
+              (ensure-equal 1 (http-kit/http2::%h2-u32
+                               (http-kit/http2::%h2-frame-payload goaway) 4)))
+            (progn
+              (ensure-false observed)
+              (ensure-false notified)
+              (ensure-equal '("103" "204")
+                            (mapcar
+                             (lambda (frame)
+                               (cdr (assoc ":status" (server-response-fields frame)
+                                           :test #'string=)))
+                             headers))
+              (ensure-equal 4 (http-kit/http2::%h2-frame-flags (first headers)))
+              (ensure-equal 5 (http-kit/http2::%h2-frame-flags (second headers)))
+              (ensure-false goaway))))))
+
+  (deftest http2-server-public-response-chunk-validation
+    (check-server-public-response-validation
+     (make-http-response :status 204)
+     (list (make-http-response :status 103)))
+    (dolist (chunk (list "bad" (make-array '(1 1) :initial-element 90)
+                        (vector 256)))
+      (let ((chunks (list chunk)))
+        (check-server-public-response-validation
+         (make-http-response-stream
+          :status 200 :body-function (lambda () (pop chunks)))
+         nil :detail chunk
+         :message (if (and (arrayp chunk) (= 1 (array-rank chunk))
+                           (not (stringp chunk)))
+                      "HTTP/2 body chunks must contain octets"
+                      "HTTP/2 body chunks must be one-dimensional octet arrays")))))
+
+  (deftest http2-server-public-response-role-validation
+    (check-server-public-response-validation
+     (make-http-response :status 204)
+     (list (make-http-response :status 103)))
+    (check-server-public-response-validation
+     :not-a-response nil :detail :not-a-response
+     :message "HTTP/2 handler must return an HTTP response")
+    (check-server-public-response-validation
+     (make-http-response :status 204) :not-a-list :detail :not-a-list
+     :message "HTTP/2 informational responses must be supplied as a list")
+    (dolist (status '(101 200))
+      (check-server-public-response-validation
+       (make-http-response :status 204)
+       (list (make-http-response :status status)) :detail status
+       :message "An HTTP/2 informational response must have status 100-199 other than 101"))
+    (check-server-public-response-validation
+     (make-http-response :status 103) nil :detail 103
+     :message "The final HTTP/2 response must have status 200 or greater"))
+
+  (deftest http2-server-public-uncollected-body-success
+    (let* ((input (concatenate-octets
+                   (h2-preface) (h2-frame 4 0 0 (octets))
+                   (h2-frame 1 4 1
+                             (h2-header-block
+                              (cons ":method" "POST") (cons ":scheme" "https")
+                              (cons ":authority" "example.com")
+                              (cons ":path" "/upload")
+                              (cons "content-length" "1")))
+                   (h2-frame 0 1 1 (octets 90))))
+           (stream (make-instance 'binary-session-stream :input input))
+           (handled 0)
+           (closed 0)
+           (chunks '()))
+      (multiple-value-bind (count termination)
+          (http-kit/http2:serve-http2-session
+           stream
+           (lambda (request)
+             (incf handled)
+             (ensure-equal "POST" (http-request-method request))
+             (ensure-equal "/upload" (http-request-target request))
+             (ensure-equal "1" (http-header-value (http-request-headers request)
+                                                 "content-length"))
+             (ensure-equal 0 (length (http-request-body request)))
+             (make-http-response :status 204))
+           :collect-body-p nil
+           :on-body-chunk (lambda (state chunk)
+                            (declare (ignore state))
+                            (ensure-equal 0 handled)
+                            (push (octets-as-string chunk) chunks))
+           :close-stream (lambda (closed-stream)
+                           (ensure-true (eq stream closed-stream))
+                           (incf closed)
+                           (close closed-stream)))
+        (ensure-equal 1 count)
+        (ensure-equal :eof termination))
+      (ensure-equal 1 handled)
+      (ensure-equal 1 closed)
+      (ensure-equal '("Z") chunks)
+      (ensure-false (open-stream-p stream))
+      (let* ((frames (server-output-frames (binary-session-output stream)))
+             (headers (find 1 frames :key #'http-kit/http2::%h2-frame-type)))
+        (ensure-true headers)
+        (ensure-equal "204"
+                      (cdr (assoc ":status" (server-response-fields headers)
+                                  :test #'string=)))
+        (ensure-false (find 7 frames :key #'http-kit/http2::%h2-frame-type))))))
+
+#+sbcl
+(progn
+  (defun check-server-public-frame-validation
+      (stream-id &key window-increment error-detail)
+    (let* ((window-payload (make-array 4 :element-type '(unsigned-byte 8)
+                                       :initial-element 0))
+           (input (concatenate-octets
+                   (h2-preface)
+                   (h2-frame 4 0 0 (octets))
+                   (if window-increment
+                       (progn
+                         (http-kit/http2::%h2-put-u32 window-payload 0 window-increment)
+                         (h2-frame 8 0 0 window-payload))
+                       (octets))
+                   (h2-frame 1 5 stream-id
+                             (h2-header-block
+                              (cons ":method" "GET")
+                              (cons ":scheme" "https")
+                              (cons ":authority" "example.com")
+                              (cons ":path" "/")))))
+           (stream (make-instance 'binary-session-stream :input input))
+           (handled 0)
+           (closed 0)
+           (observed nil)
+           (notified nil))
+      (handler-case
+          (multiple-value-bind (count termination)
+              (http-kit/http2:serve-http2-session
+               stream
+               (lambda (request)
+                 (incf handled)
+                 (ensure-equal "GET" (http-request-method request))
+                 (ensure-equal "/" (http-request-target request))
+                 (make-http-response :status 200 :body (ascii "ok")))
+               :on-error (lambda (condition request)
+                           (setf notified condition)
+                           (ensure-false request))
+               :close-stream (lambda (closed-stream)
+                               (ensure-true (eq stream closed-stream))
+                               (incf closed)
+                               (close closed-stream)))
+            (ensure-equal 1 count)
+            (ensure-equal :eof termination))
+        (http-protocol-error (condition) (setf observed condition)))
+      (ensure-equal 1 closed)
+      (ensure-false (open-stream-p stream))
+      (let* ((frames (server-output-frames (binary-session-output stream)))
+             (headers (remove-if-not
+                       (lambda (frame) (= 1 (http-kit/http2::%h2-frame-type frame)))
+                       frames))
+             (data (remove-if-not
+                    (lambda (frame) (= 0 (http-kit/http2::%h2-frame-type frame)))
+                    frames))
+             (goaway (find 7 frames :key #'http-kit/http2::%h2-frame-type)))
+        (if error-detail
+            (progn
+              (ensure-true (typep observed 'http-protocol-error))
+              (ensure-equal :http2-server (http-error-operation observed))
+              (ensure-equal error-detail (http-protocol-error-detail observed))
+              (ensure-equal 1 (http-kit::http-protocol-error-http2-error-code observed))
+              (ensure-true (eq observed notified))
+              (ensure-equal 0 handled)
+              (ensure-false headers)
+              (ensure-false data)
+              (ensure-true goaway)
+              (ensure-equal 0 (http-kit/http2::%h2-frame-stream-id goaway))
+              (ensure-equal 0 (http-kit/http2::%h2-u32
+                               (http-kit/http2::%h2-frame-payload goaway) 0))
+              (ensure-equal 1 (http-kit/http2::%h2-u32
+                               (http-kit/http2::%h2-frame-payload goaway) 4)))
+            (progn
+              (ensure-false observed)
+              (ensure-false notified)
+              (ensure-equal 1 handled)
+              (ensure-equal 1 (length headers))
+              (ensure-equal 1 (length data))
+              (ensure-equal "200"
+                            (cdr (assoc ":status"
+                                        (server-response-fields (first headers))
+                                        :test #'string=)))
+              (ensure-equal "ok" (octets-as-string
+                                 (http-kit/http2::%h2-frame-payload (first data))))
+              (ensure-equal stream-id (http-kit/http2::%h2-frame-stream-id
+                                      (first headers)))
+              (ensure-equal stream-id (http-kit/http2::%h2-frame-stream-id
+                                      (first data)))
+              (ensure-equal 1 (logand 1 (http-kit/http2::%h2-frame-flags (first data))))
+              (ensure-false goaway))))))
+
+  (deftest http2-server-public-stream-id-boundaries
+    (dolist (stream-id '(1 3))
+      (check-server-public-frame-validation stream-id))
+    (dolist (stream-id '(0 2))
+      (check-server-public-frame-validation stream-id :error-detail stream-id)))
+
+  (deftest http2-server-public-window-overflow-boundary
+    (check-server-public-frame-validation 1 :window-increment #x7fff0000)
+    (check-server-public-frame-validation
+     1 :window-increment #x7fff0001
+     :error-detail '(:connection 65535 #x7fff0001))))
+
+
+#+sbcl
+(progn
+  (defun check-server-public-unknown-flags (flags &key data-p)
+    (let* ((payload (if data-p (octets 0 255 7) (octets 0 1 2 3 4 5 6 7)))
+           (fields (append
+                    (list (cons ":method" (if data-p "POST" "GET"))
+                          (cons ":scheme" "https")
+                          (cons ":authority" "example.com")
+                          (cons ":path" (if data-p "/upload" "/")))
+                    (when data-p '(("content-length" . "3")))))
+           (stream
+             (make-instance
+              'binary-session-stream
+              :input (concatenate
+                      '(vector (unsigned-byte 8))
+                      (h2-preface) (h2-frame 4 0 0 (octets))
+                      (if data-p
+                          (concatenate '(vector (unsigned-byte 8))
+                                       (h2-frame 1 4 1 (apply #'h2-header-block fields))
+                                       (h2-frame 0 flags 1 payload))
+                          (concatenate '(vector (unsigned-byte 8))
+                                       (h2-frame 6 flags 0 payload)
+                                       (h2-frame 1 5 1 (apply #'h2-header-block fields)))))))
+           (handled 0)
+           (closed 0)
+           (notified nil)
+           (chunks '()))
+      (multiple-value-bind (count termination)
+          (http-kit/http2:serve-http2-session
+           stream
+           (lambda (request)
+             (incf handled)
+             (ensure-equal (if data-p "POST" "GET") (http-request-method request))
+             (ensure-equal (if data-p "/upload" "/") (http-request-target request))
+             (ensure-equal (if data-p payload (octets)) (http-request-body request))
+             (when data-p
+               (ensure-equal "3" (http-header-value (http-request-headers request)
+                                                   "content-length")))
+             (make-http-response :status 204 :body (octets)))
+           :on-body-chunk (lambda (state chunk)
+                            (declare (ignore state))
+                            (ensure-equal 0 handled)
+                            (push chunk chunks))
+           :on-error (lambda (condition request)
+                       (declare (ignore request))
+                       (setf notified condition))
+           :close-stream (lambda (closed-stream)
+                           (ensure-true (eq stream closed-stream))
+                           (incf closed)
+                           (close closed-stream)))
+        (ensure-equal 1 count)
+        (ensure-equal :eof termination))
+      (ensure-equal 1 handled)
+      (ensure-equal 1 closed)
+      (ensure-false (open-stream-p stream))
+      (ensure-false notified)
+      (ensure-equal (length (binary-session-input stream))
+                    (binary-session-input-position stream))
+      (ensure-equal (if data-p 1 0) (length chunks))
+      (when data-p (ensure-equal payload (first chunks)))
+      (let* ((frames (server-output-frames (binary-session-output stream)))
+             (headers (remove-if-not
+                       (lambda (frame) (= 1 (http-kit/http2::%h2-frame-type frame)))
+                       frames))
+             (pings (remove-if-not
+                     (lambda (frame) (= 6 (http-kit/http2::%h2-frame-type frame)))
+                     frames))
+             (windows (remove-if-not
+                       (lambda (frame) (= 8 (http-kit/http2::%h2-frame-type frame)))
+                       frames)))
+        (ensure-equal 1 (length headers))
+        (ensure-equal 1 (http-kit/http2::%h2-frame-stream-id (first headers)))
+        (ensure-equal 5 (http-kit/http2::%h2-frame-flags (first headers)))
+        (ensure-equal "204" (cdr (assoc ":status"
+                                       (server-response-fields (first headers))
+                                       :test #'string=)))
+        (ensure-equal 1
+                      (count-if
+                       (lambda (frame)
+                         (and (= 4 (http-kit/http2::%h2-frame-type frame))
+                              (= 1 (http-kit/http2::%h2-frame-flags frame))))
+                       frames))
+        (ensure-false (find 7 frames :key #'http-kit/http2::%h2-frame-type))
+        (ensure-false (find 0 frames :key #'http-kit/http2::%h2-frame-type))
+        (if data-p
+            (progn
+              (ensure-false pings)
+              (ensure-equal '(0 1) (mapcar #'http-kit/http2::%h2-frame-stream-id windows))
+              (dolist (frame windows)
+                (ensure-equal 3 (http-kit/http2::%h2-u32
+                                 (http-kit/http2::%h2-frame-payload frame) 0))))
+            (progn
+              (ensure-false windows)
+              (ensure-equal 1 (length pings))
+              (ensure-equal 0 (http-kit/http2::%h2-frame-stream-id (first pings)))
+              (ensure-equal 1 (http-kit/http2::%h2-frame-flags (first pings)))
+              (ensure-equal payload (http-kit/http2::%h2-frame-payload (first pings))))))))
+
+  (deftest http2-server-public-ping-unknown-flags
+    (check-server-public-unknown-flags 0)
+    (check-server-public-unknown-flags #x20))
+
+  (deftest http2-server-public-data-unknown-flags
+    (check-server-public-unknown-flags 1 :data-p t)
+    (check-server-public-unknown-flags #x21 :data-p t)))
+
+
+#+sbcl
+(progn
+  (defun public-server-request-frame (&optional (stream-id 1) (flags 5))
+    (h2-frame 1 flags stream-id
+              (h2-header-block (cons ":method" "GET") (cons ":scheme" "https")
+                               (cons ":authority" "example.com") (cons ":path" "/"))))
+
+  (defun check-public-server-boundary
+      (wire &key error-p detail frame-detail-p size-p (handled 0)
+                 (last-stream 1) response information (statuses '("204"))
+                 (body (octets)) trailer)
+    (let* ((stream (make-instance
+                    'binary-session-stream
+                    :input (concatenate-octets (h2-preface) wire)))
+           (calls 0) (closed 0) (notified nil) (notified-request nil)
+           (seen nil)
+           (result
+             (handler-case
+                 (multiple-value-list
+                  (http-kit/http2:serve-http2-session
+                   stream
+                   (lambda (request)
+                     (incf calls)
+                     (setf seen request)
+                     (ensure-equal "GET" (http-request-method request))
+                     (ensure-equal "/" (http-request-target request))
+                     (ensure-equal body (http-request-body request))
+                     (ensure-equal trailer
+                                   (http-header-value (http-request-trailers request) "x-end"))
+                     (values (or response (make-http-response :status 204)) information))
+                   :on-error (lambda (condition request)
+                               (setf notified condition notified-request request))
+                   :close-stream (lambda (closed-stream)
+                                   (ensure-true (eq stream closed-stream))
+                                   (incf closed)
+                                   (close closed-stream))))
+               (http-protocol-error (condition) condition))))
+      (ensure-equal handled calls)
+      (ensure-equal 1 closed)
+      (ensure-false (open-stream-p stream))
+      (ensure-equal (length (binary-session-input stream))
+                    (binary-session-input-position stream))
+      (if error-p
+          (progn
+            (ensure-true (typep result 'http-protocol-error))
+            (ensure-true (eq result notified))
+            (ensure-equal :http2-server (http-error-operation result))
+            (if size-p
+                (progn
+                  (ensure-true (typep result 'http-size-limit-exceeded))
+                  (ensure-equal :headers (http-kit:http-size-limit-exceeded-kind result))
+                  (ensure-equal 128 (http-kit:http-size-limit-exceeded-limit result))
+                  (ensure-equal 129 (http-kit:http-size-limit-exceeded-observed result))
+                  (ensure-true (eq seen notified-request)))
+                (if frame-detail-p
+                    (let ((frame (http-protocol-error-detail result)))
+                      (ensure-true (typep frame 'http-kit/http2::%h2-frame))
+                      (ensure-equal 8 (http-kit/http2::%h2-frame-type frame))
+                      (ensure-equal 0 (http-kit/http2::%h2-frame-flags frame))
+                      (ensure-equal 0 (http-kit/http2::%h2-frame-stream-id frame))
+                      (ensure-equal (octets 0 0 1) (http-kit/http2::%h2-frame-payload frame)))
+                    (ensure-equal detail (http-protocol-error-detail result)))))
+          (progn
+            (ensure-false notified)
+            (ensure-equal handled (first result))
+            (ensure-equal :eof (second result))))
+      (let* ((frames (server-output-frames (binary-session-output stream)))
+             (goaways (remove-if-not
+                       (lambda (frame) (= 7 (http-kit/http2::%h2-frame-type frame))) frames))
+             (headers (remove-if-not
+                       (lambda (frame) (= 1 (http-kit/http2::%h2-frame-type frame))) frames)))
+        (ensure-equal statuses
+                      (mapcar (lambda (frame)
+                                (cdr (assoc ":status" (server-response-fields frame)
+                                            :test #'string=)))
+                              headers))
+        (ensure-equal (if error-p 1 0) (length goaways))
+        (when error-p
+          (let ((frame (first goaways)))
+            (ensure-equal 0 (http-kit/http2::%h2-frame-stream-id frame))
+            (ensure-equal 0 (http-kit/http2::%h2-frame-flags frame))
+            (ensure-equal 8 (length (http-kit/http2::%h2-frame-payload frame)))
+            (ensure-equal last-stream (http-kit/http2::%h2-u32
+                                      (http-kit/http2::%h2-frame-payload frame) 0))
+            (ensure-equal (if size-p 11 1) (http-kit/http2::%h2-u32
+                                          (http-kit/http2::%h2-frame-payload frame) 4))))
+        frames)))
+
+  (deftest http2-server-public-settings-stream-window-boundary
+    (dolist (overflow-p '(nil t))
+      (check-public-server-boundary
+       (concatenate-octets
+        (h2-frame 4 0 0 (octets)) (public-server-request-frame 1 4)
+        (h2-frame 8 0 1 (if overflow-p (octets 127 255 0 0) (octets 127 254 255 255)))
+        (h2-frame 4 0 0 (octets 0 4 0 1 0 0))
+        (unless overflow-p (h2-frame 0 1 1 (octets))))
+       :error-p overflow-p :detail #x80000000 :handled (if overflow-p 0 1)
+       :statuses (unless overflow-p '("204")))))
+
+  (deftest http2-server-public-control-wire-boundary
+    (let* ((payload (octets 0 1 2 3 4 5 6 7))
+           (frames
+             (check-public-server-boundary
+              (concatenate-octets
+               (h2-frame 4 0 0 (octets)) (h2-frame 6 0 0 payload)
+               (h2-frame 8 0 0 (octets 0 0 0 1)) (public-server-request-frame))
+              :handled 1))
+           (ping (find 6 frames :key #'http-kit/http2::%h2-frame-type)))
+      (ensure-true ping)
+      (ensure-equal 0 (http-kit/http2::%h2-frame-stream-id ping))
+      (ensure-equal 1 (http-kit/http2::%h2-frame-flags ping))
+      (ensure-equal payload (http-kit/http2::%h2-frame-payload ping)))
+    (dolist (case '((6 1 (0 1 2 3 4 5 6 7) 1 nil)
+                   (6 0 (0 1 2 3 4 5 6) 7 nil)
+                   (8 0 (0 0 1) nil t)
+                   (8 0 (0 0 0 0) 0 nil)))
+      (destructuring-bind (type stream payload detail frame-p) case
+        (check-public-server-boundary
+         (concatenate-octets (h2-frame 4 0 0 (octets))
+                            (h2-frame type 0 stream (apply #'octets payload)))
+         :error-p t :detail detail :frame-detail-p frame-p :last-stream 0 :statuses nil))))
+
+  (deftest http2-server-public-request-lifecycle-boundary
+    (let ((settings (h2-frame 4 0 0 (octets)))
+          (trailer (h2-header-block (cons "x-end" "yes"))))
+      (check-public-server-boundary
+       (concatenate-octets settings (public-server-request-frame 1 4)
+                          (h2-frame 0 0 1 (octets 90)) (h2-frame 1 5 1 trailer))
+       :handled 1 :body (octets 90) :trailer "yes")
+      (check-public-server-boundary
+       (concatenate-octets settings (public-server-request-frame 1 4)
+                          (h2-frame 0 0 1 (octets 90)) (h2-frame 1 4 1 trailer))
+       :error-p t :detail 1 :statuses nil)
+      (check-public-server-boundary
+       (concatenate-octets settings (public-server-request-frame)
+                          (public-server-request-frame 3))
+       :handled 2 :statuses '("204" "204"))
+      (check-public-server-boundary
+       (concatenate-octets settings (public-server-request-frame)
+                          (public-server-request-frame))
+       :error-p t :detail 1 :handled 1)
+      (check-public-server-boundary
+       (concatenate-octets settings (public-server-request-frame 1 4)
+                          (h2-frame 3 0 1 (octets 0 0 0 8))
+                          (public-server-request-frame 3))
+       :handled 1)
+      (check-public-server-boundary
+       (concatenate-octets settings (public-server-request-frame 1 4)
+                          (h2-frame 3 0 1 (octets 0 0 0 8))
+                          (h2-frame 0 1 1 (octets 90)))
+       :error-p t :detail 1 :statuses nil)))
+
+  (deftest http2-server-public-response-boundaries
+    (let ((request (concatenate-octets (h2-frame 4 0 0 (octets))
+                                     (public-server-request-frame))))
+      (check-public-server-boundary
+       request :handled 1 :response (make-http-response :status 200)
+       :information (list (make-http-response :status 103)) :statuses '("103" "200"))
+      (dolist (information
+               (list (make-http-response :status 103 :body (octets 90))
+                     (make-http-response :status 103
+                                         :trailers (list (make-http-header "x-end" "yes")))))
+        (check-public-server-boundary
+         request :handled 1 :error-p t :detail 103 :statuses nil
+         :response (make-http-response :status 200) :information (list information))))
+    (let ((request (concatenate-octets (h2-frame 4 0 0 (octets 0 6 0 0 0 128))
+                                     (public-server-request-frame))))
+      (dolist (over-p '(nil t))
+        (let* ((value (make-string (if over-p 54 53) :initial-element #\x))
+               (frames
+                 (check-public-server-boundary
+                  request :handled 1 :error-p over-p :size-p over-p
+                  :statuses (unless over-p '("103" "200"))
+                  :response (make-http-response :status 200)
+                  :information (list (make-http-response
+                                      :status 103 :headers (list (make-http-header "x" value)))))))
+          (unless over-p
+            (let ((headers (remove-if-not
+                            (lambda (frame) (= 1 (http-kit/http2::%h2-frame-type frame))) frames)))
+              (ensure-equal value (cdr (assoc "x" (server-response-fields (first headers))
+                                            :test #'string=)))
+              (ensure-equal 4 (http-kit/http2::%h2-frame-flags (first headers)))
+              (ensure-equal 5 (http-kit/http2::%h2-frame-flags (second headers)))))))
+      (dolist (over-p '(nil t))
+        (let* ((value (make-string (if over-p 96 95) :initial-element #\x))
+               (frames
+                 (check-public-server-boundary
+                  request :handled 1 :error-p over-p :size-p over-p
+                  :statuses (unless over-p '("200" nil))
+                  :response (make-http-response
+                             :status 200 :body (octets 90)
+                             :trailers (list (make-http-header "x" value))))))
+          (unless over-p
+            (let ((data (find 0 frames :key #'http-kit/http2::%h2-frame-type))
+                  (headers (remove-if-not
+                            (lambda (frame) (= 1 (http-kit/http2::%h2-frame-type frame))) frames)))
+              (ensure-equal (octets 90) (http-kit/http2::%h2-frame-payload data))
+              (ensure-equal 0 (http-kit/http2::%h2-frame-flags data))
+              (ensure-equal value (cdr (assoc "x" (server-response-fields (second headers))
+                                            :test #'string=)))
+              (ensure-equal 5 (http-kit/http2::%h2-frame-flags (second headers))))))))))
+
+
+
+#+sbcl
+(progn
+  (defun check-public-server-entry
+      (input &key error-p detail frame-spec options (handled 0)
+                  (termination :eof) (owned-p t) (error-code 1))
+    (let* ((stream (make-instance 'binary-session-stream :input input))
+           (calls 0) (closed 0) (notified nil) (notified-request nil)
+           (result
+             (handler-case
+                 (multiple-value-list
+                  (apply #'http-kit/http2:serve-http2-session
+                         stream
+                         (lambda (request)
+                           (incf calls)
+                           (ensure-equal "GET" (http-request-method request))
+                           (ensure-equal "/" (http-request-target request))
+                           (make-http-response :status 204))
+                         :on-error (lambda (condition request)
+                                     (setf notified condition notified-request request))
+                         :close-stream (lambda (s)
+                                         (ensure-true (eq s stream))
+                                         (incf closed) (close s))
+                         options))
+               (http-protocol-error (condition) condition))))
+      (ensure-equal handled calls)
+      (ensure-equal (if owned-p 1 0) closed)
+      (ensure-equal (not owned-p) (open-stream-p stream))
+      (ensure-equal (if owned-p (length input) 0) (binary-session-input-position stream))
+      (if error-p
+          (progn
+            (ensure-true (typep result 'http-protocol-error))
+            (ensure-equal :http2-server (http-error-operation result))
+            (ensure-true (eq (and owned-p result) notified))
+            (ensure-false notified-request)
+            (if frame-spec
+                (destructuring-bind (type flags stream-id payload) frame-spec
+                  (let ((frame (http-protocol-error-detail result)))
+                    (ensure-true (typep frame 'http-kit/http2::%h2-frame))
+                    (ensure-equal type (http-kit/http2::%h2-frame-type frame))
+                    (ensure-equal flags (http-kit/http2::%h2-frame-flags frame))
+                    (ensure-equal stream-id (http-kit/http2::%h2-frame-stream-id frame))
+                    (ensure-equal payload (http-kit/http2::%h2-frame-payload frame))))
+                (ensure-equal detail (http-protocol-error-detail result))))
+          (progn
+            (ensure-false notified)
+            (ensure-equal handled (first result))
+            (ensure-equal termination (second result))))
+      (let* ((frames (server-output-frames (binary-session-output stream)))
+             (goaways (remove-if-not (lambda (frame)
+                                      (= 7 (http-kit/http2::%h2-frame-type frame))) frames))
+             (headers (remove-if-not (lambda (frame)
+                                      (= 1 (http-kit/http2::%h2-frame-type frame))) frames)))
+        (ensure-equal handled (length headers))
+        (dolist (frame headers)
+          (ensure-equal 1 (http-kit/http2::%h2-frame-stream-id frame))
+          (ensure-equal 5 (http-kit/http2::%h2-frame-flags frame))
+          (ensure-equal "204" (cdr (assoc ":status" (server-response-fields frame)
+                                         :test #'string=))))
+        (ensure-equal (if (and error-p owned-p) 1 0) (length goaways))
+        (when goaways
+          (let ((frame (first goaways)))
+            (ensure-equal 0 (http-kit/http2::%h2-frame-stream-id frame))
+            (ensure-equal 0 (http-kit/http2::%h2-frame-flags frame))
+            (ensure-equal 8 (length (http-kit/http2::%h2-frame-payload frame)))
+            (ensure-equal 0 (http-kit/http2::%h2-u32 (http-kit/http2::%h2-frame-payload frame) 0))
+            (ensure-equal error-code
+                          (http-kit/http2::%h2-u32 (http-kit/http2::%h2-frame-payload frame) 4))))
+        (unless owned-p (ensure-equal 0 (length (binary-session-output stream)))))
+      (when (open-stream-p stream) (close stream))))
+
+  (deftest http2-server-public-residual-control-shapes
+    (let ((prefix (concatenate-octets (h2-preface) (h2-frame 4 0 0 (octets)))))
+      (check-public-server-entry
+       (concatenate-octets prefix
+                           (h2-frame 2 0 1 (octets 0 0 0 0 10))
+                           (h2-frame #x10 0 0 (octets 0 0 0 1))
+                           (public-server-request-frame))
+       :handled 1)
+      (check-public-server-entry
+       (concatenate-octets prefix (public-server-request-frame)
+                           (h2-frame 7 0 0 (octets 0 0 0 1 0 0 0 0)))
+       :handled 1 :termination :goaway)
+      (check-public-server-entry
+       (concatenate-octets prefix (h2-frame 4 0 1 (octets)))
+       :error-p t :detail 1)
+      (check-public-server-entry
+       (concatenate-octets prefix (h2-frame 2 0 1 (octets 0 0 0 1 10)))
+       :error-p t :detail 1)
+      (dolist (spec '((3 0 0 (0 0 0 0)) (3 1 1 (0 0 0 0)) (3 0 1 (0 0 0))
+                      (7 0 1 (0 0 0 0 0 0 0 0)) (7 1 0 (0 0 0 0 0 0 0 0))
+                      (7 0 0 (0 0 0 0 0 0 0)) (7 0 0 (128 0 0 0 0 0 0 0))
+                      (2 0 0 (0 0 0 1 10)) (2 1 1 (0 0 0 0 10))
+                      (2 0 1 (0 0 0 0)) (2 0 1 (128 0 0 0 10))
+                      (16 0 1 (0 0 0 1)) (16 1 0 (0 0 0 1)) (16 0 0 (0 0 0))))
+        (destructuring-bind (type flags stream-id bytes) spec
+          (let ((payload (apply #'octets bytes)))
+            (check-public-server-entry
+             (concatenate-octets prefix (h2-frame type flags stream-id payload))
+             :error-p t :frame-spec (list type flags stream-id payload)))))))
+
+  (deftest http2-server-public-entry-startup-boundary
+    (let* ((settings (h2-frame 4 0 0 (octets)))
+           (valid (concatenate-octets (h2-preface) settings (public-server-request-frame))))
+      (dolist (window '(0 1/2))
+        (check-public-server-entry valid :handled 1
+                                  :options (list :max-reset-window window :max-control-window window)))
+      (dolist (key '(:max-reset-window :max-control-window))
+        (dolist (value '(-1 nil :invalid))
+          (check-public-server-entry valid :error-p t :detail value
+                                    :owned-p nil :options (list key value))))
+      (let ((closed 0) (calls 0)
+            (condition nil))
+        (setf condition
+              (handler-case
+                  (http-kit/http2:serve-http2-session
+                   nil (lambda (request) (declare (ignore request)) (incf calls))
+                   :close-stream (lambda (stream) (declare (ignore stream)) (incf closed)))
+                (http-protocol-error (caught) caught)))
+        (ensure-true (typep condition 'http-protocol-error))
+        (ensure-equal :http2-server (http-error-operation condition))
+        (ensure-equal nil (http-protocol-error-detail condition))
+        (ensure-equal 0 calls)
+        (ensure-equal 0 closed))
+      (check-public-server-entry (octets))
+      (let ((bad-preface (make-array 24 :element-type '(unsigned-byte 8) :initial-element 0)))
+        (check-public-server-entry bad-preface :error-p t :detail bad-preface))
+      (check-public-server-entry (h2-preface) :error-p t :detail nil)
+      (dolist (spec '((6 0 0 (0 1 2 3 4 5 6 7)) (4 1 0 ()) (4 0 1 ())))
+        (destructuring-bind (type flags stream-id bytes) spec
+          (let ((payload (apply #'octets bytes)))
+            (check-public-server-entry
+             (concatenate-octets (h2-preface) (h2-frame type flags stream-id payload))
+             :error-p t :frame-spec (list type flags stream-id payload)))))
+      (check-public-server-entry (concatenate-octets (h2-preface) settings)
+                                :error-p t :detail '(4 1) :error-code 11
+                                :options '(:max-control-frames 0)))))
+
+#+sbcl
+(progn
+  (deftest http2-server-wave-options-asterisk
+    (dolist (target '("*" "/"))
+      (let* ((stream (make-instance
+                      'binary-session-stream
+                      :input (concatenate-octets
+                              (h2-preface) (h2-frame 4 0 0 (octets))
+                              (h2-frame 1 5 1
+                                        (h2-header-block
+                                         (cons ":method" "OPTIONS")
+                                         (cons ":scheme" "https")
+                                         (cons ":authority" "example.com")
+                                         (cons ":path" target))))))
+             (calls 0) (closed 0) (notified nil))
+        (multiple-value-bind (count reason)
+            (http-kit/http2:serve-http2-session
+             stream (lambda (request)
+                      (incf calls)
+                      (ensure-equal "OPTIONS" (http-request-method request))
+                      (ensure-equal target (http-request-target request))
+                      (ensure-equal "/" (http-uri-path (http-request-uri request)))
+                      (make-http-response :status 204))
+             :on-error (lambda (condition request)
+                         (declare (ignore request)) (setf notified condition))
+             :close-stream (lambda (s)
+                             (ensure-true (eq stream s)) (incf closed) (close s)))
+          (ensure-equal 1 count)
+          (ensure-equal :eof reason))
+        (ensure-equal 1 calls)
+        (ensure-equal 1 closed)
+        (ensure-false notified)
+        (ensure-false (open-stream-p stream))
+        (ensure-equal (length (binary-session-input stream))
+                      (binary-session-input-position stream))
+        (let ((frames (server-output-frames (binary-session-output stream))))
+          (ensure-equal '(4 4 1) (mapcar #'http-kit/http2::%h2-frame-type frames))
+          (ensure-equal "204" (cdr (assoc ":status" (server-response-fields (third frames))
+                                         :test #'string=)))
+          (ensure-equal 5 (http-kit/http2::%h2-frame-flags (third frames)))))))
+
+  (deftest http2-server-wave-updated-frame-size
+    (dolist (limit '(16384 32768))
+      (let* ((body (make-array 20000 :element-type '(unsigned-byte 8) :initial-element 90))
+             (stream (make-instance
+                      'binary-session-stream
+                      :input (concatenate-octets
+                              (h2-preface) (h2-frame 4 0 0 (octets))
+                              (h2-frame 4 0 0 (if (= limit 16384)
+                                                 (octets 0 5 0 0 64 0)
+                                                 (octets 0 5 0 0 128 0)))
+                              (public-server-request-frame))))
+             (calls 0) (closed 0) (notified nil))
+        (multiple-value-bind (count reason)
+            (http-kit/http2:serve-http2-session
+             stream (lambda (request)
+                      (incf calls)
+                      (ensure-equal "GET" (http-request-method request))
+                      (ensure-equal "/" (http-request-target request))
+                      (make-http-response :status 200 :body body))
+             :on-error (lambda (condition request)
+                         (declare (ignore request)) (setf notified condition))
+             :close-stream (lambda (s)
+                             (ensure-true (eq stream s)) (incf closed) (close s)))
+          (ensure-equal 1 count)
+          (ensure-equal :eof reason))
+        (ensure-equal 1 calls)
+        (ensure-equal 1 closed)
+        (ensure-false notified)
+        (ensure-false (open-stream-p stream))
+        (ensure-equal (length (binary-session-input stream))
+                      (binary-session-input-position stream))
+        (let* ((frames (server-output-frames (binary-session-output stream) limit))
+               (data (remove-if-not (lambda (frame) (= 0 (http-kit/http2::%h2-frame-type frame)))
+                                    frames))
+               (headers (remove-if-not (lambda (frame) (= 1 (http-kit/http2::%h2-frame-type frame)))
+                                       frames)))
+          (ensure-equal '("200")
+                        (mapcar (lambda (frame)
+                                  (cdr (assoc ":status" (server-response-fields frame)
+                                              :test #'string=))) headers))
+          (ensure-equal (if (= limit 16384) '(4 4 4 1 0 0) '(4 4 4 1 0))
+                        (mapcar #'http-kit/http2::%h2-frame-type frames))
+        (ensure-equal (if (= limit 16384) '(16384 3616) '(20000))
+                      (mapcar (lambda (frame) (length (http-kit/http2::%h2-frame-payload frame))) data))
+        (ensure-equal (if (= limit 16384) '(0 1) '(1))
+                      (mapcar #'http-kit/http2::%h2-frame-flags data))
+        (ensure-true (every (lambda (frame) (= 1 (http-kit/http2::%h2-frame-stream-id frame))) data))
+        (ensure-true (equalp body (apply #'concatenate-octets
+                                      (mapcar #'http-kit/http2::%h2-frame-payload data))))
+        (ensure-equal '(0 1 1)
+                      (mapcar #'http-kit/http2::%h2-frame-flags
+                              (remove-if-not (lambda (frame) (= 4 (http-kit/http2::%h2-frame-type frame)))
+                                             frames)))))))
+
+  (deftest http2-server-wave-updated-peer-limits
+    (dolist (limit '(0 1))
+      (let* ((frames (check-public-server-boundary
+                      (concatenate-octets (h2-frame 4 0 0 (octets))
+                                          (h2-frame 4 0 0 (octets 0 3 0 0 0 limit))
+                                          (public-server-request-frame))
+                      :handled limit :statuses (if (zerop limit) nil '("204"))))
+             (resets (remove-if-not (lambda (frame) (= 3 (http-kit/http2::%h2-frame-type frame))) frames)))
+        (ensure-equal (if (zerop limit) 1 0) (length resets))
+        (when resets
+          (ensure-equal 1 (http-kit/http2::%h2-frame-stream-id (first resets)))
+          (ensure-equal 0 (http-kit/http2::%h2-frame-flags (first resets)))
+          (ensure-equal (octets 0 0 0 7) (http-kit/http2::%h2-frame-payload (first resets))))))
+    (dolist (limit '(0 4096))
+      (let ((frames (check-public-server-boundary
+                     (concatenate-octets
+                      (h2-frame 4 0 0 (octets))
+                      (h2-frame 4 0 0 (if (zerop limit) (octets 0 1 0 0 0 0)
+                                         (octets 0 1 0 0 16 0)))
+                      (h2-frame 1 5 1
+                                (concatenate-octets
+                                 (octets 32)
+                                 (h2-header-block (cons ":method" "GET") (cons ":scheme" "https")
+                                                  (cons ":authority" "example.com") (cons ":path" "/")))))
+                     :handled 1)))
+        (ensure-equal '(4 4 4 1) (mapcar #'http-kit/http2::%h2-frame-type frames)))))
+
+  (deftest http2-server-wave-ping-ack-and-extension
+    (dolist (flags '(0 1))
+      (let* ((payload (octets 0 1 2 3 4 5 6 7))
+             (frames (check-public-server-boundary
+                      (concatenate-octets (h2-frame 4 0 0 (octets))
+                                          (h2-frame 6 flags 0 payload)
+                                          (h2-frame 238 165 0 (ascii "extension"))
+                                          (public-server-request-frame)) :handled 1))
+             (pings (remove-if-not (lambda (frame) (= 6 (http-kit/http2::%h2-frame-type frame))) frames)))
+        (ensure-equal (if (zerop flags) '(4 4 6 1) '(4 4 1))
+                      (mapcar #'http-kit/http2::%h2-frame-type frames))
+        (ensure-equal (if (zerop flags) 1 0) (length pings))
+        (when pings
+          (ensure-equal 1 (http-kit/http2::%h2-frame-flags (first pings)))
+          (ensure-equal 0 (http-kit/http2::%h2-frame-stream-id (first pings)))
+          (ensure-equal payload (http-kit/http2::%h2-frame-payload (first pings)))))))
+
+  (deftest http2-server-wave-unexpected-header-frames
+    (dolist (spec '((9 4 1 ()) (5 4 1 (0 0 0 2))))
+      (destructuring-bind (type flags stream-id bytes) spec
+        (let ((payload (apply #'octets bytes)))
+          (check-public-server-entry
+           (concatenate-octets (h2-preface) (h2-frame 4 0 0 (octets))
+                               (h2-frame type flags stream-id payload))
+           :error-p t :frame-spec (list type flags stream-id payload)))))
+    (let ((block (h2-header-block (cons ":method" "GET") (cons ":scheme" "https")
+                                  (cons ":authority" "example.com") (cons ":path" "/"))))
+      (check-public-server-boundary
+       (concatenate-octets (h2-frame 4 0 0 (octets))
+                           (h2-frame 1 1 1 (subseq block 0 1))
+                           (h2-frame 9 4 1 (subseq block 1))) :handled 1)))
+
+  (deftest http2-server-wave-blocked-response-termination
+    (dolist (control '(:credit :reset :goaway))
+      (let* ((input (concatenate-octets
+                     (server-peer-window-request 0)
+                     (public-server-request-frame 3)
+                     (case control
+                       (:credit (h2-frame 8 0 1 (octets 0 0 0 2)))
+                       (:reset (h2-frame 3 0 1 (octets 0 0 0 8)))
+                       (:goaway (h2-frame 7 0 0 (octets 0 0 0 1 0 0 0 0))))))
+             (stream (make-instance 'binary-session-stream :input input))
+             (calls 0) (closed 0) (notified nil))
+        (multiple-value-bind (count reason)
+            (http-kit/http2:serve-http2-session
+             stream (lambda (request)
+                      (ensure-equal "GET" (http-request-method request))
+                      (incf calls)
+                      (if (= calls 1) (make-http-response :status 200 :body (ascii "ok"))
+                          (make-http-response :status 204)))
+             :on-error (lambda (condition request)
+                         (declare (ignore request)) (setf notified condition))
+             :close-stream (lambda (s)
+                             (ensure-true (eq s stream)) (incf closed) (close s)))
+          (ensure-equal (case control (:credit 2) (:reset 1) (:goaway 0)) count)
+          (ensure-equal (if (eq control :goaway) :goaway :eof) reason))
+        (ensure-equal (if (eq control :goaway) 1 2) calls)
+        (ensure-equal 1 closed)
+        (ensure-false (open-stream-p stream))
+        (ensure-false notified)
+        (ensure-equal (length input) (binary-session-input-position stream))
+        (let* ((frames (server-output-frames (binary-session-output stream)))
+               (headers (remove-if-not (lambda (frame) (= 1 (http-kit/http2::%h2-frame-type frame))) frames))
+               (data (remove-if-not (lambda (frame) (= 0 (http-kit/http2::%h2-frame-type frame))) frames)))
+          (ensure-equal (if (eq control :goaway) '(1) '(1 3))
+                        (mapcar #'http-kit/http2::%h2-frame-stream-id headers))
+          (ensure-equal (if (eq control :goaway) '("200") '("200" "204"))
+                        (mapcar (lambda (frame) (cdr (assoc ":status" (server-response-fields frame)
+                                                            :test #'string=))) headers))
+          (ensure-equal (if (eq control :credit) 1 0) (length data))
+          (when data
+            (ensure-equal 1 (http-kit/http2::%h2-frame-stream-id (first data)))
+            (ensure-equal 1 (http-kit/http2::%h2-frame-flags (first data)))
+            (ensure-equal (ascii "ok") (http-kit/http2::%h2-frame-payload (first data))))
+          (ensure-false (find 7 frames :key #'http-kit/http2::%h2-frame-type))))))
+
+  (deftest http2-server-wave-receive-window-boundary
+    (dolist (size '(65535 65536))
+      (let* ((body (make-array size :element-type '(unsigned-byte 8) :initial-element 90))
+             (input (concatenate-octets (h2-preface) (h2-frame 4 0 0 (octets))
+                                        (public-server-request-frame 1 4) (h2-frame 0 1 1 body)))
+             (stream (make-instance 'binary-session-stream :input input))
+             (calls 0) (chunks 0) (closed 0) (notified nil)
+             (result (handler-case
+                         (multiple-value-list
+                          (http-kit/http2:serve-http2-session
+                           stream (lambda (request)
+                                    (incf calls)
+                                    (ensure-true (equalp body (http-request-body request)))
+                                    (make-http-response :status 204))
+                           :max-frame-size 65536
+                           :on-body-chunk (lambda (state chunk)
+                                            (declare (ignore state)) (incf chunks)
+                                            (ensure-true (equalp body chunk)))
+                           :on-error (lambda (condition request)
+                                       (ensure-false request) (setf notified condition))
+                           :close-stream (lambda (s)
+                                           (ensure-true (eq s stream)) (incf closed) (close s))))
+                       (http-protocol-error (condition) condition))))
+        (ensure-equal 1 closed)
+        (ensure-false (open-stream-p stream))
+        (ensure-equal (length input) (binary-session-input-position stream))
+        (ensure-equal (if (= size 65535) 1 0) calls)
+        (ensure-equal (if (= size 65535) 1 0) chunks)
+        (let* ((frames (server-output-frames (binary-session-output stream)))
+               (updates (remove-if-not (lambda (frame) (= 8 (http-kit/http2::%h2-frame-type frame))) frames))
+               (goaways (remove-if-not (lambda (frame) (= 7 (http-kit/http2::%h2-frame-type frame))) frames)))
+          (if (= size 65535)
+              (progn
+                (ensure-equal '(1 :eof) result)
+                (ensure-false notified)
+                (ensure-equal '(0 1) (mapcar #'http-kit/http2::%h2-frame-stream-id updates))
+                (dolist (frame updates)
+                  (ensure-equal (octets 0 0 255 255) (http-kit/http2::%h2-frame-payload frame)))
+                (ensure-equal '(4 4 8 8 1) (mapcar #'http-kit/http2::%h2-frame-type frames))
+                (ensure-equal "204" (cdr (assoc ":status" (server-response-fields (car (last frames)))
+                                               :test #'string=)))
+                (ensure-false goaways))
+              (progn
+                (ensure-true (typep result 'http-protocol-error))
+                (ensure-true (eq result notified))
+                (ensure-equal :http2-server (http-error-operation result))
+                (ensure-equal 65536 (http-protocol-error-detail result))
+                (ensure-false updates)
+                (ensure-equal '(4 4 7) (mapcar #'http-kit/http2::%h2-frame-type frames))
+                (ensure-equal 1 (length goaways))
+                (ensure-equal (octets 0 0 0 1 0 0 0 1)
+                              (http-kit/http2::%h2-frame-payload (first goaways)))))))))
+
+  (deftest http2-server-wave-request-limit-zero
+    (dolist (limit '(0 1))
+      (let* ((startup (concatenate-octets (h2-preface) (h2-frame 4 0 0 (octets))))
+             (first-request (public-server-request-frame))
+             (input (concatenate-octets startup first-request (public-server-request-frame 3)))
+             (stream (make-instance 'binary-session-stream :input input))
+             (calls 0) (closed 0) (notified nil))
+        (multiple-value-bind (count reason)
+            (http-kit/http2:serve-http2-session
+             stream (lambda (request)
+                      (incf calls) (ensure-equal "GET" (http-request-method request))
+                      (make-http-response :status 204))
+             :max-requests limit
+             :on-error (lambda (condition request)
+                         (declare (ignore request)) (setf notified condition))
+             :close-stream (lambda (s)
+                             (ensure-true (eq s stream)) (incf closed) (close s)))
+          (ensure-equal limit count)
+          (ensure-equal :max-requests reason))
+        (ensure-equal limit calls)
+        (ensure-equal 1 closed)
+        (ensure-false (open-stream-p stream))
+        (ensure-false notified)
+        (ensure-equal (+ (length startup) (if (zerop limit) 0 (length first-request)))
+                      (binary-session-input-position stream))
+        (let ((frames (server-output-frames (binary-session-output stream))))
+          (ensure-equal (if (zerop limit) '(4 4 7) '(4 4 1 7))
+                        (mapcar #'http-kit/http2::%h2-frame-type frames))
+          (when (plusp limit)
+            (ensure-equal 1 (http-kit/http2::%h2-frame-stream-id (third frames)))
+            (ensure-equal "204" (cdr (assoc ":status" (server-response-fields (third frames))
+                                           :test #'string=))))
+          (ensure-equal (octets 0 0 0 limit 0 0 0 0)
+                        (http-kit/http2::%h2-frame-payload (car (last frames)))))))))
+
+#+sbcl
+(progn
+  (deftest http2-server-probe-extended-connect-path
+    (dolist (path '(nil "" "relative" "/chat?room=main"))
+      (let* ((fields (append '((":method" . "CONNECT")
+                              (":protocol" . "websocket")
+                              (":scheme" . "https")
+                              (":authority" . "example.com"))
+                            (when path (list (cons ":path" path)))))
+             (input (concatenate-octets
+                     (h2-preface) (h2-frame 4 0 0 (octets))
+                     (h2-frame 1 5 1 (apply #'h2-header-block fields))))
+             (stream (make-instance 'binary-session-stream :input input))
+             (handled 0) (closed 0) (notified nil) (observed nil)
+             (valid (equal path "/chat?room=main")))
+        (handler-case
+            (multiple-value-bind (count reason)
+                (http-kit/http2:serve-http2-session
+                 stream
+                 (lambda (request)
+                   (incf handled)
+                   (ensure-equal "CONNECT" (http-request-method request))
+                   (ensure-equal "websocket" (http-request-protocol request))
+                   (ensure-equal path (http-request-target request))
+                   (make-http-response :status 204))
+                 :enable-connect-p t
+                 :on-error (lambda (condition request)
+                             (ensure-false request)
+                             (setf notified condition))
+                 :close-stream (lambda (closed-stream)
+                                 (ensure-true (eq stream closed-stream))
+                                 (incf closed)
+                                 (close closed-stream)))
+              (ensure-equal 1 count)
+              (ensure-equal :eof reason))
+          (http-invalid-header (condition) (setf observed condition)))
+        (ensure-equal 1 closed)
+        (ensure-false (open-stream-p stream))
+        (ensure-equal (length input) (binary-session-input-position stream))
+        (let* ((frames (server-output-frames (binary-session-output stream)))
+               (headers (find 1 frames :key #'http-kit/http2::%h2-frame-type))
+               (goaway (find 7 frames :key #'http-kit/http2::%h2-frame-type)))
+          (ensure-false (find 0 frames :key #'http-kit/http2::%h2-frame-type))
+          (ensure-equal (if valid '(0 0 1) '(0 0 0))
+                        (mapcar #'http-kit/http2::%h2-frame-stream-id frames))
+          (if valid
+              (progn
+                (ensure-equal 1 handled)
+                (ensure-false observed)
+                (ensure-false notified)
+                (ensure-false goaway)
+                (ensure-equal '(4 4 1)
+                              (mapcar #'http-kit/http2::%h2-frame-type frames))
+                (ensure-equal "204" (cdr (assoc ":status"
+                                               (server-response-fields headers)
+                                               :test #'string=)))
+                (ensure-equal 5 (http-kit/http2::%h2-frame-flags headers)))
+              (progn
+                (ensure-equal 0 handled)
+                (ensure-true (typep observed 'http-invalid-header))
+                (ensure-true (eq observed notified))
+                (ensure-equal :http2-server (http-error-operation observed))
+                (ensure-equal ":path" (http-invalid-header-name observed))
+                (ensure-equal "Extended CONNECT requires origin-form :path"
+                              (http-invalid-header-reason observed))
+                (ensure-false (http-protocol-error-detail observed))
+                (ensure-false headers)
+                (ensure-equal '(4 4 7)
+                              (mapcar #'http-kit/http2::%h2-frame-type frames))
+                (ensure-equal 0 (http-kit/http2::%h2-frame-flags goaway))
+                (ensure-equal 8 (length (http-kit/http2::%h2-frame-payload goaway)))
+                (ensure-equal 1 (http-kit/http2::%h2-u32
+                                 (http-kit/http2::%h2-frame-payload goaway) 0))
+                (ensure-equal 1 (http-kit/http2::%h2-u32
+                                 (http-kit/http2::%h2-frame-payload goaway) 4))))))))
+
+  (deftest http2-server-probe-deferred-control
+    (flet ((headers (id target)
+             (h2-frame 1 5 id
+                       (h2-header-block (cons ":method" "GET")
+                                        (cons ":scheme" "https")
+                                        (cons ":authority" "example.com")
+                                        (cons ":path" target)))))
+      (let* ((input (concatenate-octets
+                     (h2-preface)
+                     (h2-frame 4 0 0 (octets 0 4 0 0 0 1))
+                     (headers 1 "/first")
+                     (h2-frame 11 0 0 (octets))
+                     (headers 3 "/middle")
+                     (headers 5 "/last")
+                     (h2-frame 8 0 5 (octets 0 0 0 1))
+                     (h2-frame 8 0 1 (octets 0 0 0 1))))
+             (stream (make-instance 'binary-session-stream :input input))
+             (targets '()) (closed 0) (errors 0))
+        (multiple-value-bind (count reason)
+            (http-kit/http2:serve-http2-session
+             stream
+             (lambda (request)
+               (let ((target (http-request-target request)))
+                 (push target targets)
+                 (if (string= target "/middle")
+                     (make-http-response :status 204)
+                     (make-http-response :status 200 :body (ascii "xy")))))
+             :on-error (lambda (condition request)
+                         (declare (ignore condition request))
+                         (incf errors))
+             :close-stream (lambda (closed-stream)
+                             (ensure-true (eq stream closed-stream))
+                             (incf closed)
+                             (close closed-stream)))
+          (ensure-equal 3 count)
+          (ensure-equal :eof reason))
+        (ensure-equal 0 errors)
+        (ensure-equal 1 closed)
+        (ensure-false (open-stream-p stream))
+        (ensure-equal (length input) (binary-session-input-position stream))
+        (ensure-equal '("/first" "/middle" "/last") (nreverse targets))
+        (let* ((frames (server-output-frames (binary-session-output stream)))
+               (headers (remove-if-not
+                         (lambda (frame) (= 1 (http-kit/http2::%h2-frame-type frame)))
+                         frames))
+               (data (remove-if-not
+                      (lambda (frame) (= 0 (http-kit/http2::%h2-frame-type frame)))
+                      frames)))
+          (ensure-equal '(4 4 1 0 0 1 1 0 0)
+                        (mapcar #'http-kit/http2::%h2-frame-type frames))
+          (ensure-equal '(1 3 5)
+                        (mapcar #'http-kit/http2::%h2-frame-stream-id headers))
+          (ensure-equal '("200" "204" "200")
+                        (mapcar (lambda (frame)
+                                  (cdr (assoc ":status" (server-response-fields frame)
+                                              :test #'string=)))
+                                headers))
+          (ensure-equal '((1 "x") (1 "y") (5 "x") (5 "y"))
+                        (mapcar (lambda (frame)
+                                  (list (http-kit/http2::%h2-frame-stream-id frame)
+                                        (octets-as-string
+                                         (http-kit/http2::%h2-frame-payload frame))))
+                                data))
+          (ensure-equal '(0 1 0 1)
+                        (mapcar #'http-kit/http2::%h2-frame-flags data))
+          (ensure-equal '(4 5 4)
+                        (mapcar #'http-kit/http2::%h2-frame-flags headers))
+          (ensure-false (find 7 frames :key #'http-kit/http2::%h2-frame-type))))))
+
+  (deftest http2-server-probe-empty-settings-ack
+    (dolist (ack-p '(nil t))
+      (let* ((input (concatenate-octets
+                     (h2-preface) (h2-frame 4 0 0 (octets))
+                     (if ack-p (h2-frame 4 1 0 (octets)) (octets))
+                     (h2-frame 1 5 1
+                               (h2-header-block (cons ":method" "GET")
+                                                (cons ":scheme" "https")
+                                                (cons ":authority" "example.com")
+                                                (cons ":path" "/")))))
+             (stream (make-instance 'binary-session-stream :input input))
+             (handled 0) (closed 0) (errors 0))
+        (multiple-value-bind (count reason)
+            (http-kit/http2:serve-http2-session
+             stream
+             (lambda (request)
+               (incf handled)
+               (ensure-equal "/" (http-request-target request))
+               (make-http-response :status 204))
+             :on-error (lambda (condition request)
+                         (declare (ignore condition request))
+                         (incf errors))
+             :close-stream (lambda (closed-stream)
+                             (ensure-true (eq stream closed-stream))
+                             (incf closed)
+                             (close closed-stream)))
+          (ensure-equal 1 count)
+          (ensure-equal :eof reason))
+        (ensure-equal 1 handled)
+        (ensure-equal 0 errors)
+        (ensure-equal 1 closed)
+        (ensure-false (open-stream-p stream))
+        (ensure-equal (length input) (binary-session-input-position stream))
+        (let* ((frames (server-output-frames (binary-session-output stream)))
+               (acks (remove-if-not
+                      (lambda (frame)
+                        (and (= 4 (http-kit/http2::%h2-frame-type frame))
+                             (= 1 (http-kit/http2::%h2-frame-flags frame))))
+                      frames)))
+          (ensure-equal '(4 4 1)
+                        (mapcar #'http-kit/http2::%h2-frame-type frames))
+          (ensure-equal '(0 1 5)
+                        (mapcar #'http-kit/http2::%h2-frame-flags frames))
+          (ensure-equal '(0 0 1)
+                        (mapcar #'http-kit/http2::%h2-frame-stream-id frames))
+          (ensure-equal 1 (length acks))
+          (ensure-equal 0 (length (http-kit/http2::%h2-frame-payload (first acks))))
+          (ensure-equal "204" (cdr (assoc ":status"
+                                         (server-response-fields (third frames))
+                                         :test #'string=)))))))
+
+  (deftest http2-server-probe-known-handler-error
+    (let ((known (make-condition 'simple-error
+                                 :format-control "Known handler failure"
+                                 :format-arguments nil)))
+      (dolist (failure-p '(nil t))
+        (let* ((input (concatenate-octets
+                       (h2-preface) (h2-frame 4 0 0 (octets))
+                       (h2-frame 1 5 1
+                                 (h2-header-block (cons ":method" "GET")
+                                                  (cons ":scheme" "https")
+                                                  (cons ":authority" "example.com")
+                                                  (cons ":path" "/")))))
+               (stream (make-instance 'binary-session-stream :input input))
+               (handled 0) (closed 0) (notifications 0)
+               (seen-request nil) (notified-request nil)
+               (notified nil) (observed nil))
+          (handler-case
+              (multiple-value-bind (count reason)
+                  (http-kit/http2:serve-http2-session
+                   stream
+                   (lambda (request)
+                     (incf handled)
+                     (setf seen-request request)
+                     (ensure-equal "/" (http-request-target request))
+                     (if failure-p (error known) (make-http-response :status 204)))
+                   :on-error (lambda (condition request)
+                               (incf notifications)
+                               (setf notified condition notified-request request))
+                   :close-stream (lambda (closed-stream)
+                                   (ensure-true (eq stream closed-stream))
+                                   (incf closed)
+                                   (close closed-stream)))
+                (ensure-equal 1 count)
+                (ensure-equal :eof reason))
+            (simple-error (condition) (setf observed condition)))
+          (ensure-equal 1 handled)
+          (ensure-equal 1 closed)
+          (ensure-false (open-stream-p stream))
+          (ensure-equal (length input) (binary-session-input-position stream))
+          (let* ((frames (server-output-frames (binary-session-output stream)))
+                 (headers (find 1 frames :key #'http-kit/http2::%h2-frame-type)))
+            (ensure-false (find 0 frames :key #'http-kit/http2::%h2-frame-type))
+            (ensure-false (find 7 frames :key #'http-kit/http2::%h2-frame-type))
+            (if failure-p
+                (progn
+                  (ensure-true (typep observed 'simple-error))
+                  (ensure-true (eq known observed))
+                  (ensure-true (eq known notified))
+                  (ensure-true (eq seen-request notified-request))
+                  (ensure-equal 1 notifications)
+                  (ensure-false headers)
+                  (ensure-equal '(4 4)
+                                (mapcar #'http-kit/http2::%h2-frame-type frames))
+                  (ensure-equal '(0 1)
+                                (mapcar #'http-kit/http2::%h2-frame-flags frames)))
+                (progn
+                  (ensure-false observed)
+                  (ensure-false notified)
+                  (ensure-false notified-request)
+                  (ensure-equal 0 notifications)
+                  (ensure-equal '(4 4 1)
+                                (mapcar #'http-kit/http2::%h2-frame-type frames))
+                  (ensure-equal "204" (cdr (assoc ":status"
+                                                 (server-response-fields headers)
+                                                 :test #'string=)))
+                  (ensure-equal 5 (http-kit/http2::%h2-frame-flags headers))))))))))
+
+#+sbcl
+(deftest http2-server-public-ignores-unknown-frame
+  (let ((frames
+          (check-public-server-boundary
+           (concatenate-octets (h2-frame 4 0 0 (octets))
+                               (h2-frame 255 0 0 (octets 7))
+                               (public-server-request-frame))
+           :handled 1)))
+    (ensure-equal '(4 4 1) (mapcar #'http-kit/http2::%h2-frame-type frames))))
+
+#+sbcl
+(deftest http2-server-public-ignores-unknown-frame-during-send-wait
+  (let* ((frames
+           (check-public-server-boundary
+            (concatenate-octets (h2-frame 4 0 0 (octets 0 4 0 0 0 0))
+                                (public-server-request-frame)
+                                (h2-frame 255 0 0 (octets 7))
+                                (h2-frame 8 0 1 (octets 0 0 0 2)))
+            :handled 1 :response (make-http-response :status 200 :body (ascii "ok"))
+            :statuses '("200")))
+         (data (find 0 frames :key #'http-kit/http2::%h2-frame-type)))
+    (ensure-equal '(4 4 1 0) (mapcar #'http-kit/http2::%h2-frame-type frames))
+    (ensure-true data)
+    (ensure-equal 1 (http-kit/http2::%h2-frame-stream-id data))
+    (ensure-equal 1 (http-kit/http2::%h2-frame-flags data))
+    (ensure-equal (ascii "ok") (http-kit/http2::%h2-frame-payload data))))
+
+#+sbcl
+(deftest http2-server-public-hpack-empty-name-rejected
+  (let* ((input (concatenate-octets
+                 (h2-preface) (h2-frame 4 0 0 (octets))
+                 (h2-frame 1 5 1 (octets 0 0 0))))
+         (stream (make-instance 'binary-session-stream :input input))
+         (handled 0) (closed 0) (notified nil) (notified-request nil)
+         (observed
+           (handler-case
+               (http-kit/http2:serve-http2-session
+                stream
+                (lambda (request)
+                  (declare (ignore request))
+                  (incf handled)
+                  (make-http-response :status 204))
+                :on-error (lambda (condition request)
+                            (setf notified condition notified-request request))
+                :close-stream (lambda (closed-stream)
+                                (ensure-true (eq stream closed-stream))
+                                (incf closed)
+                                (close closed-stream)))
+             (http-protocol-error (condition) condition))))
+    (ensure-equal 0 handled)
+    (ensure-equal 1 closed)
+    (ensure-false (open-stream-p stream))
+    (ensure-equal (length input) (binary-session-input-position stream))
+    (ensure-true (typep observed 'http-protocol-error))
+    (ensure-true (eq observed notified))
+    (ensure-false notified-request)
+    (ensure-equal :http2-server (http-error-operation observed))
+    (ensure-equal 9 (http-kit::http-protocol-error-http2-error-code observed))
+    (let ((detail (http-protocol-error-detail observed)))
+      (ensure-true (typep detail 'http-invalid-header))
+      (ensure-equal :hpack (http-error-operation detail))
+      (ensure-equal "" (http-invalid-header-name detail))
+      (ensure-equal :name (http-invalid-header-reason detail)))
+    (let* ((frames (server-output-frames (binary-session-output stream)))
+           (goaway (find 7 frames :key #'http-kit/http2::%h2-frame-type)))
+      (ensure-equal '(4 4 7) (mapcar #'http-kit/http2::%h2-frame-type frames))
+      (ensure-true goaway)
+      (ensure-equal 0 (http-kit/http2::%h2-frame-stream-id goaway))
+      (ensure-equal 0 (http-kit/http2::%h2-frame-flags goaway))
+      (ensure-equal 8 (length (http-kit/http2::%h2-frame-payload goaway)))
+      (ensure-equal 1 (http-kit/http2::%h2-u32
+                       (http-kit/http2::%h2-frame-payload goaway) 0))
+      (ensure-equal 9 (http-kit/http2::%h2-u32
+                       (http-kit/http2::%h2-frame-payload goaway) 4)))))
+
+#+sbcl
+(deftest http2-server-public-status-constructor-boundaries
+  (dolist (streaming-p '(nil t))
+    (dolist (status '(99 600 "200"))
+      (let ((observed
+              (handler-case
+                  (if streaming-p
+                      (make-http-response-stream
+                       :status status :body-function (lambda () nil) :body-length 0)
+                      (make-http-response :status status))
+                (http-invalid-status (condition) condition))))
+        (ensure-true (typep observed 'http-invalid-status))
+        (ensure-equal status (http-kit:http-invalid-status-code observed))))
+    (let* ((response (if streaming-p
+                         (make-http-response-stream
+                          :status 599 :body-function (lambda () nil) :body-length 0)
+                         (make-http-response :status 599)))
+           (frames
+             (check-public-server-boundary
+              (concatenate-octets (h2-frame 4 0 0 (octets))
+                                 (public-server-request-frame))
+              :handled 1 :response response
+              :information (list (make-http-response :status 100))
+              :statuses '("100" "599"))))
+      (ensure-equal '(4 4 1 1) (mapcar #'http-kit/http2::%h2-frame-type frames))
+      (ensure-equal '(0 1 4 5) (mapcar #'http-kit/http2::%h2-frame-flags frames)))))
+
+#+sbcl
+(deftest http2-server-response-validation-final-wire
+  (let* ((frames
+           (check-public-server-boundary
+            (concatenate-octets (h2-frame 4 0 0 (octets))
+                               (public-server-request-frame))
+            :handled 1 :statuses '("200")
+            :response (make-http-response
+                       :status 200 :body (ascii "ok")
+                       :headers (list (make-http-header "x-final" "ready")))))
+         (headers (find 1 frames :key #'http-kit/http2::%h2-frame-type))
+         (data (find 0 frames :key #'http-kit/http2::%h2-frame-type)))
+    (ensure-equal '(4 4 1 0) (mapcar #'http-kit/http2::%h2-frame-type frames))
+    (ensure-equal '(0 1 4 1) (mapcar #'http-kit/http2::%h2-frame-flags frames))
+    (ensure-equal '(0 0 1 1) (mapcar #'http-kit/http2::%h2-frame-stream-id frames))
+    (ensure-equal "ready" (cdr (assoc "x-final" (server-response-fields headers)
+                                     :test #'string=)))
+    (ensure-equal (ascii "ok") (http-kit/http2::%h2-frame-payload data))))
+
+#+sbcl
+(deftest http2-server-response-validation-informational-wire
+  (let* ((frames
+           (check-public-server-boundary
+            (concatenate-octets (h2-frame 4 0 0 (octets))
+                               (public-server-request-frame))
+            :handled 1 :statuses '("103" "200")
+            :information
+            (list (make-http-response
+                   :status 103
+                   :headers (list (make-http-header "x-hint" "early"))))
+            :response (make-http-response
+                       :status 200 :body (ascii "ok")
+                       :headers (list (make-http-header "x-final" "ready")))))
+         (headers (remove-if-not
+                   (lambda (frame) (= 1 (http-kit/http2::%h2-frame-type frame)))
+                   frames))
+         (data (find 0 frames :key #'http-kit/http2::%h2-frame-type)))
+    (ensure-equal '(4 4 1 1 0) (mapcar #'http-kit/http2::%h2-frame-type frames))
+    (ensure-equal '(0 1 4 4 1) (mapcar #'http-kit/http2::%h2-frame-flags frames))
+    (ensure-equal '(0 0 1 1 1) (mapcar #'http-kit/http2::%h2-frame-stream-id frames))
+    (ensure-equal "early" (cdr (assoc "x-hint" (server-response-fields (first headers))
+                                     :test #'string=)))
+    (ensure-equal "ready" (cdr (assoc "x-final" (server-response-fields (second headers))
+                                     :test #'string=)))
+    (ensure-equal (ascii "ok") (http-kit/http2::%h2-frame-payload data))))
+
+#+sbcl
+(deftest http2-server-response-validation-ordinary-arguments
+  (ensure-true (http-kit/http2::%h2-server-response-header-valid-p "x-check" "ok"))
+  (dolist (case '((":status" "200" :http2-server
+                   "Response pseudo-fields are forbidden" "Invalid HTTP/2 header")
+                  (":Status" "200" :http2-server
+                   "Response pseudo-fields are forbidden" "Invalid HTTP/2 header")
+                  ("" "ok" :http2-headers :name
+                   "HTTP/2 header field names must be lowercase.")
+                  ("X-check" "ok" :http2-headers :name
+                   "HTTP/2 header field names must be lowercase.")
+                  ("connection" "close" :http2-headers :connection-specific
+                   "Connection-specific headers are forbidden in HTTP/2 responses.")
+                  ("te" "trailers" :http2-headers :forbidden
+                   "HTTP/2 TE is permitted only in request header sections.")))
+    (destructuring-bind (name value operation reason message) case
+      (let ((observed
+              (handler-case
+                  (http-kit/http2::%h2-server-response-header-valid-p name value)
+                (http-invalid-header (condition) condition))))
+        (ensure-true (typep observed 'http-invalid-header))
+        (ensure-equal operation (http-error-operation observed))
+        (ensure-equal name (http-invalid-header-name observed))
+        (ensure-equal reason (http-invalid-header-reason observed))
+        (ensure-equal message (http-error-message observed))))))

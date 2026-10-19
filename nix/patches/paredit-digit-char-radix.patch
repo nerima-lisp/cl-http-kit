@@ -1,0 +1,68 @@
+diff --git a/packages/feature/lint-string-char/src/char_op_string/domain.rs b/packages/feature/lint-string-char/src/char_op_string/domain.rs
+--- a/packages/feature/lint-string-char/src/char_op_string/domain.rs
++++ b/packages/feature/lint-string-char/src/char_op_string/domain.rs
+@@ -85,9 +85,18 @@ fn first_non_character_argument<'a>(
+     view: &'a ExpressionView,
+     is_non_character: IsNonCharacterArgument<'_>,
+ ) -> Option<(&'a ExpressionView, CharacterMismatch)> {
++    // DIGIT-CHAR-P takes a character followed by an optional integer radix.
++    let character_arguments = if list_head(view)
++        .is_some_and(|head| head.eq_ignore_ascii_case("digit-char-p"))
++    {
++        1
++    } else {
++        usize::MAX
++    };
+     view.children
+         .iter()
+         .skip(1)
++        .take(character_arguments)
+         .find_map(|child| {
+             atom_text(child)
+                 .filter(|text| text.starts_with('"'))
+@@ -98,6 +107,7 @@ fn first_non_character_argument<'a>(
+             view.children
+                 .iter()
+                 .skip(1)
++                .take(character_arguments)
+                 .find(|child| is_non_character(child))
+                 .map(|child| (child, CharacterMismatch::InferredType))
+         })
+@@ -275,6 +285,37 @@ mod tests {
+             .expect("build char op string report")
+     }
+ 
++    #[test]
++    fn digit_char_p_checks_the_character_not_the_radix() {
++        for (input, expected) in [
++            ("(digit-char-p #\\A)", 0),
++            ("(digit-char-p #\\A 16)", 0),
++            ("(DIGIT-CHAR-P #\\A 16)", 0),
++            ("(digit-char-p 16 10)", 1),
++            ("(digit-char-p \"A\" 16)", 1),
++            ("(char= #\\A 16)", 1),
++        ] {
++            let tree = SyntaxTree::parse_with_dialect(input, Dialect::CommonLisp)
++                .expect("parse character call");
++            let view = tree.select_path(&SexprPath::root_child(0)).expect("select call").view();
++            let mut count = 0;
++            let mut violations = Vec::new();
++            examine_call(
++                &view,
++                &|child| atom_text(child).is_some_and(|text| text.parse::<u32>().is_ok()),
++                &mut count,
++                &mut violations,
++            );
++            assert_eq!(count, 1, "{input}");
++            assert_eq!(violations.len(), expected, "{input}");
++        }
++    }
++
++    #[test]
++    fn digit_char_p_still_rejects_a_string_character() {
++        assert_eq!(report("(digit-char-p \"A\" 16)").findings.len(), 1);
++    }
++
+     /// The `(char_call_count, violations)` pair the report is built from.
+     fn calls(input: &str) -> (u64, Vec<CharOpStringItem>) {
+         let report = report(input);

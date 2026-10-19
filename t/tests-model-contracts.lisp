@@ -81,3 +81,75 @@
       (ensure-equal (octets #x80 #xff) (http-response-body response))))
   (signals http-invalid-status
     (make-http-response :status "200")))
+
+(deftest core-coverage-model-validation-metadata
+  (dolist (protocol '("" "bad protocol" 7))
+    (let ((condition
+            (handler-case
+                (make-http-request :method "GET" :uri "http://example.test/"
+                                   :protocol protocol)
+              (http-protocol-error (condition) condition))))
+      (ensure-true (typep condition 'http-protocol-error))
+      (ensure-equal :request (http-error-operation condition))
+      (ensure-equal protocol (http-protocol-error-detail condition))))
+  (dolist (version '(nil 7 "HTTP/9"))
+    (loop for operation in '(:request :response)
+          for constructor in
+             (list (lambda ()
+                     (make-http-request :method "GET" :uri "http://example.test/"
+                                        :protocol-version version))
+                   (lambda ()
+                     (make-http-response :status 200 :protocol-version version)))
+          do (let ((condition
+                     (handler-case (funcall constructor)
+                       (http-protocol-error (condition) condition))))
+               (ensure-true (typep condition 'http-protocol-error))
+               (ensure-equal operation (http-error-operation condition))
+               (ensure-equal version (http-protocol-error-detail condition))))))
+
+(deftest core-coverage-response-stream-contract
+  (dolist (options '((:body-function 7) (:body-length -1)
+                    (:body-length "2") (:body-length 1/2)))
+    (let ((condition
+            (handler-case (apply #'make-http-response-stream :status 200 options)
+              (http-protocol-error (condition) condition))))
+      (ensure-true (typep condition 'http-protocol-error))
+      (ensure-equal :response (http-error-operation condition))
+      (ensure-equal (if (eq (first options) :body-function)
+                        (type-of (second options))
+                        (second options))
+                    (http-protocol-error-detail condition))))
+  (let* ((producer (lambda () nil))
+         (response
+           (make-http-response-stream
+            :status 201 :protocol-version "HTTP/1.0" :reason "Created"
+            :headers (list (make-http-header "X-Result" "accepted"))
+            :trailers (list (make-http-header "X-Checksum" "done"))
+            :body-function producer :body-length 0)))
+    (ensure-true (http-response-stream-p response))
+    (ensure-equal "HTTP/1.0" (http-response-stream-protocol-version response))
+    (ensure-equal 201 (http-response-stream-status response))
+    (ensure-equal "Created" (http-response-stream-reason response))
+    (ensure-true (eq producer (http-response-stream-body-function response)))
+    (ensure-equal 0 (http-response-stream-body-length response))
+    (let ((headers (http-response-stream-headers response))
+          (trailers (http-response-stream-trailers response)))
+      (setf (char (http-header-value headers "X-Result") 0) #\x
+            (char (http-header-value trailers "X-Checksum") 0) #\x)
+      (ensure-equal "accepted"
+                    (http-header-value (http-response-stream-headers response)
+                                       "X-Result"))
+      (ensure-equal "done"
+                    (http-header-value (http-response-stream-trailers response)
+                                       "X-Checksum")))))
+
+(deftest core-coverage-response-print-summary
+  (let* ((response (make-http-response
+                    :status 200 :headers (list (make-http-header "X-Note" "hidden-header"))
+                    :trailers (list (make-http-header "X-End" "hidden-trailer"))
+                    :body (ascii "hidden-body")))
+         (printed (princ-to-string response)))
+    (ensure-printed-contains response "HTTP/1.1" "status=200" "headers=1"
+                            "trailers=1" "body-bytes=11")
+    (dolist (value '("hidden-header" "hidden-trailer" "hidden-body"))
+      (ensure-false (search value printed)))))

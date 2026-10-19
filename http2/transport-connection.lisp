@@ -183,6 +183,11 @@ are rejected after this function marks the connection draining."
              :message "The HTTP/2 session has not started."
              :operation :http2-client
              :detail :goaway-before-session))
+    (when (%http2-connection-closed-p connection)
+      (error 'http-kit:http-protocol-error
+             :message "The HTTP/2 connection is already closed."
+             :operation :http2-client
+             :detail :goaway-after-close))
     (let ((previous-last-stream-id
             (%http2-connection-local-goaway-last-stream-id connection)))
       (when (and previous-last-stream-id
@@ -193,13 +198,13 @@ are rejected after this function marks the connection draining."
                :detail (list :previous previous-last-stream-id
                              :new last-stream-id))))
     (when (> (+ 8 (length debug-data))
-             (%http2-connection-max-frame-size connection))
+             (%http2-connection-peer-max-frame-size connection))
       (error 'http-kit:http-protocol-error
              :message "The HTTP/2 GOAWAY debug payload is too large."
              :operation :http2-client
              :detail (list :length (+ 8 (length debug-data))
                            :max-frame-size
-                           (%http2-connection-max-frame-size connection))))
+                           (%http2-connection-peer-max-frame-size connection))))
     (let ((payload (make-array (+ 8 (length debug-data))
                                :element-type '(unsigned-byte 8)))
           (writer nil))
@@ -338,6 +343,11 @@ this operation has no response stream to associate with it."
              :message "The HTTP/2 session has not started."
              :operation :http2-client
              :detail :ping-before-session))
+    (when (%http2-connection-closed-p connection)
+      (error 'http-kit:http-protocol-error
+             :message "The HTTP/2 connection is already closed."
+             :operation :http2-client
+             :detail :ping-after-close))
     (handler-case
         (http-kit:with-http-deadline (absolute-deadline timeout
                                          :inherited deadline
@@ -537,11 +547,6 @@ this operation has no response stream to associate with it."
                      nil
                      (write-data (http-kit::%empty-octets) t))
                  (return))
-                ((null pending-chunk)
-                 (error 'http-kit:http-protocol-error
-                        :message "The HTTP/2 request body producer did not provide a chunk or NIL."
-                        :operation :http2-write
-                        :detail pending-chunk))
                 (t
                  (let* ((max-frame-size (effective-max-frame-size))
                         (stream-window
@@ -1052,12 +1057,6 @@ stall can make the batch uploader read response frames into a pending queue.
 CONTINUATION frames must still be consumed contiguously from that queue."
   (declare (ignore max-frame-size))
   (let ((stream-id (%h2-frame-stream-id first-frame)))
-    (unless (and (= (%h2-frame-type first-frame) +http2-headers-type+)
-                 (plusp stream-id))
-      (error 'http-kit:http-protocol-error
-             :message "The HTTP/2 batch received HEADERS on an invalid stream."
-             :operation :http2-headers
-             :detail (list (%h2-frame-type first-frame) stream-id)))
     (let ((first-fragment (%h2-header-fragment first-frame :first-p t))
           (parts nil)
           (header-block-bytes 0)
@@ -1158,21 +1157,26 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                            candidate-status candidate-headers nil body
                            request-method :body-length body-length)))))))))
 
+(defun %h2-batch-list-length (value)
+  (handler-case (list-length value)
+    (type-error () nil)))
+
 (defun %h2-batch-option-list (name value count)
-  (cond
-    ((null value)
-     (make-list count :initial-element nil))
-    ((not (listp value))
-     (error 'http-kit:http-protocol-error
-            :message "An HTTP/2 batch option must be a proper list."
-            :operation :http2-client
-            :detail (list name value)))
-    ((/= (length value) count)
-     (error 'http-kit:http-protocol-error
-            :message "An HTTP/2 batch option must be parallel to REQUESTS."
-            :operation :http2-client
-            :detail (list name (length value) count)))
-    (t value)))
+  (let ((length (%h2-batch-list-length value)))
+    (cond
+      ((null value)
+       (make-list count :initial-element nil))
+      ((null length)
+       (error 'http-kit:http-protocol-error
+              :message "An HTTP/2 batch option must be a proper list."
+              :operation :http2-client
+              :detail (list name value)))
+      ((/= length count)
+       (error 'http-kit:http-protocol-error
+              :message "An HTTP/2 batch option must be parallel to REQUESTS."
+              :operation :http2-client
+              :detail (list name length count)))
+      (t value))))
 
 (defun send-http2-requests-over-connection
     (connection requests
@@ -1201,19 +1205,20 @@ sent in successive multiplexed waves under the same deadline."
            :message "The HTTP/2 connection is closed."
            :operation :http2-client
            :cause :closed))
-  (unless (and (listp requests) requests)
-    (error 'http-kit:http-protocol-error
-           :message "HTTP/2 batch requests must be a non-empty proper list."
-           :operation :http2-client
-           :detail requests))
-  (let* ((body-functions
+  (let* ((request-count
+           (or (and requests (%h2-batch-list-length requests))
+               (error 'http-kit:http-protocol-error
+                      :message "HTTP/2 batch requests must be a non-empty proper list."
+                      :operation :http2-client
+                      :detail requests)))
+         (body-functions
            (%h2-batch-option-list :request-body-functions
                                   request-body-functions
-                                  (length requests)))
+                                  request-count))
          (body-lengths
            (%h2-batch-option-list :request-body-lengths
                                   request-body-lengths
-                                  (length requests))))
+                                  request-count)))
     (loop for request in requests
           for body-function in body-functions
           for body-length in body-lengths
@@ -1473,9 +1478,8 @@ sent in successive multiplexed waves under the same deadline."
                            (enqueue frame))
                          (setf first-settings-p new-first-settings-p)))
                      (mark-complete (entry response)
-                       (unless (%h2-batch-entry-response entry)
-                         (setf (%h2-batch-entry-response entry) response)
-                         (decf remaining)))
+                       (setf (%h2-batch-entry-response entry) response)
+                       (decf remaining))
                   )
                   (dolist (entry entries)
                     (send-entry-body-with-producer entry))

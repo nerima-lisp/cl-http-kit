@@ -127,3 +127,25 @@
     (ensure-true
      (not (search "secret=value" (princ-to-string uri)))
      "URI printing omits query contents")))
+
+(deftest uri-public-path-prevalidation-contract
+  (dolist (path (list "" "relative" 7 nil))
+    (let ((caught (handler-case
+                      (make-http-uri :authority "example.test" :path path)
+                    (http-invalid-uri (condition) condition))))
+      (ensure-true (typep caught 'http-invalid-uri))
+      (ensure-equal :uri (http-error-operation caught))
+      (ensure-equal :path (http-protocol-error-detail caught))
+      (ensure-equal (princ-to-string path) (http-invalid-uri-input caught))))
+  (dolist (text '("/" "/directory/base" "/%25/%2F"))
+    (let* ((path (copy-seq text))
+           (uri (make-http-uri :authority "example.test" :path path)))
+      (ensure-equal text (http-uri-path uri))
+      (setf (char path 0) #\X)
+      (ensure-equal text (http-uri-path uri))
+      (ensure-equal text (http-uri-path
+                          (parse-http-uri (http-uri-string uri))))))
+  (let ((uri (make-http-uri :authority "example.test")))
+    (ensure-equal "/" (http-uri-path uri))
+    (ensure-equal nil (http-uri-query uri))
+    (ensure-equal "http://example.test/" (http-uri-string uri))))

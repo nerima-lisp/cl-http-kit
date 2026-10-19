@@ -111,5 +111,6 @@
                   (%read-body-segment source size deadline clock-function
                                       :chunk-data body on-body-chunk)
                   (%read-framing-crlf source deadline clock-function)
-                  (incf bytes (+ size 2))))))))
+                  (incf bytes 2)
+                  (%check-limit :headers bytes max-header-bytes)))))))
     (values (%finish-body-collector body) trailers body-length)))
