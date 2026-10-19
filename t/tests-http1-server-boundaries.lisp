@@ -54,22 +54,32 @@
      (ascii "GET * HTTP/1.1|CRLF|Host: example.com|CRLF||CRLF|"))))
 
 (deftest http1-request-target-control-octets-rejected
-  (dolist (target (list (format nil "/tab~Ctarget" #\Tab)
-                        (format nil "/del~Ctarget" (code-char #x7f))))
-    (let ((condition
-            (handler-case
-                (progn
-                  (parse-http-request
-                   (http1-request-wire-for-test
-                    (format nil
-                            "GET ~A HTTP/1.1|CRLF|Host: example.com|CRLF||CRLF|"
-                            target)))
-                  nil)
-              (http-protocol-error (condition) condition))))
+  (dolist (case
+           (list (list (format nil "/tab~Ctarget" #\Tab)
+                       (format nil "/tab~Ctarget" #\Tab))
+                 (list (format nil "/del~Ctarget" (code-char #x7f))
+                       (list :line-control #x7f))))
+    (let* ((target (first case))
+           (expected-detail (second case))
+           (condition
+             (handler-case
+                 (progn
+                   (parse-http-request
+                    (http1-request-wire-for-test
+                     (format nil
+                             "GET ~A HTTP/1.1|CRLF|Host: example.com|CRLF||CRLF|"
+                             target)))
+                   nil)
+               (http-protocol-error (condition) condition))))
       (ensure-true condition)
       (when condition
         (ensure-equal :request-parse (http-error-operation condition))
-        (ensure-equal target (http-protocol-error-detail condition))))))
+        (ensure-equal expected-detail (http-protocol-error-detail condition))))))
+
+(deftest http1-request-target-value-rejects-del
+  (ensure-false
+   (http-kit::%request-target-value-p
+    (format nil "/del~Ctarget" (code-char #x7f)))))
 
 (deftest http1-request-body-and-trailer-boundaries
   (let ((request
