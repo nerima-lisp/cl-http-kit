@@ -1,4 +1,4 @@
-(require :sb-cover)
+(eval-when (:compile-toplevel :load-toplevel :execute) (require :asdf) (require :sb-cover))
 
 (defpackage #:http-coverage-normalization
   (:use #:cl)
@@ -41,7 +41,13 @@
         (values value t)))))
 
 (defparameter *callback-macro-source*
-  (merge-pathnames "../src/control-macros.lisp" *load-truename*))
+  (or (when (asdf:find-system "cl-http-kit" nil)
+        (asdf:system-relative-pathname "cl-http-kit" "src/control-macros.lisp"))
+      (let ((source (or *compile-file-truename* *load-truename* *load-pathname*)))
+        (unless source
+          (error "Coverage normalization: source pathname unavailable"))
+        (merge-pathnames "../src/control-macros.lisp"
+                         (uiop:pathname-directory-pathname source)))))
 (defparameter *callback-macro-bytes* (source-bytes *callback-macro-source*))
 
 (defun callback-macro-dependencies ()

@@ -1,5 +1,5 @@
-(require :asdf)
-(require :sb-cover)
+(eval-when (:compile-toplevel :load-toplevel :execute) (require :asdf))
+(eval-when (:compile-toplevel :load-toplevel :execute) (require :sb-cover))
 
 (defpackage #:http-coverage-child-merge
   (:use #:cl)
@@ -8,7 +8,14 @@
 (in-package #:http-coverage-child-merge)
 
 (defvar *collector* nil)
-(defvar *bridge* (truename *load-truename*))
+(defvar *bridge* (or (when (asdf:find-system "cl-http-kit" nil)
+                         (asdf:system-relative-pathname "cl-http-kit"
+                                                         "scripts/coverage-child-merge.lisp"))
+                       (let ((source (or *compile-file-truename* *load-truename*
+                                         *load-pathname*)))
+                         (unless source
+                           (error "Coverage child merge: source pathname unavailable"))
+                         (truename source))))
 (defvar *child-request* nil)
 (defvar *child-methods* nil)
 (defvar *child-input-method* nil)

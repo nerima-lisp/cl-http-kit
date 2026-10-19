@@ -241,3 +241,11 @@
   :perform (asdf:test-op (op c)
              (declare (ignore op c))
              (uiop:symbol-call "HTTP-KIT/TEST" "RUN-TESTS")))
+(asdf:defsystem "cl-http-kit/coverage-tools"
+  :description "Coverage tooling helpers for cl-http-kit."
+  :version "0.4.1"
+  :depends-on ("cl-http-kit")
+  :pathname "scripts"
+  :serial t
+  :components ((:file "coverage-normalization")
+               (:file "coverage-child-merge")))

@@ -503,6 +503,49 @@
                 touch "$out"
               '';
 
+          coverage-child-merge =
+            pkgs.runCommand "cl-http-kit-coverage-child-merge"
+              {
+                nativeBuildInputs = [
+                  pkgs.sbcl
+                  pkgs.perl
+                  clWeave
+                ];
+              }
+              ''
+                export XDG_CACHE_HOME="$TMPDIR/cache"
+                mkdir -p "$XDG_CACHE_HOME" "$TMPDIR/coverage-child-merge"
+                export ASDF_OUTPUT_TRANSLATIONS="(:output-translations (t (\"$XDG_CACHE_HOME/\" :implementation)) :ignore-inherited-configuration)"
+                cd ${source}
+                export SBCL_HOME="${pkgs.sbcl}/lib/sbcl"
+                export CL_SOURCE_REGISTRY="$PWD//:${sourceRegistry}"
+                COVERAGE_CHILD_TEST_OUTPUT="$TMPDIR/coverage-child-merge/" \
+                  sbcl --noinform --no-userinit --no-sysinit --disable-debugger \
+                    --script t/coverage-child-merge.lisp
+                touch "$out"
+              '';
+
+          coverage-tools-asdf =
+            pkgs.runCommand "cl-http-kit-coverage-tools-asdf"
+              {
+                nativeBuildInputs = [ pkgs.sbcl ];
+              }
+              ''
+                export XDG_CACHE_HOME="$TMPDIR/cache"
+                mkdir -p "$XDG_CACHE_HOME"
+                export ASDF_OUTPUT_TRANSLATIONS="(:output-translations (t (\"$XDG_CACHE_HOME/\" :implementation)) :ignore-inherited-configuration)"
+                cd ${source}
+                export SBCL_HOME="${pkgs.sbcl}/lib/sbcl"
+                export CL_SOURCE_REGISTRY="$PWD//:${sourceRegistry}"
+                sbcl --noinform --no-userinit --no-sysinit --non-interactive \
+                  --eval '(require :asdf)' \
+                  --eval '(asdf:load-system "cl-http-kit/coverage-tools")' \
+                  --eval '(unless (string= (namestring (truename (asdf:system-relative-pathname "cl-http-kit" "scripts/coverage-child-merge.lisp"))) (namestring (truename http-coverage-child-merge::*bridge*))) (error "Coverage tools child bridge path mismatch"))' \
+                  --eval '(unless (string= (namestring (truename (asdf:system-relative-pathname "cl-http-kit" "src/control-macros.lisp"))) (namestring (truename http-coverage-normalization::*callback-macro-source*))) (error "Coverage tools normalization source path mismatch"))' \
+                  --eval '(format t "Verified two coverage tooling source paths through ASDF FASL loads.~%")'
+                touch "$out"
+              '';
+
           test =
             pkgs.runCommand "cl-http-kit-test"
               {
