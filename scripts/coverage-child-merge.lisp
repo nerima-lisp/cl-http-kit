@@ -24,8 +24,12 @@
   (unless value (error "Child coverage: ~A" message)))
 
 (defun supported-runtime-p ()
-  (and (member (lisp-implementation-version) '("2.6.6" "2.6.8") :test #'string=)
-       (member :arm64 *features*) (member :darwin *features*) t))
+  (let ((version (lisp-implementation-version)))
+    (and (or (and (member version '("2.6.6" "2.6.8") :test #'string=)
+                  (member :arm64 *features*) (member :darwin *features*))
+             (and (string= version "2.6.6")
+                  (member :x86-64 *features*) (member :linux *features*)))
+         t)))
 
 (defun runtime-identity ()
   (require-proof (supported-runtime-p)
@@ -147,11 +151,27 @@
     (maphash (lambda (file codes) (setf (gethash file index) (nreverse codes))) index)
     index))
 
+;;; SBCL keeps coverage marks in a byte vector on ARM64 and as raw bytes after
+;;; the jump tables on other backends. An unexecuted mark is 0 on x86 and #xFF
+;;; elsewhere (contrib/sb-cover/cover.lisp).
+(defconstant +unmarked-byte+ #+(or x86-64 x86) 0 #-(or x86-64 x86) #xFF)
+
+(defun native-marks (code length)
+  (declare (ignorable length))
+  #+arm64
+  (copy-seq (sb-cover::code-coverage-marks code))
+  #-arm64
+  (sb-sys:with-pinned-objects (code)
+    (let ((sap (sb-cover::code-coverage-marks code))
+          (marks (make-array length :element-type '(unsigned-byte 8))))
+      (dotimes (index length marks)
+        (setf (aref marks index) (sb-sys:sap-ref-8 sap index))))))
+
 (defun code-records (file index)
   (sort (loop for code in (gethash file index)
               for map = (sb-c::code-coverage-map code)
                 collect (list (copy-tree (coerce map 'list))
-                              (copy-seq (sb-cover::code-coverage-marks code))))
+                              (native-marks code (length map))))
         #'string< :key (lambda (entry) (prin1-to-string (first entry)))))
 
 (defun metadata (file codes)
@@ -271,7 +291,7 @@
         (require-proof (= (length map) (length marks)) "native mark length")
         (loop for paths in map for mark across marks
               do (require-proof (typep mark '(unsigned-byte 8)) "invalid native mark")
-              unless (= mark 255)
+              unless (= mark +unmarked-byte+)
                 do (dolist (path paths) (setf (gethash path observed) t)))))
     (dotimes (index (length (second record)))
       (require-proof (= (sbit (cddr record) index)

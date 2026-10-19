@@ -19,8 +19,8 @@
                                     (machine (machine-type))
                                     (software (software-type)))
   (and (string= version "2.6.6")
-       (string= machine "ARM64")
-       (string= software "Darwin")))
+       (or (and (string= machine "ARM64") (string= software "Darwin"))
+           (and (string= machine "X86-64") (string= software "Linux")))))
 
 (defun source-bytes (pathname)
   (with-open-file (stream pathname :element-type '(unsigned-byte 8))

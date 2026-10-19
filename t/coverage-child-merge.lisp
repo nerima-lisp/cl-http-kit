@@ -25,7 +25,7 @@
     (let ((*read-eval* nil)) (read-from-string (prin1-to-string payload)))))
 
 (check (http-coverage-child-merge:supported-runtime-p) :verified-native-platform)
-(let ((*features* (remove :darwin *features*))
+(let ((*features* (remove :linux (remove :darwin *features*)))
       (http-coverage-child-merge:*collector* nil))
   (check (not (http-coverage-child-merge:supported-runtime-p)) :missing-platform-rejected)
   (check (handler-case (progn (http-coverage-child-merge::runtime-identity) nil)
@@ -94,10 +94,12 @@
         (dolist (code (getf entry :codes))
           (destructuring-bind (map marks) code
             (loop for paths in map for index from 0
-                  when (and paths (= 255 (aref marks index)))
-                    do (setf (aref marks index) 0))
+                  when (and paths (= http-coverage-child-merge::+unmarked-byte+
+                                     (aref marks index)))
+                    do (setf (aref marks index)
+                             (logxor http-coverage-child-merge::+unmarked-byte+ 1)))
             (loop for paths in map for mark across marks
-                  unless (= mark 255)
+                  unless (= mark http-coverage-child-merge::+unmarked-byte+)
                     do (dolist (path paths) (setf (gethash path observed) t)))))
         (dotimes (index (length (second record)))
           (let ((bit (if (gethash (aref (second record) index) observed) 1 0)))
@@ -184,7 +186,8 @@
                      for map = (sb-c::code-coverage-map code)
                      when (and map (equal file (http-coverage-child-merge::code-name code)))
                        collect (list (copy-tree (coerce map 'list))
-                                     (copy-seq (sb-cover::code-coverage-marks code))))
+                                     (http-coverage-child-merge::native-marks
+                                      code (length map))))
                #'string< :key (lambda (entry) (prin1-to-string (first entry))))
          (http-coverage-child-merge::code-records file index))
         :indexed-records-equal-original-snapshot))

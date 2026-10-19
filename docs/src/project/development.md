@@ -29,8 +29,9 @@ Coverage requires complete expression and branch counts and audits unexecuted
 source spans in the generated HTML. Missing, duplicate, or malformed summary
 counts fail the audit, as does an empty HTML index. A rounded percentage of
 100 is not sufficient when the executed and total counts differ.
-On SBCL 2.6.6 on ARM64 Darwin, coverage removes proven non-executable atomic
-keyword defaults in top-level functions, directly returned lambdas, and
+On SBCL 2.6.6 on ARM64 Darwin and X86-64 Linux, coverage removes proven
+non-executable atomic keyword defaults in top-level functions, directly
+returned lambdas, and
 single explicit BOA structure constructors. The same projection covers exact
 `(quote nil)` defaults in those keyword argument lists, including supplied-p
 parameters, and non-executable NIL defaults in implicit keyword structure
@@ -44,8 +45,9 @@ unnormalized. Function bodies, dynamic defaults, and branch records remain
 measured. Other compiler versions and platforms use the unmodified coverage
 table and the same gates.
 Fresh-process client capability tests also contribute their native coverage on
-SBCL 2.6.6 and 2.6.8 on ARM64 Darwin. The collector requires matching source,
-FASL, runtime, and native coverage metadata, a successful child exit, and
+SBCL 2.6.6 and 2.6.8 on ARM64 Darwin and on SBCL 2.6.6 on X86-64 Linux. The
+collector requires matching source, FASL, runtime, and native coverage
+metadata, a successful child exit, and
 unchanged result bytes before using SBCL's coverage merge. A failed validation
 stops reporting rather than substituting coverage data.
 The test and coverage apps isolate their compilation caches without changing
