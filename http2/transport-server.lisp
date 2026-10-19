@@ -847,11 +847,7 @@ values.
                               (status headers trailers body body-length no-body)
                             (%h2-server-materialize-response
                              response current-request :informational-p t)
-                          (declare (ignore body no-body))
-                          (when (or (plusp body-length) trailers)
-                            (%h2-server-error
-                             "An HTTP/2 informational response cannot carry a body or trailers"
-                             status))
+                          (declare (ignore body body-length no-body trailers))
                           (let ((fields (response-fields status headers)))
                             (when peer-max-header-list-size
                               (http-kit::%check-limit
