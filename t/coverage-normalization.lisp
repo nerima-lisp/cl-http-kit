@@ -1212,7 +1212,11 @@
                               '("src/package.lisp" "src/conditions.lisp"
                                 "src/utilities.lisp" "src/control-macros.lisp")))
          (hashes (mapcar #'sb-md5:md5sum-file dependencies)))
-    (dolist (pathname dependencies) (load pathname :verbose nil :print nil))
+    ;; The callback fixture needs the package, not its message-kit imports.
+    (unless (find-package "HTTP-KIT")
+      (make-package "HTTP-KIT" :use (list "COMMON-LISP")))
+    (dolist (pathname (rest dependencies))
+      (load pathname :verbose nil :print nil))
     (group :callback-finite-source-grammar)
     (let* ((base (callback-fixture-form 'callback-atomic '(&key (error-code 8))))
            (foreign (or (find-package "HTTP-COVERAGE-FOREIGN-CONTROL")
