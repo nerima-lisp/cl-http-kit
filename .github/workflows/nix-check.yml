@@ -3,7 +3,7 @@ name: Nix checks
 on:
   push:
     branches:
-      - p4a-pr5-coverage-diagnostic-62d35c57
+      - p4a-pr5-coverage-diagnostic-62d35c57-retry
 
 jobs:
   nix-flake-check:
