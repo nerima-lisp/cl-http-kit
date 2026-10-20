@@ -184,7 +184,7 @@ pseudo-fields are kept separate because they are not ordinary HTTP headers.
                    ":path" "Asterisk-form is valid only for OPTIONS"))
                 path))))
       (handler-case
-          (http-kit::%authority-parts authority authority)
+          (http-kit:make-http-uri :authority authority)
         (http-kit:http-invalid-uri ()
           (%h2-server-invalid-header ":authority" "Invalid authority")))
       (when (and (or (not connect-p) protocol)
@@ -288,6 +288,13 @@ pseudo-fields are kept separate because they are not ordinary HTTP headers.
                         (= status 205)
                         (= status 304)
                         (<= 100 status 199))))
+      (when (and (or informational-p (= status 204) (= status 304))
+                 (or (plusp actual-body-length) trailers))
+        (%h2-server-error
+         (if informational-p
+             "An HTTP/2 informational response cannot carry a body or trailers"
+             "HTTP/2 responses with status 204 or 304 cannot carry a body or trailers")
+         status))
       (multiple-value-bind (validated)
           (%h2-finish-response status headers trailers body
                                :no-body no-body
@@ -840,11 +847,7 @@ values.
                               (status headers trailers body body-length no-body)
                             (%h2-server-materialize-response
                              response current-request :informational-p t)
-                          (declare (ignore body no-body))
-                          (when (or (plusp body-length) trailers)
-                            (%h2-server-error
-                             "An HTTP/2 informational response cannot carry a body or trailers"
-                             status))
+                          (declare (ignore body body-length no-body trailers))
                           (let ((fields (response-fields status headers)))
                             (when peer-max-header-list-size
                               (http-kit::%check-limit

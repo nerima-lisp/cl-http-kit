@@ -1,5 +1,88 @@
 (defpackage #:http-kit
   (:use #:cl)
+  (:import-from #:http-message-kit
+   ;; URI values
+   #:http-uri
+   #:http-uri-p
+   #:make-http-uri
+   #:parse-http-uri
+   #:http-uri-scheme
+   #:http-uri-authority
+   #:http-uri-host
+   #:http-uri-port
+   #:http-uri-path
+   #:http-uri-query
+   #:http-uri-string
+   ;; Header values
+   #:http-header
+   #:http-header-p
+   #:make-http-header
+   #:http-header-name
+   #:http-header-content
+   #:http-header-values
+   #:http-header-value
+   #:http-header-present-p
+   ;; Request and response values
+   #:http-request
+   #:http-request-p
+   #:make-http-request
+   #:http-request-protocol-version
+   #:http-request-method
+   #:http-request-protocol
+   #:http-request-uri
+   #:http-request-target
+   #:http-request-headers
+   #:http-request-trailers
+   #:http-request-body
+   #:http-request-authority
+   #:http-request-path
+   #:http-request-query
+   #:http-response
+   #:http-response-p
+   #:make-http-response
+   #:http-response-protocol-version
+   #:http-response-status
+   #:http-response-reason
+   #:http-response-headers
+   #:http-response-trailers
+   #:http-response-body
+   #:http-response-stream
+   #:http-response-stream-p
+   #:make-http-response-stream
+   #:http-response-stream-protocol-version
+   #:http-response-stream-status
+   #:http-response-stream-reason
+   #:http-response-stream-headers
+   #:http-response-stream-trailers
+   #:http-response-stream-body-function
+   #:http-response-stream-body-length
+   ;; Deadlines and size limits
+   #:http-deadline
+   #:with-http-deadline
+   #:http-size-limit-exceeded
+   #:http-size-limit-exceeded-limit
+   #:http-size-limit-exceeded-observed
+   #:http-size-limit-exceeded-kind
+   ;; Structured conditions
+   #:http-error
+   #:http-error-message
+   #:http-error-operation
+   #:http-protocol-error
+   #:http-protocol-error-detail
+   #:http-invalid-uri
+   #:http-invalid-uri-input
+   #:http-invalid-header
+   #:http-invalid-header-name
+   #:http-invalid-header-reason
+   #:http-invalid-status
+   #:http-invalid-status-line
+   #:http-invalid-status-code
+   #:http-connection-error
+   #:http-connection-error-cause
+   #:http-timeout
+   #:http-timeout-kind
+   #:http-unsupported-feature
+   #:http-unsupported-feature-name)
   (:export
    ;; URI values
    #:http-uri

@@ -5,7 +5,7 @@
   :author "nerima-lisp"
   :license "MIT"
   :version "0.4.1"
-  :depends-on ()
+  :depends-on ("cl-http-message-kit")
   :pathname "src"
   :serial t
   :components ((:file "package")
@@ -160,6 +160,7 @@
                (:file "tests-utilities-boundaries")
                (:file "tests-model-header-boundaries")
                (:file "tests-model-contracts")
+               (:file "tests-p4a-message-model-contracts")
                (:file "tests-stream-transport")
                (:file "tests-transport-cps-core")
                (:file "tests-core")
