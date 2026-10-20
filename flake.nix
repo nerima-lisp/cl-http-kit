@@ -370,6 +370,7 @@
                 -type f \
                 -name '*.html' \
                 -delete
+              coverage_status=0
               CL_HTTP_KIT_COVERAGE_TIMEOUT_SECONDS="$coverage_timeout_seconds" \
                 perl -e 'alarm $ENV{CL_HTTP_KIT_COVERAGE_TIMEOUT_SECONDS}; exec @ARGV' \
                 sbcl --noinform --no-userinit --no-sysinit --non-interactive \
@@ -408,7 +409,15 @@
                 --max-workers "$max_workers" \
                 --bail true \
                 --coverage-report-directory "$coverage_report_directory/" \
-                --fail-with-no-tests "$@"
+                --fail-with-no-tests "$@" || coverage_status=$?
+              if [ "$coverage_status" -ne 0 ]; then
+                if [ -s "''${coverage_report_directory}/cover-index.html" ]; then
+                  perl scripts/check-coverage.pl "$coverage_report_directory" || true
+                else
+                  echo "Coverage report is unavailable; skipped uncovered-expression diagnostic." >&2
+                fi
+                exit "$coverage_status"
+              fi
               perl scripts/check-coverage.pl "$coverage_report_directory"
               html_count=$(find "$coverage_report_directory" -maxdepth 1 -type f -name '*.html' | wc -l)
               if [ "$html_count" -eq 0 ] || [ ! -s "''${coverage_report_directory}/cover-index.html" ]; then

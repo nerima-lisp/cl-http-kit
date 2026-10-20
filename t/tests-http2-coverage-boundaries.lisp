@@ -526,3 +526,24 @@
                        (public-server-request-frame)
                        (h2-frame 8 0 1 (octets 0 0 0 1)))
    :handled 1))
+#+sbcl
+(deftest http2-coverage-hpack-adapter-validates-name-and-preserves-non-list-detail
+  (let ((condition
+          (handler-case
+              (http-kit/http2::%h2-encode-header-block
+               (list (cons 42 "value")))
+            (http-invalid-header (condition) condition))))
+    (ensure-true condition)
+    (ensure-equal :header (http-error-operation condition))
+    (ensure-equal 42 (http-invalid-header-name condition))
+    (ensure-equal :name (http-invalid-header-reason condition)))
+  (let ((condition
+          (handler-case
+              (http-kit/http2::%h2-decode-header-block
+               (octets)
+               (http-kit/http2::%h2-make-hpack-context)
+               :max-fields -1)
+            (http-protocol-error (condition) condition))))
+    (ensure-true condition)
+    (ensure-equal :hpack (http-error-operation condition))
+    (ensure-equal -1 (http-protocol-error-detail condition))))

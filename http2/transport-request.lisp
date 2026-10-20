@@ -134,17 +134,6 @@
      :static-only-p t
      :huffman huffman-p))
 
-  (defun %h2-invalid-hpack-header-name-p (name)
-    (or (not (string= name (string-downcase name)))
-        (handler-case
-            (progn
-              (if (and (plusp (length name))
-                       (char= (char name 0) #\:))
-                  (http-message-kit:make-http-pseudo-header name "")
-                  (http-message-kit:make-http-header name ""))
-              nil)
-          (http-kit:http-invalid-header () t))))
-
   (defun %h2-decode-header-block
       (octets context &key max-header-bytes max-fields)
     (handler-case
@@ -166,16 +155,58 @@
                           (http-message-kit:http-header-content header)))
                   headers))
       (http-kit:http-protocol-error (condition)
-        (let ((name (http-kit:http-protocol-error-detail condition)))
-          (if (and (eq :hpack (http-kit:http-error-operation condition))
-                   (stringp name)
-                   (%h2-invalid-hpack-header-name-p name))
-              (error 'http-kit:http-invalid-header
-                     :message "HTTP/2 header names must be lowercase ASCII tokens."
-                     :operation :hpack
-                     :name name
-                     :reason :name)
-              (error condition)))))))
+        (let* ((detail (http-kit:http-protocol-error-detail condition))
+               (codec-detail
+                 (if (and (listp detail)
+                          (eq (getf detail :codec-operation) :hpack-decode))
+                     (getf detail :codec-detail)
+                     detail))
+               (name
+                (when (and (vectorp codec-detail)
+                           (every (lambda (octet)
+                                    (typep octet '(unsigned-byte 8)))
+                                  codec-detail))
+                  (map 'string
+                       (lambda (octet) (or (code-char octet) #\?))
+                       codec-detail))))
+          (cond
+            ((and (eq :hpack (http-kit:http-error-operation condition))
+                  (and (listp detail)
+                      (eq (getf detail :codec-operation) :hpack-decode))
+                  (string= (http-kit:http-error-message condition)
+                           "An HPACK table size update exceeds the decoder limit.")
+                  (integerp codec-detail)
+                  (http-message-kit:hpack-context-p context))
+             (error 'http-kit:http-protocol-error
+                    :message (http-kit:http-error-message condition)
+                    :operation :hpack
+                    :detail
+                    (list codec-detail
+                          (http-message-kit:hpack-context-max-table-size context))))
+            ((and (listp detail)
+                  (eq (getf detail :codec-operation) :hpack-header-block)
+                  (string= (http-kit:http-error-message condition)
+                           "The HPACK header field count exceeds its limit.")
+                  (integerp (getf detail :codec-detail)))
+             (error 'http-kit:http-size-limit-exceeded
+                    :message (http-kit:http-error-message condition)
+                    :operation :hpack
+                    :limit (getf detail :codec-detail)
+                    :observed (1+ (getf detail :codec-detail))
+                    :kind :headers))
+            ((and (eq :hpack (http-kit:http-error-operation condition))
+                  (and (listp detail)
+                      (eq (getf detail :codec-operation) :hpack-decode))
+                  (string= (http-kit:http-error-message condition)
+                           "An HPACK header name is invalid for HTTP/2.")
+                  (stringp name))
+             (error 'http-kit:http-invalid-header
+                    :message "HTTP/2 header names must be lowercase ASCII tokens."
+                    :operation :hpack
+                    :name name
+                    :reason :name))
+            (t
+             (error condition))))))))
 
 (defun %h2-request-header-wire (request max-frame-size max-header-bytes
                                 max-body-bytes

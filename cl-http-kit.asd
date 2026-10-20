@@ -212,6 +212,7 @@
                (:file "tests-http2-server")
                (:file "tests-http2-coverage-boundaries")
                (:file "tests-http2-public-contract-boundaries")
+               (:file "tests-hpack-boundaries")
                (:file "tests-http3")
                (:file "tests-http3-coverage-boundaries")
                (:file "tests-http3-server-coverage-boundaries")

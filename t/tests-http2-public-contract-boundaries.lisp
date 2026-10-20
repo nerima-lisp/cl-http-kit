@@ -987,7 +987,7 @@
              (ensure-false (http-kit/http2:http2-connection-goaway-last-stream-id connection))
              (ensure-false (http-kit/http2:http2-connection-local-goaway-last-stream-id connection))
              (let ((context (http-kit/http2::%http2-connection-hpack-context connection)))
-               (ensure-false (http-message-kit:hpack-context-dynamic-entry-count context))
+               (ensure-equal 0 (http-message-kit:hpack-context-dynamic-entry-count context))
                (ensure-equal 0 (http-message-kit:hpack-context-table-size context)))
              ;; Completed empty-body streams leave no flow-control entries or HPACK
              ;; dynamic entries. Skip their equivalent ID increments, not lifecycle state.
@@ -1124,7 +1124,10 @@
                  (progn
                    (ensure-true (typep result 'http-protocol-error))
                    (ensure-equal :hpack (http-error-operation result))
-                   (ensure-equal error-detail (http-protocol-error-detail result))
+                   (let ((detail (http-protocol-error-detail result)))
+                     (ensure-equal 4 (length detail))
+                     (ensure-equal error-detail (list (first detail) (second detail) (third detail)))
+                     (ensure-true (typep (fourth detail) 'condition)))
                    (ensure-equal error-message (http-error-message result))
                    (ensure-equal 1 closed)
                    (ensure-false (http-kit/http2:http2-connection-open-p connection)))
@@ -1168,19 +1171,21 @@
      (concatenate-octets
       (http-message-kit:hpack-encode-integer 4 7 #x80)
       (octets #xff #xff #xff #xfc))
-     nil :huffman-eos
-     "An HPACK Huffman string contains EOS."))
+     nil '(:codec-operation :hpack-string :codec-detail)
+     "An HPACK Huffman string is invalid."))
 
   (deftest http2-public-contract-huffman-excessive-padding-response-rejected
     (%h2-public-huffman-response-contract
      (concatenate-octets
       (http-message-kit:hpack-encode-integer 1 7 #x80)
       (octets #xff))
-     nil 8 "An HPACK Huffman string has excessive padding."))
+     nil '(:codec-operation :hpack-string :codec-detail)
+     "An HPACK Huffman string is invalid."))
 
   (deftest http2-public-contract-huffman-invalid-padding-response-rejected
     (%h2-public-huffman-response-contract
      (concatenate-octets
       (http-message-kit:hpack-encode-integer 1 7 #x80)
       (octets #x1e))
-     nil 6 "An HPACK Huffman string has invalid padding.")))
+     nil '(:codec-operation :hpack-string :codec-detail)
+     "An HPACK Huffman string is invalid.")))

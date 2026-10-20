@@ -38,6 +38,18 @@
   (signals http-protocol-error
     (http-kit/http2:make-http2-client
      :exchange #'identity
+     :max-fields :invalid))
+  (signals http-protocol-error
+    (http-kit/http2:make-http2-client
+     :exchange #'identity
+     :max-fields 1/2))
+  (signals http-protocol-error
+    (http-kit/http2:make-http2-client
+     :exchange #'identity
+     :max-fields -1))
+  (signals http-protocol-error
+    (http-kit/http2:make-http2-client
+     :exchange #'identity
      :max-fields "bad"))
   (signals http-protocol-error
     (http-kit/http2:make-http2-client
@@ -147,6 +159,14 @@
                   (cdr (assoc 1
                               (http-kit/http2::%http2-connection-peer-stream-windows
                                connection))))))
+(deftest http2-message-kit-hpack-zero-field-limit
+  (let ((wire (octets #x82)))
+    (ensure-equal 1
+                  (length
+                   (http-message-kit:hpack-decode-header-block wire)))
+    (signals http-protocol-error
+      (http-message-kit:hpack-decode-header-block
+       wire :max-fields 0))))
   (let ((connection
           (http-kit/http2::%make-http2-connection
            :peer-initial-window-size #x7fffffff)))
