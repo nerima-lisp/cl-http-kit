@@ -529,13 +529,12 @@
                                     (send-http1
                                      request arguments key
                                      (%http-client-alpn-handoff-stream
-                                      fallback)))
-                             (when *client-http2-pending-stream*
+                                      fallback)))) (when *client-http2-pending-stream*
                                (%pool-close
                                 connection-pool
                                 *client-http2-pending-stream*)
                                (setf *client-http2-pending-stream* nil
-                                     *client-http2-pending-key* nil)))))))))
+                                     *client-http2-pending-key* nil))))))))
       (setf http2-manager
             (http-kit/http2:make-http2-connection-manager
              :open-connection #'open-http2-connection
