@@ -115,13 +115,26 @@
        (%deflate-kit-call #'deflate-kit:gzip-decompress
                           body :max-output max-body-bytes))
       (:deflate
-       (%deflate-kit-raw-or-zlib body max-body-bytes)))))
+       (%deflate-kit-raw-or-zlib body max-body-bytes))
+      (:brotli
+       (%deflate-kit-call #'deflate-kit:brotli-decode
+                          body :max-output-bytes max-body-bytes))
+      (:zstd
+       (let ((max-window-size-bytes (* 8 1024 1024)))
+         (if max-body-bytes
+             (deflate-kit:zstd-decode
+              body :max-output-bytes max-body-bytes
+              :max-window-size-bytes max-window-size-bytes)
+             (deflate-kit:zstd-decode
+              body :max-window-size-bytes max-window-size-bytes)))))))
 
 (defun make-http-content-decoders (&rest decoders)
   "Return a validated Content-Encoding decoder association list."
   (let ((result
           (list (cons "gzip" (%deflate-kit-content-decoder :gzip))
-                (cons "deflate" (%deflate-kit-content-decoder :deflate)))))
+                (cons "deflate" (%deflate-kit-content-decoder :deflate))
+                (cons "br" (%deflate-kit-content-decoder :brotli))
+                (cons "zstd" (%deflate-kit-content-decoder :zstd)))))
     (dolist (decoder decoders)
       (unless (and (consp decoder)
                    (stringp (car decoder))
@@ -159,30 +172,41 @@
                            codings)))
     (if (or (null codings) (member nil decoders))
         response
-        (handler-case
-            (let ((body (http-response-body response)))
-              (dolist (decoder (reverse decoders))
-                (setf body (funcall decoder body max-body-bytes)))
-              (make-http-response
-               :protocol-version (http-response-protocol-version response)
-               :status (http-response-status response)
-               :reason (http-response-reason response)
-               :headers (remove-if
-                         (lambda (header)
-                           (member (http-header-name header)
-                                   '("Content-Encoding" "Content-Length")
-                                   :test #'string-equal))
-                         headers)
-               :trailers (http-response-trailers response)
-               :body body))
-          (deflate-kit:inflate-size-limit-exceeded (condition)
-            (error 'http-size-limit-exceeded
-                   :message "The decoded HTTP body limit was exceeded."
-                   :operation :content-decoding
-                   :limit (deflate-kit:deflate-output-limit-limit condition)
-                   :observed (deflate-kit:inflate-error-observed condition)
-                   :kind :body))
-          (deflate-kit:deflate-error (condition)
-            (%client-protocol-error
-             "The encoded HTTP response body could not be decompressed."
-             condition))))))
+        (labels ((signal-size-limit (condition)
+                   (error 'http-size-limit-exceeded
+                          :message "The decoded HTTP body limit was exceeded."
+                          :operation :content-decoding
+                          :limit (deflate-kit:deflate-output-limit-limit condition)
+                          :observed (deflate-kit:inflate-error-observed condition)
+                          :kind :body)))
+          (handler-case
+              (let ((body (http-response-body response)))
+                (dolist (decoder (reverse decoders))
+                  (setf body (funcall decoder body max-body-bytes)))
+                (make-http-response
+                 :protocol-version (http-response-protocol-version response)
+                 :status (http-response-status response)
+                 :reason (http-response-reason response)
+                 :headers (remove-if
+                           (lambda (header)
+                             (member (http-header-name header)
+                                     '("Content-Encoding" "Content-Length")
+                                     :test #'string-equal))
+                           headers)
+                 :trailers (http-response-trailers response)
+                 :body body))
+            (deflate-kit:inflate-size-limit-exceeded (condition)
+              (signal-size-limit condition))
+            (deflate-kit:brotli-size-limit-exceeded (condition)
+              (signal-size-limit condition))
+            (deflate-kit:zstd-size-limit-exceeded (condition)
+              (if (eq :output-size-limit
+                      (deflate-kit:inflate-error-reason condition))
+                  (signal-size-limit condition)
+                  (%client-protocol-error
+                   "The encoded HTTP response body could not be decompressed."
+                   condition)))
+            (deflate-kit:deflate-error (condition)
+              (%client-protocol-error
+               "The encoded HTTP response body could not be decompressed."
+               condition)))))))

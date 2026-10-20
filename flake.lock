@@ -372,11 +372,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1790993481,
-        "narHash": "sha256-rvyTveWs6NdaOKKAxOnBlGQENo7CnYyaAh7H1cjwbrA=",
+        "lastModified": 1792439299,
+        "narHash": "sha256-xl40KvbWekBGOqDv1c+hDVlCIERYIg1OorZzI17lFCs=",
         "owner": "nerima-lisp",
         "repo": "cl-deflate-kit",
-        "rev": "7eb113733b0b76ee2e32cd88565fb8f2535a4c24",
+        "rev": "2bd528c6f79dc8d486d7b9c0cf84213be8d5f9bf",
         "type": "github"
       },
       "original": {
