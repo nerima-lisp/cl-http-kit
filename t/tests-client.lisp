@@ -444,7 +444,7 @@
          (request (http-client-request client "GET" "http://example.test/")))
     (multiple-value-bind (response effective-request)
         (http-client-send client request)
-      (ensure-equal "gzip, deflate"
+      (ensure-equal "gzip, deflate, br, zstd"
                     (http-header-value
                      (http-request-headers effective-request)
                      "Accept-Encoding"))
@@ -552,7 +552,7 @@
             :transport-function
             (lambda (request &rest arguments)
               (declare (ignore arguments))
-              (ensure-equal "gzip, deflate, br"
+              (ensure-equal "gzip, deflate, zstd, br"
                             (http-header-value
                              (http-request-headers request)
                              "Accept-Encoding"))
