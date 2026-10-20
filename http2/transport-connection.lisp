@@ -60,9 +60,7 @@ SETTINGS, stream identifiers, HPACK decoder state, and control frames."
    :max-control-window max-control-window
    :clock-function clock-function
    :hpack-context
-   (%make-hpack-context
-    :max-size +hpack-default-table-size+
-    :maximum-size +hpack-default-table-size+)))
+   (%h2-make-hpack-context :max-table-size +hpack-default-table-size+)))
 
 (defun http2-connection-open-p (connection)
   (and (http2-connection-p connection)
@@ -413,9 +411,7 @@ this operation has no response stream to associate with it."
           max-table-size)
     ;; The peer's SETTINGS value bounds the table size it may use in
     ;; outbound header blocks, so the decoder must enforce it as well.
-    (%hpack-set-maximum-size
-     (%http2-connection-hpack-context connection)
-     (min max-table-size *h2-max-peer-hpack-table-size*)))
+    (http-message-kit:hpack-context-set-decoder-max-table-size (%http2-connection-hpack-context connection) (min max-table-size *h2-max-peer-hpack-table-size*)))
   (when max-concurrent-streams
     (setf (%http2-connection-peer-max-concurrent-streams connection)
           max-concurrent-streams))
@@ -514,7 +510,7 @@ this operation has no response stream to associate with it."
                   (%http2-connection-stream connection)
                   (%h2-concat
                    (%h2-header-frames
-                    (%hpack-encode-block trailer-fields
+                    (%h2-encode-header-block trailer-fields
                                           :huffman-p huffman-p)
                     t (effective-max-frame-size) stream-id))
                   deadline clock-function))))
@@ -1116,7 +1112,7 @@ CONTINUATION frames must still be consumed contiguously from that queue."
   (multiple-value-bind (block end-stream)
       (%h2-batch-read-header-block frame next-frame max-frame-size
                                    max-header-bytes)
-    (let* ((fields (%hpack-decode-block block context
+    (let* ((fields (%h2-decode-header-block block context
                                         :max-header-bytes max-header-bytes
                                         :max-fields max-fields))
            (status (%h2-batch-entry-status entry))

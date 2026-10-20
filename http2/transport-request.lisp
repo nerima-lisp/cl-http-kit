@@ -92,7 +92,8 @@
   (mapcar
    (lambda (header)
      (let* ((name (string-downcase (http-kit:http-header-name header)))
-            (value (http-kit:http-header-content header)))
+            (value (http-kit:http-header-content header))
+            (field (cons name value)))
        (when (http-kit::%forbidden-trailer-field-name-p name)
          (error 'http-kit:http-invalid-header
                 :message "The field definition does not permit this HTTP/2 request trailer."
@@ -105,8 +106,107 @@
                 :operation :http2-trailers
                 :name name
                 :reason :connection-specific))
-       (%hpack-validate-field name value)))
+       (%h2-hpack-header-object field)
+       field))
    (http-kit:http-request-trailers request)))
+(progn
+  (defun %h2-make-hpack-context
+      (&key (max-table-size +hpack-default-table-size+))
+    (http-message-kit:make-hpack-context
+     :max-table-size max-table-size
+     :max-header-list-size +http2-default-hpack-max-header-bytes+
+     :max-field-count +http2-default-hpack-max-field-count+
+     :validate-header-names t
+     :huffman nil))
+
+  (defun %h2-hpack-header-object (field)
+    (let ((name (car field))
+          (value (cdr field)))
+      (if (and (stringp name)
+               (plusp (length name))
+               (char= (char name 0) #\:))
+          (http-message-kit:make-http-pseudo-header name value)
+          (http-message-kit:make-http-header name value))))
+
+  (defun %h2-encode-header-block (fields &key (huffman-p nil))
+    (http-message-kit:hpack-encode-header-block
+     (mapcar #'%h2-hpack-header-object fields)
+     :static-only-p t
+     :huffman huffman-p))
+
+  (defun %h2-decode-header-block
+      (octets context &key max-header-bytes max-fields)
+    (handler-case
+        (multiple-value-bind (headers end-position)
+            (http-message-kit:hpack-decode-header-block
+             octets
+             :context context
+             :max-header-bytes
+             (min (or max-header-bytes
+                      +http2-default-hpack-max-header-bytes+)
+                  +http2-default-hpack-max-header-bytes+)
+             :max-fields
+             (min (or max-fields +http2-default-hpack-max-field-count+)
+                  +http2-default-hpack-max-field-count+)
+             :validate-header-names t)
+          (declare (ignore end-position))
+          (mapcar (lambda (header)
+                    (cons (http-message-kit:http-header-name header)
+                          (http-message-kit:http-header-content header)))
+                  headers))
+      (http-kit:http-protocol-error (condition)
+        (let* ((detail (http-kit:http-protocol-error-detail condition))
+               (codec-detail
+                 (if (and (listp detail)
+                          (eq (getf detail :codec-operation) :hpack-decode))
+                     (getf detail :codec-detail)
+                     detail))
+               (name
+                (when (and (vectorp codec-detail)
+                           (every (lambda (octet)
+                                    (typep octet '(unsigned-byte 8)))
+                                  codec-detail))
+                  (map 'string
+                       (lambda (octet) (or (code-char octet) #\?))
+                       codec-detail))))
+          (cond
+            ((and (eq :hpack (http-kit:http-error-operation condition))
+                  (and (listp detail)
+                      (eq (getf detail :codec-operation) :hpack-decode))
+                  (string= (http-kit:http-error-message condition)
+                           "An HPACK table size update exceeds the decoder limit.")
+                  (integerp codec-detail)
+                  (http-message-kit:hpack-context-p context))
+             (error 'http-kit:http-protocol-error
+                    :message (http-kit:http-error-message condition)
+                    :operation :hpack
+                    :detail
+                    (list codec-detail
+                          (http-message-kit:hpack-context-max-table-size context))))
+            ((and (listp detail)
+                  (eq (getf detail :codec-operation) :hpack-header-block)
+                  (string= (http-kit:http-error-message condition)
+                           "The HPACK header field count exceeds its limit.")
+                  (integerp (getf detail :codec-detail)))
+             (error 'http-kit:http-size-limit-exceeded
+                    :message (http-kit:http-error-message condition)
+                    :operation :hpack
+                    :limit (getf detail :codec-detail)
+                    :observed (1+ (getf detail :codec-detail))
+                    :kind :headers))
+            ((and (eq :hpack (http-kit:http-error-operation condition))
+                  (and (listp detail)
+                      (eq (getf detail :codec-operation) :hpack-decode))
+                  (string= (http-kit:http-error-message condition)
+                           "An HPACK header name is invalid for HTTP/2.")
+                  (stringp name))
+             (error 'http-kit:http-invalid-header
+                    :message "HTTP/2 header names must be lowercase ASCII tokens."
+                    :operation :hpack
+                    :name name
+                    :reason :name))
+            (t
+             (error condition))))))))
 
 (defun %h2-request-header-wire (request max-frame-size max-header-bytes
                                 max-body-bytes
@@ -146,7 +246,7 @@
       (http-kit::%check-limit :headers trailer-size peer-max-header-list-size))
     (http-kit::%check-limit :body (or expected-body-length (length body))
                             max-body-bytes)
-    (let* ((block (%hpack-encode-block fields :huffman-p huffman-p))
+    (let* ((block (%h2-encode-header-block fields :huffman-p huffman-p))
            ;; A peer has not received our SETTINGS yet, so the initial
            ;; request must obey HTTP/2's default peer receive limit.
            (outgoing-frame-size
@@ -202,7 +302,7 @@
                                     (null trailer-fields))
                    (if trailer-fields
                        (%h2-header-frames
-                        (%hpack-encode-block trailer-fields
+                        (%h2-encode-header-block trailer-fields
                                               :huffman-p huffman-p)
                         t outgoing-frame-size stream-id)
                        '()))))))

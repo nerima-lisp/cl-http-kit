@@ -198,7 +198,7 @@
                 :huffman-p t))
          (reader (http-kit/http2::%h2-reader-for wire))
          (headers (http-kit/http2::%h2-read-frame reader 16384 nil nil))
-         (context (http-kit/http2::%make-hpack-context))
+         (context (h2-hpack-context))
          (huffman-value
            (octets #x8c #xf1 #xe3 #xc2 #xe5 #xf2 #x3a
                    #x6b #xa0 #xab #x90 #xf4 #xff)))
@@ -212,8 +212,7 @@
            (cons ":authority" "example.test")
            (cons ":path" "/path")
            (cons "x-huffman" "www.example.com"))
-     (http-kit/http2::%hpack-decode-block
-      (http-kit/http2::%h2-frame-payload headers) context))
+     (h2-decode-header-block (http-kit/http2::%h2-frame-payload headers) context))
     (ensure-equal :eof (http-kit/http2::%h2-read-frame reader 16384 nil nil))))
 
 (deftest http2-client-huffman-option
@@ -237,7 +236,7 @@
                     (subseq observed-wire (length (h2-preface)))))
            (settings (http-kit/http2::%h2-read-frame reader 16384 nil nil))
            (headers (http-kit/http2::%h2-read-frame reader 16384 nil nil))
-           (context (http-kit/http2::%make-hpack-context)))
+           (context (h2-hpack-context)))
       (ensure-equal 4 (http-kit/http2::%h2-frame-type settings))
       (ensure-equal 1 (http-kit/http2::%h2-frame-type headers))
       (ensure-equal
@@ -246,8 +245,7 @@
              (cons ":authority" "example.test")
              (cons ":path" "/path")
              (cons "x-huffman" "www.example.com"))
-       (http-kit/http2::%hpack-decode-block
-        (http-kit/http2::%h2-frame-payload headers) context)))))
+       (h2-decode-header-block (http-kit/http2::%h2-frame-payload headers) context)))))
 
 (deftest http2-request-trailer-wire-boundaries
   (let* ((request
@@ -261,19 +259,17 @@
          (reader (http-kit/http2::%h2-reader-for wire))
          (initial (http-kit/http2::%h2-read-frame reader 16384 nil nil))
          (trailer (http-kit/http2::%h2-read-frame reader 16384 nil nil))
-         (context (http-kit/http2::%make-hpack-context)))
+         (context (h2-hpack-context)))
     (ensure-equal 1 (http-kit/http2::%h2-frame-type initial))
     (ensure-equal 4 (http-kit/http2::%h2-frame-flags initial))
     (ensure-equal 1 (http-kit/http2::%h2-frame-stream-id initial))
     (ensure-equal 1 (http-kit/http2::%h2-frame-type trailer))
     (ensure-equal 5 (http-kit/http2::%h2-frame-flags trailer))
     (ensure-equal 1 (http-kit/http2::%h2-frame-stream-id trailer))
-    (http-kit/http2::%hpack-decode-block
-     (http-kit/http2::%h2-frame-payload initial) context)
+    (h2-decode-header-block (http-kit/http2::%h2-frame-payload initial) context)
     (ensure-equal
      (list (cons "x-checksum" "done"))
-     (http-kit/http2::%hpack-decode-block
-      (http-kit/http2::%h2-frame-payload trailer) context))
+     (h2-decode-header-block (http-kit/http2::%h2-frame-payload trailer) context))
     (ensure-equal :eof (http-kit/http2::%h2-read-frame reader 16384 nil nil)))
   (let* ((body (octets 65 66))
          (request

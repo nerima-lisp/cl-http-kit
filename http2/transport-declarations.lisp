@@ -18,6 +18,10 @@
   (max-control-frames 100)
   (max-control-window 1.0d0)
   (control-frame-times nil))
+(progn
+  (defparameter *h2-max-peer-hpack-table-size* +hpack-default-table-size+)
+  (defconstant +http2-default-hpack-max-field-count+ 256)
+  (defconstant +http2-default-hpack-max-header-bytes+ 65536))
 
 (defstruct (http2-connection
              (:conc-name %http2-connection-)

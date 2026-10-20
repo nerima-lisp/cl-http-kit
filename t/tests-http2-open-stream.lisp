@@ -536,7 +536,7 @@
              (initial (first stream-frames))
              (data (second stream-frames))
              (trailer (third stream-frames))
-             (context (http-kit/http2::%make-hpack-context)))
+             (context (h2-hpack-context)))
         (ensure-equal 3 (length stream-frames))
         (ensure-equal 1 (http-kit/http2::%h2-frame-type initial))
         (ensure-equal 4 (http-kit/http2::%h2-frame-flags initial))
@@ -546,12 +546,10 @@
                       (http-kit/http2::%h2-frame-payload data))
         (ensure-equal 1 (http-kit/http2::%h2-frame-type trailer))
         (ensure-equal 5 (http-kit/http2::%h2-frame-flags trailer))
-        (http-kit/http2::%hpack-decode-block
-         (http-kit/http2::%h2-frame-payload initial) context)
+        (h2-decode-header-block (http-kit/http2::%h2-frame-payload initial) context)
         (ensure-equal
          (list (cons "x-checksum" "done"))
-         (http-kit/http2::%hpack-decode-block
-          (http-kit/http2::%h2-frame-payload trailer) context)))
+         (h2-decode-header-block (http-kit/http2::%h2-frame-payload trailer) context)))
       (ensure-equal 200 (http-response-status response))
       (ensure-equal (octets 9 8) (http-response-body response))
       (ensure-true closed)))

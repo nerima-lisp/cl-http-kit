@@ -44,7 +44,7 @@
 
 (defun %h2-server-decode-headers (block context max-header-bytes max-fields)
     (handler-case
-      (%hpack-decode-block block context
+      (%h2-decode-header-block block context
                            :max-header-bytes max-header-bytes
                            :max-fields max-fields)
     (http-kit:http-size-limit-exceeded (condition)
@@ -450,14 +450,10 @@ values.
                       (peer-connection-window +http2-default-window-size+)
                       (receive-connection-window +http2-default-window-size+)
                       (decoder-context
-                        (%make-hpack-context
-                         :max-size max-hpack-table-size
-                         :maximum-size max-hpack-table-size)))
+                        (%h2-make-hpack-context :max-table-size max-hpack-table-size)))
                  (labels
                      ((set-peer-hpack-table-size (size)
-                        (%hpack-set-maximum-size
-                         decoder-context
-                         (min size max-hpack-table-size))))
+                        (http-message-kit:hpack-context-set-decoder-max-table-size decoder-context (min size max-hpack-table-size))))
                  (let ((preface
                          (%h2-reader-read reader
                                          (length +http2-connection-preface+)
@@ -857,7 +853,7 @@ values.
                                :operation :http2-server))
                             (dolist (wire
                                      (%h2-header-frames
-                                      (%hpack-encode-block fields
+                                      (%h2-encode-header-block fields
                                                            :huffman-p huffman-p)
                                       nil
                                       peer-max-frame-size
@@ -876,8 +872,7 @@ values.
                                  (has-trailers
                                    (not (null response-trailer-fields)))
                                  (header-block
-                                   (%hpack-encode-block
-                                    response-header-fields
+                                   (%h2-encode-header-block response-header-fields
                                     :huffman-p huffman-p))
                                  (header-frames
                                    (%h2-header-frames
@@ -951,8 +946,7 @@ values.
                             (when has-trailers
                               (dolist (wire
                                        (%h2-header-frames
-                                        (%hpack-encode-block
-                                         response-trailer-fields
+                                        (%h2-encode-header-block response-trailer-fields
                                          :huffman-p huffman-p)
                                         t
                                         peer-max-frame-size

@@ -672,9 +672,9 @@
                        (ensure-equal 1 (http-kit/http2::%h2-frame-stream-id trailer))
                        (ensure-equal 5 (http-kit/http2::%h2-frame-flags trailer))
                        (ensure-equal '(("x-end" . "done"))
-                                     (http-kit/http2::%hpack-decode-block
+                                     (h2-decode-header-block
                                       (http-kit/http2::%h2-frame-payload trailer)
-                                      (http-kit/http2::%make-hpack-context)))))))
+                                      (h2-hpack-context)))))))
           (http-kit/http2:close-http2-connection connection))
         (ensure-equal 1 closed)
         (ensure-false (open-stream-p stream))
@@ -987,8 +987,8 @@
              (ensure-false (http-kit/http2:http2-connection-goaway-last-stream-id connection))
              (ensure-false (http-kit/http2:http2-connection-local-goaway-last-stream-id connection))
              (let ((context (http-kit/http2::%http2-connection-hpack-context connection)))
-               (ensure-false (http-kit/http2::%hpack-context-entries context))
-               (ensure-equal 0 (http-kit/http2::%hpack-context-size context)))
+               (ensure-equal 0 (http-message-kit:hpack-context-dynamic-entry-count context))
+               (ensure-equal 0 (http-message-kit:hpack-context-table-size context)))
              ;; Completed empty-body streams leave no flow-control entries or HPACK
              ;; dynamic entries. Skip their equivalent ID increments, not lifecycle state.
              (setf (http-kit/http2::%http2-connection-next-stream-id connection) #x7fffffff)
@@ -1085,67 +1085,11 @@
 
 #+sbcl
 (progn
-  (deftest http2-public-contract-huffman-complete-rfc-tree
-    (let* ((codes http-kit/http2::+hpack-huffman-codes+)
-           (lengths http-kit/http2::+hpack-huffman-lengths+)
-           (root http-kit/http2::*hpack-huffman-tree*)
-           (seen (make-hash-table :test #'eq))
-           (symbols nil)
-           (internals 0)
-           (complete t)
-           (paths-match t)
-           (unique-nodes t)
-           (leaf-children-empty t))
-      (ensure-equal 257 (length codes))
-      (ensure-equal 257 (length lengths))
-      (ensure-equal 30 (reduce #'max lengths))
-      (ensure-equal (ash 1 30)
-                    (loop for width across lengths sum (ash 1 (- 30 width))))
-      (ensure-equal #x3fffffff (aref codes 256))
-      (ensure-equal 30 (aref lengths 256))
-      (labels ((visit (node code depth)
-                 (if (gethash node seen)
-                     (setf unique-nodes nil)
-                     (let ((zero (http-kit/http2::%hpack-huffman-node-zero node))
-                           (one (http-kit/http2::%hpack-huffman-node-one node))
-                           (symbol (http-kit/http2::%hpack-huffman-node-symbol node)))
-                       (setf (gethash node seen) t)
-                       (if symbol
-                           (progn
-                             (push symbol symbols)
-                             (unless (and (integerp symbol) (<= 0 symbol 256)
-                                          (= code (aref codes symbol))
-                                          (= depth (aref lengths symbol)))
-                               (setf paths-match nil))
-                             (when (or zero one) (setf leaf-children-empty nil)))
-                           (progn
-                             (incf internals)
-                             (unless (and zero one) (setf complete nil))
-                             (when zero (visit zero (ash code 1) (1+ depth)))
-                             (when one (visit one (1+ (ash code 1)) (1+ depth)))))))))
-        (visit root 0 0))
-      (ensure-equal 513 (hash-table-count seen))
-      (ensure-equal 256 internals)
-      (ensure-equal 257 (length symbols))
-      (ensure-equal (loop for symbol below 257 collect symbol) (sort symbols #'<))
-      (ensure-true complete)
-      (ensure-true paths-match)
-      (ensure-true unique-nodes)
-      (ensure-true leaf-children-empty)
-      ;; All data leaves must reset to the root before the next symbol's bits.
-      (let ((data (map '(vector (unsigned-byte 8)) #'identity
-                       (append (loop for symbol below 256 collect symbol)
-                               (loop for symbol downfrom 255 to 0 collect symbol)))))
-        (ensure-equal data
-                      (http-kit/http2::%hpack-huffman-decode
-                       (http-kit/http2::%hpack-huffman-encode data))))
-      (ensure-true (eq root http-kit/http2::*hpack-huffman-tree*))))
-
-  (defun %h2-public-huffman-response-contract (encoded expected &optional error-detail error-message)
+  (defun %h2-public-huffman-response-contract
+      (encoded-string expected &optional error-detail error-message)
     (let* ((block (concatenate-octets
                    (octets #x88 #x00 #x01 #x78)
-                   (http-kit/http2::%hpack-encode-integer (length encoded) 7 #x80)
-                   encoded))
+                   encoded-string))
            (stream (make-instance 'binary-session-stream
                                   :input (concatenate-octets
                                           (h2-frame 4 0 0 (octets))
@@ -1180,7 +1124,10 @@
                  (progn
                    (ensure-true (typep result 'http-protocol-error))
                    (ensure-equal :hpack (http-error-operation result))
-                   (ensure-equal error-detail (http-protocol-error-detail result))
+                   (let ((detail (http-protocol-error-detail result)))
+                     (ensure-equal 4 (length detail))
+                     (ensure-equal error-detail (list (first detail) (second detail) (third detail)))
+                     (ensure-true (typep (fourth detail) 'condition)))
                    (ensure-equal error-message (http-error-message result))
                    (ensure-equal 1 closed)
                    (ensure-false (http-kit/http2:http2-connection-open-p connection)))
@@ -1208,23 +1155,37 @@
 
   (deftest http2-public-contract-huffman-normal-response
     (%h2-public-huffman-response-contract
-     (octets #xf1 #xe3 #xc2 #xe5 #xf2 #x3a #x6b #xa0 #xab #x90 #xf4 #xff)
+     (concatenate-octets
+      (http-message-kit:hpack-encode-integer 12 7 #x80)
+      (octets #xf1 #xe3 #xc2 #xe5 #xf2 #x3a #x6b #xa0 #xab #x90 #xf4 #xff))
      "www.example.com")
-    (%h2-public-huffman-response-contract (octets) "")
+    (%h2-public-huffman-response-contract
+     (http-message-kit:hpack-encode-string "" :huffman t) "")
     (let ((text (concatenate 'string "abcdefghijklmnopqrstuvwxyz"
                              "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")))
       (%h2-public-huffman-response-contract
-       (http-kit/http2::%hpack-huffman-encode (ascii text)) text)))
+       (http-message-kit:hpack-encode-string text :huffman t) text)))
 
   (deftest http2-public-contract-huffman-eos-response-rejected
     (%h2-public-huffman-response-contract
-     (octets #xff #xff #xff #xfc) nil :huffman-eos
-     "An HPACK Huffman string contains EOS."))
+     (concatenate-octets
+      (http-message-kit:hpack-encode-integer 4 7 #x80)
+      (octets #xff #xff #xff #xfc))
+     nil '(:codec-operation :hpack-string :codec-detail)
+     "An HPACK Huffman string is invalid."))
 
   (deftest http2-public-contract-huffman-excessive-padding-response-rejected
     (%h2-public-huffman-response-contract
-     (octets #xff) nil 8 "An HPACK Huffman string has excessive padding."))
+     (concatenate-octets
+      (http-message-kit:hpack-encode-integer 1 7 #x80)
+      (octets #xff))
+     nil '(:codec-operation :hpack-string :codec-detail)
+     "An HPACK Huffman string is invalid."))
 
   (deftest http2-public-contract-huffman-invalid-padding-response-rejected
     (%h2-public-huffman-response-contract
-     (octets #x1e) nil 6 "An HPACK Huffman string has invalid padding.")))
+     (concatenate-octets
+      (http-message-kit:hpack-encode-integer 1 7 #x80)
+      (octets #x1e))
+     nil '(:codec-operation :hpack-string :codec-detail)
+     "An HPACK Huffman string is invalid.")))

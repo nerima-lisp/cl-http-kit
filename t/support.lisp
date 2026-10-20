@@ -73,8 +73,43 @@ the behavior they exercise and prevents test doubles from drifting apart."
   (http-kit/http2::%h2-reader-for
    (apply #'concatenate-octets frames)))
 
-(defun h2-header-block (&rest fields)
-  (http-kit/http2::%hpack-encode-block fields))
+(progn
+  (defun h2-hpack-context ()
+    (http-message-kit:make-hpack-context
+     :max-table-size 4096
+     :max-header-list-size 65536
+     :max-field-count 256
+     :validate-header-names t
+     :huffman nil))
+
+  (defun h2-decode-header-block (block context &key max-header-bytes max-fields)
+    (multiple-value-bind (headers end-position)
+        (http-message-kit:hpack-decode-header-block
+         block
+         :context context
+         :max-header-bytes (or max-header-bytes 65536)
+         :max-fields (or max-fields 256)
+         :validate-header-names t)
+      (declare (ignore end-position))
+      (mapcar (lambda (header)
+                (cons (http-message-kit:http-header-name header)
+                      (http-message-kit:http-header-content header)))
+              headers)))
+
+  (defun h2-header-block (&rest fields)
+    (let ((encoded-fields
+            (mapcar (lambda (field)
+                      (concatenate-octets
+                       (http-message-kit:hpack-encode-integer 0 4 0)
+                       (http-message-kit:hpack-encode-string
+                        (car field) :huffman nil)
+                       (http-message-kit:hpack-encode-string
+                        (cdr field) :huffman nil)))
+                    fields)))
+      (if encoded-fields
+          (apply #'concatenate-octets encoded-fields)
+          (octets))))
+)
 
 (defun h2-response-wire (body)
   (concatenate-octets
