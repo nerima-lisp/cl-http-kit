@@ -276,7 +276,7 @@
                 -- run cl-http-kit/test-core \
                 --test-timeout-ms "$test_timeout_ms" \
                 --max-workers "$max_workers" \
-                --bail true \
+                --bail false \
                 --fail-with-no-tests "$@"
             '';
           };
@@ -315,7 +315,7 @@
                 -- run cl-http-kit/test \
                 --test-timeout-ms "$test_timeout_ms" \
                 --max-workers "$max_workers" \
-                --bail true \
+                --bail false \
                 --fail-with-no-tests "$@"
             '';
           };
@@ -406,7 +406,8 @@
                 --coverage-min-branch 100 \
                 --test-timeout-ms "$test_timeout_ms" \
                 --max-workers "$max_workers" \
-                --bail true \
+                --bail false \
+                --coverage-output "$coverage_report_directory/sb-cover.sexp" \
                 --coverage-report-directory "$coverage_report_directory/" \
                 --fail-with-no-tests "$@"
               perl scripts/check-coverage.pl "$coverage_report_directory"

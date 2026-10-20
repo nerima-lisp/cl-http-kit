@@ -1,0 +1,53 @@
+name: Post-merge count diagnostics
+
+on:
+  push:
+    branches:
+      - p4a-postmerge-counts-b220fdf
+
+jobs:
+  count-diagnostics:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v20
+      - name: Run test suites and preserve statuses
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_id="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          output_dir="$GITHUB_WORKSPACE/diagnostic-output/$run_id"
+          coverage_dir="$GITHUB_WORKSPACE/coverage-diagnostic/$run_id"
+          mkdir -p "$output_dir" "$coverage_dir"
+          export CL_HTTP_KIT_COVERAGE_DIR="$coverage_dir"
+          status_file="$output_dir/status.txt"
+          overall_status=0
+
+          run_suite() {
+            local suite_name="$1"
+            local -a pipeline_status
+            set +e
+            nix run --print-build-logs ".#$suite_name" 2>&1 | tee "$output_dir/$suite_name.log"
+            pipeline_status=("${PIPESTATUS[@]}")
+            set -e
+            local app_status="${pipeline_status[0]}"
+            local tee_status="${pipeline_status[1]}"
+            printf '%s=%s tee=%s\n' "$suite_name" "$app_status" "$tee_status" | tee -a "$status_file"
+            if [ "$app_status" -ne 0 ] || [ "$tee_status" -ne 0 ]; then
+              overall_status=1
+            fi
+            return 0
+          }
+
+          run_suite test
+          run_suite test-core
+          run_suite coverage
+          exit "$overall_status"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: post-merge-counts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            diagnostic-output/${{ github.run_id }}-${{ github.run_attempt }}/
+            coverage-diagnostic/${{ github.run_id }}-${{ github.run_attempt }}/
+          if-no-files-found: error
