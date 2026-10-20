@@ -100,7 +100,7 @@
     (signals http-protocol-error
       (http-kit/http2::%h2-process-headers-frame
        frame (h2-reader-from-frames) 16384 nil (lambda () 0d0) 1024
-       (http-kit/http2::%make-hpack-context) nil nil
+       (h2-hpack-context) nil nil
        (make-array 0 :element-type '(unsigned-byte 8)
                    :adjustable t :fill-pointer 0)
        "GET"))))

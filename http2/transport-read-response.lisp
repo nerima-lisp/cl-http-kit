@@ -55,9 +55,7 @@
                        :operation :http2-read
                        :detail key))))
     (let ((context (or hpack-context
-                       (%make-hpack-context
-                        :max-size +hpack-default-table-size+
-                        :maximum-size +hpack-default-table-size+)))
+                       (%h2-make-hpack-context :max-table-size +hpack-default-table-size+)))
         (status nil)
         (headers nil)
         (body (if collect-body-p

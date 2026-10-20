@@ -127,18 +127,9 @@
                         :headers (list (make-http-header "Host" "127.0.0.1")
                                        (make-http-header "host" "127.0.0.1"))))))
 
-(deftest http2-decodes-hpack-huffman
-  (multiple-value-bind (value position)
-      (http-kit/http2::%hpack-decode-string
-       (octets #x8c #xf1 #xe3 #xc2 #xe5 #xf2 #x3a #x6b #xa0 #xab #x90 #xf4 #xff)
-       0)
-    (ensure-equal "www.example.com" value "RFC 7541 Huffman vector")
-    (ensure-equal 13 position "RFC 7541 Huffman vector length")))
-
 (deftest http2-rejects-uppercase-response-header
   (let ((uppercase-headers
-          (http-kit/http2::%hpack-encode-block
-           (list (cons ":status" "200")
+          (apply #'h2-header-block (list (cons ":status" "200")
                  (cons "X-Test" "yes")))))
     (signals http-invalid-header
       (http-kit/http2:send-http2-request
@@ -152,8 +143,7 @@
 
 (deftest http2-304-response-has-no-body
   (let ((not-modified-headers
-          (http-kit/http2::%hpack-encode-block
-           (list (cons ":status" "304")
+          (apply #'h2-header-block (list (cons ":status" "304")
                  (cons "content-length" "3")))))
     (let ((response
             (http-kit/http2:send-http2-request
@@ -171,8 +161,7 @@
 
 (deftest http2-204-response-rejects-content-length
   (let ((no-content-headers
-          (http-kit/http2::%hpack-encode-block
-           (list (cons ":status" "204")
+          (apply #'h2-header-block (list (cons ":status" "204")
                  (cons "content-length" "1")))))
     (signals http-invalid-header
       (http-kit/http2:send-http2-request
@@ -234,7 +223,7 @@
 
 (deftest http2-rejects-oversized-table-update
   (let ((oversized-table-update
-          (http-kit/http2::%hpack-encode-integer 4097 5 0)))
+          (http-message-kit:hpack-encode-integer 4097 5 0)))
     (signals http-protocol-error
       (http-kit/http2:send-http2-request
        (http-kit/http2:make-http2-client
@@ -567,7 +556,7 @@
                      (multiple-value-bind (status actual-headers response)
                          (apply #'http-kit/http2::%h2-process-headers-frame
                                 frame reader 16384 nil nil 65536
-                                (http-kit/http2::%make-hpack-context) 200 headers body arguments)
+                                (h2-hpack-context) 200 headers body arguments)
                        (ensure-equal 200 status)
                        (ensure-true (eq headers actual-headers))
                        response))

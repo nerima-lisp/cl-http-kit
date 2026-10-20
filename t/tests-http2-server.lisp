@@ -16,10 +16,8 @@
 
   (defun server-response-fields (frame)
     (let ((context
-            (http-kit/http2::%make-hpack-context
-             :max-size http-kit/http2::+hpack-default-table-size+
-             :maximum-size http-kit/http2::+hpack-default-table-size+)))
-      (http-kit/http2::%hpack-decode-block
+            (h2-hpack-context)))
+      (h2-decode-header-block
        (http-kit/http2::%h2-frame-payload frame)
        context
        :max-header-bytes 65536)))

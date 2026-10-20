@@ -46,9 +46,7 @@
                     :no-body t)))))
 
 (deftest http2-response-header-processing-errors
-  (let* ((context (http-kit/http2::%make-hpack-context
-                   :max-size http-kit/http2::+hpack-default-table-size+
-                   :maximum-size http-kit/http2::+hpack-default-table-size+))
+  (let* ((context (h2-hpack-context))
          (body (make-array 0 :element-type '(unsigned-byte 8)
                            :adjustable t :fill-pointer 0))
          (headers-frame
@@ -103,7 +101,7 @@
        headers-frame (h2-reader-from-frames) 16384 nil (lambda () 0d0)
        1024 context 200 '() body "GET")))
 
-  (let* ((context (http-kit/http2::%make-hpack-context))
+  (let* ((context (h2-hpack-context))
          (body (make-array 0 :element-type '(unsigned-byte 8)
                            :adjustable t :fill-pointer 0))
          (initial
@@ -166,7 +164,7 @@
            1
            (h2-header-block (cons ":status" "103")
                             (cons "content-length" "0"))))
-        (context (http-kit/http2::%make-hpack-context)))
+        (context (h2-hpack-context)))
     (signals http-invalid-header
       (http-kit/http2::%h2-batch-process-headers-frame
        entry frame (lambda () :eof) 16384 1024 128 context "GET"))))

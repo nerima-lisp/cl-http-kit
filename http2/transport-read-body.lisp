@@ -60,7 +60,7 @@
   (multiple-value-bind (block end-stream)
       (%h2-read-header-block frame reader max-frame-size deadline clock-function
                              max-header-bytes expected-stream-id)
-    (let ((fields (%hpack-decode-block block context
+    (let ((fields (%h2-decode-header-block block context
                                        :max-header-bytes max-header-bytes
                                        :max-fields max-fields)))
       (if status

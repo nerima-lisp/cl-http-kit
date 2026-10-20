@@ -341,7 +341,7 @@
          (h2-frame-object 1 5 3 (h2-header-block (cons ":status" "201")
                                                (cons "content-length" "0")))
          (lambda () (incf reads) :eof) 16384 nil (lambda () 0) 4096
-         (http-kit/http2::%make-hpack-context) nil nil (octets) 0 "GET" 3)
+         (h2-hpack-context) nil nil (octets) 0 "GET" 3)
       (ensure-equal 201 status)
       (ensure-equal "0" (http-header-value headers "content-length"))
       (ensure-equal 201 (http-response-status response))
@@ -359,7 +359,7 @@
                   (apply #'http-kit/http2::%h2-process-headers-frame
                          (h2-frame-object 1 5 1 (octets))
                          (lambda () (incf reads) :eof) 16384 nil (lambda () 0)
-                         4096 (http-kit/http2::%make-hpack-context) nil nil body
+                         4096 (h2-hpack-context) nil nil body
                          arguments)
                 (http-protocol-error (error) error))))
         (ensure-true (typep condition 'http-protocol-error))
@@ -407,25 +407,6 @@
         (ensure-equal 0 clocks)))))
 
 #+sbcl
-(deftest http2-coverage-hpack-field-limit-type-before-mutation
-  (let ((context (http-kit/http2::%make-hpack-context))
-        (block (h2-header-block (cons ":status" "200"))))
-    (dolist (limit '(0 -1 1/2 "1" :invalid))
-      (let ((condition
-              (handler-case
-                  (http-kit/http2::%hpack-decode-block block context :max-fields limit)
-                (http-protocol-error (error) error))))
-        (ensure-true (typep condition 'http-protocol-error))
-        (ensure-equal :hpack (http-error-operation condition))
-        (ensure-equal limit (http-protocol-error-detail condition)))
-      (ensure-equal 0 (http-kit/http2::%hpack-context-size context))
-      (ensure-false (http-kit/http2::%hpack-context-entries context)))
-    (ensure-equal '((":status" . "200"))
-                  (http-kit/http2::%hpack-decode-block block context :max-fields 1))
-    (ensure-equal '((":status" . "200"))
-                  (http-kit/http2::%hpack-decode-block block context))))
-
-#+sbcl
 (deftest http2-coverage-server-stream-omitted-defaults
   (let* ((first (http-kit/http2::%make-h2-server-stream 1))
          (second (http-kit/http2::%make-h2-server-stream 3))
@@ -450,29 +431,6 @@
     (ensure-equal 65536
                   (http-kit/http2::%h2-server-window-add
                    (http-kit/http2::%h2-server-stream-receive-window first) 1 :stream))))
-
-#+sbcl
-(deftest http2-coverage-hpack-name-predicate-boundaries
-  (dolist (name '(nil 1 "" ":" "bad name" ":bad name"))
-    (ensure-false (http-kit/http2::%hpack-name-p name)))
-  (dolist (name '("x-name" ":status"))
-    (ensure-true (http-kit/http2::%hpack-name-p name)))
-  (let ((context (http-kit/http2::%make-hpack-context)))
-    (dolist (name '("" ":"))
-      (let ((condition
-              (handler-case
-                  (http-kit/http2::%hpack-decode-block
-                   (concatenate-octets (octets 0 (length name))
-                                       (map '(vector (unsigned-byte 8)) #'char-code name)
-                                       (octets 0))
-                   context)
-                (http-invalid-header (error) error))))
-        (ensure-true (typep condition 'http-invalid-header))
-        (ensure-equal :hpack (http-error-operation condition))
-        (ensure-equal name (http-invalid-header-name condition))
-        (ensure-equal :name (http-invalid-header-reason condition)))
-      (ensure-equal 0 (http-kit/http2::%hpack-context-size context))
-      (ensure-false (http-kit/http2::%hpack-context-entries context)))))
 
 #+sbcl
 (deftest http2-coverage-settings-peer-role-validation
@@ -503,35 +461,6 @@
       (ensure-equal 1 (http-kit::http-protocol-error-http2-error-code condition))))
   (ensure-equal #x7fffffff
                 (http-kit/http2::%h2-server-window-add 65535 (- #x7fffffff 65535) :stream)))
-
-#+sbcl
-(deftest http2-coverage-huffman-complete-tree-and-all-octets
-  (let ((symbols nil) (internal 0)
-        (input (make-array 256 :element-type '(unsigned-byte 8))))
-    (labels ((visit (node)
-               (ensure-true (typep node 'http-kit/http2::%hpack-huffman-node))
-               (let ((symbol (http-kit/http2::%hpack-huffman-node-symbol node))
-                     (zero (http-kit/http2::%hpack-huffman-node-zero node))
-                     (one (http-kit/http2::%hpack-huffman-node-one node)))
-                 (if symbol
-                     (progn
-                       (ensure-true (and (integerp symbol) (<= 0 symbol 256)))
-                       (ensure-false zero)
-                       (ensure-false one)
-                       (push symbol symbols))
-                     (progn
-                       (incf internal)
-                       (ensure-true zero)
-                       (ensure-true one)
-                       (visit zero)
-                       (visit one))))))
-      (visit http-kit/http2::*hpack-huffman-tree*))
-    (ensure-equal 256 internal)
-    (ensure-equal (loop for symbol from 0 to 256 collect symbol) (sort symbols #'<))
-    (dotimes (index 256) (setf (aref input index) index))
-    (ensure-equal input
-                  (http-kit/http2::%hpack-huffman-decode
-                   (http-kit/http2::%hpack-huffman-encode input)))))
 
 #+sbcl
 (deftest http2-coverage-response-omitted-body-length
