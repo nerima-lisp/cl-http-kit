@@ -129,8 +129,13 @@
             (ensure-equal payload (http-response-body response))
             (ensure-false (http-header-present-p
                            (http-response-headers response) "Content-Encoding"))
-            (ensure-false (http-header-present-p
-                           (http-response-headers response) "Content-Length"))))))
+            (progn
+              (ensure-false (http-header-present-p
+                             (http-response-headers response) "Content-Length"))
+              (ensure-equal payload
+                            (http-response-body
+                             (decode-http-response-content
+                              (%fr014-response encoded coding)))))))))
     (dolist (entry cases)
       (destructuring-bind (coding encoded payload) entry
         (let* ((limit (1- (length payload)))
