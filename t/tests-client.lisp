@@ -8173,7 +8173,7 @@
                     (client-test-response
                      200 :body body :headers (list (make-http-header "Content-Encoding" "Br")))
                     :max-body-bytes 2 :content-decoders registry)))
-    (ensure-equal '("gzip" "deflate" "br") (mapcar #'car registry))
+    (ensure-equal '("gzip" "deflate" "zstd" "br") (mapcar #'car registry))
     (ensure-octets-equal decoded (http-response-body response))
     (ensure-equal 0 old-calls)
     (ensure-equal 1 new-calls)
