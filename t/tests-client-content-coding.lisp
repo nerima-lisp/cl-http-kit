@@ -111,7 +111,7 @@
                  (make-http-client
                   :transport-function
                   (lambda (request &rest arguments)
-                    (declare (ignore request arguments))
+                    (declare (ignore arguments))
                     (setf seen-request request)
                     (%fr014-response encoded coding)))))
           (multiple-value-bind (response effective-request)
