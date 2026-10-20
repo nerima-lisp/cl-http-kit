@@ -1848,7 +1848,7 @@
                     :transport-function
                     (lambda (prepared &key &allow-other-keys)
                       (incf calls)
-                      (ensure-equal (if enabled '("gzip, deflate") nil)
+                      (ensure-equal (if enabled '("gzip, deflate, br, zstd") nil)
                                     (http-header-values (http-request-headers prepared) "Accept-Encoding"))
                       (make-http-response :status 200 :body body)))))
       (let ((response (http-client-send client request)))

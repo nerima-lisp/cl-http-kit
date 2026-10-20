@@ -444,7 +444,7 @@
          (request (http-client-request client "GET" "http://example.test/")))
     (multiple-value-bind (response effective-request)
         (http-client-send client request)
-      (ensure-equal "gzip, deflate"
+      (ensure-equal "gzip, deflate, br, zstd"
                     (http-header-value
                      (http-request-headers effective-request)
                      "Accept-Encoding"))
@@ -552,7 +552,7 @@
             :transport-function
             (lambda (request &rest arguments)
               (declare (ignore arguments))
-              (ensure-equal "gzip, deflate, br"
+              (ensure-equal "gzip, deflate, zstd, br"
                             (http-header-value
                              (http-request-headers request)
                              "Accept-Encoding"))
@@ -8173,7 +8173,7 @@
                     (client-test-response
                      200 :body body :headers (list (make-http-header "Content-Encoding" "Br")))
                     :max-body-bytes 2 :content-decoders registry)))
-    (ensure-equal '("gzip" "deflate" "br") (mapcar #'car registry))
+    (ensure-equal '("gzip" "deflate" "zstd" "br") (mapcar #'car registry))
     (ensure-octets-equal decoded (http-response-body response))
     (ensure-equal 0 old-calls)
     (ensure-equal 1 new-calls)
