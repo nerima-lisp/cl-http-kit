@@ -815,7 +815,7 @@ this operation has no response stream to associate with it."
     (connection request
      &key timeout deadline max-header-bytes max-fields max-body-bytes clock-function
        request-body-function request-body-length
-       on-body-chunk on-stream-open (collect-body-p t) (huffman-p nil))
+       on-body-chunk on-information on-stream-open (collect-body-p t) (huffman-p nil))
   "Send REQUEST on CONNECTION and retain the connection for later streams.
 
 Requests on one connection are serialized by this API.  A caller that needs
@@ -838,11 +838,17 @@ concurrent streams should use SEND-HTTP2-REQUESTS-OVER-CONNECTION."
            :message "ON-BODY-CHUNK must be a function or NIL."
            :operation :http2-client
            :detail on-body-chunk))
-  (when (and on-stream-open (not (functionp on-stream-open)))
-    (error 'http-kit:http-protocol-error
-           :message "ON-STREAM-OPEN must be a function or NIL."
-           :operation :http2-client
-           :detail on-stream-open))
+  (progn
+    (when (and on-information (not (functionp on-information)))
+      (error 'http-kit:http-protocol-error
+             :message "ON-INFORMATION must be a function or NIL."
+             :operation :http2-client
+             :detail on-information))
+    (when (and on-stream-open (not (functionp on-stream-open)))
+      (error 'http-kit:http-protocol-error
+             :message "ON-STREAM-OPEN must be a function or NIL."
+             :operation :http2-client
+             :detail on-stream-open)))
   (unless (member collect-body-p '(nil t))
     (error 'http-kit:http-protocol-error
            :message "COLLECT-BODY-P must be NIL or T."
@@ -939,7 +945,7 @@ concurrent streams should use SEND-HTTP2-REQUESTS-OVER-CONNECTION."
                            :expected-stream-id stream-id
                            :hpack-context
                            (%http2-connection-hpack-context connection)
-                           :max-fields field-limit
+                           :max-fields field-limit :on-information on-information
                            :budget-owner connection
                            :read-initial-settings-p read-initial-settings-p
                            :peer-max-frame-size
@@ -1001,7 +1007,8 @@ concurrent streams should use SEND-HTTP2-REQUESTS-OVER-CONNECTION."
   (lambda (request
            &key timeout deadline max-header-bytes max-fields max-body-bytes clock-function
              request-body-function request-body-length
-             on-body-chunk on-stream-open (collect-body-p t) (huffman-p nil)
+             on-body-chunk on-information on-stream-open
+             (collect-body-p t) (huffman-p nil)
              &allow-other-keys)
     (send-http2-request-over-connection
      connection request
@@ -1015,6 +1022,7 @@ concurrent streams should use SEND-HTTP2-REQUESTS-OVER-CONNECTION."
      :request-body-length request-body-length
      :huffman-p huffman-p
      :on-body-chunk on-body-chunk
+     :on-information on-information
      :on-stream-open on-stream-open
      :collect-body-p collect-body-p)))
 

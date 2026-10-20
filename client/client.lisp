@@ -1,5 +1,9 @@
 (in-package #:http-kit/client)
 
+(progn
+  (defvar *client-http2-pending-stream* nil)
+  (defvar *client-http2-pending-key* nil))
+
 (defun %client-empty-octets ()
   (make-array 0 :element-type '(unsigned-byte 8)))
 
@@ -402,18 +406,144 @@
     (funcall resolver host :timeout timeout :deadline deadline)))
 
 (defun %client-native-tls-upgrade ()
-  (let ((upgrader nil))
+  (let ((proxy-upgrader nil)
+        (origin-upgrader nil))
     (lambda (stream uri &key timeout deadline &allow-other-keys)
-      (unless upgrader
-        (let ((factory (%client-runtime-function
-                        "HTTP-KIT/TLS" "MAKE-HTTP-TLS-UPGRADER")))
-          (unless factory
-            (%client-missing-native-feature :tls "HTTP-KIT/TLS"))
-          (setf upgrader
-                ;; HTTP/2 dispatch is not implemented by this client path yet.
-                ;; Offering h2 would route an h2 wire stream into the HTTP/1.1 parser.
-                (funcall factory :alpn-protocols '("http/1.1")))))
-      (funcall upgrader stream uri :timeout timeout :deadline deadline))))
+      (let ((proxy-tls-p *proxy-tls-upgrade-p*))
+        (unless (if proxy-tls-p proxy-upgrader origin-upgrader)
+          (let ((factory (%client-runtime-function
+                          "HTTP-KIT/TLS" "MAKE-HTTP-TLS-UPGRADER")))
+            (unless factory
+              (%client-missing-native-feature :tls "HTTP-KIT/TLS"))
+            (let ((upgrader
+                    (funcall factory
+                             :alpn-protocols
+                             (if proxy-tls-p
+                                 '("http/1.1")
+                                 '("h2" "http/1.1")))))
+              (if proxy-tls-p
+                  (setf proxy-upgrader upgrader)
+                  (setf origin-upgrader upgrader)))))
+        (let* ((upgrader (if proxy-tls-p proxy-upgrader origin-upgrader))
+               (tls-stream (funcall upgrader stream uri
+                                    :timeout timeout :deadline deadline))
+               (selected-alpn
+                 (%client-runtime-function
+                  "HTTP-KIT/TLS" "HTTP-TLS-SELECTED-ALPN-PROTOCOL")))
+          (values tls-stream
+                  (and selected-alpn (funcall selected-alpn tls-stream))))))))
+
+(defun %client-transport-from-negotiated-connection-pool
+    (connection-pool)
+  (let* ((open-stream (%http-connection-pool-open-stream connection-pool))
+         (close-stream (%http-connection-pool-close-stream connection-pool))
+         (http1-transport
+           (%client-transport-from-connection-pool connection-pool))
+         (http2-manager nil)
+         (http2-transport nil)
+         (routes (make-hash-table :test #'equal))
+         (routes-lock (%make-client-lock "http-client-protocol-routes")))
+    (labels ((http2-route-p (key)
+               (%with-client-lock (routes-lock)
+                 (eq (gethash key routes) :http2)))
+             (mark-http2-route (key)
+               (%with-client-lock (routes-lock)
+                 (setf (gethash key routes) :http2)))
+             (mark-http1-route (key)
+               (%with-client-lock (routes-lock)
+                 (remhash key routes)))
+             (send-http1 (request arguments key &optional stream)
+               (if stream
+                   (apply #'%http-connection-pool-send-on-stream
+                          connection-pool request stream
+                          (append (list :key key) arguments))
+                   (apply http1-transport request arguments)))
+             (send-http2 (request arguments key)
+               (apply http2-transport request
+                      (append (list :connection-key key) arguments)))
+             (open-http2-connection
+                 (request &key timeout deadline proxy-plan proxy &allow-other-keys)
+               (let ((stream nil)
+                     (negotiated-alpn nil)
+                     (transferred-p nil))
+                 (unwind-protect
+                      (progn
+                        (if (and *client-http2-pending-stream*
+                                 (equal (%client-connection-key request proxy-plan)
+                                        *client-http2-pending-key*))
+                            (setf stream
+                                  (prog1 *client-http2-pending-stream*
+                                    (setf *client-http2-pending-stream* nil
+                                          *client-http2-pending-key* nil))
+                                  negotiated-alpn "h2")
+                            (multiple-value-setq (stream negotiated-alpn)
+                              (funcall open-stream request
+                                       :timeout timeout
+                                       :deadline deadline
+                                       :proxy-plan proxy-plan
+                                       :proxy proxy)))
+                        (unless (equal negotiated-alpn "h2")
+                          (let ((handoff-stream stream))
+                            (setf stream nil
+                                  transferred-p t)
+                            (error '%http-client-alpn-handoff
+                                   :stream handoff-stream
+                                   :protocol :http/1.1)))
+                        (prog1
+                            (http-kit/http2:make-http2-connection
+                             :stream stream
+                             :close-stream close-stream)
+                          (setf stream nil
+                                transferred-p t)))
+                   (when (and stream (not transferred-p))
+                     (%pool-close connection-pool stream)))))
+             (send (request &rest arguments)
+               (let* ((proxy-plan (getf arguments :proxy-plan))
+                      (key (%client-connection-key request proxy-plan)))
+                 (if (http2-route-p key)
+                     (handler-case
+                         (send-http2 request arguments key)
+                       (%http-client-alpn-handoff (condition)
+                         (mark-http1-route key)
+                         (send-http1
+                          request arguments key
+                          (%http-client-alpn-handoff-stream condition))))
+                     (handler-case
+                         (send-http1 request arguments key)
+                       (%http-client-alpn-handoff (condition)
+                         (mark-http2-route key)
+                         (let ((*client-http2-pending-stream*
+                                 (%http-client-alpn-handoff-stream condition))
+                               (*client-http2-pending-key* key))
+                           (unwind-protect
+                                (handler-case
+                                    (send-http2 request arguments key)
+                                  (%http-client-alpn-handoff (fallback)
+                                    (mark-http1-route key)
+                                    (when *client-http2-pending-stream*
+                                      (%pool-close
+                                       connection-pool
+                                       *client-http2-pending-stream*)
+                                      (setf *client-http2-pending-stream* nil
+                                            *client-http2-pending-key* nil))
+                                    (send-http1
+                                     request arguments key
+                                     (%http-client-alpn-handoff-stream
+                                      fallback)))
+                             (when *client-http2-pending-stream*
+                               (%pool-close
+                                connection-pool
+                                *client-http2-pending-stream*)
+                               (setf *client-http2-pending-stream* nil
+                                     *client-http2-pending-key* nil)))))))))
+      (setf http2-manager
+            (http-kit/http2:make-http2-connection-manager
+             :open-connection #'open-http2-connection
+             :clock-function #'%client-monotonic-time)
+            http2-transport
+            (http-kit/http2:make-http2-connection-manager-transport
+             http2-manager))
+      #'send)))))
 
 (defun make-http-client
     (&key transport-function open-stream close-stream connection-pool
@@ -608,8 +738,11 @@ Pass NIL explicitly to disable either store."
                      :resolve-host-style resolve-host-style))))
          (transport (or transport-function
                         (and effective-connection-pool
-                             (%client-transport-from-connection-pool
-                              effective-connection-pool))
+                             (if native-default-p
+                                 (%client-transport-from-negotiated-connection-pool
+                                  effective-connection-pool)
+                                 (%client-transport-from-connection-pool
+                                  effective-connection-pool)))
                         (%client-transport-from-stream-boundary
                          (make-http-proxy-stream-opener
                           effective-open-stream effective-close-stream

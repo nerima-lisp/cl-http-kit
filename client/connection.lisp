@@ -23,6 +23,12 @@
   lock
   (entries nil))
 
+(progn
+  (defvar *client-preopened-http-stream* nil)
+  (define-condition %http-client-alpn-handoff (error)
+    ((stream :initarg :stream :reader %http-client-alpn-handoff-stream)
+     (protocol :initarg :protocol :reader %http-client-alpn-handoff-protocol))))
+
 (defun %pool-monotonic-time ()
   (/ (float (get-internal-real-time))
      internal-time-units-per-second))
@@ -256,9 +262,9 @@ be used concurrently from multiple threads."
                      (collect-body-p t))
   "Send REQUEST using an idle connection or a newly opened stream.
 
-The request is never retried automatically after a transport failure.  A
-stream is retained only when the core parser proves that the response is
-self-delimited and neither side requested connection closure."
+The request is never retried automatically after a transport failure. A stream
+is retained only when the core parser proves that the response is self-delimited
+and neither side requested connection closure."
   (%pool-ensure-pool pool)
   (unless (http-request-p request)
     (%pool-protocol-error "The pooled request must be an HTTP-REQUEST." request))
@@ -272,21 +278,32 @@ self-delimited and neither side requested connection closure."
                                :inherited deadline
                                :clock-function #'%pool-monotonic-time)
           (let ((entry
-                  (%with-client-lock ((%http-connection-pool-lock pool))
-                    (%pool-purge-expired pool)
-                    (%pool-take pool key))))
-            (if entry
-                (progn
-                  (setf stream (%http-pooled-connection-stream entry)
-                        opened-at (%http-pooled-connection-opened-at entry)))
-                (progn
-                  (setf opened-at (%pool-now pool)
-                        stream (%pool-open
-                                pool request
-                                :timeout timeout
-                                :deadline absolute-deadline
-                                :proxy-plan proxy-plan
-                                :proxy proxy))))
+                  (unless *client-preopened-http-stream*
+                    (%with-client-lock ((%http-connection-pool-lock pool))
+                      (%pool-purge-expired pool)
+                      (%pool-take pool key)))))
+            (cond
+              (*client-preopened-http-stream*
+               (setf stream (prog1 *client-preopened-http-stream*
+                              (setf *client-preopened-http-stream* nil))
+                     opened-at (%pool-now pool)))
+              (entry
+               (setf stream (%http-pooled-connection-stream entry)
+                     opened-at (%http-pooled-connection-opened-at entry)))
+              (t
+               (setf opened-at (%pool-now pool))
+               (multiple-value-bind (opened-stream negotiated-alpn)
+                   (%pool-open pool request
+                               :timeout timeout
+                               :deadline absolute-deadline
+                               :proxy-plan proxy-plan
+                               :proxy proxy)
+                 (setf stream opened-stream)
+                 (when (equal negotiated-alpn "h2")
+                   (setf stream nil)
+                   (error '%http-client-alpn-handoff
+                          :stream opened-stream
+                          :protocol :http2)))))
             (multiple-value-bind (response reusable-p)
                 (send-http-request-over-open-stream
                  request
@@ -313,6 +330,8 @@ self-delimited and neither side requested connection closure."
                   (%pool-close pool stream))
               (setf stream nil)
               response)))
+      (%http-client-alpn-handoff (condition)
+        (error condition))
       (http-error (condition)
         (unless retained-p
           (%pool-close pool stream))
@@ -324,3 +343,11 @@ self-delimited and neither side requested connection closure."
                :message "The pooled HTTP exchange signaled an error."
                :operation :transport
                :cause condition)))))
+
+(defun %http-connection-pool-send-on-stream
+    (pool request stream &rest arguments)
+  (let ((*client-preopened-http-stream* stream))
+    (unwind-protect
+         (apply #'http-connection-pool-send pool request arguments)
+      (when *client-preopened-http-stream*
+        (%pool-close pool *client-preopened-http-stream*)))))

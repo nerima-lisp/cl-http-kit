@@ -83,7 +83,7 @@
   :author "nerima-lisp"
   :license "MIT"
   :version "0.4.1"
-  :depends-on ("cl-http-kit" "cl-codec-kit" "cl-deflate-kit")
+  :depends-on ("cl-http-kit" "cl-http-kit/http2" "cl-codec-kit" "cl-deflate-kit")
   :pathname "client"
   :serial t
   :components ((:file "package")

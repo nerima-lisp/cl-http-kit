@@ -2450,3 +2450,238 @@
              (ensure-equal uri-before (http-uri-string uri)))
         (ensure-true (eq jar (http-cookie-jar-clear jar)))))))
 
+#+sbcl
+(deftest client-native-alpn-http1-first-stream-reuse
+  (let* ((http-kit/client::*proxy-environment-function*
+           (lambda (name) (declare (ignore name)) nil))
+         (wire (ascii
+                "HTTP/1.1 200 OK|CRLF|Content-Length: 0|CRLF||CRLF|HTTP/1.1 200 OK|CRLF|Content-Length: 0|CRLF||CRLF|"))
+         (stream (make-instance 'binary-test-stream :input wire))
+         (opened 0)
+         (upgraded 0)
+         (closed 0)
+         (pool
+           (make-http-connection-pool
+            :open-stream
+            (lambda (request &key timeout deadline &allow-other-keys)
+              (declare (ignore request timeout deadline))
+              (incf opened)
+              stream)
+            :tls-upgrade
+            (lambda (seen uri &key timeout deadline)
+              (declare (ignore uri timeout deadline))
+              (ensure-true (eq stream seen))
+              (incf upgraded)
+              (values stream "http/1.1"))
+            :close-stream
+            (lambda (seen)
+              (ensure-true (eq stream seen))
+              (incf closed)
+              (close seen :abort t))))
+         (transport
+           (http-kit/client::%client-transport-from-negotiated-connection-pool
+            pool))
+         (client (make-http-client :transport-function transport :cache nil)))
+    (unwind-protect
+         (progn
+           (ensure-equal
+            200
+            (http-response-status
+             (http-client-send client "GET" "https://reuse.test/one")))
+           (ensure-equal
+            200
+            (http-response-status
+             (http-client-send client "GET" "https://reuse.test/two")))
+           (ensure-equal 1 opened)
+           (ensure-equal 1 upgraded)
+           (ensure-equal 1 (getf (http-connection-pool-stats pool) :idle-count))
+           (let ((output (octets-as-string (binary-test-output stream))))
+             (ensure-true (search "GET /one HTTP/1.1" output))
+             (ensure-true (search "GET /two HTTP/1.1" output))))
+      (http-connection-pool-clear pool))
+    (ensure-equal 1 closed)))
+
+#+sbcl
+(deftest client-native-alpn-proxy-h2-routes-and-information
+  (let* ((http-kit/client::*proxy-environment-function*
+           (lambda (name) (declare (ignore name)) nil))
+         (http-proxy (make-http-proxy :scheme :http
+                                      :host "connect-proxy.test" :port 8080))
+         (socks-proxy (make-http-proxy :scheme :socks5h
+                                       :host "socks-proxy.test" :port 1080))
+         (h2-wire
+           (concatenate-octets
+            (h2-frame 4 0 0 (octets))
+            (h2-frame 1 4 1
+                      (h2-header-block (cons ":status" "103")
+                                       (cons "link" "</early>; rel=preload")))
+            (h2-frame 1 5 1 (h2-header-block (cons ":status" "200")))))
+         (connect-stream
+           (make-instance
+            'binary-test-stream
+            :input (concatenate-octets
+                    (ascii "HTTP/1.1 200 Connection Established|CRLF||CRLF|")
+                    h2-wire)))
+         (socks-stream
+           (make-instance
+            'binary-test-stream
+            :input (concatenate-octets
+                    (octets 5 0 5 0 0 1 127 0 0 1 0 0)
+                    h2-wire)))
+         (opened-modes nil)
+         (upgraded 0)
+         (pool
+           (make-http-connection-pool
+            :open-stream
+            (lambda (request &key proxy-plan &allow-other-keys)
+              (declare (ignore request))
+              (let ((mode (getf proxy-plan :mode)))
+                (push mode opened-modes)
+                (case mode
+                  (:connect connect-stream)
+                  (:socks5 socks-stream)
+                  (otherwise (error "Unexpected proxy mode ~S." mode)))))
+            :tls-upgrade
+            (lambda (stream uri &key timeout deadline)
+              (declare (ignore uri timeout deadline))
+              (incf upgraded)
+              (values stream "h2"))
+            :close-stream (lambda (stream) (close stream :abort t))))
+         (transport
+           (http-kit/client::%client-transport-from-negotiated-connection-pool
+            pool))
+         (client
+           (make-http-client
+            :transport-function transport
+            :proxy (lambda (uri)
+                     (if (string= (http-uri-path uri) "/connect")
+                         http-proxy
+                         socks-proxy))
+            :cache nil))
+         (information-statuses nil))
+    (ensure-equal
+     200
+     (http-response-status
+      (http-client-send
+       client "GET" "https://origin.test/connect"
+       :on-information
+       (lambda (response)
+         (push (http-response-status response) information-statuses)))))
+    (ensure-equal
+     200
+     (http-response-status
+      (http-client-send
+       client "GET" "https://origin.test/socks"
+       :on-information
+       (lambda (response)
+         (push (http-response-status response) information-statuses)))))
+    (ensure-equal '(:connect :socks5) (nreverse opened-modes))
+    (ensure-equal 2 upgraded)
+    (ensure-equal '(103 103) (nreverse information-statuses))
+    (ensure-equal 0 (getf (http-connection-pool-stats pool) :idle-count))
+    (ensure-true
+     (search "CONNECT origin.test:443 HTTP/1.1"
+             (octets-as-string (binary-test-output connect-stream))))
+    (ensure-true
+     (search (h2-preface) (binary-test-output connect-stream)))
+    (ensure-octets-equal #(5 1 0)
+                         (subseq (binary-test-output socks-stream) 0 3))
+    (ensure-true
+     (search (h2-preface) (binary-test-output socks-stream)))))
+
+#+sbcl
+(deftest client-native-tls-alpn-offer-distinguishes-origin
+  (let* ((runtime-symbol 'http-kit/client::%client-runtime-function)
+         (original-runtime (symbol-function runtime-symbol))
+         (offers nil)
+         (stream (make-instance 'binary-test-stream))
+         (upgrade (http-kit/client::%client-native-tls-upgrade)))
+    (unwind-protect
+         (progn
+           (setf (symbol-function runtime-symbol)
+                 (lambda (package-name function-name)
+                   (cond
+                     ((and (string= package-name "HTTP-KIT/TLS")
+                           (string= function-name "MAKE-HTTP-TLS-UPGRADER"))
+                      (lambda (&key alpn-protocols)
+                        (push alpn-protocols offers)
+                        (lambda (seen uri &key timeout deadline)
+                          (declare (ignore uri timeout deadline))
+                          seen)))
+                     ((and (string= package-name "HTTP-KIT/TLS")
+                           (string= function-name
+                                    "HTTP-TLS-SELECTED-ALPN-PROTOCOL"))
+                      (lambda (seen)
+                        (declare (ignore seen))
+                        (if http-kit/client::*proxy-tls-upgrade-p*
+                            "http/1.1"
+                            "h2")))
+                     (t nil))))
+           (multiple-value-bind (upgraded protocol)
+               (funcall upgrade stream "https://origin.test/")
+             (ensure-true (eq stream upgraded))
+             (ensure-equal "h2" protocol))
+           (let ((http-kit/client::*proxy-tls-upgrade-p* t))
+             (multiple-value-bind (upgraded protocol)
+                 (funcall upgrade stream "https://proxy.test/")
+               (ensure-true (eq stream upgraded))
+               (ensure-equal "http/1.1" protocol)))
+           (ensure-equal '(("h2" "http/1.1") ("http/1.1"))
+                         (nreverse offers)))
+      (setf (symbol-function runtime-symbol) original-runtime))))
+
+#+sbcl
+(deftest client-native-alpn-h2-stream-closed-on-constructor-failure
+  (let* ((constructor-symbol
+           (find-symbol "MAKE-HTTP2-CONNECTION" "HTTP-KIT/HTTP2"))
+         (original-constructor (symbol-function constructor-symbol))
+         (expected-stream (make-instance 'binary-test-stream))
+         (opened 0)
+         (constructed 0)
+         (received-stream nil)
+         (failure-signaled nil)
+         (closed 0)
+         (pool
+           (make-http-connection-pool
+            :open-stream
+            (lambda (request &key timeout deadline &allow-other-keys)
+              (declare (ignore request timeout deadline))
+              (incf opened)
+              expected-stream)
+            :tls-upgrade
+            (lambda (seen uri &key timeout deadline)
+              (declare (ignore uri timeout deadline))
+              (ensure-true (eq expected-stream seen))
+              (values expected-stream "h2"))
+            :close-stream
+            (lambda (seen)
+              (ensure-true (eq expected-stream seen))
+              (incf closed)
+              (close seen :abort t))))
+         (transport
+           (http-kit/client::%client-transport-from-negotiated-connection-pool
+            pool))
+         (request (make-http-request :method "GET"
+                                     :uri "https://handoff.test/")))
+    (unwind-protect
+         (progn
+           (setf (symbol-function constructor-symbol)
+                 (lambda (&key stream close-stream &allow-other-keys)
+                   (incf constructed)
+                   (setf received-stream stream)
+                   (ensure-true (functionp close-stream))
+                   (setf failure-signaled t)
+                   (error "Synthetic HTTP/2 connection construction failure.")))
+           (let ((caught
+                   (handler-case
+                       (progn (funcall transport request) nil)
+                     (error (condition) condition))))
+             (ensure-true caught))
+           (ensure-true failure-signaled)
+           (ensure-true (eq expected-stream received-stream))
+           (ensure-equal 1 opened)
+           (ensure-equal 1 constructed)
+           (ensure-equal 1 closed))
+      (setf (symbol-function constructor-symbol) original-constructor)
+      (http-connection-pool-clear pool))))
+

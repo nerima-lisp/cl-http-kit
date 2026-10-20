@@ -90,7 +90,7 @@
                            :message "An informational HTTP/2 response cannot end the stream."
                            :operation :http2-read
                            :detail candidate-status))
-                  (values nil nil nil))
+                  (values nil nil nil candidate-status candidate-headers))
                 (values candidate-status candidate-headers
                         (when end-stream
                           (%h2-finish-request-response
