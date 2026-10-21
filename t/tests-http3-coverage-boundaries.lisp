@@ -1371,6 +1371,77 @@
          :message (unless (eq value :function)
                     "A blocked QPACK field section requires an await-qpack callback.")
          :detail (unless (eq value :function) 0))))))
+(cl-weave:it-sequential
+ "http3-qpack-public-blocked-resume-calls-on-decoded-once-outside-serializer"
+ (multiple-value-bind (decoder-context section instruction)
+     (http3-test-qpack-blocked-section
+      (list (cons ":status" "204") (cons "x-blocked" "ready")))
+   (let* ((adapter
+            (http-message-kit:qpack-make-http3-decoder-context
+             decoder-context :max-blocked-streams 1))
+          (wire
+            (http3-test-concat-octets
+             (http-kit/http3:encode-http3-frame
+              (http-kit/http3:make-http3-frame
+               :type http-kit/http3:+http3-headers-type+ :payload section))))
+          (decoder-function
+            'http-message-kit::decode-http3-qpack-field-section)
+          (original-decoder (symbol-function decoder-function))
+          (inside-serializer-p nil)
+          (on-decoded-wired-p nil)
+          (decoded-count 0)
+          (decoded-inside-serializer-p nil)
+          (serializer-calls 0))
+     (unwind-protect
+          (progn
+            (setf (symbol-function decoder-function)
+                  (lambda (octets context stream-id &rest arguments)
+                    (let* ((callback-position (position :on-decoded arguments))
+                           (callback (when callback-position
+                                       (nth (1+ callback-position) arguments))))
+                      (when (functionp callback)
+                        (setf on-decoded-wired-p t)
+                        (setf (nth (1+ callback-position) arguments)
+                              (lambda (fields)
+                                (incf decoded-count)
+                                (setf decoded-inside-serializer-p
+                                      inside-serializer-p)
+                                (funcall callback fields))))
+                      (apply original-decoder octets context stream-id arguments))))
+            (http3-qpack-contract-send-case
+             0
+             (lambda (client await)
+               (setf (http-kit/http3::http3-client-serialize client)
+                     (lambda (thunk)
+                       (incf serializer-calls)
+                       (setf inside-serializer-p t)
+                       (unwind-protect
+                            (funcall thunk)
+                         (setf inside-serializer-p nil))))
+               (list
+                :qpack-decoder-context decoder-context
+                :qpack-http3-decoder-context adapter
+                :await-qpack
+                (lambda (token)
+                  (funcall await token)
+                  (ensure-true on-decoded-wired-p)
+                  (ensure-equal 0 decoded-count)
+                  (let ((headers
+                          (http3-test-decode-inserts-and-resume
+                           adapter decoder-context instruction token)))
+                    (ensure-equal 1 decoded-count)
+                    (ensure-equal nil decoded-inside-serializer-p)
+                    headers))))
+             '(:open :on-open :write :write :read :close)
+             :wire wire
+             :qpack-decoder-context decoder-context
+             :qpack-http3-decoder-context adapter
+             :expected-await-count 1)
+            (ensure-true on-decoded-wired-p)
+            (ensure-equal 1 decoded-count)
+            (ensure-equal nil decoded-inside-serializer-p)
+            (ensure-true (plusp serializer-calls)))
+       (setf (symbol-function decoder-function) original-decoder)))))
 
 (deftest http3-qpack-public-inserted-encoder-stream-id-contract
   (dolist (stream-id '(nil 0))
