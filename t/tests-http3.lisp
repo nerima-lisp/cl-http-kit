@@ -1875,52 +1875,101 @@
              (http-kit/http3:encode-http3-frame
               (http-kit/http3:make-http3-frame
                :type http-kit/http3:+http3-headers-type+
-               :payload (octets)))))
-    (let ((inside-p nil)
-          (events '())
-          client)
-      (setf client
-            (http-kit/http3::%make-http3-client
-             :serialize
-             (lambda (thunk)
-               (push :serialize-enter events)
-               (let ((inside-p t))
-                 (handler-bind
-                     ((error (lambda (condition)
-                               (declare (ignore condition))
-                               (push (list :decode-condition inside-p) events))))
-                   (funcall thunk))))
-             :read-stream
-             (lambda (stream &key timeout deadline)
-               (declare (ignore stream timeout deadline))
-               (push (list :read inside-p) events)
-               (values (malformed-headers-wire) t))))
-      (signals http-protocol-error
-        (http-kit/http3::%h3-read-response
-         client :stream :collect-body-p t))
-      (ensure-equal '(:serialize-enter (:read nil)
-                      :serialize-enter (:decode-condition t))
-                    (nreverse events)))
-    (let* ((inside-p nil)
+               :payload (octets))))
+           (valid-response-wire ()
+             (http-kit/http3:encode-http3-frame
+              (http-kit/http3:make-http3-frame
+               :type http-kit/http3:+http3-headers-type+
+               :payload
+               (http3-test-qpack-encode
+                (list (cons ":status" "204")) :huffman nil)))))
+    (let* ((decoder-context
+             (http-message-kit:make-qpack-context
+              :max-table-capacity 0 :table-capacity 0
+              :max-blocked-streams 0 :huffman nil))
+           (adapter
+             (http-message-kit:qpack-make-http3-decoder-context
+              decoder-context :max-blocked-streams 0))
+           (inside-p nil)
            (events '())
-           (caller-context (http-message-kit:make-qpack-context :huffman nil))
            (client
              (http-kit/http3::%make-http3-client
+              :qpack-decoder-context decoder-context
+              :qpack-http3-decoder-context adapter
+              :open-p t
               :serialize
               (lambda (thunk)
-                (declare (ignore thunk))
-                (push :unexpected-serialize events)
-                (error "Caller-owned QPACK decode was serialized."))
+                (push :serialize-enter events)
+                (let ((previous inside-p))
+                  (setf inside-p t)
+                  (unwind-protect
+                       (handler-bind
+                           ((http-message-kit:http-connection-error
+                              (lambda (condition)
+                                (declare (ignore condition))
+                                (push (list :decode-condition inside-p)
+                                      events))))
+                         (funcall thunk))
+                    (setf inside-p previous))))
               :read-stream
               (lambda (stream &key timeout deadline)
                 (declare (ignore stream timeout deadline))
                 (push (list :read inside-p) events)
                 (values (malformed-headers-wire) t)))))
-      (signals simple-error
+      (signals http-message-kit:http-connection-error
         (http-kit/http3::%h3-read-response
          client :stream :collect-body-p t
-         :qpack-decoder-context caller-context))
-      (ensure-equal '(:unexpected-serialize) (nreverse events)))))
+         :qpack-http3-decoder-context adapter :stream-id 0))
+      (ensure-equal '(:serialize-enter (:read nil)
+                      :serialize-enter (:decode-condition t))
+                    (nreverse events)))
+    (let* ((decoder-context
+             (http-message-kit:make-qpack-context
+              :max-table-capacity 0 :table-capacity 0
+              :max-blocked-streams 0 :huffman nil))
+           (adapter
+             (http-message-kit:qpack-make-http3-decoder-context
+              decoder-context :max-blocked-streams 0))
+           (caller-context
+             (http-message-kit:make-qpack-context
+              :max-table-capacity 0 :table-capacity 0
+              :max-blocked-streams 0 :huffman nil))
+           (caller-adapter
+             (http-message-kit:qpack-make-http3-decoder-context
+              caller-context :max-blocked-streams 0))
+           (inside-p nil)
+           (events '())
+           (client
+             (http-kit/http3::%make-http3-client
+              :qpack-decoder-context decoder-context
+              :qpack-http3-decoder-context adapter
+              :open-p t
+              :serialize
+              (lambda (thunk)
+                (push :serialize-enter events)
+                (let ((previous inside-p))
+                  (setf inside-p t)
+                  (unwind-protect
+                       (handler-bind
+                           ((http-protocol-error
+                              (lambda (condition)
+                                (declare (ignore condition))
+                                (push (list :decode-condition inside-p)
+                                      events))))
+                         (funcall thunk))
+                    (setf inside-p previous))))
+              :read-stream
+              (lambda (stream &key timeout deadline)
+                (declare (ignore stream timeout deadline))
+                (push (list :read inside-p) events)
+                (values (valid-response-wire) t)))))
+      (signals http-protocol-error
+        (http-kit/http3::%h3-read-response
+         client :stream :collect-body-p t
+         :qpack-http3-decoder-context caller-adapter :stream-id 0))
+      (ensure-equal '(:serialize-enter (:read nil)
+                      :serialize-enter (:decode-condition t))
+                    (nreverse events)))))
 
 (deftest http3-client-blocked-response-pauses-same-chunk
   (multiple-value-bind (decoder-table section instruction)
