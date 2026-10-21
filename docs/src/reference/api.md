@@ -665,8 +665,10 @@ select or validate a connection separately for each request; callers must
 supply requests that the selected connection may serve. The underlying
 session multiplexes the streams.
 `make-http2-connection-manager-transport` adapts a manager to the high-level
-client transport protocol. All three accept and forward the per-section
-`max-fields` limit. `clear-http2-connection-manager` is idempotent. It retires
+client transport protocol. The two send functions and the function returned by
+`make-http2-connection-manager-transport` each accept and forward the per-section
+`max-fields` limit.
+`clear-http2-connection-manager` is idempotent. It retires
 all retained connections without closing the manager and returns it on success.
 A call whose connection was still opening when clear began may finish using
 that connection, but it closes after the call releases its lease instead of
@@ -1665,10 +1667,6 @@ HTTP/1 streams and clears every HTTP/2 manager registered with that pool. It
 returns the number of idle HTTP/1 streams closed. Active HTTP/2 connections are
 retired immediately and close when their current request completes. Pool
 operations may be used concurrently from multiple SBCL threads.
-
-The native HTTP/2 client can be shared by multiple SBCL threads. The manager
-protects its connection state, and an overlapping request uses a separate
-connection while another request is using the same connection.
 
 ### `http-client`
 
