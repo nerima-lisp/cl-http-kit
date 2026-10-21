@@ -3148,7 +3148,7 @@
            (ensure-equal 200 (http-response-status response))
            (ensure-octets-equal response-body (http-response-body response))
            (ensure-equal :socks5 (getf plan :mode))
-           (ensure-true (eq plan seen-plan))
+           (ensure-true (eq explicit-proxy (getf seen-plan :proxy)))
            (ensure-true (eq explicit-proxy seen-proxy))
            (let ((wire (octets-as-string (binary-test-output stream))))
              (ensure-true
