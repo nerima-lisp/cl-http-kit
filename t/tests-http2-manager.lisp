@@ -868,3 +868,193 @@
 
   (deftest http2-public-contract-mutable-key-prefers-last-opened
     (%check-http2-manager-mutable-key-recency nil)))
+#+sbcl
+(deftest http2-connection-manager-clear-retires-an-opening-connection
+  (let* ((open-entered (sb-thread:make-semaphore :count 0))
+         (release-open (sb-thread:make-semaphore :count 0))
+         (streams
+           (list
+            (make-instance 'binary-session-stream
+                           :input (h2-response-wire (octets)))
+            (make-instance 'binary-session-stream
+                           :input (h2-response-wire (octets)))))
+         (opened 0)
+         (closed 0)
+         (connections (make-array 2 :initial-element nil))
+         (manager
+           (http-kit/http2:make-http2-connection-manager
+            :open-connection
+            (lambda (request &key timeout deadline)
+              (declare (ignore request timeout deadline))
+              (let* ((index opened)
+                     (stream (nth index streams)))
+                (incf opened)
+                (when (zerop index)
+                  (sb-thread:signal-semaphore open-entered)
+                  (sb-thread:wait-on-semaphore release-open))
+                (setf (aref connections index)
+                      (http-kit/http2:make-http2-connection
+                       :stream stream
+                       :close-stream
+                       (lambda (closed-stream)
+                         (ensure-equal stream closed-stream)
+                         (incf closed))))
+                (aref connections index)))))
+         (first-response nil)
+         (first-error nil)
+         (first-thread nil))
+    (unwind-protect
+         (progn
+           (setf first-thread
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (handler-case
+                        (setf first-response
+                              (http-kit/http2:send-http2-request-over-connection-manager
+                               manager
+                               (make-http-request
+                                :method "GET"
+                                :uri "https://clear-race.test/")))
+                      (error (condition)
+                        (setf first-error condition))))))
+           (ensure-true
+            (sb-thread:wait-on-semaphore open-entered :timeout 5))
+           (http-kit/http2:clear-http2-connection-manager manager)
+           (ensure-true
+            (http-kit/http2:http2-connection-manager-open-p manager))
+           (ensure-equal
+            0
+            (http-kit/http2:http2-connection-manager-connection-count manager))
+           (sb-thread:signal-semaphore release-open)
+           (sb-thread:join-thread first-thread)
+           (setf first-thread nil)
+           (ensure-true (null first-error))
+           (ensure-equal 200 (http-response-status first-response))
+           (ensure-equal
+            0
+            (http-kit/http2:http2-connection-manager-connection-count manager))
+           (ensure-equal 1 closed)
+           (ensure-false
+            (http-kit/http2:http2-connection-open-p (aref connections 0)))
+           (ensure-equal
+            200
+            (http-response-status
+             (http-kit/http2:send-http2-request-over-connection-manager
+              manager
+              (make-http-request
+               :method "GET"
+               :uri "https://clear-race.test/"))))
+           (ensure-equal 2 opened)
+           (ensure-equal
+            1
+            (http-kit/http2:http2-connection-manager-connection-count manager)))
+      (when first-thread
+        (sb-thread:signal-semaphore release-open)
+        (sb-thread:join-thread first-thread))
+      (http-kit/http2:close-http2-connection-manager manager))
+    (ensure-equal 2 closed)
+    (ensure-false
+     (http-kit/http2:http2-connection-manager-open-p manager))))
+#+sbcl
+(deftest http2-connection-manager-notifies-only-unretained-transient-close
+  (let* ((opened 0)
+         (closed 0)
+         (evicted-keys nil)
+         (transient-events nil)
+         (request
+           (make-http-request
+            :method "GET"
+            :uri "https://transient-callback.test/"))
+         (manager
+           (http-kit/http2:make-http2-connection-manager
+            :max-connections 1
+            :open-connection
+            (lambda (request &key timeout deadline)
+              (declare (ignore request timeout deadline))
+              (incf opened)
+              (http-kit/http2:make-http2-connection
+               :stream
+               (make-instance (find-class (quote binary-session-stream))
+                              :input (octets))
+               :close-stream
+               (lambda (stream)
+                 (declare (ignore stream))
+                 (incf closed))))
+            :on-evict
+            (lambda (key)
+              (push key evicted-keys))
+            :on-transient-close
+            (lambda (key)
+              (push (list key closed) transient-events)
+              (when (equal key "callback-error")
+                (error "Transient close callback failure.")))))
+         (retained-entry nil)
+         (transient-entry nil))
+    (unwind-protect
+         (progn
+           (multiple-value-bind (connection entry)
+               (http-kit/http2::%h2-manager-connection-for
+                manager request "retained" t nil nil nil nil)
+             (declare (ignore connection))
+             (setf retained-entry entry))
+           (multiple-value-bind (connection entry)
+               (http-kit/http2::%h2-manager-connection-for
+                manager request "uncached" t nil nil nil nil)
+             (declare (ignore connection))
+             (setf transient-entry entry))
+           (http-kit/http2::%h2-manager-finish-entry
+            manager transient-entry)
+           (setf transient-entry nil)
+           (ensure-equal 1 closed)
+           (ensure-equal
+            (list (list "uncached" 1))
+            (reverse transient-events))
+           (ensure-false
+            (member "uncached" evicted-keys :test (function equal)))
+           (multiple-value-bind (connection entry)
+               (http-kit/http2::%h2-manager-connection-for
+                manager request "retained" t nil nil nil nil)
+             (declare (ignore connection))
+             (setf transient-entry entry))
+           (http-kit/http2::%h2-manager-finish-entry
+            manager transient-entry)
+           (setf transient-entry nil)
+           (ensure-equal 2 closed)
+           (ensure-equal
+            (list (list "uncached" 1))
+            (reverse transient-events))
+           (ensure-false
+            (member "retained" transient-events
+                    :key (function first)
+                    :test (function equal)))
+           (multiple-value-bind (connection entry)
+               (http-kit/http2::%h2-manager-connection-for
+                manager request "callback-error" t nil nil nil nil)
+             (declare (ignore connection))
+             (setf transient-entry entry))
+           (signals simple-error
+             (http-kit/http2::%h2-manager-finish-entry
+              manager transient-entry))
+           (setf transient-entry nil)
+           (ensure-equal 3 closed)
+           (ensure-equal
+            (list (list "uncached" 1)
+                  (list "callback-error" 3))
+            (reverse transient-events))
+           (ensure-false
+            (member "callback-error" evicted-keys
+                    :test (function equal))))
+      (when transient-entry
+        (http-kit/http2::%h2-manager-finish-entry
+         manager transient-entry))
+      (when retained-entry
+        (http-kit/http2::%h2-manager-finish-entry
+         manager retained-entry))
+      (http-kit/http2:close-http2-connection-manager manager))
+    (ensure-equal 4 opened)
+    (ensure-equal 4 closed)
+    (ensure-equal (list "retained") (reverse evicted-keys))
+    (ensure-equal
+     (list (list "uncached" 1)
+           (list "callback-error" 3))
+     (reverse transient-events))))

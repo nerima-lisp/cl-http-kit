@@ -49,4 +49,4 @@
    #:send-http2-request-over-connection/cps
    #:send-http2-requests-over-connection
    #:send-http2-requests-over-connection/cps
-   #:serve-http2-session))
+   #:serve-http2-session #:clear-http2-connection-manager))

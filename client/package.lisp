@@ -250,6 +250,7 @@
    #:http-client
    #:http-client-p
    #:make-http-client
+   #:http-client-clear-connections
    #:http-client-transport-function
    #:http-client-http3-transport-function
    #:http-client-connection-pool

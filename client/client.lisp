@@ -1,8 +1,7 @@
 (in-package #:http-kit/client)
 
-(progn
-  (defvar *client-http2-pending-stream* nil)
-  (defvar *client-http2-pending-key* nil))
+(defvar *client-http2-pending-stream* nil)
+  (defvar *client-http2-pending-key* nil)
 
 (defun %client-empty-octets ()
   (make-array 0 :element-type '(unsigned-byte 8)))
@@ -340,14 +339,15 @@
                      (http-proxy-username proxy)
                      (http-proxy-password proxy))))))
 
-(defun %client-transport-from-connection-pool (connection-pool)
+(defun %client-transport-from-connection-pool (connection-pool &key allow-alpn-handoff)
   (lambda (request &key timeout deadline max-header-bytes max-fields max-body-bytes
                          request-target request-body-function request-body-length
                          on-body-chunk on-information (collect-body-p t)
                          proxy-plan proxy)
-    (http-connection-pool-send
-     connection-pool
-     request
+    (funcall (if allow-alpn-handoff
+                 #'%http-connection-pool-send-with-alpn-handoff
+                 #'http-connection-pool-send)
+     connection-pool request
      :key (%client-connection-key request proxy-plan)
      :timeout timeout
      :deadline deadline
@@ -438,7 +438,7 @@
   (let* ((open-stream (%http-connection-pool-open-stream connection-pool))
          (close-stream (%http-connection-pool-close-stream connection-pool))
          (http1-transport
-           (%client-transport-from-connection-pool connection-pool))
+           (%client-transport-from-connection-pool connection-pool :allow-alpn-handoff t))
          (http2-manager nil)
          (http2-transport nil)
          (routes (make-hash-table :test #'equal))
@@ -482,13 +482,18 @@
                                        :deadline deadline
                                        :proxy-plan proxy-plan
                                        :proxy proxy)))
-                        (unless (equal negotiated-alpn "h2")
-                          (let ((handoff-stream stream))
-                            (setf stream nil
-                                  transferred-p t)
-                            (error '%http-client-alpn-handoff
-                                   :stream handoff-stream
-                                   :protocol :http/1.1)))
+                        (if (member negotiated-alpn
+                                   (list nil "http/1.1" "h2")
+                                   :test (function equal))
+                            (unless (equal negotiated-alpn "h2")
+                              (let ((handoff-stream stream))
+                                (setf stream nil
+                                      transferred-p t)
+                                (error (quote %http-client-alpn-handoff)
+                                       :stream handoff-stream)))
+                            (%client-protocol-error
+                             "TLS opener selected an unsupported ALPN protocol."
+                             negotiated-alpn))
                         (prog1
                             (http-kit/http2:make-http2-connection
                              :stream stream
@@ -536,13 +541,25 @@
                     *client-http2-pending-stream*)
                    (setf *client-http2-pending-stream* nil
                          *client-http2-pending-key* nil))))))))))
-      (setf http2-manager
-            (http-kit/http2:make-http2-connection-manager
-             :open-connection #'open-http2-connection
-             :clock-function #'%client-monotonic-time)
-            http2-transport
-            (http-kit/http2:make-http2-connection-manager-transport
-             http2-manager))
+      (let ((manager
+         (http-kit/http2:make-http2-connection-manager
+          :open-connection #'open-http2-connection
+          :clock-function #'%client-monotonic-time
+          :idle-timeout (%http-connection-pool-idle-timeout connection-pool)
+          :max-connection-age
+          (%http-connection-pool-max-connection-age connection-pool)
+          :on-evict #'mark-http1-route
+          :on-transient-close #'mark-http1-route)))
+  (%http-connection-pool-register-clear-callback
+   connection-pool
+   (lambda ()
+     (unwind-protect
+          (http-kit/http2:clear-http2-connection-manager manager)
+       (%with-client-lock (routes-lock)
+         (clrhash routes)))))
+  (setf http2-manager manager
+        http2-transport
+        (http-kit/http2:make-http2-connection-manager-transport manager)))
       #'send)))
 
 (defun make-http-client
@@ -782,6 +799,15 @@ Pass NIL explicitly to disable either store."
      :content-decoders (copy-list content-decoders)
      :on-request on-request
      :on-response on-response)))
+(defun http-client-clear-connections (client)
+  "Clear CLIENT's connection pool and its registered HTTP/2 managers.
+Return the number of idle HTTP/1 connections closed."
+  (unless (http-client-p client)
+    (%client-protocol-error "The client must be an HTTP-CLIENT." client))
+  (let ((connection-pool (http-client-connection-pool client)))
+    (if connection-pool
+        (http-connection-pool-clear connection-pool)
+        0)))
 
 (defun http-client-request
     (client method uri &key headers trailers body

@@ -2,9 +2,7 @@
 
 This page documents the primary exported symbols of the registered ASDF
 systems. Package definition files remain authoritative for lower-level and
-auxiliary exports not described here. Common arguments such as timeout,
-deadline, byte limits, and clock-function are accepted by the direct and CPS
-transport APIs where shown.
+auxiliary exports not described here.
 
 The registered systems in this checkout are version 0.4.1.
 
@@ -543,10 +541,12 @@ optional on-error, timeout, deadline, byte-limit, and clock arguments.
 
 ### Reusable HTTP/2 connections
 
-`make-http2-connection` creates an owner-thread connection over an already
-negotiated binary stream. `send-http2-request-over-connection` sends one
-request, while `send-http2-requests-over-connection` multiplexes a non-empty
-batch. `send-http2-request-over-connection/cps` and
+`make-http2-connection` creates a connection over an already negotiated binary
+stream. Callers must serialize operations on this low-level connection; on
+SBCL, use a connection manager or the high-level client for requests shared
+across threads. `send-http2-request-over-connection` sends one request, while
+`send-http2-requests-over-connection` multiplexes a non-empty batch.
+`send-http2-request-over-connection/cps` and
 `send-http2-requests-over-connection/cps` accept success and error
 continuations, and
 `make-http2-connection-transport` adapts a connection to the high-level client
@@ -608,24 +608,72 @@ also clamps peer HPACK table settings to 4096 bytes by default through
 
 ### HTTP/2 connection manager
 
-`make-http2-connection-manager` constructs an owner-thread connection pool
-with `&key open-connection max-connections idle-timeout max-connection-age
-clock-function`.
-Connections are reused by origin unless a caller supplies `connection-key`,
-the least-recently-used idle connection is evicted at the configured cap, and
-an idle timeout of `nil` disables idle expiry. `max-connection-age` optionally
-recycles connections after a total lifetime even when they remain active. The
-open callback must accept `(request &key timeout deadline)`: both keywords are
-passed on every call. It must return an
-`http2-connection`.
+`make-http2-connection-manager` constructs a reusable connection pool with
+`&key open-connection max-connections idle-timeout max-connection-age
+clock-function on-evict on-transient-close`. `max-connections` defaults to `8`
+and limits retained cache entries; request-scoped connections do not count
+toward that limit. On SBCL, the manager synchronizes its entry state for
+concurrent callers and leases each retained connection to at most one manager
+call at a time.
+By default, the cache key includes the request scheme, host, port, proxy plan,
+and proxy.
+Supplying `connection-key` to a send function replaces that default; keys are
+compared with `EQUAL`, so choose them to keep requests on the same reusable
+connection only when their origin and proxy routes are compatible.
 
-`send-http2-request-over-connection-manager` sends one request through the
-pool. `send-http2-requests-over-connection-manager` sends a non-empty batch on
-one connection so the underlying session can multiplex the streams.
+The open callback receives a request and must return an `http2-connection`.
+Each invocation passes `:timeout` and `:deadline`; proxy-routed requests also
+pass `:proxy-plan` and `:proxy`. Caller-supplied `open-connection`,
+`clock-function`, `on-evict`, and `on-transient-close` functions may run
+concurrently with manager calls, so they must synchronize any shared state
+they use. A request for a key whose retained connection is busy uses a
+request-scoped connection. For a different key, the manager can create a
+retained entry while below the cap, or evict the least-recently-used idle
+entry at capacity. If the cache is full and every retained entry is active,
+it uses a request-scoped connection.
+
+`idle-timeout`, `max-connection-age`, and `on-evict` default to `nil`. Idle
+expiry is based on the time since the last completed manager call; maximum age
+is based on the time since the connection was opened. The manager checks these
+policies during manager operations; it does not use a background timer. Either
+policy may retire an entry while a call is active. Retired entries are removed
+from reuse immediately, and active calls finish before their connections
+close.
+
+When a retained entry leaves the cache, a supplied `on-evict` callback receives
+its key. This includes expiry, capacity eviction, clear, close, and loss of
+connection usability. The callback runs without the manager lock and may run
+concurrently with other callbacks. Callback errors propagate after the
+retirement actions have been attempted. A supplied `on-transient-close`
+callback receives the key after a request-scoped connection closes when no
+retained usable connection for that key remains. It also runs without the
+manager lock and may run concurrently with other callbacks.
+
+`send-http2-request-over-connection-manager` takes `(manager request)` and
+accepts `&key connection-key timeout deadline max-header-bytes max-fields
+max-body-bytes clock-function request-body-function request-body-length
+on-body-chunk on-information collect-body-p huffman-p proxy-plan proxy`. It
+retries once for an unprocessed GOAWAY or REFUSED_STREAM failure only when no
+`request-body-function` is supplied.
+`send-http2-requests-over-connection-manager` takes `(manager requests)` and
+accepts `&key connection-key timeout deadline max-header-bytes max-fields
+max-body-bytes clock-function request-body-functions request-body-lengths
+on-body-chunk collect-body-p huffman-p`. It selects one connection using the
+first request's default cache key, or the supplied `connection-key`, and sends
+every request in the non-empty batch on that connection. The manager does not
+select or validate a connection separately for each request; callers must
+supply requests that the selected connection may serve. The underlying
+session multiplexes the streams.
 `make-http2-connection-manager-transport` adapts a manager to the high-level
 client transport protocol. All three accept and forward the per-section
-`max-fields` limit. `close-http2-connection-manager` closes all retained
-connections and permanently closes the manager.
+`max-fields` limit. `clear-http2-connection-manager` is idempotent. It retires
+all retained connections without closing the manager and returns it on success.
+A call whose connection was still opening when clear began may finish using
+that connection, but it closes after the call releases its lease instead of
+being retained.
+`close-http2-connection-manager`
+prevents new calls and closes retained connections after their active leases
+are released.
 
 The inspection functions are `http2-connection-manager-p`,
 `http2-connection-manager-open-p`,
@@ -1613,7 +1661,14 @@ proxy route, DNS mode, and proxy credentials.
 include `HTTP-CONNECTION-POOL-IDLE-TIMEOUT` and
 `HTTP-CONNECTION-POOL-MAX-CONNECTION-AGE`. It deliberately omits internal route keys because they can
 contain authentication material. `HTTP-CONNECTION-POOL-CLEAR` closes all idle
-streams. Pool operations may be used concurrently from multiple SBCL threads.
+HTTP/1 streams and clears every HTTP/2 manager registered with that pool. It
+returns the number of idle HTTP/1 streams closed. Active HTTP/2 connections are
+retired immediately and close when their current request completes. Pool
+operations may be used concurrently from multiple SBCL threads.
+
+The native HTTP/2 client can be shared by multiple SBCL threads. The manager
+protects its connection state, and an overlapping request uses a separate
+connection while another request is using the same connection.
 
 ### `http-client`
 
@@ -1642,6 +1697,12 @@ optional for the direct stream transport boundary. Omitting
 strict-transport-store creates a new RFC 6797 store; explicitly passing nil
 disables HSTS. Omitting alternative-service-store creates a new RFC 7838 store;
 explicitly passing nil disables alternative-service discovery.
+
+### `http-client-clear-connections`
+
+Clear CLIENT's connection pool and all HTTP/2 managers registered with that
+pool. Active HTTP/2 connections close when their current request completes.
+Return the number of idle HTTP/1 connections closed.
 
 By default, each client has a new cookie jar, no cache, and automatic
 gzip/deflate response decoding enabled. `cookie-jar` must be an
