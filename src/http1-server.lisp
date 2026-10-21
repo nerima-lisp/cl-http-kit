@@ -1124,14 +1124,53 @@ body is never written to the wire."
             (values (if reusable-p :running :close) nil))))))
 
 ;; The listener retains cleanup until the session's unwind-protect is active.
-(defvar *http1-session-ownership-marker* nil)
+(progn
+  #+sbcl
+  (defclass %http1-session-prefix-stream
+      (sb-gray:fundamental-binary-input-stream)
+    ((stream :initarg :stream :reader %http1-session-prefix-stream-stream)
+     (prefix-byte :initarg :prefix-byte
+                  :reader %http1-session-prefix-stream-byte)
+     (prefix-p :initform t :accessor %http1-session-prefix-stream-prefix-p)))
+  #+sbcl
+  (defmethod sb-gray:stream-read-byte
+      ((stream %http1-session-prefix-stream))
+    (if (%http1-session-prefix-stream-prefix-p stream)
+        (progn
+          (setf (%http1-session-prefix-stream-prefix-p stream) nil)
+          (%http1-session-prefix-stream-byte stream))
+        (read-byte (%http1-session-prefix-stream-stream stream) nil :eof)))
+  (defun %http1-session-call-with-deadline
+      (thunk deadline clock-function kind)
+    (%check-deadline deadline clock-function kind)
+    #+sbcl
+    (if deadline
+        (handler-case
+            (sb-ext:with-timeout
+                (max 0 (- deadline (funcall clock-function)))
+              (funcall thunk))
+          (sb-ext:timeout ()
+            (error 'http-timeout
+                   :message "The HTTP operation exceeded its deadline."
+                   :operation kind
+                   :kind kind)))
+        (funcall thunk))
+    #-sbcl
+    (funcall thunk))
+  #+sbcl
+  (defun %http1-session-replay-stream (stream first-byte)
+    (make-instance '%http1-session-prefix-stream
+                   :stream stream
+                   :prefix-byte first-byte))
+  (defvar *http1-session-ownership-marker* nil))
 
 (defun serve-http1-session
     (stream handler &key timeout deadline max-header-bytes max-fields max-body-bytes
              default-authority on-body-chunk (collect-body-p t)
              (on-expect-continue :automatic)
              max-requests on-error on-upgrade (close-stream #'close)
-             (clock-function #'%monotonic-time))
+             (clock-function #'%monotonic-time)
+             request-timeout idle-timeout shutdown-p)
   "Serve HTTP/1 requests from STREAM until EOF, close, or a request limit.
 
   HANDLER receives each parsed request and must return an HTTP response or
@@ -1151,21 +1190,21 @@ response."
         (*http1-session-ownership-marker* nil))
     (unless (streamp stream)
       (%http1-session-error "HTTP/1 session stream must be a stream."
-                            (type-of stream)))
+                           (type-of stream)))
     (unless (functionp handler)
       (%http1-session-error "HTTP/1 session handler must be a function."
-                            (type-of handler)))
+                           (type-of handler)))
     (unless (or (null max-requests)
                 (and (integerp max-requests)
                      (>= max-requests 0)))
       (%http1-session-error "HTTP/1 session max-requests must be a non-negative integer or NIL."
-                            max-requests))
+                           max-requests))
     (unless (or (null on-error) (functionp on-error))
       (%http1-session-error "HTTP/1 session on-error must be a function or NIL."
-                            (type-of on-error)))
+                           (type-of on-error)))
     (unless (or (null on-upgrade) (functionp on-upgrade))
       (%http1-session-error "HTTP/1 session on-upgrade must be a function or NIL."
-                            (type-of on-upgrade)))
+                           (type-of on-upgrade)))
     (unless (or (eq on-expect-continue :automatic)
                 (null on-expect-continue)
                 (functionp on-expect-continue))
@@ -1174,7 +1213,18 @@ response."
        (type-of on-expect-continue)))
     (unless (or (null close-stream) (functionp close-stream))
       (%http1-session-error "HTTP/1 session close-stream must be a function or NIL."
-                            (type-of close-stream)))
+                           (type-of close-stream)))
+    (dolist (entry (list (cons :request-timeout request-timeout)
+                         (cons :idle-timeout idle-timeout)))
+      (unless (or (null (cdr entry))
+                  (and (realp (cdr entry))
+                       (not (minusp (cdr entry)))))
+        (%http1-session-error
+         "HTTP/1 session request and idle timeouts must be non-negative reals or NIL."
+         entry)))
+    (unless (or (null shutdown-p) (functionp shutdown-p))
+      (%http1-session-error "HTTP/1 session shutdown-p must be a function or NIL."
+                           (type-of shutdown-p)))
     (let* ((expect-continue-callback
              (cond
                ((eq on-expect-continue :automatic)
@@ -1186,49 +1236,128 @@ response."
              (http-deadline timeout
                             :deadline deadline
                             :clock-function clock-function))
+           (idle-deadline
+             (and idle-timeout
+                  (http-deadline idle-timeout
+                                 :deadline absolute-deadline
+                                 :clock-function clock-function)))
            (count 0)
            (termination :running)
            (handed-off-p nil))
-      (unwind-protect
-           (progn
-             (when ownership-marker
-               (setf (car ownership-marker) t))
-             (loop while (eq termination :running)
-                   do (if (and max-requests
-                               (>= count max-requests))
-                          (setf termination :max-requests)
-                          (let ((request nil))
-                            (handler-case
-                                (let ((parsed
-                                        (parse-http-request
-                                         stream
-                                         :deadline absolute-deadline
-                                         :max-header-bytes max-header-bytes
-                                         :max-fields max-fields
-                                         :max-body-bytes max-body-bytes
-                                         :default-authority default-authority
-                                         :on-body-chunk on-body-chunk
-                                         :collect-body-p collect-body-p
-                                         :on-expect-continue expect-continue-callback
-                                         :clock-function clock-function
-                                         :allow-eof-p t)))
-                                  (if (null parsed)
-                                      (setf termination :eof)
-                                      (progn
-                                        (setf request parsed)
-                                        (multiple-value-bind (response information)
-                                            (funcall handler request)
-                                          (multiple-value-bind (next-termination
-                                                                next-handed-off-p)
-                                              (%http1-session-write-handler-response
-                                               stream request response information on-upgrade)
-                                            (incf count)
-                                            (setf termination next-termination
-                                                  handed-off-p next-handed-off-p))))))
-                              (error (caught-condition)
-                                (when on-error
-                                  (funcall on-error caught-condition request))
-                                (error caught-condition))))))
-             (values count termination))
-        (when (and close-stream (not handed-off-p))
-          (funcall close-stream stream))))))
+      (labels
+          ((parse-request (input read-deadline allow-eof-p request-deadline)
+             (let ((parse
+                     (lambda ()
+                       (parse-http-request
+                        input
+                        :deadline read-deadline
+                        :max-header-bytes max-header-bytes
+                        :max-fields max-fields
+                        :max-body-bytes max-body-bytes
+                        :default-authority default-authority
+                        :on-body-chunk on-body-chunk
+                        :collect-body-p collect-body-p
+                        :on-expect-continue expect-continue-callback
+                        :clock-function clock-function
+                        :allow-eof-p allow-eof-p))))
+               (if request-deadline
+                   (%http1-session-call-with-deadline
+                    parse read-deadline clock-function :read)
+                   (funcall parse))))
+           (read-next-request ()
+             (if (or request-timeout idle-timeout)
+                 #+sbcl
+                 (let* ((first-byte-deadline
+                          (cond
+                            ((and idle-deadline absolute-deadline)
+                             (min idle-deadline absolute-deadline))
+                            (idle-deadline idle-deadline)
+                            (t absolute-deadline)))
+                        (first-byte
+                          (%http1-session-call-with-deadline
+                           (lambda () (read-byte stream nil :eof))
+                           first-byte-deadline clock-function :read)))
+                   (if (eq first-byte :eof)
+                       (values nil nil)
+                       (let* ((request-deadline
+                                (and request-timeout
+                                     (http-deadline
+                                      request-timeout
+                                      :clock-function clock-function)))
+                              (read-deadline
+                                (cond
+                                  ((and request-deadline absolute-deadline)
+                                   (min request-deadline absolute-deadline))
+                                  (request-deadline request-deadline)
+                                  (t absolute-deadline)))
+                              (request-stream
+                                (%http1-session-replay-stream stream first-byte)))
+                         (setf idle-deadline nil)
+                         (values
+                          (parse-request request-stream read-deadline nil
+                                         request-deadline)
+                          request-deadline))))
+                 #-sbcl
+                 (values (parse-request stream absolute-deadline t nil) nil)
+                 (values (parse-request stream absolute-deadline t nil) nil))))
+        (unwind-protect
+             (progn
+               (when ownership-marker
+                 (setf (car ownership-marker) t))
+               (loop while (eq termination :running)
+                     do (cond
+                          ((and max-requests (>= count max-requests))
+                           (setf termination :max-requests))
+                          ((and shutdown-p (funcall shutdown-p))
+                           (setf termination :close))
+                          (t
+                           (let ((request nil)
+                                 (request-deadline nil))
+                             (handler-case
+                                 (multiple-value-bind (parsed parsed-deadline)
+                                     (read-next-request)
+                                   (setf request-deadline parsed-deadline)
+                                   (if (null parsed)
+                                       (setf termination :eof)
+                                       (progn
+                                         (setf request parsed)
+                                         (multiple-value-bind (response information)
+                                             (funcall handler request)
+                                           (%check-deadline
+                                            request-deadline
+                                            clock-function :write)
+                                           (multiple-value-bind
+                                                 (next-termination next-handed-off-p)
+                                               (if request-deadline
+                                                   (%http1-session-call-with-deadline
+                                                    (lambda ()
+                                                      (%http1-session-write-handler-response
+                                                       stream request response
+                                                       information on-upgrade))
+                                                    request-deadline
+                                                    clock-function :write)
+                                                   (%http1-session-write-handler-response
+                                                    stream request response
+                                                    information on-upgrade))
+                                             (incf count)
+                                             (setf termination next-termination
+                                                   handed-off-p
+                                                   next-handed-off-p)
+                                             (when (eq termination :running)
+                                               (when idle-timeout
+                                                 (setf idle-deadline
+                                                       (http-deadline
+                                                        idle-timeout
+                                                        :deadline absolute-deadline
+                                                        :clock-function
+                                                        clock-function)))
+                                               (when (and shutdown-p
+                                                          (funcall shutdown-p))
+                                                 (setf termination :close))))))))
+                               (error (caught-condition)
+                                 (when on-error
+                                   (funcall on-error caught-condition request))
+                                 (error caught-condition)))))))
+               (values count termination))
+          (when (and close-stream (not handed-off-p))
+            (funcall close-stream stream)))))))
