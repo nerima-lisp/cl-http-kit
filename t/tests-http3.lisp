@@ -2178,6 +2178,8 @@
              :max-table-capacity 0 :table-capacity 0 :huffman nil)
             :qpack-decoder-context owned-table
             :qpack-http3-decoder-context owned-adapter
+            :peer-control-state
+            (http-kit/http3:make-http3-control-state :peer-role :server)
             :open-stream
             (lambda (request &key stream-type timeout deadline)
               (declare (ignore request stream-type timeout deadline))
@@ -2293,6 +2295,8 @@
                   (closed nil)
                   (client
                     (http-kit/http3::%make-http3-client
+                     :peer-control-state
+                     (http-kit/http3:make-http3-control-state :peer-role :server)
                      :qpack-decoder-context push-table
                      :qpack-http3-decoder-context push-adapter
                      :push-promises (list (cons 2 promise-fields))
