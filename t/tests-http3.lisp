@@ -2299,6 +2299,7 @@
                      (http-kit/http3:make-http3-control-state :peer-role :server)
                      :qpack-decoder-context push-table
                      :qpack-http3-decoder-context push-adapter
+                     :promised-push-ids (list 2)
                      :push-promises (list (cons 2 promise-fields))
                      :read-stream
                      (lambda (actual &key timeout deadline)
