@@ -291,10 +291,11 @@ value octet lengths; `:max-fields` limits the number of decoded fields. The
 HTTP/3 decoder has no separate compressed-input keyword. It caps compressed
 input at `min(262144, max-header-bytes + 16 * max-fields + 16)` using the
 effective header and field limits; omitted limits use their defaults, while an
-explicit `nil` for either is rejected. The existing client
-transport supplies those keywords at `http3/transport.lisp` lines 1312–1314
-and applies the minimum of per-call and client limits at lines 1325–1341. The
-server passes its configured values at lines 2721–2725.
+explicit `nil` for either is rejected. `send-http3-request` passes per-call
+limits to response decoding at `http3/transport.lisp` lines 1900–1914, and
+`%h3-decode-response-field-section` applies the minimum of per-call and client
+limits at lines 1448–1469. `serve-http3-request-stream` passes its configured
+limits at lines 2888–2910.
 
 #### Section Ack behavior
 
@@ -376,10 +377,10 @@ In `nerima-lisp/cl-sse-kit` `main` revision
 `161951de39e73544b9e7a05fb6385d7d68364fae`, the same fixed-string scan found
 no references to any of the 57 exports.
 
-### Phase 13: cl-websocket-kit migration
+### Downstream cl-websocket-kit migration
 
-Phase 13 is the downstream cl-websocket-kit migration after it updates its
-cl-http-kit pin to 0.5.0. It is separate from this cl-http-kit migration:
+The downstream cl-websocket-kit migration follows its update to cl-http-kit
+0.5.0. It is separate from this cl-http-kit migration:
 
 1. Replace the 10 old QPACK exports at the call sites in the table above.
    Use `make-qpack-context` and context operations for encoder state, and the
