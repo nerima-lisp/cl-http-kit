@@ -2713,7 +2713,7 @@
             (lambda (stream &key condition)
               (push (list stream condition) closed)))))
     (multiple-value-bind (push-id response)
-        (http-kit/http3:receive-http3-push client :push-stream)
+        (http-kit/http3:receive-http3-push client :push-stream :stream-id 0)
       (ensure-equal 2 push-id)
       (ensure-equal 200 (http-response-status response))
       (ensure-equal (octets 1 2 3) (http-response-body response))
@@ -2743,21 +2743,29 @@
                      (cons "content-type" "text/css")))))))
          (make-client
            (lambda ()
-             (http-kit/http3::%make-http3-client
-              :push-promises (list (cons 2 promised-fields))
-              :read-stream
-              (lambda (stream &key timeout deadline)
-                (declare (ignore stream timeout deadline))
-                (values wire t))
-              :close-stream
-              (lambda (stream &key condition)
-                (declare (ignore stream condition)))))))
+             (let* ((decoder-context
+                      (http-message-kit:make-qpack-context
+                       :max-table-capacity 0 :table-capacity 0 :huffman nil))
+                    (decoder-adapter
+                      (http-message-kit:qpack-make-http3-decoder-context
+                       decoder-context :max-blocked-streams 1)))
+               (http-kit/http3::%make-http3-client
+                :qpack-decoder-context decoder-context
+                :qpack-http3-decoder-context decoder-adapter
+                :push-promises (list (cons 2 promised-fields))
+                :read-stream
+                (lambda (stream &key timeout deadline)
+                  (declare (ignore stream timeout deadline))
+                  (values wire t))
+                :close-stream
+                (lambda (stream &key condition)
+                  (declare (ignore stream condition))))))))
     (signals http-size-limit-exceeded
       (http-kit/http3:receive-http3-push
-       (funcall make-client) :push-stream :max-fields 1))
+       (funcall make-client) :push-stream :stream-id 0 :max-fields 1))
     (signals http-size-limit-exceeded
       (http-kit/http3:receive-http3-push
-       (funcall make-client) :push-stream :max-header-bytes 1))
+       (funcall make-client) :push-stream :stream-id 0 :max-header-bytes 1))
     (signals http-protocol-error
       (http-kit/http3:receive-http3-push
        (funcall make-client) :push-stream :max-fields 0))
@@ -2783,17 +2791,26 @@
               (http3-test-qpack-encode (list (cons ":status" "204")))))))
          (awaited '())
          (client
-           (http-kit/http3::%make-http3-client
-            :read-stream
-            (lambda (stream &key timeout deadline)
-              (declare (ignore stream timeout deadline))
-              (values wire t))
-            :close-stream
-            (lambda (stream &key condition)
-              (declare (ignore stream condition))))))
+           (let* ((decoder-context
+                      (http-message-kit:make-qpack-context
+                       :max-table-capacity 0 :table-capacity 0 :huffman nil))
+                    (decoder-adapter
+                      (http-message-kit:qpack-make-http3-decoder-context
+                       decoder-context :max-blocked-streams 1)))
+               (http-kit/http3::%make-http3-client
+                :qpack-decoder-context decoder-context
+                :qpack-http3-decoder-context decoder-adapter
+                :read-stream
+                (lambda (stream &key timeout deadline)
+                  (declare (ignore stream timeout deadline))
+                  (values wire t))
+                :close-stream
+                (lambda (stream &key condition)
+                  (declare (ignore stream condition)))))))
     (multiple-value-bind (push-id response)
         (http-kit/http3:receive-http3-push
          client :push-stream
+         :stream-id 0
          :await-push-promise
          (lambda (push-id)
            (push push-id awaited)
@@ -7416,28 +7433,37 @@
               :type http-kit/http3:+http3-data-type+ :payload (octets 1 2 3)))))
          (push-stream (make-http3-test-stream :reads (list (list push-wire t))))
          (client
-           (http-kit/http3:make-http3-client
-            :max-push-id 2
-            :open-stream
-            (lambda (request &key stream-type timeout deadline)
-              (declare (ignore request timeout deadline))
-              (values (make-http3-test-stream
-                       :kind stream-type
-                       :reads (when (eq stream-type :request) (list (list response-wire t))))
-                      (when (eq stream-type :request) 0)))
-            :write-stream
-            (lambda (stream octets &key fin-p timeout deadline)
-              (declare (ignore stream octets fin-p timeout deadline))
-              (incf writes))
-            :read-stream
-            (lambda (stream &key timeout deadline)
-              (declare (ignore timeout deadline))
-              (ensure-true (consp (http3-test-stream-reads stream)))
-              (incf reads)
-              (let ((entry (pop (http3-test-stream-reads stream))))
-                (values (first entry) (second entry))))
-            :close-stream
-            (lambda (stream &key condition) (push (list stream condition) closes)))))
+           (let* ((decoder-context
+                    (http-message-kit:make-qpack-context
+                     :max-table-capacity 0 :table-capacity 0 :huffman nil))
+                  (decoder-adapter
+                    (http-message-kit:qpack-make-http3-decoder-context
+                     decoder-context :max-blocked-streams 1)))
+             (http-kit/http3:make-http3-client
+              :qpack-decoder-context decoder-context
+              :qpack-http3-decoder-context decoder-adapter
+              :max-push-id 2
+              :open-stream
+              (lambda (request &key stream-type timeout deadline)
+                (declare (ignore request timeout deadline))
+                (values (make-http3-test-stream
+                         :kind stream-type
+                         :reads (when (eq stream-type :request) (list (list response-wire t))))
+                        (when (eq stream-type :request) 0)))
+              :write-stream
+              (lambda (stream octets &key fin-p timeout deadline)
+                (declare (ignore stream octets fin-p timeout deadline))
+                (incf writes))
+              :read-stream
+              (lambda (stream &key timeout deadline)
+                (declare (ignore timeout deadline))
+                (ensure-true (consp (http3-test-stream-reads stream)))
+                (incf reads)
+                (let ((entry (pop (http3-test-stream-reads stream))))
+                  (values (first entry) (second entry))))
+              :close-stream
+              (lambda (stream &key condition)
+                (push (list stream condition) closes))))))
     (ensure-equal 204
                   (http-response-status
                    (http-kit/http3:send-http3-request
@@ -7446,7 +7472,7 @@
                     (lambda (id promised-fields) (push (list id promised-fields) promises)))))
     (ensure-equal (list (list 2 fields)) promises)
     (ensure-equal '(2) (http-kit/http3:http3-client-promised-push-ids client))
-    (multiple-value-bind (id response) (http-kit/http3:receive-http3-push client push-stream)
+    (multiple-value-bind (id response) (http-kit/http3:receive-http3-push client push-stream :stream-id 0)
       (ensure-equal 2 id)
       (ensure-equal 200 (http-response-status response))
       (ensure-equal (octets 1 2 3) (http-response-body response)))
@@ -7733,25 +7759,35 @@
            (stream (make-http3-test-stream :kind :push :reads (list (list wire t))))
            (closes nil) (awaits 0) (chunks nil) (id nil) (response nil)
            (client
-             (http-kit/http3:make-http3-client
-              :max-push-id 2
-              :open-stream
-              (lambda (request &key stream-type timeout deadline)
-                (declare (ignore request timeout deadline))
-                (values (make-http3-test-stream
-                         :kind stream-type
-                         :reads (when (eq stream-type :request) (list (list response-wire t))))
-                        (when (eq stream-type :request) 0)))
-              :write-stream
-              (lambda (target bytes &key fin-p timeout deadline)
-                (declare (ignore target bytes fin-p timeout deadline)))
-              :read-stream
-              (lambda (target &key timeout deadline)
-                (declare (ignore timeout deadline))
-                (ensure-true (consp (http3-test-stream-reads target)))
-                (let ((entry (pop (http3-test-stream-reads target))))
-                  (values (first entry) (second entry))))
-              :close-stream (lambda (target &key condition) (push (list target condition) closes)))))
+             (let* ((decoder-context
+                      (http-message-kit:make-qpack-context
+                       :max-table-capacity 0 :table-capacity 0 :huffman nil))
+                    (decoder-adapter
+                      (http-message-kit:qpack-make-http3-decoder-context
+                       decoder-context :max-blocked-streams 1)))
+               (http-kit/http3:make-http3-client
+                :qpack-decoder-context decoder-context
+                :qpack-http3-decoder-context decoder-adapter
+                :max-push-id 2
+                :open-stream
+                (lambda (request &key stream-type timeout deadline)
+                  (declare (ignore request timeout deadline))
+                  (values (make-http3-test-stream
+                           :kind stream-type
+                           :reads (when (eq stream-type :request) (list (list response-wire t))))
+                          (when (eq stream-type :request) 0)))
+                :write-stream
+                (lambda (target bytes &key fin-p timeout deadline)
+                  (declare (ignore target bytes fin-p timeout deadline)))
+                :read-stream
+                (lambda (target &key timeout deadline)
+                  (declare (ignore timeout deadline))
+                  (ensure-true (consp (http3-test-stream-reads target)))
+                  (let ((entry (pop (http3-test-stream-reads target))))
+                    (values (first entry) (second entry))))
+                :close-stream
+                (lambda (target &key condition)
+                  (push (list target condition) closes))))))
       (unwind-protect
            (progn
              (ensure-equal 204
@@ -7765,6 +7801,7 @@
                          (multiple-value-setq (id response)
                            (http-kit/http3:receive-http3-push
                             client stream
+                            :stream-id 0
                             :await-push-promise (lambda (push-id) (ensure-equal 2 push-id) (incf awaits))
                             :on-body-chunk (lambda (chunk) (push (copy-seq chunk) chunks)))))))
                     (push-closes (remove-if-not (lambda (entry) (eq stream (first entry))) closes)))
