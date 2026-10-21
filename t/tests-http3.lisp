@@ -2436,6 +2436,8 @@
                 :payload (octets 1)))))
            (client
              (http-kit/http3::%make-http3-client
+              :peer-control-state
+              (http-kit/http3:make-http3-control-state :peer-role :server)
               :read-stream
               (lambda (stream &key timeout deadline)
                 (declare (ignore stream timeout deadline))
@@ -2456,6 +2458,8 @@
               :payload (octets 1 2 3)))))
          (client
            (http-kit/http3::%make-http3-client
+            :peer-control-state
+            (http-kit/http3:make-http3-control-state :peer-role :server)
             :read-stream
             (lambda (stream &key timeout deadline)
               (declare (ignore stream timeout deadline))
