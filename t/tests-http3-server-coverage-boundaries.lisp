@@ -26,6 +26,9 @@
                      :stream-id stream-id
                      :on-qpack-section-acknowledgment
                      on-qpack-section-acknowledgment
+                     :await-qpack
+                     (when qpack-http3-decoder-context
+                       (lambda (token) (declare (ignore token))))
                      :read-stream
                      (lambda (actual &key timeout deadline)
                        (declare (ignore timeout deadline))
@@ -75,12 +78,16 @@
          (http3-public-error-check
           failure "An HTTP/3 handler must return an HTTP response or response stream."
           (type-of value))
-         (ensure-equal nil writes))
+         (progn
+           (ensure-equal nil response)
+           (ensure-equal nil writes)))
         ((< (http-response-status value) 200)
          (http3-public-error-check
           failure "HTTP/3 handlers must return a final status from 200 through 599."
           (http-response-status value))
-         (ensure-equal nil writes))
+         (progn
+           (ensure-equal nil response)
+           (ensure-equal nil writes)))
         (t
          (ensure-equal nil failure)
          (ensure-true (eq value response))
@@ -113,12 +120,16 @@
            (http3-public-error-check
             failure "HTTP/3 informational responses must be HTTP responses or response streams."
             (type-of information))
-           (ensure-equal nil writes))
+           (progn
+             (ensure-equal nil response)
+             (ensure-equal nil writes)))
           ((member (http-response-status information) '(101 200))
            (http3-public-error-check
             failure "An HTTP/3 informational response must have status 100-199 other than 101."
             (http-response-status information))
-           (ensure-equal nil writes))
+           (progn
+             (ensure-equal nil response)
+             (ensure-equal nil writes)))
           (t
            (ensure-equal nil failure)
            (ensure-true (eq final response))
@@ -809,3 +820,100 @@
                               (http-kit/http3:http3-frame-payload (first frames)))
                              :key (function http-message-kit:http-header-name)
                              :test (function string=))))))))
+(deftest http3-server-qpack-stream-id-is-validated-before-read
+  (multiple-value-bind (decoder-context section instruction)
+      (http3-test-qpack-blocked-section
+       (list (cons ":method" "POST")
+             (cons ":scheme" "https")
+             (cons ":authority" "example.test")
+             (cons ":path" "/")
+             (cons "x-blocked" "ready")))
+    (declare (ignore instruction))
+    (let* ((adapter
+             (http-message-kit:qpack-make-http3-decoder-context
+              decoder-context :max-blocked-streams 1))
+           (wire
+             (http-kit/http3:encode-http3-frame
+              (http-kit/http3:make-http3-frame
+               :type http-kit/http3:+http3-headers-type+ :payload section)))
+           (stream (make-http3-test-stream :kind :request))
+           (reads 0)
+           (failure
+             (http3-boundary-error
+              (lambda ()
+                (http-kit/http3:serve-http3-request-stream
+                 stream
+                 (lambda (request)
+                   (declare (ignore request))
+                   (make-http-response :status 204))
+                 :stream-id nil
+                 :qpack-decoder-context decoder-context
+                 :qpack-http3-decoder-context adapter
+                 :on-qpack-section-acknowledgment
+                 (lambda (stream-id) (declare (ignore stream-id)))
+                 :qpack-serialize (lambda (thunk) (funcall thunk))
+                 :await-qpack (lambda (token) (declare (ignore token)))
+                 :read-stream
+                 (lambda (actual &key timeout deadline)
+                   (declare (ignore actual timeout deadline))
+                   (incf reads)
+                   (values wire t))
+                 :write-stream
+                 (lambda (actual bytes &key fin-p timeout deadline)
+                   (declare (ignore actual bytes fin-p timeout deadline)))
+                 :close-stream
+                 (lambda (actual &key condition)
+                   (declare (ignore actual condition))))))))
+      (http3-public-error-check
+       failure
+       "Dynamic QPACK request decoding requires a numeric stream ID."
+       nil)
+      (ensure-equal 0 reads))))
+(deftest http3-server-rejects-missing-qpack-await-before-read
+  (multiple-value-bind (decoder-context section instruction)
+      (http3-test-qpack-blocked-section
+       (list (cons ":method" "POST")
+             (cons ":scheme" "https")
+             (cons ":authority" "example.test")
+             (cons ":path" "/")
+             (cons "x-blocked" "ready")))
+    (declare (ignore instruction))
+    (let* ((adapter
+             (http-message-kit:qpack-make-http3-decoder-context
+              decoder-context :max-blocked-streams 1))
+           (wire
+             (http-kit/http3:encode-http3-frame
+              (http-kit/http3:make-http3-frame
+               :type http-kit/http3:+http3-headers-type+ :payload section)))
+           (stream (make-http3-test-stream :kind :request))
+           (reads 0)
+           (failure
+             (http3-boundary-error
+              (lambda ()
+                (http-kit/http3:serve-http3-request-stream
+                 stream
+                 (lambda (request)
+                   (declare (ignore request))
+                   (make-http-response :status 204))
+                 :stream-id 16
+                 :qpack-decoder-context decoder-context
+                 :qpack-http3-decoder-context adapter
+                 :on-qpack-section-acknowledgment
+                 (lambda (stream-id) (declare (ignore stream-id)))
+                 :qpack-serialize (lambda (thunk) (funcall thunk))
+                 :read-stream
+                 (lambda (actual &key timeout deadline)
+                   (declare (ignore actual timeout deadline))
+                   (incf reads)
+                   (values wire t))
+                 :write-stream
+                 (lambda (actual bytes &key fin-p timeout deadline)
+                   (declare (ignore actual bytes fin-p timeout deadline)))
+                 :close-stream
+                 (lambda (actual &key condition)
+                   (declare (ignore actual condition))))))))
+      (http3-public-error-check
+       failure
+       "A blocked QPACK field section requires an await-qpack callback."
+       16)
+      (ensure-equal 0 reads))))

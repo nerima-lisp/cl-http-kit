@@ -1223,15 +1223,16 @@
          (inside-p nil)
          (open-outside-p nil)
          (close-outside-p nil))
-    (multiple-value-bind (capacity transaction)
+    (multiple-value-bind (capacity-instruction transaction)
         (http-message-kit:qpack-prepare-set-capacity encoder-context 256)
-      (declare (ignore capacity))
+      (setf encoder-instructions capacity-instruction)
       (http-message-kit:qpack-commit-encoding transaction))
     (multiple-value-bind (instruction transaction)
         (http-message-kit:qpack-prepare-insert-with-literal-name
          encoder-context "x-local" "yes" :huffman nil)
       (http-message-kit:qpack-commit-encoding transaction)
-      (setf encoder-instructions instruction))
+      (setf encoder-instructions
+            (http3-test-concat-octets encoder-instructions instruction)))
     (http-message-kit:qpack-decode-encoder-stream
      decoder-context encoder-instructions)
     (let ((client
@@ -1260,7 +1261,7 @@
              :open-p t
              :qpack-encoder-context encoder-context
              :qpack-decoder-context
-             (http-message-kit:make-qpack-context :huffman nil)
+             nil
              :peer-control-state
              (http-kit/http3:make-http3-control-state :peer-role :server))))
       (signals simple-error
@@ -2008,17 +2009,18 @@
                                                             (first event)
                                                             event))))
                  (let ((before-resume serializations))
-                   (http3-test-decode-inserts-and-resume
-                    context decoder-table instruction token
-                    (lambda (token)
-                      (let ((before-resume serializations))
-                        (prog1
-                            (http-message-kit:qpack-resume-blocked-stream
-                             token)
-                          (ensure-true
-                           (> serializations before-resume))))))
-                   (ensure-equal (+ before-resume 3) serializations))
-                 (push :resumed events))
+                   (prog1
+                       (http3-test-decode-inserts-and-resume
+                        context decoder-table instruction token
+                        (lambda (token)
+                          (let ((before-resume serializations))
+                            (prog1
+                                (http-message-kit:qpack-resume-blocked-stream
+                                 token)
+                              (ensure-true
+                               (> serializations before-resume))))))
+                     (ensure-equal (+ before-resume 3) serializations)
+                     (push :resumed events))))
                :on-body-chunk
                (lambda (chunk)
                  (push (list :data (subseq chunk 0)) events)))))
@@ -2095,9 +2097,10 @@
                                                 (if (consp event)
                                                     (first event)
                                                     event))))
-         (http3-test-decode-inserts-and-resume
-          context decoder-table instruction token)
-         (push :resumed events))
+         (prog1
+             (http3-test-decode-inserts-and-resume
+              context decoder-table instruction token)
+           (push :resumed events)))
        :on-body-chunk
        (lambda (chunk) (push (list :data (subseq chunk 0)) events)))
       (ensure-equal 1 await-count)
@@ -2164,12 +2167,14 @@
      204
      (http-response-status
       (http-kit/http3:send-http3-request
-       client request :qpack-decoder-context owned-table)))
+       client request :qpack-decoder-context owned-table
+       :await-qpack (lambda (token) (declare (ignore token))))))
     (ensure-equal
      204
      (http-response-status
       (http-kit/http3:send-http3-request
-       client request :qpack-http3-decoder-context owned-adapter)))
+       client request :qpack-http3-decoder-context owned-adapter
+       :await-qpack (lambda (token) (declare (ignore token))))))
     (ensure-equal 2 opens)
     (ensure-equal 2 reads)
     (ensure-equal 4 writes)
@@ -2178,7 +2183,8 @@
               (handler-case
                   (progn
                     (http-kit/http3:send-http3-request
-                     client request :qpack-decoder-context other-table)
+                     client request :qpack-decoder-context other-table
+                     :await-qpack (lambda (token) (declare (ignore token))))
                     nil)
                 (http-protocol-error (condition) condition))))
         (http3-public-error-check
@@ -2191,7 +2197,8 @@
               (handler-case
                   (progn
                     (http-kit/http3:send-http3-request
-                     client request :qpack-http3-decoder-context other-adapter)
+                     client request :qpack-http3-decoder-context other-adapter
+                     :await-qpack (lambda (token) (declare (ignore token))))
                     nil)
                 (http-protocol-error (condition) condition))))
         (http3-public-error-check
@@ -2204,7 +2211,8 @@
       (signals http-protocol-error
         (http-kit/http3::%h3-read-response
          client :response-stream
-         :qpack-http3-decoder-context owned-adapter :stream-id nil))
+         :qpack-http3-decoder-context owned-adapter :stream-id nil
+         :await-qpack (lambda (token) (declare (ignore token)))))
       (ensure-equal reads-before reads))
     (labels
         ((run-push-case (mode)
@@ -2273,6 +2281,8 @@
                        (multiple-value-list
                         (apply #'http-kit/http3:receive-http3-push
                                client stream :stream-id 0
+                               :await-qpack
+                               (lambda (token) (declare (ignore token)))
                                :await-push-promise
                                (lambda (push-id)
                                  (declare (ignore push-id))
@@ -2326,14 +2336,17 @@
         (http-kit/http3:serve-http3-request-stream
          :request-stream handler :read-stream read-stream :write-stream write-stream
          :qpack-http3-decoder-context owned-adapter :stream-id 0
-         :on-qpack-section-acknowledgment acknowledge :qpack-serialize serialize))
+         :on-qpack-section-acknowledgment acknowledge
+         :qpack-serialize serialize
+         :await-qpack (lambda (token) (declare (ignore token)))))
       (signals http-protocol-error
         (http-kit/http3:serve-http3-request-stream
          :request-stream handler :read-stream read-stream :write-stream write-stream
          :qpack-decoder-context owned-table
          :qpack-http3-decoder-context owned-adapter
          :stream-id nil :on-qpack-section-acknowledgment acknowledge
-         :qpack-serialize serialize)))
+         :qpack-serialize serialize
+         :await-qpack (lambda (token) (declare (ignore token))))))
     (ensure-equal 0 server-reads)
     (ensure-equal 0 server-writes)))
 
@@ -7846,25 +7859,19 @@
        (lambda ()
          (http-message-kit:qpack-decode-http3-field-section
           wire context 0 :role :response
-          :on-decoded :not-a-function
+          :on-section-acknowledgment :not-a-function
           :serialize (lambda (thunk) (push :serialize calls) (funcall thunk))))
        :not-a-function)
       (ensure-equal nil calls)
       (ensure-equal
-       :decoded
+       fields
        (http-message-kit:qpack-decode-http3-field-section
         wire context 0 :role :response
         :serialize (lambda (thunk)
                      (push :serialize-enter calls)
                      (funcall thunk)
-                     (push :serialize-exit calls))
-        :on-decoded (lambda (decoded)
-                      (ensure-equal
-                       (http3-test-qpack-headers fields)
-                       decoded)
-                      (push :decoded calls)
-                      :decoded)))
-      (ensure-equal '(:serialize-enter :serialize-exit :decoded)
+                     (push :serialize-exit calls))))
+      (ensure-equal '(:serialize-enter :serialize-exit)
                     (nreverse calls)))
     (multiple-value-bind (fields table wire instruction)
         (http3-test-qpack-blocked-fixture)
@@ -7882,30 +7889,23 @@
       (let* ((context
                (http-message-kit:qpack-make-http3-decoder-context
                 table :max-blocked-streams 1))
-             (callbacks 0)
+             (acknowledged nil)
+             (ack-callback
+               (lambda (stream-id) (push stream-id acknowledged)))
              (failure
                (http3-boundary-error
                 (lambda ()
                   (http-message-kit:qpack-decode-http3-field-section
                    wire context -1 :role :trailers
-                   :on-decoded (lambda (decoded)
-                                 (declare (ignore decoded))
-                                 (incf callbacks))))))
+                   :on-section-acknowledgment ack-callback))))
              (token
                (http-message-kit:qpack-decode-http3-field-section
                 wire context 4 :role :trailers
-                :on-decoded (lambda (decoded)
-                              (declare (ignore decoded))
-                              (incf callbacks)))))
-        (declare (ignore instruction))
+                :on-section-acknowledgment ack-callback)))
         (ensure-true (typep failure 'http-protocol-error))
-        (ensure-equal :http3-transport (http-error-operation failure))
-        (let ((detail (http-protocol-error-detail failure)))
-          (ensure-equal 2 (length detail))
-          (ensure-equal :qpack-decompression-failed (first detail))
-          (ensure-true (typep (second detail) 'http-protocol-error))
-          (ensure-equal :qpack (http-error-operation (second detail)))
-          (ensure-equal -1 (http-protocol-error-detail (second detail))))
+        (ensure-equal :qpack (http-error-operation failure))
+        (ensure-equal -1 (http-protocol-error-detail failure))
+        (ensure-equal nil acknowledged)
         (ensure-true (http-message-kit:qpack-blocked-stream-p token))
         (ensure-equal nil (http-message-kit:qpack-take-ready-streams context))
         (http-message-kit:qpack-decode-encoder-stream table instruction)
@@ -7913,13 +7913,15 @@
           (ensure-equal 1 (length ready))
           (ensure-true (eq token (first ready)))
           (ensure-equal
-           (http3-test-qpack-headers fields)
+           fields
            (http-message-kit:qpack-resume-blocked-stream token)))
-        (ensure-equal 1 callbacks)
+        (ensure-equal '(4) (nreverse acknowledged))
         (ensure-equal
-         (http3-test-qpack-headers fields)
+         fields
          (http-message-kit:qpack-decode-http3-field-section
-          wire context 8 :role :trailers))))))
+          wire context 8 :role :trailers
+          :on-section-acknowledgment ack-callback))
+        (ensure-equal '(8 4) acknowledged)))))
 
 (deftest http3-public-preflight-qpack-encoder-tracking
   (flet ((reject (thunk detail)
@@ -10015,7 +10017,7 @@
            (http-message-kit:qpack-make-http3-decoder-context
             decoder :max-blocked-streams 1))
          (calls 0)
-         (callbacks 0)
+         (inside-serializer-p nil)
          (acknowledged nil)
          (fields '(("x" . "y"))))
     (http-message-kit:qpack-encode-insert-with-literal-name
@@ -10026,20 +10028,24 @@
              (http3-test-qpack-encode
               fields :context encoder :use-dynamic-p t :stream-id 4 :huffman nil))
            (serializer
-             (lambda (thunk) (incf calls) (funcall thunk)))
-           (callback
-             (lambda (decoded) (incf callbacks) decoded))
+             (lambda (thunk)
+               (incf calls)
+               (setf inside-serializer-p t)
+               (unwind-protect
+                    (funcall thunk)
+                 (setf inside-serializer-p nil))))
            (ack-callback
-             (lambda (stream-id) (push stream-id acknowledged)))
+             (lambda (stream-id)
+               (ensure-equal nil inside-serializer-p)
+               (push stream-id acknowledged)))
            (token
              (http-message-kit:qpack-decode-http3-field-section
               wire context 4 :role :trailers
-              :serialize serializer :on-decoded callback
+              :serialize serializer
               :on-section-acknowledgment ack-callback)))
       (ensure-true (http-message-kit:qpack-blocked-stream-p token))
       (ensure-equal nil acknowledged)
       (ensure-equal nil (http-message-kit:qpack-take-ready-streams context))
-      (ensure-equal 0 callbacks)
       (ensure-equal 1 calls)
       (http-message-kit:qpack-decode-encoder-stream
        decoder
@@ -10052,7 +10058,6 @@
         (ensure-equal fields
                       (http-message-kit:qpack-resume-blocked-stream token)))
       (ensure-equal '(4) (nreverse acknowledged))
-      (ensure-equal 1 callbacks)
       (ensure-equal 3 calls)
       (ensure-equal
        fields
@@ -10411,4 +10416,96 @@
                          (find ":status" headers
                                :key (function http-message-kit:http-header-name)
                                :test (function string=)))))))))
+(deftest http3-client-qpack-stream-id-is-validated-before-read
+  (multiple-value-bind (decoder-context section instruction)
+      (http3-test-qpack-blocked-section
+       (list (cons ":status" "204") (cons "x-blocked" "ready")))
+    (declare (ignore decoder-context instruction))
+    (let* ((response-wire
+             (http-kit/http3:encode-http3-frame
+              (http-kit/http3:make-http3-frame
+               :type http-kit/http3:+http3-headers-type+ :payload section)))
+           (reads 0)
+           (client
+             (http-kit/http3:make-http3-client
+              :qpack-settings
+              (list
+               (cons http-kit/http3:+http3-setting-qpack-max-table-capacity+ 256)
+               (cons http-kit/http3:+http3-setting-qpack-blocked-streams+ 1))
+              :open-stream
+              (lambda (request &key stream-type timeout deadline)
+                (declare (ignore request timeout deadline))
+                (values (make-http3-test-stream :kind stream-type)
+                        (when (eq stream-type :request) nil)))
+              :write-stream
+              (lambda (stream bytes &key fin-p timeout deadline)
+                (declare (ignore stream bytes fin-p timeout deadline)))
+              :read-stream
+              (lambda (stream &key timeout deadline)
+                (declare (ignore stream timeout deadline))
+                (incf reads)
+                (values response-wire t))
+              :close-stream
+              (lambda (stream &key condition)
+                (declare (ignore stream condition)))))
+           (failure
+             (http3-boundary-error
+              (lambda ()
+                (http-kit/http3:send-http3-request
+                 client
+                 (make-http-request :method "GET"
+                                    :uri "https://example.test/")
+                 :await-qpack
+                 (lambda (token) (declare (ignore token))))))))
+      (http3-public-error-check
+       failure
+       "Dynamic QPACK response decoding requires a numeric stream ID."
+       nil)
+      (ensure-equal 0 reads)
+      (http-kit/http3:close-http3-client client))))
+(deftest http3-client-rejects-missing-qpack-await-before-read
+  (multiple-value-bind (decoder-context section instruction)
+      (http3-test-qpack-blocked-section
+       (list (cons ":status" "204") (cons "x-blocked" "ready")))
+    (declare (ignore decoder-context instruction))
+    (let* ((response-wire
+             (http-kit/http3:encode-http3-frame
+              (http-kit/http3:make-http3-frame
+               :type http-kit/http3:+http3-headers-type+ :payload section)))
+           (reads 0)
+           (client
+             (http-kit/http3:make-http3-client
+              :qpack-settings
+              (list
+               (cons http-kit/http3:+http3-setting-qpack-max-table-capacity+ 256)
+               (cons http-kit/http3:+http3-setting-qpack-blocked-streams+ 1))
+              :open-stream
+              (lambda (request &key stream-type timeout deadline)
+                (declare (ignore request timeout deadline))
+                (values (make-http3-test-stream :kind stream-type)
+                        (when (eq stream-type :request) 0)))
+              :write-stream
+              (lambda (stream bytes &key fin-p timeout deadline)
+                (declare (ignore stream bytes fin-p timeout deadline)))
+              :read-stream
+              (lambda (stream &key timeout deadline)
+                (declare (ignore stream timeout deadline))
+                (incf reads)
+                (values response-wire t))
+              :close-stream
+              (lambda (stream &key condition)
+                (declare (ignore stream condition)))))
+           (failure
+             (http3-boundary-error
+              (lambda ()
+                (http-kit/http3:send-http3-request
+                 client
+                 (make-http-request :method "GET"
+                                    :uri "https://example.test/"))))))
+      (http3-public-error-check
+       failure
+       "A blocked QPACK field section requires an await-qpack callback."
+       0)
+      (ensure-equal 0 reads)
+      (http-kit/http3:close-http3-client client))))
 

@@ -1485,6 +1485,15 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
     (unless (and (integerp stream-id) (>= stream-id 0))
       (%h3-transport-error
        "Dynamic QPACK response decoding requires a numeric stream ID."
+       stream-id))
+    (when (and
+           (plusp
+            (or (cdr (assoc +http3-setting-qpack-blocked-streams+
+                            (http3-client-qpack-settings client)))
+                0))
+           (not (functionp await-qpack)))
+      (%h3-transport-error
+       "A blocked QPACK field section requires an await-qpack callback."
        stream-id)))
   (let ((buffer (make-array 0 :element-type '(unsigned-byte 8)))
         (status nil)
@@ -2828,11 +2837,17 @@ is NIL if parsing failed before the request model was constructed."
       (%h3-transport-error
        "Dynamic QPACK request decoding requires a serializer."
        qpack-serialize)))
-  (when (not (eq (null qpack-decoder-context)
-                 (null qpack-http3-decoder-context)))
-    (%h3-transport-error
-     "A QPACK decoder context and its HTTP/3 adapter must be supplied together."
-     (list qpack-decoder-context qpack-http3-decoder-context))))
+  (progn
+    (when (not (eq (null qpack-decoder-context)
+                   (null qpack-http3-decoder-context)))
+      (%h3-transport-error
+       "A QPACK decoder context and its HTTP/3 adapter must be supplied together."
+       (list qpack-decoder-context qpack-http3-decoder-context)))
+    (when qpack-http3-decoder-context
+      (unless (functionp await-qpack)
+        (%h3-transport-error
+         "A blocked QPACK field section requires an await-qpack callback."
+         stream-id)))))
   (let ((closer (or close-stream
                     (lambda (ignored-stream &key condition)
                       (declare (ignore ignored-stream condition))
