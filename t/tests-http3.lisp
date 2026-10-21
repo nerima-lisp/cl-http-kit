@@ -1322,11 +1322,16 @@
     (signals http-protocol-error
       (http-message-kit:qpack-decode-decoder-stream
        context (http-message-kit:qpack-encode-section-ack 4)))
-    (http-message-kit:qpack-decode-decoder-stream
-     context (http-message-kit:qpack-encode-stream-cancellation 8))
-    (signals http-protocol-error
-      (http-message-kit:qpack-decode-decoder-stream
-       context (http-message-kit:qpack-encode-stream-cancellation 8)))
+    (multiple-value-bind (events consumed)
+        (http-message-kit:qpack-decode-decoder-stream
+         context (http-message-kit:qpack-encode-stream-cancellation 8))
+      (ensure-equal '((:stream-cancellation 8)) events)
+      (ensure-equal 1 consumed))
+    (multiple-value-bind (events consumed)
+        (http-message-kit:qpack-decode-decoder-stream
+         context (http-message-kit:qpack-encode-stream-cancellation 8))
+      (ensure-equal '((:stream-cancellation 8)) events)
+      (ensure-equal 1 consumed))
     (signals http-protocol-error
       (http-message-kit:qpack-decode-decoder-stream
        context (http-message-kit:qpack-encode-insert-count-increment 1))))
