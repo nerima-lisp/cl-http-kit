@@ -6670,7 +6670,12 @@
      fields
      (http3-test-qpack-decode (http3-test-qpack-encode fields)
       :max-header-bytes (* 34 (length fields))
-      :max-fields (length fields)))))
+      :max-fields (length fields))))
+  (ensure-equal '(("x" . "y"))
+                (http3-test-qpack-decode
+                 (http3-test-qpack-encode '(("x" . "y")))
+                 :max-header-bytes nil
+                 :max-fields 1)))
 
 (deftest http3-qpack-public-decoder-limit-size-conditions
   (dolist (row '((((":status" . "200")) 41 1 :headers 41 42)
@@ -6693,7 +6698,7 @@
   (let ((section
           (http3-test-qpack-encode '(("x" . "y")))))
     (dolist (row '((:max-header-bytes -1) (:max-header-bytes 1/2)
-                   (:max-header-bytes nil) (:max-fields 0) (:max-fields 1/2)))
+                   (:max-fields 0) (:max-fields 1/2)))
       (destructuring-bind (key value) row
         (declare (ignore key))
         (let ((failure
