@@ -6673,7 +6673,7 @@
       :max-fields (length fields)))))
 
 (deftest http3-qpack-public-decoder-limit-size-conditions
-  (dolist (row '(((("x" . "y")) 33 1 :headers 33 34)
+  (dolist (row '((((":status" . "200")) 41 1 :headers 41 42)
                  ((("x" . "y") ("z" . "w")) 68 1 :fields 1 2)))
     (destructuring-bind (fields header-limit field-limit kind limit observed) row
       (let ((failure
