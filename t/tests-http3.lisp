@@ -20,7 +20,10 @@
      (if (http-message-kit:http-header-p field)
          field
          (let ((name (car field))
-               (value (cdr field)))
+               (value (if (and (consp (cdr field))
+                               (null (cddr field)))
+                          (cadr field)
+                          (cdr field))))
            (if (and (plusp (length name))
                     (char= (char name 0) #\:))
                (http-message-kit:make-http-pseudo-header name value)
