@@ -2444,7 +2444,7 @@
                 (values wire t)))))
       (signals http-protocol-error
         (http-kit/http3::%h3-read-response
-         client :stream :request-method "GET" :collect-body-p t)))
+         client :stream :stream-id 0 :request-method "GET" :collect-body-p t)))
   (let* ((wire
            (http3-test-concat-octets
             (http-kit/http3:encode-http3-frame
@@ -2471,7 +2471,7 @@
      (octets 1 2 3)
     (http-response-body
       (http-kit/http3::%h3-read-response
-       client :stream :request-method "CONNECT" :collect-body-p t)))))
+       client :stream :stream-id 0 :request-method "CONNECT" :collect-body-p t)))))
 
 (deftest http3-disabled-server-push-is-id-error
   (let* ((wire
