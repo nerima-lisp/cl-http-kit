@@ -1283,7 +1283,7 @@
             (declare (ignore base))
             (ensure-equal (length payload) consumed)
             (ensure-equal 1 required-insert-count)
-            (ensure-equal '(("x-local" . "yes"))
+            (ensure-equal '((":method" . "GET") (":scheme" . "https") (":authority" . "example.test") (":path" . "/") ("x-local" . "yes"))
                           (mapcar (lambda (header)
                                     (cons (http-message-kit:http-header-name header)
                                           (http-message-kit:http-header-content header)))
