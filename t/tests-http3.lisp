@@ -1086,14 +1086,15 @@
                          (http-message-kit:qpack-context-insert-count
                           decoder-context))
                    events)
-             (let ((inside-p t))
+             (let ((previous-inside-p inside-p))
+               (setf inside-p t)
                (unwind-protect
                     (multiple-value-prog1 (funcall thunk)
                       (push (list :leave
                                   (http-message-kit:qpack-context-insert-count
                                    decoder-context))
                             events))
-                 (setf inside-p nil))))
+                 (setf inside-p previous-inside-p))))
            :read-stream
            (lambda (actual &key timeout deadline)
              (declare (ignore timeout deadline))
@@ -1108,7 +1109,11 @@
         (http-kit/http3:read-http3-qpack-encoder-stream client)
       (ensure-equal '(:set-capacity :insert) (mapcar #'first application-events))
       (ensure-equal nil ended-p))
-    (ensure-equal '((:read nil) (:enter 0) (:leave 1))
+    (ensure-equal '((:enter 0)
+                    (:leave 0)
+                    (:read nil)
+                    (:enter 0)
+                    (:leave 1))
                   (nreverse events))
     (ensure-equal 1 (http-message-kit:qpack-context-insert-count decoder-context))))
 
