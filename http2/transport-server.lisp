@@ -306,22 +306,58 @@ pseudo-fields are kept separate because they are not ordinary HTTP headers.
                           (list body-length actual-body-length)))
       (values status headers trailers body actual-body-length no-body))))
 
-(defun %h2-server-settings-wire (max-frame-size max-concurrent-streams
-                                  enable-connect-p)
-  (let ((payload (make-array (if enable-connect-p 24 18)
-                             :element-type '(unsigned-byte 8)
-                             :initial-element 0)))
-    ;; Disable server push, advertise the local frame and stream limits.
-    (%h2-put-u16 payload 0 2)
-    (%h2-put-u32 payload 2 0)
-    (%h2-put-u16 payload 6 5)
-    (%h2-put-u32 payload 8 max-frame-size)
-    (%h2-put-u16 payload 12 3)
-    (%h2-put-u32 payload 14 max-concurrent-streams)
-    (when enable-connect-p
-      (%h2-put-u16 payload 18 8)
-      (%h2-put-u32 payload 20 1))
-    (%h2-frame-wire +http2-settings-type+ 0 0 payload)))
+(progn
+  (defun %h2-server-settings-wire (max-frame-size max-concurrent-streams
+                                   enable-connect-p)
+    (let ((payload (make-array (if enable-connect-p 24 18)
+                               :element-type '(unsigned-byte 8)
+                               :initial-element 0)))
+      ;; Disable server push, advertise the local frame and stream limits.
+      (%h2-put-u16 payload 0 2)
+      (%h2-put-u32 payload 2 0)
+      (%h2-put-u16 payload 6 5)
+      (%h2-put-u32 payload 8 max-frame-size)
+      (%h2-put-u16 payload 12 3)
+      (%h2-put-u32 payload 14 max-concurrent-streams)
+      (when enable-connect-p
+        (%h2-put-u16 payload 18 8)
+        (%h2-put-u32 payload 20 1))
+      (%h2-frame-wire +http2-settings-type+ 0 0 payload)))
+  (defun %h2-server-effective-deadline
+      (session-deadline idle-deadline stream-deadlines)
+    (let ((deadline
+            (cond
+              ((and session-deadline idle-deadline)
+               (min session-deadline idle-deadline))
+              (session-deadline session-deadline)
+              (t idle-deadline))))
+      (maphash
+       (lambda (stream-id stream-deadline)
+         (declare (ignore stream-id))
+         (when (or (null deadline) (< stream-deadline deadline))
+           (setf deadline stream-deadline)))
+       stream-deadlines)
+      deadline))
+  (defun %h2-server-write-wire
+      (stream wire session-deadline idle-deadline stream-deadlines
+       clock-function)
+    (let ((deadline (%h2-server-effective-deadline
+                     session-deadline idle-deadline stream-deadlines)))
+      (http-kit::%check-deadline deadline clock-function :write)
+      #+sbcl
+      (if deadline
+          (handler-case
+              (sb-ext:with-timeout
+                  (max 0 (- deadline (funcall clock-function)))
+                (%h2-write-wire stream wire deadline clock-function))
+            (sb-ext:timeout ()
+              (error 'http-kit:http-timeout
+                     :message "The HTTP/2 write operation exceeded its deadline."
+                     :operation :write
+                     :kind :write)))
+          (%h2-write-wire stream wire deadline clock-function))
+      #-sbcl
+      (%h2-write-wire stream wire deadline clock-function))))
 
 (defun serve-http2-session
     (stream handler &key timeout deadline
@@ -343,7 +379,10 @@ pseudo-fields are kept separate because they are not ordinary HTTP headers.
              (close-stream #'close)
              (clock-function #'http-kit::%monotonic-time)
              (huffman-p nil)
-             (enable-connect-p nil))
+             (enable-connect-p nil)
+             request-timeout
+             idle-timeout
+             shutdown-p)
   "Serve one HTTP/2 connection on STREAM.
 
 The caller owns the network transport and supplies HANDLER.  This function
@@ -398,7 +437,22 @@ values.
            :message "HTTP/2 enable-connect-p must be boolean"
            :operation :http2-server
            :detail enable-connect-p))
-  (%h2-validate-frame-size max-frame-size)
+  (progn
+  (dolist (entry (list (cons :request-timeout request-timeout)
+                       (cons :idle-timeout idle-timeout)))
+    (unless (or (null (cdr entry))
+                (and (realp (cdr entry))
+                     (not (minusp (cdr entry)))))
+      (error 'http-kit:http-protocol-error
+             :message "HTTP/2 request and idle timeouts must be non-negative reals or NIL"
+             :operation :http2-server
+             :detail entry)))
+  (unless (or (null shutdown-p) (functionp shutdown-p))
+    (error 'http-kit:http-protocol-error
+           :message "HTTP/2 shutdown-p must be a function or NIL"
+           :operation :http2-server
+           :detail shutdown-p))
+  (%h2-validate-frame-size max-frame-size))
   (%h2-validate-limit :max-header-bytes max-header-bytes)
   (%h2-validate-limit :max-fields max-fields)
   (%h2-validate-limit :max-body-bytes max-body-bytes :allow-zero t)
@@ -432,10 +486,19 @@ values.
                                     :clock-function clock-function
                                     :kind :http2-server)
                (let* ((reader (%h2-reader-for stream))
+                      (stream-deadlines (make-hash-table :test #'eql))
+                      (idle-deadline
+                        (and idle-timeout
+                             (http-kit:http-deadline
+                              idle-timeout
+                              :deadline absolute-deadline
+                              :clock-function clock-function)))
+                      (frame-start-idle-deadline nil)
                       (writer
                         (lambda (wire)
-                          (%h2-write-wire stream wire absolute-deadline
-                                          clock-function)))
+                          (%h2-server-write-wire stream wire absolute-deadline
+                                                 idle-deadline stream-deadlines
+                                                 clock-function)))
                       (streams (make-hash-table :test #'eql))
                       (pending-frames '())
                       (wire-header-stream-id nil)
@@ -457,7 +520,9 @@ values.
                  (let ((preface
                          (%h2-reader-read reader
                                          (length +http2-connection-preface+)
-                                         absolute-deadline
+                                         (%h2-server-effective-deadline
+                                          absolute-deadline idle-deadline
+                                          stream-deadlines)
                                          clock-function
                                          :allow-eof t)))
                    (cond
@@ -470,8 +535,11 @@ values.
                        "Invalid HTTP/2 client connection preface"
                        preface))))
                  (let ((first-frame
-                         (%h2-read-frame reader max-frame-size
-                                        absolute-deadline clock-function)))
+                         (%h2-read-frame
+                          reader max-frame-size
+                          (%h2-server-effective-deadline
+                           absolute-deadline idle-deadline stream-deadlines)
+                          clock-function)))
                    (when (eq first-frame :eof)
                      (%h2-server-error
                       "HTTP/2 peer closed before sending SETTINGS" nil))
@@ -512,14 +580,11 @@ values.
                        (set-peer-hpack-table-size new-table-size))
                      (when new-initial-window-size
                        (setf peer-initial-window-size new-initial-window-size))))
-                 (%h2-send-control writer
-                                   +http2-settings-type+
-                                   0
-                                   0
-                                   (%h2-server-settings-wire
-                                    max-frame-size
-                                    max-concurrent-streams
-                                    enable-connect-p))
+                 (funcall writer
+                          (%h2-server-settings-wire
+                           max-frame-size
+                           max-concurrent-streams
+                           enable-connect-p))
                  (%h2-send-control writer
                                    +http2-settings-type+
                                    +http2-ack-flag+
@@ -534,8 +599,51 @@ values.
                             (pop pending-frames)
                             (read-wire-frame)))
                       (read-wire-frame ()
-                        (let ((frame (%h2-read-frame reader max-frame-size
-                                                     absolute-deadline clock-function)))
+                        (let ((frame
+                                (%h2-read-frame
+                                 reader max-frame-size
+                                 (%h2-server-effective-deadline
+                                  absolute-deadline idle-deadline stream-deadlines)
+                                 clock-function
+                                 :deadline-function
+                                 (lambda ()
+                                   (%h2-server-effective-deadline
+                                    absolute-deadline idle-deadline stream-deadlines))
+                                 :on-first-byte
+                                 (lambda ()
+                                   (setf frame-start-idle-deadline idle-deadline
+                                         idle-deadline nil)
+                                   (when (and request-timeout
+                                              (not goaway-sent-p))
+                                     (setf (gethash :frame-start stream-deadlines)
+                                           (http-kit:http-deadline
+                                            request-timeout
+                                            :deadline absolute-deadline
+                                            :clock-function clock-function))))
+                                 :on-header
+                                 (lambda (length type flags stream-id)
+                                   (declare (ignore length flags))
+                                   (let ((frame-start-deadline
+                                           (gethash :frame-start stream-deadlines))
+                                         (saved-idle-deadline
+                                           frame-start-idle-deadline))
+                                     (remhash :frame-start stream-deadlines)
+                                     (setf frame-start-idle-deadline nil)
+                                     (unless (= type +http2-headers-type+)
+                                       (setf idle-deadline saved-idle-deadline))
+                                     (when (and shutdown-p (funcall shutdown-p))
+                                       (send-goaway))
+                                     (when (and (= type +http2-headers-type+)
+                                                (> stream-id last-client-stream-id)
+                                                (not (gethash stream-id streams)))
+                                       (unless goaway-sent-p
+                                         (when request-timeout
+                                           (setf (gethash stream-id stream-deadlines)
+                                                 (or frame-start-deadline
+                                                     (http-kit:http-deadline
+                                                      request-timeout
+                                                      :deadline absolute-deadline
+                                                      :clock-function clock-function)))))))))))
                           ;; Validate the wire sequence before controls can bypass
                           ;; the queued header block while a response is blocked.
                           (unless (eq frame :eof)
@@ -553,7 +661,7 @@ values.
                                       (= (%h2-frame-type frame) +http2-headers-type+))
                               (setf wire-header-stream-id
                                     (when (zerop (logand (%h2-frame-flags frame)
-                                                        +http2-end-headers-flag+))
+                                                         +http2-end-headers-flag+))
                                       (%h2-frame-stream-id frame)))))
                           frame))
                       (stream-window-control-p (frame stream-id)
@@ -624,6 +732,7 @@ values.
                                     new-initial-window-size)))))
                       (send-goaway ()
                         (unless goaway-sent-p
+                          (setf idle-deadline nil)
                           (let ((payload (make-array 8
                                                      :element-type
                                                      '(unsigned-byte 8))))
@@ -748,6 +857,7 @@ values.
                                  (when state
                                    (setf (%h2-server-stream-reset-p state) t)
                                    (remhash stream-id streams)
+                                   (remhash stream-id stream-deadlines)
                                    (when (and interested-state
                                               (eq state interested-state))
                                      (return-from process-control-frame :reset))))
@@ -970,6 +1080,9 @@ values.
                                   current-request request)
                             (multiple-value-bind (response information)
                                 (funcall handler request)
+                              (http-kit::%check-deadline
+                               (gethash (%h2-server-stream-id state) stream-deadlines)
+                               clock-function :write)
                               (unless (listp information)
                                 (%h2-server-error
                                  "HTTP/2 informational responses must be supplied as a list"
@@ -983,11 +1096,20 @@ values.
                                   (return-from finish-request :reset)))
                               (setf (%h2-server-stream-responded-p state) t)
                               (remhash (%h2-server-stream-id state) streams)
+                              (remhash (%h2-server-stream-id state) stream-deadlines)
                               (incf request-count)
                               (when (and max-requests
                                          (>= request-count max-requests))
                                 (send-goaway)
-                                (return-from finish-request :max-requests))))))
+                                (return-from finish-request :max-requests))
+                              (when (and idle-timeout
+                                         (zerop (hash-table-count streams))
+                                         (zerop (hash-table-count stream-deadlines)))
+                                (setf idle-deadline
+                                      (http-kit:http-deadline
+                                       idle-timeout
+                                       :deadline absolute-deadline
+                                       :clock-function clock-function)))))))
                       (handle-headers (frame)
                         (let ((stream-id (%h2-frame-stream-id frame))
                               (flags (%h2-frame-flags frame)))
@@ -1025,16 +1147,15 @@ values.
                                     (%h2-server-error
                                      "HTTP/2 request stream IDs must increase"
                                      stream-id))
-                                  (when (>= (hash-table-count streams)
-                                             (min max-concurrent-streams
-                                                  (or peer-max-concurrent-streams
-                                                      max-concurrent-streams)))
-                                    ;; REFUSED_STREAM is stream-local.  The
-                                    ;; connection remains usable for later
-                                    ;; increasing stream IDs.
+                                  (when (or goaway-sent-p
+                                            (>= (hash-table-count streams)
+                                                (min max-concurrent-streams
+                                                     (or peer-max-concurrent-streams
+                                                         max-concurrent-streams))))
                                     (%h2-send-rst-stream
                                      writer stream-id +http2-refused-stream+)
                                     (setf last-client-stream-id stream-id)
+                                    (remhash stream-id stream-deadlines)
                                     (return-from handle-headers nil))
                                   (setf last-client-stream-id stream-id)
                                   (multiple-value-bind (block end-stream-p)
@@ -1140,6 +1261,13 @@ values.
                                 (>= request-count max-requests))
                        (send-goaway)
                        (setf termination :max-requests)
+                       (return))
+                     (when (and shutdown-p (funcall shutdown-p))
+                       (send-goaway))
+                     (when (and goaway-sent-p
+                                (zerop (hash-table-count streams))
+                                (zerop (hash-table-count stream-deadlines)))
+                       (setf termination :goaway)
                        (return))
                      (let ((result (process-frame (next-frame))))
                        (case result
