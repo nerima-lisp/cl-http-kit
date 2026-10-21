@@ -2501,6 +2501,60 @@
              (ensure-true (search "GET /two HTTP/1.1" output))))
       (http-connection-pool-clear pool))
     (ensure-equal 1 closed)))
+#+sbcl
+(deftest client-preopened-http-stream-transfer
+  (let* ((stream
+           (make-instance 'binary-test-stream
+                          :input (ascii "HTTP/1.1 200 OK|CRLF|Content-Length: 0|CRLF||CRLF|")))
+         (opened 0)
+         (closed 0)
+         (pool
+           (make-http-connection-pool
+            :open-stream (lambda (request &key timeout deadline &allow-other-keys)
+                           (declare (ignore request timeout deadline))
+                           (incf opened)
+                           stream)
+            :close-stream (lambda (seen)
+                            (ensure-true (eq stream seen))
+                            (incf closed)
+                            (close seen :abort t))))
+         (request (make-http-request :method "GET"
+                                     :uri "http://preopened.test/")))
+    (unwind-protect
+         (let ((response
+                 (http-kit/client::%http-connection-pool-send-on-stream
+                  pool request stream)))
+           (ensure-equal 200 (http-response-status response))
+           (ensure-equal 0 opened)
+           (ensure-equal 0 closed)
+           (ensure-equal 1 (getf (http-connection-pool-stats pool) :idle-count))
+           (ensure-true (search "GET / HTTP/1.1"
+                                (octets-as-string (binary-test-output stream)))))
+      (ensure-equal 1 (http-connection-pool-clear pool)))
+    (ensure-equal 1 closed)))
+#+sbcl
+(deftest client-preopened-http-stream-closes-before-transfer
+  (let* ((stream (make-instance 'binary-test-stream))
+         (closed 0)
+         (pool
+           (make-http-connection-pool
+            :open-stream (lambda (&rest arguments)
+                           (declare (ignore arguments))
+                           (error "Unexpected open"))
+            :close-stream (lambda (seen)
+                            (ensure-true (eq stream seen))
+                            (incf closed)
+                            (close seen :abort t))))
+         (caught
+           (handler-case
+               (http-kit/client::%http-connection-pool-send-on-stream
+                pool nil stream)
+             (http-protocol-error (condition) condition))))
+    (ensure-true (typep caught 'http-protocol-error))
+    (ensure-equal 0 (length (binary-test-output stream)))
+    (ensure-equal 0 (getf (http-connection-pool-stats pool) :idle-count))
+    (ensure-equal 1 closed)
+    (ensure-equal 0 (http-connection-pool-clear pool))))
 
 #+sbcl
 (deftest client-native-alpn-proxy-h2-routes-and-information
