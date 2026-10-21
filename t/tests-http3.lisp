@@ -5529,11 +5529,16 @@
                    (:missing-prefix (ascii ""))
                    (:truncated (http3-test-concat-octets
                                  prefix (subseq instruction 0 1)))
-                   (t (http3-test-concat-octets
-                       prefix (http-message-kit:qpack-encode-section-ack 0)))))
+                   (t (http3-test-concat-octets prefix instruction))))
            (stream (make-http3-test-stream :reads (list (list wire (not (eq ending :open))))))
            (client (http-kit/http3::%make-http3-client
                     :open-p t
+                    :qpack-encoder-context
+                    (http-message-kit:make-qpack-context
+                     :max-table-capacity 0
+                     :table-capacity 0
+                     :max-blocked-streams 0
+                     :huffman nil)
                     :read-stream (lambda (stream &key timeout deadline)
                                    (declare (ignore timeout deadline))
                                    (let ((entry (pop (http3-test-stream-reads stream))))
@@ -5550,7 +5555,7 @@
       (if (eq ending :open)
           (progn
             (ensure-equal nil failure)
-            (ensure-equal '((:section-ack 0)) events)
+            (ensure-equal '((:stream-cancellation 128)) events)
             (ensure-equal 0 (length (http-kit/http3::http3-client-peer-qpack-decoder-buffer client))))
           (progn
             (ensure-true (typep failure 'http-protocol-error))
