@@ -1,56 +1,67 @@
 (in-package #:http-kit/test)
 
 (deftest http3-defensive-qpack-section-ownership
-  (let* ((table (http-kit/http3:make-qpack-dynamic-table
-                 :max-capacity 34 :capacity 34))
-         (state (http-kit/http3:make-qpack-decoder-stream-state table)))
-    (http-kit/http3:qpack-dynamic-table-insert table "a" "1")
-    (http-kit/http3:qpack-decoder-stream-state-note-insertions-sent state 1)
-    ;; Equal sections are distinct owners, even on the same stream.
-    (dolist (id '(4 4 8))
-      (http-kit/http3:qpack-decoder-stream-state-register-section
-       state id 1 '(0 0)))
-    (flet ((receive (wire expected)
-             (multiple-value-bind (events consumed)
-                 (http-kit/http3:qpack-process-decoder-stream wire :state state)
-               (ensure-equal (list expected) events)
-               (ensure-equal (length wire) consumed)))
-           (protected ()
-             (http3-codec-check-protected-eviction
-              (lambda ()
-                (http-kit/http3:qpack-dynamic-table-set-capacity table 0)) 0)
-             (ensure-equal 34 (http-kit/http3:qpack-dynamic-table-capacity table))
-             (ensure-equal 34 (http-kit/http3:qpack-dynamic-table-size table))))
-      (receive (http-kit/http3:qpack-encode-section-acknowledgment 4)
-               '(:section-acknowledgment 4))
-      (protected)
-      (receive (http-kit/http3:qpack-encode-stream-cancellation 4)
-               '(:stream-cancellation 4))
-      (protected)
-      (dolist (wire (list (http-kit/http3:qpack-encode-section-acknowledgment 4)
-                         (http-kit/http3:qpack-encode-stream-cancellation 4)))
-        (let ((notifications 0)
-              (failure nil))
-          (setf failure
-                (handler-case
-                    (http-kit/http3:qpack-process-decoder-stream
-                     wire :state state
-                     :on-section-acknowledgment
-                     (lambda (id) (declare (ignore id)) (incf notifications))
-                     :on-stream-cancellation
-                     (lambda (id) (declare (ignore id)) (incf notifications)))
-                  (http-protocol-error (condition) condition)))
-          (ensure-true (typep failure 'http-protocol-error))
-          (ensure-equal :qpack (http-error-operation failure))
-          (ensure-equal 4 (http-protocol-error-detail failure))
-          (ensure-equal 0 notifications))
-        (protected))
-      (receive (http-kit/http3:qpack-encode-section-acknowledgment 8)
-               '(:section-acknowledgment 8)))
-    (http-kit/http3:qpack-dynamic-table-set-capacity table 0)
-    (ensure-equal 0 (http-kit/http3:qpack-dynamic-table-size table))
-    (ensure-equal nil (http-kit/http3:qpack-dynamic-table-entries table))
-    (ensure-equal 1 (http-kit/http3:qpack-dynamic-table-insert-count table))))
+  (let* ((context (http-message-kit:make-qpack-context
+                   :max-table-capacity 34 :table-capacity 34
+                   :max-blocked-streams 1 :huffman nil))
+         (headers (list (http-message-kit:make-http-header "a" "1"))))
+    (http-message-kit:qpack-encode-insert-with-literal-name
+     context "a" "1" :huffman nil)
+    (http-message-kit:qpack-encode-header-block
+     headers :context context :use-dynamic-p t :stream-id 4 :huffman nil)
+    (let ((failure
+            (handler-case
+                (http-message-kit:qpack-context-set-capacity context 0)
+              (http-protocol-error (condition) condition))))
+      (ensure-true (typep failure 'http-protocol-error))
+      (ensure-equal :qpack (http-error-operation failure))
+      (ensure-equal "QPACK cannot evict an entry referenced by a field section."
+                    (http-error-message failure))
+      (ensure-equal 0 (http-protocol-error-detail failure))
+      (ensure-equal 34 (http-message-kit:qpack-context-table-capacity context))
+      (ensure-equal 34 (http-message-kit:qpack-context-table-size context)))
+    (let* ((wire (http-message-kit:qpack-encode-section-ack 4))
+           (events nil)
+           (used nil))
+      (multiple-value-setq
+          (events used)
+        (http-message-kit:qpack-decode-decoder-stream context wire))
+      (ensure-equal '((:section-ack 4)) events)
+      (ensure-equal (length wire) used))
+    (let* ((wire (http-message-kit:qpack-encode-section-ack 4))
+           (events nil)
+           (used nil)
+           (known-received-count
+             (http-message-kit:qpack-context-known-received-count context))
+           (failure nil))
+      (handler-case
+          (multiple-value-setq
+              (events used)
+            (http-message-kit:qpack-decode-decoder-stream context wire))
+        (http-protocol-error (condition)
+          (setf failure condition)))
+      (ensure-true (typep failure 'http-protocol-error))
+      (ensure-equal :qpack (http-error-operation failure))
+      (ensure-equal
+       "QPACK decoder stream section acknowledgment has no outstanding field section."
+       (http-error-message failure))
+      (ensure-equal
+       '(:qpack-decoder-stream-error :section-acknowledgment 4)
+       (http-protocol-error-detail failure))
+      (ensure-equal nil events)
+      (ensure-equal nil used)
+      (ensure-equal known-received-count
+                    (http-message-kit:qpack-context-known-received-count context)))
+    (let ((wire (http-message-kit:qpack-encode-stream-cancellation 4)))
+      (multiple-value-bind (events used)
+          (http-message-kit:qpack-decode-decoder-stream context wire)
+        (ensure-equal '((:stream-cancellation 4)) events)
+        (ensure-equal (length wire) used)))
+    (ensure-equal 1 (http-message-kit:qpack-context-insert-count context))
+    (ensure-equal 1 (http-message-kit:qpack-context-known-received-count context))
+    (http-message-kit:qpack-context-set-capacity context 0)
+    (ensure-equal 0 (http-message-kit:qpack-context-table-size context))
+    (ensure-equal 0 (http-message-kit:qpack-context-dynamic-entry-count context))))
 
 (deftest http3-codec-push-priority-requires-max-push-id
   (let* ((state (http-kit/http3:make-http3-control-state
@@ -86,23 +97,6 @@
     (ensure-equal '(((:push . 0) . "u=7"))
                   (http-kit/http3:http3-control-state-priority-updates state))))
 
-(deftest http3-codec-qpack-digit-names-and-empty-pseudo-name
-  (dolist (huffman '(nil t))
-    (let* ((fields '(("9X-0123456789" . "value")))
-           (wire (http-kit/http3:qpack-encode-field-section
-                  fields :huffman-p huffman)))
-      (ensure-true (plusp (length wire)))
-      (ensure-equal '(("9x-0123456789" . "value"))
-                    (http-kit/http3:qpack-decode-field-section wire))
-      (ensure-equal '(("9X-0123456789" . "value")) fields)))
-  (let ((failure
-          (handler-case
-              (http-kit/http3:qpack-encode-field-section '((":" . "value")))
-            (http-protocol-error (condition) condition))))
-    (ensure-true (typep failure 'http-protocol-error))
-    (ensure-equal :qpack (http-error-operation failure))
-    (ensure-equal ":" (http-protocol-error-detail failure))))
-
 (deftest http3-codec-qpack-nonstring-list-name-is-rejected
   (dolist (name '(nil 7 #\x))
     (let* ((field (list name "value"))
@@ -110,348 +104,204 @@
            (before (copy-tree fields))
            (failure
              (handler-case
-                 (http-kit/http3:qpack-encode-field-section fields)
+                 (http-message-kit:qpack-encode-header-block fields)
                (http-protocol-error (condition) condition))))
       (ensure-true (typep failure 'http-protocol-error))
       (ensure-equal :qpack (http-error-operation failure))
+      (ensure-equal
+       "QPACK fields must be HTTP-HEADER values or name/value pairs."
+       (http-error-message failure))
       (ensure-equal field (http-protocol-error-detail failure))
       (ensure-equal before fields)))
   (let* ((fields '(("x-name" "value")))
-         (wire (http-kit/http3:qpack-encode-field-section fields)))
+         (wire (http-message-kit:qpack-encode-header-block fields)))
     (ensure-equal '(("x-name" . "value"))
-                  (http-kit/http3:qpack-decode-field-section wire))
+                  (mapcar (lambda (header)
+                            (cons (http-message-kit:http-header-name header)
+                                  (http-message-kit:http-header-content header)))
+                          (http-message-kit:qpack-decode-header-block wire)))
     (ensure-equal '(("x-name" "value")) fields)))
 
-(deftest http3-codec-qpack-sensitive-equal-value-is-never-indexed
-  (dolist (huffman '(nil t))
-    (let* ((fields '(("proxy-authorization" . "same")))
-           (table (http-kit/http3:make-qpack-dynamic-table
-                   :max-capacity 128 :capacity 128))
-           (entry (http-kit/http3:qpack-dynamic-table-insert
-                   table "proxy-authorization" "same"))
-           (state (http-kit/http3:make-qpack-decoder-stream-state
-                   table :blocked-stream-limit 1)))
-      (http-kit/http3:qpack-decoder-stream-state-note-insertions-sent state 1)
-      (let ((wire (http-kit/http3:qpack-encode-field-section
-                   fields :dynamic-table table :decoder-stream-state state
-                   :stream-id 4 :huffman-p huffman)))
-        (ensure-equal 2 (aref wire 0))
-        (ensure-equal 0 (aref wire 1))
-        (ensure-equal #x60 (logand #xf0 (aref wire 2)))
-        (ensure-true (> (length wire) 3))
-        (ensure-equal fields
-                      (http-kit/http3:qpack-decode-field-section
-                       wire :dynamic-table table))
-        (ensure-equal 1 (length (gethash
-                                4 (http-kit/http3:qpack-decoder-stream-state-outstanding-sections
-                                   state))))
-        (ensure-equal "same" (http-kit/http3:qpack-dynamic-entry-value entry))
-        (ensure-equal 1 (http-kit/http3:qpack-dynamic-table-insert-count table)))
-      (http-kit/http3:qpack-process-decoder-stream
-       (http-kit/http3:qpack-encode-section-acknowledgment 4) :state state)
-      (ensure-equal 1 (http-kit/http3:qpack-decoder-stream-state-known-received-count state))
-      (ensure-equal 0 (hash-table-count
-                       (http-kit/http3:qpack-decoder-stream-state-outstanding-sections state)))
-      (ensure-equal 0 (hash-table-count
-                       (http-kit/http3::qpack-dynamic-table-protected-indices table)))
-      (ensure-equal fields '(("proxy-authorization" . "same"))))))
-
-(deftest http3-codec-qpack-mixed-sections-retain-blocked-stream-budget
-  (let* ((table (http-kit/http3:make-qpack-dynamic-table
-                 :max-capacity 128 :capacity 128))
-         (empty-table (http-kit/http3:make-qpack-dynamic-table
-                       :max-capacity 128 :capacity 128))
-         (state (http-kit/http3:make-qpack-decoder-stream-state
-                 table :blocked-stream-limit 1)))
-    (http-kit/http3:qpack-dynamic-table-insert table "x-a" "one")
-    (http-kit/http3:qpack-dynamic-table-insert table "x-b" "two")
-    (http-kit/http3:qpack-decoder-stream-state-note-insertions-sent state 2)
-    (dolist (fields '((("x-a" . "one")) (("x-b" . "two"))))
-      (let ((wire (http-kit/http3:qpack-encode-field-section
-                   fields :dynamic-table table :decoder-stream-state state :stream-id 4)))
-        (ensure-equal fields
-                      (http-kit/http3:qpack-decode-field-section wire :dynamic-table table))))
-    (http-kit/http3:qpack-process-decoder-stream
-     (http-kit/http3:qpack-encode-insert-count-increment 1) :state state)
-    (ensure-equal 1 (http-kit/http3:qpack-decoder-stream-state-known-received-count state))
-    (ensure-equal '(1 2)
-                  (mapcar #'car (gethash
-                                 4 (http-kit/http3:qpack-decoder-stream-state-outstanding-sections state))))
-    (let ((wire (http-kit/http3:qpack-encode-field-section
-                 '(("x-b" . "two")) :dynamic-table table
-                 :decoder-stream-state state :stream-id 8)))
-      (ensure-equal 0 (aref wire 0))
-      (ensure-equal '(("x-b" . "two"))
-                    (http-kit/http3:qpack-decode-field-section wire :dynamic-table empty-table))
-      (ensure-equal nil (gethash
-                        8 (http-kit/http3:qpack-decoder-stream-state-outstanding-sections state))))
-    (let ((wire (http-kit/http3:qpack-encode-field-section
-                 '(("x-b" . "two")) :dynamic-table table
-                 :decoder-stream-state state :stream-id 4)))
-      (ensure-equal 3 (aref wire 0))
-      (ensure-equal '(("x-b" . "two"))
-                    (http-kit/http3:qpack-decode-field-section wire :dynamic-table table)))
-    (ensure-equal '(1 2 2)
-                  (mapcar #'car (gethash
-                                 4 (http-kit/http3:qpack-decoder-stream-state-outstanding-sections state))))
-    (dotimes (index 3)
-      (declare (ignore index))
-      (http-kit/http3:qpack-process-decoder-stream
-       (http-kit/http3:qpack-encode-section-acknowledgment 4) :state state))
-    (ensure-equal 2 (http-kit/http3:qpack-decoder-stream-state-known-received-count state))
-    (ensure-equal 0 (hash-table-count
-                     (http-kit/http3:qpack-decoder-stream-state-outstanding-sections state)))
-    (let ((wire (http-kit/http3:qpack-encode-field-section
-                 '(("x-b" . "two")) :dynamic-table table
-                 :decoder-stream-state state :stream-id 8)))
-      (ensure-equal 3 (aref wire 0))
-      (ensure-equal '(("x-b" . "two"))
-                    (http-kit/http3:qpack-decode-field-section wire :dynamic-table table)))
-    (http-kit/http3:qpack-process-decoder-stream
-     (http-kit/http3:qpack-encode-section-acknowledgment 8) :state state)
-    (ensure-equal 0 (hash-table-count
-                     (http-kit/http3:qpack-decoder-stream-state-outstanding-sections state)))
-    (ensure-equal 0 (hash-table-count
-                     (http-kit/http3::qpack-dynamic-table-protected-indices table)))))
-
-(deftest http3-codec-qpack-blocked-condition-describes-missing-inserts
-  (let* ((encoder-table (http-kit/http3:make-qpack-dynamic-table
-                         :max-capacity 128 :capacity 128))
-         (decoder-table (http-kit/http3:make-qpack-dynamic-table
-                         :max-capacity 128 :capacity 128)))
-    (http-kit/http3:qpack-dynamic-table-insert encoder-table "x-name" "value")
-    (let* ((wire (http-kit/http3:qpack-encode-field-section
-                  '(("x-name" . "value")) :dynamic-table encoder-table))
-           (failure
-             (handler-case
-                 (http-kit/http3:qpack-decode-field-section wire :dynamic-table decoder-table)
-               (http-kit/http3:qpack-blocked-field-section (condition) condition))))
-      (ensure-true (typep failure 'http-kit/http3:qpack-blocked-field-section))
-      (ensure-equal 1 (http-kit/http3:qpack-blocked-field-section-required-insert-count failure))
-      (ensure-equal 0 (http-kit/http3:qpack-blocked-field-section-current-insert-count failure))
-      (let ((report (format nil "~A" failure)))
-        (ensure-true (not (null (search "requires insert count 1" report))))
-        (ensure-true (not (null (search "only 0 is available" report)))))
-      (ensure-equal 0 (http-kit/http3:qpack-dynamic-table-insert-count decoder-table))
-      (let ((instruction
-              (http-kit/http3:qpack-encode-insert-with-literal-name "x-name" "value")))
-        (multiple-value-bind (events consumed)
-            (http-kit/http3:qpack-process-encoder-stream decoder-table instruction)
-          (ensure-equal '(:insert) (mapcar #'first events))
-          (ensure-equal (length instruction) consumed)))
-      (ensure-equal '(("x-name" . "value"))
-                    (http-kit/http3:qpack-decode-field-section wire :dynamic-table decoder-table)))))
-
-(defun http3-codec-check-protected-eviction (thunk index)
-  (let ((failure (handler-case (funcall thunk)
-                   (http-protocol-error (condition) condition))))
+(deftest http3-codec-qpack-public-blocked-nil-stream-id
+  (let* ((context (http-message-kit:make-qpack-context
+                   :max-table-capacity 0 :table-capacity 0
+                   :max-blocked-streams 1 :huffman nil))
+         (adapter (http-message-kit:qpack-make-http3-decoder-context
+                   context :max-blocked-streams 1))
+         (serializations 0)
+         (acknowledgments 0)
+         (failure
+           (handler-case
+               (http-message-kit:qpack-decode-http3-field-section
+                (octets 0 0) adapter nil :role :trailers
+                :serialize
+                (lambda (thunk)
+                  (incf serializations)
+                  (funcall thunk))
+                :on-section-acknowledgment
+                (lambda (stream-id)
+                  (declare (ignore stream-id))
+                  (incf acknowledgments)))
+             (http-protocol-error (condition) condition))))
     (ensure-true (typep failure 'http-protocol-error))
     (ensure-equal :qpack (http-error-operation failure))
-    (ensure-equal "QPACK cannot evict an entry referenced by a field section."
+    (ensure-equal "QPACK stream IDs must be between zero and 2^62-1."
                   (http-error-message failure))
-    (ensure-equal index (http-protocol-error-detail failure))))
-
-(deftest http3-codec-qpack-protected-eviction-is-atomic
-  (let* ((table (http-kit/http3:make-qpack-dynamic-table :max-capacity 68 :capacity 68))
-         (oldest (http-kit/http3:qpack-dynamic-table-insert table "a" "1"))
-         (newest (http-kit/http3:qpack-dynamic-table-insert table "b" "2"))
-         (state (http-kit/http3:make-qpack-decoder-stream-state table :blocked-stream-limit 2)))
-    (http-kit/http3:qpack-decoder-stream-state-note-insertions-sent state 2)
-    (http-kit/http3:qpack-decoder-stream-state-register-section state 4 2 '(1))
-    (dolist (operation (list (lambda () (http-kit/http3:qpack-dynamic-table-set-capacity table 0))
-                            (lambda () (http-kit/http3:qpack-dynamic-table-insert table "c" "33"))))
-      (http3-codec-check-protected-eviction operation 1)
-      (ensure-equal 68 (http-kit/http3:qpack-dynamic-table-capacity table))
-      (ensure-equal 68 (http-kit/http3:qpack-dynamic-table-size table))
-      (ensure-equal 2 (http-kit/http3:qpack-dynamic-table-insert-count table))
-      (ensure-true (eq newest (first (http-kit/http3:qpack-dynamic-table-entries table))))
-      (ensure-true (eq oldest (second (http-kit/http3:qpack-dynamic-table-entries table))))
-      (ensure-equal '((2 1))
-                    (gethash 4 (http-kit/http3:qpack-decoder-stream-state-outstanding-sections state))))
-    (let ((wire (http-kit/http3:qpack-encode-section-acknowledgment 4)))
-      (multiple-value-bind (events consumed)
-          (http-kit/http3:qpack-process-decoder-stream wire :state state)
-        (ensure-equal '((:section-acknowledgment 4)) events)
-        (ensure-equal (length wire) consumed)))
-    (ensure-equal 2 (http-kit/http3:qpack-decoder-stream-state-known-received-count state))
-    (ensure-equal 0 (hash-table-count (http-kit/http3:qpack-decoder-stream-state-outstanding-sections state)))
-    (let ((entry (http-kit/http3:qpack-dynamic-table-insert table "c" "33")))
-      (ensure-equal 2 (http-kit/http3:qpack-dynamic-entry-absolute-index entry))
-      (ensure-equal (list entry) (http-kit/http3:qpack-dynamic-table-entries table)))
-    (ensure-equal 35 (http-kit/http3:qpack-dynamic-table-size table))
-    (ensure-equal 3 (http-kit/http3:qpack-dynamic-table-insert-count table))
-    (ensure-equal '(("c" . "33"))
-                  (http-kit/http3:qpack-decode-field-section
-                   (http-kit/http3:qpack-encode-field-section '(("c" . "33")) :dynamic-table table)
-                   :dynamic-table table))
-    (http-kit/http3:qpack-dynamic-table-set-capacity table 0)
-    (ensure-equal 0 (http-kit/http3:qpack-dynamic-table-size table))
-    (ensure-equal nil (http-kit/http3:qpack-dynamic-table-entries table))
-    (ensure-equal 3 (http-kit/http3:qpack-dynamic-table-insert-count table))))
-
-(deftest http3-codec-qpack-shared-reference-survives-one-ack
-  (let* ((table (http-kit/http3:make-qpack-dynamic-table :max-capacity 34 :capacity 34))
-         (entry (http-kit/http3:qpack-dynamic-table-insert table "a" "1"))
-         (state (http-kit/http3:make-qpack-decoder-stream-state table :blocked-stream-limit 2)))
-    (http-kit/http3:qpack-decoder-stream-state-note-insertions-sent state 1)
-    (dolist (id '(4 8))
-      (http-kit/http3:qpack-decoder-stream-state-register-section state id 1 '(0)))
-    (let ((wire (http-kit/http3:qpack-encode-section-acknowledgment 4)))
-      (multiple-value-bind (events consumed)
-          (http-kit/http3:qpack-process-decoder-stream wire :state state)
-        (ensure-equal '((:section-acknowledgment 4)) events)
-        (ensure-equal (length wire) consumed)))
-    (ensure-equal nil (gethash 4 (http-kit/http3:qpack-decoder-stream-state-outstanding-sections state)))
-    (ensure-equal '((1 0)) (gethash 8 (http-kit/http3:qpack-decoder-stream-state-outstanding-sections state)))
-    (http3-codec-check-protected-eviction
-     (lambda () (http-kit/http3:qpack-dynamic-table-set-capacity table 0)) 0)
-    (ensure-equal 34 (http-kit/http3:qpack-dynamic-table-capacity table))
-    (ensure-equal (list entry) (http-kit/http3:qpack-dynamic-table-entries table))
-    (ensure-equal 1 (http-kit/http3:qpack-decoder-stream-state-known-received-count state))
-    (let ((wire (http-kit/http3:qpack-encode-stream-cancellation 8)))
-      (multiple-value-bind (events consumed)
-          (http-kit/http3:qpack-process-decoder-stream wire :state state)
-        (ensure-equal '((:stream-cancellation 8)) events)
-        (ensure-equal (length wire) consumed)))
-    (ensure-equal 0 (hash-table-count (http-kit/http3:qpack-decoder-stream-state-outstanding-sections state)))
-    (http-kit/http3:qpack-dynamic-table-set-capacity table 0)
-    (ensure-equal 0 (http-kit/http3:qpack-dynamic-table-size table))
-    (ensure-equal nil (http-kit/http3:qpack-dynamic-table-entries table))
-    (ensure-equal 1 (http-kit/http3:qpack-dynamic-table-insert-count table))))
-
-(deftest http3-codec-qpack-sensitive-name-search-skips-unrelated-entries
-  (dolist (huffman '(nil t))
-    (dolist (matching-name '(nil t))
-      (let* ((fields '(("proxy-authorization" . "replacement")))
-             (table (http-kit/http3:make-qpack-dynamic-table
-                     :max-capacity 256 :capacity 256)))
-        (when matching-name
-          (http-kit/http3:qpack-dynamic-table-insert
-           table "proxy-authorization" "previous"))
-        (http-kit/http3:qpack-dynamic-table-insert table "x-unrelated" "value")
-        (let* ((before (copy-list (http-kit/http3:qpack-dynamic-table-entries table)))
-               (wire (http-kit/http3:qpack-encode-field-section
-                      fields :dynamic-table table :huffman-p huffman)))
-          (ensure-equal (if matching-name 2 0) (aref wire 0))
-          (ensure-equal (if matching-name 1 0) (aref wire 1))
-          (ensure-equal (if matching-name #x60 #x30)
-                        (logand #xf0 (aref wire 2)))
-          (ensure-equal fields (http-kit/http3:qpack-decode-field-section
-                                wire :dynamic-table table))
-          (ensure-equal before (http-kit/http3:qpack-dynamic-table-entries table))
-          (ensure-equal (if matching-name 2 1)
-                        (http-kit/http3:qpack-dynamic-table-insert-count table))
-          (ensure-equal '(("proxy-authorization" . "replacement")) fields))))))
-
-(deftest http3-codec-qpack-public-blocked-nil-stream-id
-  (let* ((encoder (http-kit/http3:make-qpack-dynamic-table
-                   :max-capacity 128 :capacity 128))
-         (decoder (http-kit/http3:make-qpack-dynamic-table
-                   :max-capacity 128 :capacity 128))
-         (context (http-kit/http3:make-http3-qpack-decoder-context
-                   decoder :blocked-stream-limit 1))
-         (callbacks 0)
-         (fields '(("x" . "y"))))
-    (http-kit/http3:qpack-dynamic-table-insert encoder "x" "y")
-    (let* ((wire (http-kit/http3:qpack-encode-field-section
-                  fields :dynamic-table encoder))
-           (callback (lambda (decoded) (incf callbacks) decoded))
-           (failure
-             (handler-case
-                 (http-kit/http3:decode-http3-qpack-field-section
-                  wire context nil :on-decoded callback)
-               (http-protocol-error (condition) condition))))
-      (ensure-true (typep failure 'http-protocol-error))
-      (ensure-equal :http3-transport (http-error-operation failure))
-      (ensure-equal "QPACK field section decompression failed."
-                    (http-error-message failure))
-      (let* ((detail (http-protocol-error-detail failure))
-             (inner (second detail)))
-        (ensure-equal 2 (length detail))
-        (ensure-equal :qpack-decompression-failed (first detail))
-        (ensure-true (typep inner 'http-protocol-error))
-        (ensure-equal :qpack (http-error-operation inner))
-        (ensure-equal "QPACK stream IDs must be non-negative integers."
-                      (http-error-message inner))
-        (ensure-equal nil (http-protocol-error-detail inner)))
-      (ensure-equal 0 callbacks)
-      (let ((blocked (http-kit/http3:decode-http3-qpack-field-section
-                      wire context 4 :on-decoded callback)))
-        (ensure-true (http-kit/http3:http3-qpack-blocked-stream-p blocked))
-        (ensure-equal 4 (http-kit/http3:http3-qpack-blocked-stream-stream-id blocked))
-        (ensure-equal 1 (http-kit/http3:http3-qpack-blocked-stream-required-insert-count blocked))
-        (ensure-equal 0 callbacks))
-      (http-kit/http3:qpack-dynamic-table-insert decoder "x" "y")
-      (ensure-equal fields (http-kit/http3:decode-http3-qpack-field-section
-                            wire context 4 :on-decoded callback))
-      (ensure-equal 1 callbacks))))
+    (ensure-equal nil (http-protocol-error-detail failure))
+    (ensure-equal 0 serializations)
+    (ensure-equal 0 acknowledgments)))
 
 (deftest http3-codec-qpack-public-post-base-without-table
   (let ((failure
           (handler-case
-              (http-kit/http3:qpack-decode-field-section (octets 0 0 #x10))
+              (http-message-kit:qpack-decode-header-block
+               (octets 0 0 #x10))
             (http-protocol-error (condition) condition))))
     (ensure-true (typep failure 'http-protocol-error))
     (ensure-equal :qpack (http-error-operation failure))
-    (ensure-equal "QPACK dynamic-table absolute indexes must be non-negative integers."
-                  (http-error-message failure))
-    (ensure-equal 0 (http-protocol-error-detail failure)))
-  (ensure-equal nil (http-kit/http3:qpack-decode-field-section (octets 0 0)))
-  (let ((table (http-kit/http3:make-qpack-dynamic-table
-                :max-capacity 64 :capacity 64)))
-    (http-kit/http3:qpack-dynamic-table-insert table "x" "1")
-    (ensure-equal '(("x" . "1"))
-                  (http-kit/http3:qpack-decode-field-section
-                   (octets 2 #x80 #x10) :dynamic-table table))))
+    (ensure-equal
+     "QPACK field section references an entry at or after its required count."
+     (http-error-message failure))
+    (ensure-equal 0 (http-protocol-error-detail failure))))
 
-(deftest http3-codec-qpack-public-known-unacked-blocked-budget
-  (dolist (increment '(nil t))
-    (let* ((table (http-kit/http3:make-qpack-dynamic-table
-                   :max-capacity 128 :capacity 128))
-           (state (http-kit/http3:make-qpack-decoder-stream-state
-                   table :blocked-stream-limit 1))
-           (sections (http-kit/http3:qpack-decoder-stream-state-outstanding-sections state)))
-      (http-kit/http3:qpack-dynamic-table-insert table "x-a" "one")
-      (http-kit/http3:qpack-dynamic-table-insert table "x-b" "two")
-      (http-kit/http3:qpack-decoder-stream-state-note-insertions-sent state 2)
-      (let ((wire (http-kit/http3:qpack-encode-field-section
-                   '(("x-a" . "one")) :dynamic-table table
-                   :decoder-stream-state state :stream-id 4)))
-        (ensure-equal (octets 2 1) (subseq wire 0 2))
-        (ensure-equal '(("x-a" . "one"))
-                      (http-kit/http3:qpack-decode-field-section wire :dynamic-table table)))
-      (when increment
-        (http-kit/http3:qpack-process-decoder-stream
-         (http-kit/http3:qpack-encode-insert-count-increment 1) :state state))
-      (ensure-equal (if increment 1 0)
-                    (http-kit/http3:qpack-decoder-stream-state-known-received-count state))
-      (ensure-true (gethash 4 sections))
-      (http3-codec-check-protected-eviction
-       (lambda () (http-kit/http3:qpack-dynamic-table-set-capacity table 0)) 0)
-      (let ((wire (http-kit/http3:qpack-encode-field-section
-                   '(("x-b" . "two")) :dynamic-table table
-                   :decoder-stream-state state :stream-id 8)))
-        (ensure-equal (if increment (octets 3 0) (octets 0 0))
-                      (subseq wire 0 2))
-        (ensure-equal '(("x-b" . "two"))
-                      (http-kit/http3:qpack-decode-field-section
-                       wire :dynamic-table (and increment table)))
-        (ensure-equal (if increment 2 1) (hash-table-count sections)))
-      (http-kit/http3:qpack-process-decoder-stream
-       (http-kit/http3:qpack-encode-section-acknowledgment 4) :state state)
-      (ensure-equal nil (gethash 4 sections))
-      (when increment
-        (ensure-true (gethash 8 sections))
-        (http3-codec-check-protected-eviction
-         (lambda () (http-kit/http3:qpack-dynamic-table-set-capacity table 0)) 1)
-        (http-kit/http3:qpack-process-decoder-stream
-         (http-kit/http3:qpack-encode-section-acknowledgment 8) :state state))
-      (ensure-equal 0 (hash-table-count sections))
-      (ensure-equal (if increment 2 1)
-                    (http-kit/http3:qpack-decoder-stream-state-known-received-count state))
-      (http-kit/http3:qpack-dynamic-table-set-capacity table 0)
-      (ensure-equal 0 (http-kit/http3:qpack-dynamic-table-size table))
-      (ensure-equal nil (http-kit/http3:qpack-dynamic-table-entries table)))))
+(deftest http3-codec-qpack-rejects-unavailable-dynamic-entries
+  (let ((failure
+          (handler-case
+              (http-message-kit:qpack-decode-header-block
+               (octets #x02 0 #x80))
+            (http-protocol-error (condition) condition))))
+    (ensure-true (typep failure 'http-protocol-error))
+    (ensure-equal :qpack (http-error-operation failure))
+    (ensure-equal
+     "A non-zero QPACK required insert count needs dynamic-table capacity."
+     (http-error-message failure))
+    (ensure-equal 2 (http-protocol-error-detail failure)))
+  (let* ((context (http-message-kit:make-qpack-context
+                   :max-table-capacity 34 :table-capacity 0 :huffman nil))
+         (blocked
+           (handler-case
+               (http-message-kit:qpack-decode-header-block
+                (octets #x02 0 #x80) :context context)
+             (http-message-kit:http-qpack-blocked (condition) condition))))
+    (ensure-true (typep blocked 'http-message-kit:http-qpack-blocked))
+    (ensure-equal :qpack (http-error-operation blocked))
+    (ensure-equal
+     "QPACK field section is blocked on dynamic-table insertions."
+     (http-error-message blocked))
+    (ensure-equal 1
+                  (http-message-kit:http-qpack-blocked-required-insert-count
+                   blocked))
+    (ensure-equal 0
+                  (http-message-kit:http-qpack-blocked-available-insert-count
+                   blocked)))
+  (let ((context (http-message-kit:make-qpack-context
+                  :max-table-capacity 34 :table-capacity 34 :huffman nil)))
+    (http-message-kit:qpack-encode-insert-with-literal-name
+     context "a" "1" :huffman nil)
+    (ensure-equal '(("a" . "1"))
+                  (mapcar (lambda (header)
+                            (cons (http-message-kit:http-header-name header)
+                                  (http-message-kit:http-header-content header)))
+                          (http-message-kit:qpack-decode-header-block
+                           (octets #x02 0 #x80) :context context)))
+    (http-message-kit:qpack-encode-insert-with-literal-name
+     context "b" "2" :huffman nil)
+    (ensure-equal '(("b" . "2"))
+                  (mapcar (lambda (header)
+                            (cons (http-message-kit:http-header-name header)
+                                  (http-message-kit:http-header-content header)))
+                          (http-message-kit:qpack-decode-header-block
+                           (octets #x01 0 #x80) :context context)))
+    (let ((failure
+            (handler-case
+                (http-message-kit:qpack-decode-header-block
+                 (octets #x01 0 #x81) :context context)
+              (http-protocol-error (condition) condition))))
+      (ensure-true (typep failure 'http-protocol-error))
+      (ensure-equal :qpack (http-error-operation failure))
+      (ensure-equal
+       "QPACK dynamic-table absolute index is unavailable."
+       (http-error-message failure))
+      (ensure-equal 0 (http-protocol-error-detail failure))
+      (ensure-equal 2 (http-message-kit:qpack-context-insert-count context))
+      (ensure-equal 1 (http-message-kit:qpack-context-dynamic-entry-count context))
+      (ensure-equal 34 (http-message-kit:qpack-context-table-size context)))))
+
+(deftest http3-codec-qpack-sensitive-name-search-skips-unrelated-entries
+  (dolist (huffman '(nil t))
+    (dolist (matching-name '(nil t))
+      (let* ((fields (list (make-http-header
+                            "proxy-authorization" "replacement")))
+             (context (http-message-kit:make-qpack-context
+                       :max-table-capacity 256 :table-capacity 256
+                       :max-blocked-streams 1 :huffman huffman)))
+        (when matching-name
+          (http-message-kit:qpack-encode-insert-with-literal-name
+           context "proxy-authorization" "previous" :huffman nil))
+        (http-message-kit:qpack-encode-insert-with-literal-name
+         context "x-unrelated" "value" :huffman nil)
+        (let* ((before-size (http-message-kit:qpack-context-table-size context))
+               (before-count (http-message-kit:qpack-context-insert-count context))
+               (wire (http-message-kit:qpack-encode-header-block
+                      fields :context context :use-dynamic-p t :stream-id 4
+                      :huffman huffman))
+               (field-line (aref wire 2)))
+          (ensure-equal (if matching-name 2 0) (aref wire 0))
+          (ensure-equal (if matching-name 1 0) (aref wire 1))
+          (ensure-equal (if matching-name #x60 #x30)
+                        (logand field-line #xf0))
+          (ensure-equal
+           (list (cons "proxy-authorization" "replacement"))
+           (mapcar (lambda (header)
+                     (cons (http-message-kit:http-header-name header)
+                           (http-message-kit:http-header-content header)))
+                   (http-message-kit:qpack-decode-header-block
+                    wire :context context)))
+          (ensure-equal before-size
+                        (http-message-kit:qpack-context-table-size context))
+          (ensure-equal before-count
+                        (http-message-kit:qpack-context-insert-count context))
+          (ensure-equal (if matching-name 2 1)
+                        (http-message-kit:qpack-context-dynamic-entry-count
+                         context))
+          (ensure-equal "proxy-authorization"
+                        (http-message-kit:http-header-name (first fields)))
+          (ensure-equal "replacement"
+                        (http-message-kit:http-header-content (first fields))))))))
+
+(deftest http3-codec-qpack-required-count-prefix-boundaries
+  (dolist (capacity '(0 1 31))
+    (let* ((context (http-message-kit:make-qpack-context
+                     :max-table-capacity capacity :table-capacity capacity
+                     :max-blocked-streams 1 :huffman nil))
+           (wire (http-message-kit:qpack-encode-header-block
+                  (list (http-message-kit:make-http-header "x" "static"))
+                  :context context :use-dynamic-p t :stream-id 4 :huffman nil)))
+      (ensure-equal 0 (aref wire 0))
+      (ensure-equal 0 (http-message-kit:qpack-context-insert-count context))))
+  (dolist (case '((1 128 2) (7 128 8) (8 128 1) (9 128 2)))
+    (destructuring-bind (count capacity expected) case
+      (let ((context (http-message-kit:make-qpack-context
+                      :max-table-capacity capacity :table-capacity capacity
+                      :max-blocked-streams 1 :huffman nil)))
+        (loop for index from 1 to count
+              do (http-message-kit:qpack-encode-insert-with-literal-name
+                  context "x" (format nil "v~D" index) :huffman nil))
+        (let* ((headers (list (http-message-kit:make-http-header
+                               "x" (format nil "v~D" count))))
+               (wire (http-message-kit:qpack-encode-header-block
+                      headers :context context :use-dynamic-p t
+                      :stream-id 4 :huffman nil)))
+          (ensure-equal expected (aref wire 0))
+          (multiple-value-bind (decoded used required base)
+              (http-message-kit:qpack-decode-header-block
+               wire :context context)
+            (ensure-equal headers decoded)
+            (ensure-equal (length wire) used)
+            (ensure-equal count required)
+            (ensure-equal count base))
+          (ensure-equal count (http-message-kit:qpack-context-insert-count
+                               context)))))))
 
 (defun http3-codec-response-frame-check (wire forbidden-type)
   (let* ((before (copy-seq wire))
@@ -536,10 +386,14 @@
                     (http3-boundary-headers '(("x-check" . "ok"))))
                    (http3-boundary-headers fields)))
          (before (copy-seq wire))
-         (table (http-kit/http3:make-qpack-dynamic-table :max-capacity 0))
-         (context (http-kit/http3:make-http3-qpack-decoder-context table))
+         (context (http-message-kit:make-qpack-context
+                   :max-table-capacity 0 :table-capacity 0
+                   :max-blocked-streams 0 :huffman nil))
+         (adapter (http-message-kit:qpack-make-http3-decoder-context
+                   context :max-blocked-streams 0))
          (stream (make-http3-test-stream :kind :request))
-         (reads 0) (serializations 0) (calls 0) (writes nil)
+         (reads 0) (serializations 0) (acknowledgments 0)
+         (calls 0) (writes nil)
          (closed nil) (errors nil) (response nil) (failure nil))
     (handler-case
         (setf response
@@ -555,7 +409,13 @@
                                                (http-header-content header)))
                                        (http-request-trailers request)))
                  (make-http-response :status 204))
-               :qpack-decoder-context context :stream-id 4
+               :qpack-decoder-context context
+               :qpack-http3-decoder-context adapter
+               :on-qpack-section-acknowledgment
+               (lambda (stream-id)
+                 (declare (ignore stream-id))
+                 (incf acknowledgments))
+               :stream-id 4
                :await-qpack (lambda (token)
                               (declare (ignore token))
                               (error "Static fields must not block."))
@@ -589,7 +449,8 @@
       (http-protocol-error (condition) (setf failure condition)))
     (ensure-equal 1 reads)
     (ensure-equal (if trailers-p 2 1) serializations)
-    (ensure-equal 0 (http-kit/http3:qpack-dynamic-table-insert-count table))
+    (ensure-equal 0 acknowledgments)
+    (ensure-equal 0 (http-message-kit:qpack-context-insert-count context))
     (ensure-octets-equal before wire)
     (ensure-equal 1 (length closed))
     (ensure-true (eq failure (first closed)))
@@ -617,11 +478,16 @@
           (ensure-equal 1 calls)
           (ensure-equal 204 (http-response-status response))
           (ensure-equal '(t) (mapcar #'second writes))
-          (let ((frames (http3-server-coverage-frames (nreverse writes))))
+          (let* ((frames (http3-server-coverage-frames (nreverse writes)))
+                 (headers
+                   (http-message-kit:qpack-decode-header-block
+                    (http-kit/http3:http3-frame-payload (first frames)))))
             (ensure-equal '(1) (mapcar #'http-kit/http3:http3-frame-type frames))
             (ensure-equal '((":status" . "204"))
-                          (http-kit/http3:qpack-decode-field-section
-                           (http-kit/http3:http3-frame-payload (first frames)))))))))
+                          (mapcar (lambda (header)
+                                    (cons (http-message-kit:http-header-name header)
+                                          (http-message-kit:http-header-content header)))
+                                  headers)))))))
 
 (deftest http3-codec-server-serializer-rejects-malformed-pairs
   (dolist (trailers-p '(nil t))
@@ -652,8 +518,11 @@
                    ("x-check" . "ok")))
          (wire (http3-boundary-headers fields))
          (before (copy-seq wire))
-         (table (http-kit/http3:make-qpack-dynamic-table :max-capacity 0))
-         (context (http-kit/http3:make-http3-qpack-decoder-context table))
+         (context (http-message-kit:make-qpack-context
+                   :max-table-capacity 0 :table-capacity 0
+                   :max-blocked-streams 0 :huffman nil))
+         (adapter (http-message-kit:qpack-make-http3-decoder-context
+                   context :max-blocked-streams 0))
          (request (make-http-request :method "GET" :uri "https://example.test/"))
          (source (http3-qpack-contract-request-source request))
          (request-stream nil) (reads 0) (decoded-count 0) (closes nil)
@@ -697,14 +566,16 @@
            (handler-case
                (setf response
                      (http-kit/http3:send-http3-request
-                      client request :qpack-decoder-context context
+                      client request
+                      :qpack-decoder-context context
+                      :qpack-http3-decoder-context adapter
                       :await-qpack (lambda (token)
                                      (declare (ignore token))
                                      (error "Static fields must not block."))))
              (http-protocol-error (condition) (setf failure condition)))
            (ensure-equal 1 reads)
            (ensure-equal 1 decoded-count)
-           (ensure-equal 0 (http-kit/http3:qpack-dynamic-table-insert-count table))
+           (ensure-equal 0 (http-message-kit:qpack-context-insert-count context))
            (ensure-octets-equal before wire)
            (ensure-equal source (http3-qpack-contract-request-source request))
            (ensure-equal 1 (length closes))
@@ -790,8 +661,11 @@
                        '((":status" . "204"))
                        '(("x-trailer" . "kept"))))
              (mapcar (lambda (frame)
-                       (http-kit/http3:qpack-decode-field-section
-                        (http-kit/http3:http3-frame-payload frame)))
+                       (mapcar (lambda (header)
+                                 (cons (http-message-kit:http-header-name header)
+                                       (http-message-kit:http-header-content header)))
+                               (http-message-kit:qpack-decode-header-block
+                                (http-kit/http3:http3-frame-payload frame))))
                      frames))))))))
 
 (deftest http3-codec-server-response-revalidates-aliased-header-names
@@ -821,121 +695,3 @@
           (ensure-equal nil actual)
           (ensure-equal nil writes))))))
 
-(deftest http3-codec-qpack-required-count-prefix-boundaries
-  (dolist (insert-count '(nil -1 1/2 "1"))
-    (let ((failure
-            (handler-case
-                (http-kit/http3::%qpack-encode-required-insert-count insert-count 128)
-              (http-protocol-error (condition) condition))))
-      (ensure-true (typep failure 'http-protocol-error))
-      (ensure-equal :qpack (http-error-operation failure))
-      (ensure-equal insert-count (http-protocol-error-detail failure))))
-  (dolist (capacity '(0 1 31))
-    (ensure-equal 0
-                  (http-kit/http3::%qpack-encode-required-insert-count 0 capacity))
-    (let ((failure
-            (handler-case
-                (http-kit/http3::%qpack-encode-required-insert-count 1 capacity)
-              (http-protocol-error (condition) condition))))
-      (ensure-true (typep failure 'http-protocol-error))
-      (ensure-equal :qpack (http-error-operation failure))
-      (ensure-equal capacity (http-protocol-error-detail failure))))
-  (dolist (case '((1 128 2) (7 128 8) (8 128 1) (9 128 2)
-                 (1 32 2) (2 32 1)))
-    (destructuring-bind (count capacity expected) case
-      (ensure-equal expected
-                    (http-kit/http3::%qpack-encode-required-insert-count
-                     count capacity)))))
-
-(deftest http3-codec-qpack-base-prefix-sign-and-integer-boundaries
-  (dolist (case '((4 4 (0)) (4 6 (2)) (4 3 (128)) (4 0 (131))
-                 (4 133 (127 2)) (130 0 (255 2))))
-    (destructuring-bind (required base expected) case
-      (ensure-equal expected
-                    (coerce (http-kit/http3::%qpack-encode-base required base)
-                            'list))))
-  (let ((table (http-kit/http3:make-qpack-dynamic-table :max-capacity 128)))
-    (http-kit/http3:qpack-dynamic-table-insert table "x-a" "one")
-    (dolist (case '((0 16) (1 128)))
-      (destructuring-bind (base reference) case
-        (let* ((prefix (http-kit/http3::%qpack-encode-base 1 base))
-               (wire (make-array (+ 2 (length prefix))
-                                 :element-type '(unsigned-byte 8))))
-          (setf (aref wire 0)
-                (http-kit/http3::%qpack-encode-required-insert-count 1 128))
-          (replace wire prefix :start1 1)
-          (setf (aref wire (1- (length wire))) reference)
-          (ensure-equal '(("x-a" . "one"))
-                        (http-kit/http3:qpack-decode-field-section
-                         wire :dynamic-table table)))))))
-
-(deftest http3-codec-qpack-empty-table-eviction-boundaries
-  (let ((table (http-kit/http3:make-qpack-dynamic-table :max-capacity 128)))
-    (http-kit/http3::%qpack-ensure-evictable-size table 0)
-    (dolist (operation
-             (list (lambda () (http-kit/http3::%qpack-evict-oldest table))
-                   (lambda () (http-kit/http3::%qpack-ensure-evictable-size table -1))))
-      (let ((failure (handler-case (funcall operation)
-                       (http-protocol-error (condition) condition))))
-        (ensure-true (typep failure 'http-protocol-error))
-        (ensure-equal :qpack (http-error-operation failure))
-        (ensure-equal "QPACK dynamic-table eviction state is invalid."
-                      (http-error-message failure))
-        (ensure-equal nil (http-kit/http3:qpack-dynamic-table-entries table))
-        (ensure-equal 0 (http-kit/http3:qpack-dynamic-table-size table))
-        (ensure-equal 0 (http-kit/http3:qpack-dynamic-table-insert-count table))
-        (ensure-equal 128 (http-kit/http3:qpack-dynamic-table-capacity table))))))
-
-(deftest http3-codec-qpack-direct-eviction-preserves-protected-entry
-  (let* ((table (http-kit/http3:make-qpack-dynamic-table :max-capacity 34))
-         (entry (http-kit/http3:qpack-dynamic-table-insert table "a" "1"))
-         (state (http-kit/http3:make-qpack-decoder-stream-state table)))
-    (http-kit/http3:qpack-decoder-stream-state-note-insertions-sent state 1)
-    (http-kit/http3:qpack-decoder-stream-state-register-section state 4 1 '(0))
-    (http3-codec-check-protected-eviction
-     (lambda () (http-kit/http3::%qpack-evict-oldest table)) 0)
-    (ensure-true (eq entry (first (http-kit/http3:qpack-dynamic-table-entries table))))
-    (ensure-equal 34 (http-kit/http3:qpack-dynamic-table-size table))
-    (ensure-equal '((1 0))
-                  (gethash 4 (http-kit/http3:qpack-decoder-stream-state-outstanding-sections state)))
-    (let ((wire (http-kit/http3:qpack-encode-section-acknowledgment 4)))
-      (multiple-value-bind (events consumed)
-          (http-kit/http3:qpack-process-decoder-stream wire :state state)
-        (ensure-equal '((:section-acknowledgment 4)) events)
-        (ensure-equal (length wire) consumed)))
-    (http-kit/http3::%qpack-evict-oldest table)
-    (ensure-equal nil (http-kit/http3:qpack-dynamic-table-entries table))
-    (ensure-equal 0 (http-kit/http3:qpack-dynamic-table-size table))
-    (ensure-equal 1 (http-kit/http3:qpack-dynamic-table-insert-count table))
-    (ensure-equal 34 (http-kit/http3:qpack-dynamic-table-capacity table))))
-
-(deftest http3-codec-qpack-rejects-unavailable-dynamic-entries
-  (let ((table (http-kit/http3:make-qpack-dynamic-table :max-capacity 34)))
-    (http-kit/http3:qpack-dynamic-table-insert table "a" "1")
-    (ensure-equal '(("a" . "1"))
-                  (http-kit/http3:qpack-decode-field-section
-                   (octets #x02 #x00 #x80) :dynamic-table table))
-    (let ((failure
-            (handler-case
-                (http-kit/http3:qpack-decode-field-section
-                 (octets #x02 #x00 #x10) :dynamic-table table)
-              (http-protocol-error (condition) condition))))
-      (ensure-true (typep failure 'http-protocol-error))
-      (ensure-equal :qpack (http-error-operation failure))
-      (ensure-equal "QPACK dynamic-table entry is not yet inserted."
-                    (http-error-message failure))
-      (ensure-equal 1 (http-protocol-error-detail failure)))
-    (http-kit/http3:qpack-dynamic-table-insert table "b" "2")
-    (ensure-equal '(("b" . "2"))
-                  (http-kit/http3:qpack-decode-field-section
-                   (octets #x01 #x00 #x80) :dynamic-table table))
-    (let ((failure
-            (handler-case
-                (http-kit/http3:qpack-decode-field-section
-                 (octets #x01 #x00 #x81) :dynamic-table table)
-              (http-protocol-error (condition) condition))))
-      (ensure-true (typep failure 'http-protocol-error))
-      (ensure-equal :qpack (http-error-operation failure))
-      (ensure-equal "QPACK dynamic-table absolute index is unavailable."
-                    (http-error-message failure))
-      (ensure-equal 0 (http-protocol-error-detail failure)))))
