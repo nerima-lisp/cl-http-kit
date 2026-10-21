@@ -2644,6 +2644,56 @@
                          (subseq (binary-test-output socks-stream) 0 3))
     (ensure-true
      (search (h2-preface) (binary-test-output socks-stream)))))
+#+sbcl (deftest client-native-alpn-h2-goaway-falls-back-to-http1
+  (let* ((http-kit/client::*proxy-environment-function*
+           (lambda (name) (declare (ignore name)) nil))
+         (wire
+           (concatenate-octets
+            (h2-frame 4 0 0 (octets))
+            (h2-frame 1 5 1 (h2-header-block (cons ":status" "200")))
+            (h2-frame 7 0 0 (octets 0 0 0 1 0 0 0 0))))
+         (h2-stream (make-instance 'binary-test-stream :input wire))
+         (http1-stream
+           (make-instance 'binary-test-stream
+                          :input (ascii "HTTP/1.1 200 OK|CRLF|Content-Length: 0|CRLF||CRLF|")))
+         (opened 0)
+         (upgraded 0)
+         (closed-streams nil)
+         (pool
+           (make-http-connection-pool
+            :open-stream (lambda (request &key timeout deadline &allow-other-keys)
+                           (declare (ignore request timeout deadline))
+                           (incf opened)
+                           (if (= opened 1) h2-stream http1-stream))
+            :tls-upgrade (lambda (stream uri &key timeout deadline)
+                           (declare (ignore uri timeout deadline))
+                           (incf upgraded)
+                           (values stream (if (= upgraded 1) "h2" "http/1.1")))
+            :close-stream (lambda (stream)
+                            (push stream closed-streams)
+                            (when (open-stream-p stream)
+                              (close stream :abort t)))))
+         (transport
+           (http-kit/client::%client-transport-from-negotiated-connection-pool
+            pool))
+         (client (make-http-client :transport-function transport :cache nil)))
+    (ensure-equal
+     200
+     (http-response-status
+      (http-client-send client "GET" "https://goaway.test/first")))
+    (ensure-equal
+     200
+     (http-response-status
+      (http-client-send client "GET" "https://goaway.test/fallback")))
+    (ensure-equal 2 opened)
+    (ensure-equal 2 upgraded)
+    (ensure-true (search (h2-preface) (binary-test-output h2-stream)))
+    (ensure-true
+     (search "GET /fallback HTTP/1.1"
+             (octets-as-string (binary-test-output http1-stream))))
+    (ensure-equal 1 (getf (http-connection-pool-stats pool) :idle-count))
+    (ensure-equal 1 (http-connection-pool-clear pool))
+    (ensure-true (member http1-stream closed-streams :test #'eq))))
 
 #+sbcl
 (deftest client-native-tls-alpn-offer-distinguishes-origin
@@ -2739,5 +2789,101 @@
            (ensure-equal 1 constructed)
            (ensure-equal 1 closed))
       (setf (symbol-function constructor-symbol) original-constructor)
+      (http-connection-pool-clear pool))))
+#+sbcl (deftest client-native-alpn-pending-stream-closes-on-http2-transport-error
+  (let* ((sender-symbol
+           (find-symbol "SEND-HTTP2-REQUEST-OVER-CONNECTION-MANAGER" "HTTP-KIT/HTTP2"))
+         (original-sender (symbol-function sender-symbol))
+         (stream (make-instance 'binary-test-stream))
+         (opened 0)
+         (closed 0)
+         (pool
+           (make-http-connection-pool
+            :open-stream (lambda (request &key timeout deadline &allow-other-keys)
+                           (declare (ignore request timeout deadline))
+                           (incf opened)
+                           stream)
+            :tls-upgrade (lambda (seen uri &key timeout deadline)
+                           (declare (ignore uri timeout deadline))
+                           (values seen "h2"))
+            :close-stream (lambda (seen)
+                            (ensure-true (eq stream seen))
+                            (incf closed)
+                            (when (open-stream-p seen)
+                              (close seen :abort t))))))
+    (unwind-protect
+         (progn
+           (setf (symbol-function sender-symbol)
+                 (lambda (&rest arguments)
+                   (declare (ignore arguments))
+                   (error "Synthetic HTTP/2 transport failure.")))
+           (let* ((transport
+                    (http-kit/client::%client-transport-from-negotiated-connection-pool
+                     pool))
+                  (client (make-http-client :transport-function transport :cache nil))
+                  (caught
+                    (handler-case
+                        (http-client-send client "GET" "https://pending.test/error")
+                      (error (condition) condition))))
+             (ensure-true (typep caught 'error))
+             (ensure-equal 1 opened)
+             (ensure-equal 1 closed)
+             (ensure-false (open-stream-p stream))
+             (ensure-equal 0 (length (binary-test-output stream)))))
+      (setf (symbol-function sender-symbol) original-sender))))
+#+sbcl (deftest client-native-alpn-handoff-falls-back-after-key-mismatch
+  (let* ((key-symbol 'http-kit/client::%client-connection-key)
+         (original-key (symbol-function key-symbol))
+         (pending-stream (make-instance 'binary-test-stream))
+         (fallback-stream
+           (make-instance 'binary-test-stream
+                          :input (ascii "HTTP/1.1 200 OK|CRLF|Content-Length: 0|CRLF||CRLF|")))
+         (opened 0)
+         (upgraded 0)
+         (closed-streams nil)
+         (pool
+           (make-http-connection-pool
+            :open-stream
+            (lambda (request &key timeout deadline &allow-other-keys)
+              (declare (ignore request timeout deadline))
+              (incf opened)
+              (if (= opened 1) pending-stream fallback-stream))
+            :tls-upgrade
+            (lambda (stream uri &key timeout deadline)
+              (declare (ignore uri timeout deadline))
+              (incf upgraded)
+              (values stream (if (= upgraded 1) "h2" "http/1.1")))
+            :close-stream
+            (lambda (stream)
+              (push stream closed-streams)
+              (when (open-stream-p stream)
+                (close stream :abort t))))))
+    (unwind-protect
+         (progn
+           (setf (symbol-function key-symbol)
+                 (lambda (request proxy-plan)
+                   (if http-kit/client::*client-http2-pending-stream*
+                       :mismatched-key
+                       (funcall original-key request proxy-plan))))
+           (let* ((transport
+                    (http-kit/client::%client-transport-from-negotiated-connection-pool
+                     pool))
+                  (client (make-http-client :transport-function transport :cache nil))
+                  (response
+                    (http-client-send client "GET" "https://handoff.test/fallback")))
+             (ensure-equal 200 (http-response-status response))
+             (ensure-equal 2 opened)
+             (ensure-equal 2 upgraded)
+             (ensure-equal 1 (count pending-stream closed-streams :test #'eq))
+             (ensure-equal 0 (length (binary-test-output pending-stream)))
+             (ensure-true
+              (search "GET /fallback HTTP/1.1"
+                      (octets-as-string (binary-test-output fallback-stream))))
+             (ensure-equal 1 (getf (http-connection-pool-stats pool) :idle-count))
+             (ensure-equal 1 (http-connection-pool-clear pool))
+             (ensure-equal 1 (count fallback-stream closed-streams :test #'eq))
+             (ensure-equal 0 (getf (http-connection-pool-stats pool) :idle-count)))
+           )
+      (setf (symbol-function key-symbol) original-key)
       (http-connection-pool-clear pool))))
 
