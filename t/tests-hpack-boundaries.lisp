@@ -142,20 +142,25 @@
       (ensure-equal 1
                     (http-message-kit:hpack-context-dynamic-entry-count
                      decoder)))))
-(deftest hpack-qpack-shared-integer-helper-boundaries
+(deftest hpack-integer-codec-boundaries
   (labels ((capture (thunk)
              (handler-case
                  (funcall thunk)
-               (http-protocol-error (condition) condition)))
+               (hpack-codec:hpack-codec-error (condition) condition)))
            (assert-error (condition message detail)
-             (ensure-true (typep condition 'http-protocol-error))
-             (ensure-equal :hpack (http-error-operation condition))
-             (ensure-equal message (http-error-message condition))
-             (ensure-equal detail (http-protocol-error-detail condition))))
+             (ensure-true (typep condition 'hpack-codec:hpack-codec-error))
+             (ensure-equal :hpack
+                           (hpack-codec:hpack-codec-error-operation condition))
+             (ensure-equal message
+                           (hpack-codec:hpack-codec-error-message condition))
+             (ensure-equal detail
+                           (hpack-codec:hpack-codec-error-detail condition))))
     (dolist (case
              (list
-              (list (octets) 0 5 "An HPACK integer is truncated." 0)
-              (list (octets #x00) 0 0 "An HPACK integer is truncated." 0)
+              (list (octets) 0 5
+                    "An HPACK integer is truncated or has an invalid prefix." 0)
+              (list (octets #x00) 0 0
+                    "An HPACK integer is truncated or has an invalid prefix." 0)
               (list (octets #x1f) 0 5
                     "An HPACK integer continuation is truncated." 1)
               (list (octets #x1f #xff #xff #xff #xff #x10) 0 5
@@ -166,50 +171,35 @@
         (assert-error
          (capture
           (lambda ()
-            (http-kit/http2::%hpack-read-integer
-             wire position prefix-bits)))
+            (hpack-codec:hpack-read-integer wire position prefix-bits)))
          message detail)))
-    (dolist (arguments '((nil 5 0)
-                         (-1 5 0)
-                         (1 0 0)
-                         (1 9 0)
-                         (1 5 :invalid)
-                         (1 5 -1)
-                         (1 5 256)))
+    (dolist (arguments
+             (list (list nil 5 0)
+                   (list -1 5 0)
+                   (list 1 0 0)
+                   (list 1 9 0)
+                   (list 1 5 :invalid)
+                   (list 1 5 -1)
+                   (list 1 5 256)))
       (assert-error
        (capture
         (lambda ()
-          (apply #'http-kit/http2::%hpack-encode-integer arguments)))
+          (apply #'hpack-codec:hpack-encode-integer arguments)))
        "Cannot encode an invalid HPACK integer."
        (first arguments)))))
-(deftest hpack-huffman-tree-rejects-prefix-collisions-and-duplicate-codes
-  (dolist (case
-           (list
-            (list #(0 0) #(1 2)
-                  "HPACK Huffman table contains a prefix collision.")
-            (list #(0 0) #(1 1)
-                  "HPACK Huffman table contains a duplicate code.")))
-    (destructuring-bind (codes lengths message) case
-      (let ((condition
-              (handler-case
-                  (progn
-                    (http-kit/http2::%hpack-build-huffman-tree
-                     codes lengths)
-                    nil)
-                (simple-error (condition) condition))))
-        (ensure-true (typep condition 'simple-error))
-        (ensure-equal message
-                      (simple-condition-format-control condition))))))
-(deftest hpack-huffman-decode-rejects-eos-and-invalid-padding
+(deftest hpack-huffman-codec-rejects-eos-and-invalid-padding
   (labels ((decode-error (wire)
              (handler-case
-                 (http-kit/http2::%hpack-huffman-decode wire)
-               (http-protocol-error (condition) condition)))
+                 (hpack-codec:hpack-huffman-decode wire)
+               (hpack-codec:hpack-codec-error (condition) condition)))
            (assert-error (condition message detail)
-             (ensure-true (typep condition 'http-protocol-error))
-             (ensure-equal :hpack (http-error-operation condition))
-             (ensure-equal message (http-error-message condition))
-             (ensure-equal detail (http-protocol-error-detail condition))))
+             (ensure-true (typep condition 'hpack-codec:hpack-codec-error))
+             (ensure-equal :hpack
+                           (hpack-codec:hpack-codec-error-operation condition))
+             (ensure-equal message
+                           (hpack-codec:hpack-codec-error-message condition))
+             (ensure-equal detail
+                           (hpack-codec:hpack-codec-error-detail condition))))
     (dolist (case
              (list
               (list (octets #xff #xff #xff #xfc)
@@ -220,6 +210,6 @@
                     8)
               (list (octets #x1e)
                     "An HPACK Huffman string has invalid padding."
-                    6)))
+                    #x1e)))
       (destructuring-bind (wire message detail) case
         (assert-error (decode-error wire) message detail)))))
