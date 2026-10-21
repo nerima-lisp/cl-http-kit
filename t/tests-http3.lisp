@@ -1624,10 +1624,8 @@
         (ensure-equal 1 (length ready))
         (ensure-true (eq token (first ready))))
       (let ((headers (http-message-kit:qpack-resume-blocked-stream token)))
-        (ensure-equal "x-second"
-                      (http-message-kit:http-header-name (first headers)))
-        (ensure-equal "two"
-                      (http-message-kit:http-header-content (first headers)))))))
+        (ensure-equal "x-second" (car (first headers)))
+        (ensure-equal "two" (cdr (first headers)))))))
 
 (deftest http3-qpack-ready-stream-detaches-once
   (multiple-value-bind (fields decoder-context section instruction)
@@ -1647,10 +1645,8 @@
         (ensure-true (eq token (first ready))))
       (ensure-equal nil (http-message-kit:qpack-take-ready-streams adapter))
       (let ((headers (http-message-kit:qpack-resume-blocked-stream token)))
-        (ensure-equal "x-blocked"
-                      (http-message-kit:http-header-name (first headers)))
-        (ensure-equal "ready"
-                      (http-message-kit:http-header-content (first headers)))))))
+        (ensure-equal "x-blocked" (car (first headers)))
+        (ensure-equal "ready" (cdr (first headers)))))))
 
 (deftest http3-qpack-cancelled-token-cannot-resume
   (multiple-value-bind (fields decoder-context section instruction)
@@ -1733,10 +1729,8 @@
          (eq current (first
                       (http-message-kit:qpack-take-ready-streams adapter))))
         (let ((headers (http-message-kit:qpack-resume-blocked-stream current)))
-          (ensure-equal "x-second"
-                        (http-message-kit:http-header-name (first headers)))
-          (ensure-equal "two"
-                        (http-message-kit:http-header-content (first headers))))))))
+          (ensure-equal "x-second" (car (first headers)))
+          (ensure-equal "two" (cdr (first headers))))))))
 
 (deftest http3-qpack-ready-token-resumes-once
   (multiple-value-bind (fields decoder-context section instruction)
@@ -1787,10 +1781,8 @@
                (lambda (stream-id)
                  (setf callback-inside-p inside-serializer-p
                        acknowledged-stream-id stream-id)))))
-        (ensure-equal "x-blocked"
-                      (http-message-kit:http-header-name (first headers)))
-        (ensure-equal "ready"
-                      (http-message-kit:http-header-content (first headers))))
+        (ensure-equal "x-blocked" (car (first headers)))
+        (ensure-equal "ready" (cdr (first headers))))
       (ensure-equal 1 serializer-calls)
       (ensure-equal nil callback-inside-p)
       (ensure-equal 0 acknowledged-stream-id))))
