@@ -304,8 +304,14 @@ be used concurrently from multiple threads."
           (if proxy
               (http-proxy-plan proxy (http-request-uri request))
             proxy-plan))
-         (key (or key
-                  (%pool-default-key request effective-proxy-plan proxy)))
+         (key
+          (handler-case
+              (or key (%pool-default-key request effective-proxy-plan proxy))
+            (type-error (condition)
+              (error 'http-connection-error
+                     :message "The connection pool opener signaled an error."
+                     :operation :connect
+                     :cause condition))))
          (stream nil)
          (opened-at nil)
          (retained-p nil))
