@@ -814,3 +814,22 @@
                 (http-message-kit:http-header-content header)))
         (http3-test-decode-inserts-and-resume
          adapter decoder-context instruction token))))))
+(deftest http3-codec-qpack-empty-table-rejects-negative-capacity
+  (let ((context
+          (http-message-kit:make-qpack-context
+           :max-table-capacity 64 :table-capacity 0 :huffman nil)))
+    (ensure-equal 0 (http-message-kit:qpack-context-table-size context))
+    (ensure-equal 0 (http-message-kit:qpack-context-dynamic-entry-count context))
+    (let ((failure
+            (handler-case
+                (progn
+                  (http-message-kit:qpack-context-set-capacity context -1)
+                  nil)
+              (http-protocol-error (condition) condition))))
+      (ensure-true (typep failure 'http-protocol-error))
+      (ensure-equal :qpack (http-error-operation failure))
+      (ensure-equal -1 (http-protocol-error-detail failure))
+      (ensure-equal 0 (http-message-kit:qpack-context-table-capacity context))
+      (ensure-equal 0 (http-message-kit:qpack-context-table-size context))
+      (ensure-equal 0 (http-message-kit:qpack-context-insert-count context))
+      (ensure-equal 0 (http-message-kit:qpack-context-dynamic-entry-count context)))))
