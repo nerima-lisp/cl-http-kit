@@ -2540,8 +2540,17 @@
               :payload
               (http3-test-qpack-encode (list (cons ":status" "204")))))))
          (promises '())
+         (decoder-context
+           (http-message-kit:make-qpack-context
+            :max-table-capacity 0 :table-capacity 0
+            :max-blocked-streams 0 :huffman nil))
+         (adapter
+           (http-message-kit:qpack-make-http3-decoder-context
+            decoder-context :max-blocked-streams 0))
          (client
            (http-kit/http3::%make-http3-client
+            :qpack-decoder-context decoder-context
+            :qpack-http3-decoder-context adapter
             :max-push-id 2
             :read-stream
             (lambda (stream &key timeout deadline)
@@ -2552,6 +2561,7 @@
      (http-response-status
       (http-kit/http3::%h3-read-response
        client :stream :stream-id 0 :request-method "GET" :collect-body-p t
+       :qpack-http3-decoder-context adapter
        :on-push-promise
        (lambda (push-id promised-fields)
          (push (list push-id promised-fields) promises)))))
