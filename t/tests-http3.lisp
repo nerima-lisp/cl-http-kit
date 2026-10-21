@@ -643,11 +643,20 @@
             (http-message-kit:qpack-encode-insert-with-name-reference
              encoder-context 17 "PATCH" :huffman nil)))
          (fields (list (cons ":method" "PATCH")
+                       (cons ":scheme" "https")
+                       (cons ":authority" "example.com")
+                       (cons ":path" "/")
                        (cons "x-request-id" "two")))
          (headers (list (http-message-kit:make-http-pseudo-header
-                         ":method" "PATCH")
-                        (http-message-kit:make-http-header
-                         "x-request-id" "two"))))
+                        ":method" "PATCH")
+                       (http-message-kit:make-http-pseudo-header
+                        ":scheme" "https")
+                       (http-message-kit:make-http-pseudo-header
+                        ":authority" "example.com")
+                       (http-message-kit:make-http-pseudo-header
+                        ":path" "/")
+                       (http-message-kit:make-http-header
+                        "x-request-id" "two"))))
     (multiple-value-bind (events consumed)
         (http-message-kit:qpack-decode-encoder-stream
          decoder-context encoder-stream)
@@ -681,7 +690,7 @@
               blocked-context :max-blocked-streams 1))
            (blocked
              (http-message-kit:qpack-decode-http3-field-section
-              encoded blocked-adapter 0)))
+              encoded blocked-adapter 0 :role :request)))
       (ensure-equal fields decoded)
       (ensure-true (http-message-kit:qpack-blocked-stream-p blocked))
       (ensure-equal 0
@@ -1485,14 +1494,16 @@
     (values decoder-context section instruction)))
 
 (defun http3-test-decode-inserts-and-resume
-    (adapter decoder-context instruction token)
+    (adapter decoder-context instruction token
+     &optional
+       (resume (function http-message-kit:qpack-resume-blocked-stream)))
   (http-message-kit:qpack-decode-encoder-stream
    decoder-context instruction)
   (let ((ready
           (http-message-kit:qpack-take-ready-streams adapter)))
     (ensure-equal 1 (length ready))
     (ensure-true (eq token (first ready)))
-    (http-message-kit:qpack-resume-blocked-stream token)))
+    (funcall resume token)))
 
 (deftest http3-qpack-blocked-section-returns-opaque-token
   (multiple-value-bind (fields decoder-context section instruction)
@@ -1990,7 +2001,14 @@
                                                             event))))
                  (let ((before-resume serializations))
                    (http3-test-decode-inserts-and-resume
-                    context decoder-table instruction token)
+                    context decoder-table instruction token
+                    (lambda (token)
+                      (let ((before-resume serializations))
+                        (prog1
+                            (http-message-kit:qpack-resume-blocked-stream
+                             token)
+                          (ensure-true
+                           (> serializations before-resume))))))
                    (ensure-equal (+ before-resume 3) serializations))
                  (push :resumed events))
                :on-body-chunk
@@ -7808,24 +7826,26 @@
        (lambda ()
          (http-message-kit:qpack-decode-http3-field-section
           wire :not-a-context 0
+          :role :response
           :serialize (lambda (thunk) (push :serialize calls) (funcall thunk))))
        :not-a-context)
       (reject
        (lambda ()
          (http-message-kit:qpack-decode-http3-field-section
-          wire context 0 :serialize nil))
+          wire context 0 :role :response :serialize nil))
        nil)
       (reject
        (lambda ()
          (http-message-kit:qpack-decode-http3-field-section
-          wire context 0 :on-decoded :not-a-function
+          wire context 0 :role :response
+          :on-decoded :not-a-function
           :serialize (lambda (thunk) (push :serialize calls) (funcall thunk))))
        :not-a-function)
       (ensure-equal nil calls)
       (ensure-equal
        :decoded
        (http-message-kit:qpack-decode-http3-field-section
-        wire context 0
+        wire context 0 :role :response
         :serialize (lambda (thunk)
                      (push :serialize-enter calls)
                      (funcall thunk)
@@ -7847,7 +7867,7 @@
                 (http3-boundary-error
                  (lambda ()
                    (http-message-kit:qpack-decode-http3-field-section
-                    wire context 4)))))
+                    wire context 4 :role :trailers)))))
           (ensure-true (typep failure 'http-protocol-error))
           (ensure-equal :qpack (http-error-operation failure))
           (ensure-equal 4 (http-protocol-error-detail failure))))
@@ -7859,13 +7879,13 @@
                (http3-boundary-error
                 (lambda ()
                   (http-message-kit:qpack-decode-http3-field-section
-                   wire context -1
+                   wire context -1 :role :trailers
                    :on-decoded (lambda (decoded)
                                  (declare (ignore decoded))
                                  (incf callbacks))))))
              (token
                (http-message-kit:qpack-decode-http3-field-section
-                wire context 4
+                wire context 4 :role :trailers
                 :on-decoded (lambda (decoded)
                               (declare (ignore decoded))
                               (incf callbacks)))))
@@ -7891,7 +7911,7 @@
         (ensure-equal
          (http3-test-qpack-headers fields)
          (http-message-kit:qpack-decode-http3-field-section
-          wire context 8))))))
+          wire context 8 :role :trailers))))))
 
 (deftest http3-public-preflight-qpack-encoder-tracking
   (flet ((reject (thunk detail)
@@ -10005,7 +10025,8 @@
              (lambda (stream-id) (push stream-id acknowledged)))
            (token
              (http-message-kit:qpack-decode-http3-field-section
-              wire context 4 :serialize serializer :on-decoded callback
+              wire context 4 :role :trailers
+              :serialize serializer :on-decoded callback
               :on-section-acknowledgment ack-callback)))
       (ensure-true (http-message-kit:qpack-blocked-stream-p token))
       (ensure-equal nil acknowledged)
@@ -10028,7 +10049,8 @@
       (ensure-equal
        fields
        (http-message-kit:qpack-decode-http3-field-section
-        wire context 8 :on-section-acknowledgment ack-callback))
+        wire context 8 :role :trailers
+        :on-section-acknowledgment ack-callback))
       (ensure-equal '(8 4) acknowledged))))
 
 (deftest http3-qpack-public-context-boundary-shared-release-order
