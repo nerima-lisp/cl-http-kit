@@ -408,7 +408,7 @@
                             (incf closed)
                             (close received))))
          (initial-input-position (binary-session-input-position stream))
-         (initial-output-count (length (h2-output-frames stream))))
+         (initial-output (copy-seq (binary-session-output stream))))
     (unwind-protect
          (let ((condition
                  (handler-case
@@ -423,7 +423,7 @@
            (ensure-equal :http2-client (http-error-operation condition))
            (ensure-equal 17 (http-protocol-error-detail condition))
            (ensure-equal initial-input-position (binary-session-input-position stream))
-           (ensure-equal initial-output-count (length (h2-output-frames stream)))
+           (ensure-equal initial-output (binary-session-output stream))
            (ensure-true (http-kit/http2:http2-connection-open-p connection))
            (ensure-equal 0 closed))
       (http-kit/http2:close-http2-connection connection))
