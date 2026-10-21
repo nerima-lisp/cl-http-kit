@@ -267,7 +267,7 @@
     (open-stream close-stream request proxy-plan proxy tls-upgrade resolve-host
                  resolve-host-style timeout deadline clock-function)
   (let* ((mode (or (getf proxy-plan :mode) :direct))
-         (proxy (or proxy (getf proxy-plan :proxy)))
+         (proxy (if proxy-plan (getf proxy-plan :proxy) proxy))
          (target (or (getf proxy-plan :target)
                      (http-request-uri request)))
          (stream (%proxy-open-raw open-stream request timeout deadline
