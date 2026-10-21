@@ -1551,7 +1551,7 @@
     (ensure-equal 2 opened)
     (ensure-equal 2 closed)))
 #+sbcl
-(deftest http2-connection-manager-clear-defers-close-error-until-lease-release
+(deftest http2-connection-manager-clear-defers-close-until-lease-release
   (let* ((close-attempts 0)
         (manager
           (http-kit/http2:make-http2-connection-manager
@@ -1578,8 +1578,7 @@
        0
        (http-kit/http2:http2-connection-manager-connection-count manager))
       (ensure-equal 0 close-attempts)
-      (signals simple-error
-        (http-kit/http2::%h2-manager-finish-entry manager entry))
+      (http-kit/http2::%h2-manager-finish-entry manager entry)
       (ensure-equal 1 close-attempts)
       (ensure-false (http-kit/http2:http2-connection-open-p connection)))
     (http-kit/http2:close-http2-connection-manager manager)))
