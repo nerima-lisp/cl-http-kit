@@ -2484,6 +2484,7 @@
          (client (make-http-client :transport-function transport :cache nil)))
     (unwind-protect
          (progn
+           (ensure-true (eq transport (http-client-transport-function client)))
            (ensure-equal
             200
             (http-response-status
@@ -2559,6 +2560,7 @@
                          socks-proxy))
             :cache nil))
          (information-statuses nil))
+    (ensure-true (eq transport (http-client-transport-function client)))
     (ensure-equal
      200
      (http-response-status
@@ -2676,7 +2678,7 @@
                    (handler-case
                        (progn (funcall transport request) nil)
                      (error (condition) condition))))
-             (ensure-true caught))
+             (ensure-true (and caught (functionp transport))))
            (ensure-true failure-signaled)
            (ensure-true (eq expected-stream received-stream))
            (ensure-equal 1 opened)
