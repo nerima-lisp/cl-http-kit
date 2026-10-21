@@ -878,6 +878,71 @@ including on non-local exits. After that transfer, only the session invokes
 CLOSE-STREAM; NIL retains the stream, and a successful upgrade transfers
 ownership to ON-UPGRADE.
 
+### HTTPS server
+
+The optional `cl-http-kit/tls` system provides an HTTPS listener on SBCL.
+`make-http-server`, `start-http-server`, `stop-http-server`, and
+`http-server-port` are exported from `HTTP-KIT`. `make-http-server` has this
+signature: `(&key (transport :https) host port handler
+certificate-chain private-key ticket-key-store max-connections
+max-handshakes max-concurrent-streams handshake-timeout request-timeout
+idle-timeout graceful-timeout max-header-bytes max-fields max-body-bytes
+on-event on-error)`. HOST, PORT, HANDLER, CERTIFICATE-CHAIN, and PRIVATE-KEY
+are required. `certificate-chain` is a list of DER-encoded certificate byte
+vectors with the leaf first; `private-key` is the matching P-256 ECDSA or
+Ed25519 key object. Construct it with `crypto-kit:make-ec-private-key` using
+`:p256` and scalar octets, or `crypto-kit:make-ed25519-private-key` using a
+32-octet seed. The listener does not parse PEM or DER private-key files. PORT
+may be zero to request an ephemeral port. The only supported transport is
+`:https`.
+
+The server advertises `h2` and `http/1.1` through ALPN and dispatches each
+connection to the matching session. A handshake without one of those selected
+protocols is rejected. The handler receives each HTTP request and returns
+`(values response informational-responses)`. The second value may be omitted;
+the response may be an HTTP response or response stream.
+
+Defaults are 128 concurrent connections, 32 concurrent handshakes, 100 HTTP/2
+streams per connection, a 10-second handshake timeout, a 30-second request
+timeout, a 60-second idle timeout, and a 30-second graceful-stop timeout.
+Request headers are limited to 65,536 bytes and 100 fields; request bodies are
+limited to 16,777,216 bytes. Limits are finite and cannot be disabled with NIL.
+The handshake timeout runs from accept through TLS negotiation. The request
+timeout covers request reads, handler execution, and response writes; the idle
+timeout bounds the initial request wait and each wait between requests,
+including the HTTP/2 preface and first SETTINGS frame. A handler that finishes
+after its request deadline does not send a response. The graceful timeout bounds
+shutdown from its start until remaining connections are closed.
+
+`on-event` receives a sanitized plist with `:type` and `:phase`. Listener
+events use `:listener-started`, `:listener-stopping`, and `:listener-stopped`;
+the start event also includes `:host` and `:port`. Connection events use
+`:connection-accepted`, `:connection-rejected`, `:alpn-selected`, and
+`:connection-closed`; they include `:peer-address` and `:peer-port`, with
+`:reason-code` on rejection and `:protocol` on ALPN selection and close.
+`on-error` receives a condition and a context plist with `:phase`, `:protocol`,
+`:peer-address`, and `:peer-port`. The callback payloads omit request contents
+and secret material. Callback failures are reported as
+HTTP-SERVER-CALLBACK-ERROR conditions.
+
+`start-http-server` binds the listener, starts accepting connections, and
+returns the server handle. `http-server-port` returns the actual bound port,
+including when PORT was zero. `stop-http-server` stops accepting new
+connections and asks active HTTP/2 sessions to send GOAWAY at their next
+frame-processing point. Active responses can drain until the configured
+graceful timeout; sessions still waiting for a frame are closed when it
+expires. It is safe to call more than once. `http-server-p` identifies a server
+handle; `http-server-port` returns its bound port and `http-server-failure`
+returns a fatal server failure, if one occurred. `http-server-error-reason-code`
+and `http-server-error-phase` expose safe error metadata, while
+`http-server-callback-error-callback` identifies whether `:on-event` or
+`:on-error` failed.
+
+Each server creates its own ticket-key store by default. Pass a store created
+with `cl-tls-kit:make-tls13-server-ticket-key-store` to multiple server
+instances to share their TLS 1.3 session-ticket keys. Each instance still
+enforces its own connection and handshake limits.
+
 ## TLS package
 
 The optional package name is HTTP-KIT/TLS and is provided by the
@@ -898,17 +963,20 @@ certificates from the CA file selected by cl-tls-kit: SSL_CERT_FILE takes
 precedence over NIX_SSL_CERT_FILE, followed by an existing platform CA file.
 The wrapper rejects transport EOF without a peer close_notify instead of
 treating a truncated TLS stream as a completed HTTP response.
-MAKE-HTTP-TLS-SERVER-WRAPPER validates its certificate arguments then signals
-an explicit unsupported-feature condition because the current kit does not
-expose a server driver. For an HTTPS server, terminate TLS in a reverse proxy
-or load balancer and forward HTTP to `cl-http-kit/network`.
-HTTP-TLS-SELECTED-ALPN-PROTOCOL returns the protocol negotiated by the
-cl-tls-kit client driver for an upgraded client stream, or NIL when no protocol
-was negotiated. Applications can use that result to dispatch HTTP/2 or
-HTTP/1.1 handling.
+The lambda list for `make-http-tls-server-wrapper` is
+`(make-http-tls-server-wrapper &key certificate-chain private-key
+ticket-key-store alpn-protocols clock-function)`. The certificate chain and
+private key are required; the clock defaults to a monotonic clock. It returns a
+callback invoked as
+`(funcall wrapper stream &key timeout deadline)`. The callback completes the
+TLS 1.3 server handshake and returns the negotiated TLS stream; `timeout` and
+`deadline` bound the handshake.
+HTTP-TLS-SELECTED-ALPN-PROTOCOL returns the protocol negotiated on an upgraded
+client or server stream, or NIL when no protocol was negotiated. The HTTPS
+listener accepts only `h2` and `http/1.1`.
 
-The TLS package is TLS 1.3 only through cl-tls-kit. TLS 1.2, OCSP/CRL, and
-server-side wrapping are outside the current boundary.
+The TLS package is TLS 1.3 only through cl-tls-kit. TLS 1.2 and OCSP/CRL are
+outside the current boundary.
 
 ## Observability package
 
@@ -1788,9 +1856,10 @@ deadline still applies. Passing `:idle-timeout nil` or
 parsing, `:max-body-bytes nil` selects the finite default. Automatic response
 decoding instead passes nil to the decoder; built-in decoders omit their
 explicit output-limit argument. Use a finite integer to explicitly bound
-built-in gzip/deflate expansion. The native
-client offers only `http/1.1` through ALPN; HTTP/2 requires the explicit
-`cl-http-kit/http2` transport boundary until native client dispatch is provided.
+built-in gzip/deflate expansion. The native origin client offers `h2` and
+`http/1.1` through ALPN and dispatches requests to the negotiated protocol. TLS
+to an HTTPS proxy offers only `http/1.1`; custom transports supply their own
+ALPN policy.
 
 ### `http-client-transport-function`
 
