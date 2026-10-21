@@ -725,7 +725,7 @@
        "value" :huffman nil)))
   (let ((context
           (http-message-kit:make-qpack-context
-           :max-table-capacity 128 :table-capacity 128
+           :max-table-capacity 175 :table-capacity 175
            :max-blocked-streams 4 :huffman nil)))
     (http-message-kit:qpack-encode-insert-with-literal-name
      context "x-stream" "one" :huffman nil)
