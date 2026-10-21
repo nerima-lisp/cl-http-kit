@@ -2,12 +2,8 @@
 
 cl-http-kit is organized around a small protocol core and explicit integration
 boundaries. The registered ASDF systems share the HTTP-KIT message model where
-appropriate, while application-owned I/O remains outside the package.
-
-This describes the checked-in 0.4.1 architecture.
-The high-level client can assemble native TCP/TLS and a connection
-pool when no transport is supplied, and `http-client-send` accepts the
-URL-and-method convenience form.
+appropriate, while application-owned I/O remains outside the core HTTP-KIT
+package.
 
 ## Core layers
 
@@ -110,16 +106,8 @@ delegates actual I/O to an injected transport function, stream callbacks, or a
 callback-driven connection pool. When no transport boundary is supplied, the
 current integration creates native TCP/TLS and a pool lazily; custom callers
 can still keep socket creation, DNS, TLS, and ALPN at the application boundary.
-
-The URL-and-method convenience path runs over these layers. `make-http-client`
-and `http-client-send` stay as compatibility entry points. If the client
-receives an Alt-Svc `h3` alternative and the caller supplies
-`:http3-transport-function`, it attempts HTTP/3. TCP fallback requires an
-`http-connection-error` with `http-connection-error-request-sent-p` false,
-before any request-body producer or response callback has run. Other failures
-propagate. Explicit HTTP/3 requests do not fall back. The HTTP/3
-layer remains an injected QUIC stream boundary so applications retain socket,
-TLS, and certificate policy.
+Custom transports also own pool synchronization and their sensitive-data
+logging policy.
 
 ## Optional native network system
 
@@ -130,15 +118,13 @@ explicit policies supplied by the surrounding application.
 
 The network system also provides TCP listener primitives. Its
 serve-http1-listener combines accept, HTTP/1 session dispatch, connection
-limits, and error callbacks for a caller-owned listener. TLS, ALPN, proxy
-negotiation, and HTTP/2 or HTTP/3 protocol selection remain explicit policies
-supplied by the surrounding application.
+limits, and error callbacks for a caller-owned listener.
 
-The native TLS implementation is cl-tls-kit. The client wrapper adapts its
-TLS 1.3 driver to the binary stream boundary; server-side TLS remains an
-explicit unsupported feature because the kit exposes no server driver. An
-HTTPS deployment can terminate TLS in a reverse proxy or load balancer and
-forward plain HTTP to the listener.
+The optional `cl-http-kit/tls` system adapts cl-tls-kit's TLS 1.3 server driver
+to the native listener. It negotiates `h2` or `http/1.1` with ALPN, then passes
+the wrapped stream to the matching server session.
+HTTP/3 server acceptance and plaintext server startup through this high-level
+API remain outside the boundary.
 
 ## Optional observability system
 
@@ -147,11 +133,3 @@ cl-observability-kit counters. It records request totals by method and outcome,
 and error totals by method and condition kind. Metrics are injected into the
 operation wrapper rather than coupled to the HTTP/1.1 parser.
 
-## Ownership boundary
-
-The library owns protocol values, wire correctness, and the policies explicitly
-provided by the optional client system. The optional network system can own
-native TCP and DNS setup on SBCL, and the default client path composes it with
-the native TLS wrapper and pool. Custom transports still own TLS, ALPN, pool
-synchronization, and policy about sensitive logging. This boundary keeps the
-core portable and makes deterministic testing possible.
