@@ -6,9 +6,15 @@
   (finish-output stream)
   wire)
 
-(defun %h2-writer (stream deadline clock-function)
+(defun %h2-writer (stream deadline clock-function &optional lock)
   (and stream
        (lambda (wire)
+         #+sbcl
+         (if lock
+             (sb-thread:with-mutex (lock)
+               (%h2-write-wire stream wire deadline clock-function))
+             (%h2-write-wire stream wire deadline clock-function))
+         #-sbcl
          (%h2-write-wire stream wire deadline clock-function))))
 
 (defun %h2-send-control (writer type flags stream-id payload)

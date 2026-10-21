@@ -2840,6 +2840,105 @@
            (ensure-equal 1 closed))
       (setf (symbol-function constructor-symbol) original-constructor)
       (http-connection-pool-clear pool))))
+#+sbcl
+(deftest client-clear-connections-clears-http1-pool-and-remains-usable
+  (let* ((opened 0)
+         (closed-streams nil)
+         (pool
+           (make-http-connection-pool
+            :open-stream
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              (incf opened)
+              (make-instance
+               'binary-test-stream
+               :input (ascii "HTTP/1.1 200 OK|CRLF|Content-Length: 0|CRLF||CRLF|")))
+            :close-stream
+            (lambda (stream)
+              (push stream closed-streams)
+              (when (open-stream-p stream)
+                (close stream :abort t)))))
+         (client (make-http-client :connection-pool pool :cache nil)))
+    (unwind-protect
+         (progn
+           (ensure-equal
+            200
+            (http-response-status
+             (http-client-send client "GET" "http://clear.test/first")))
+           (ensure-equal 1 (getf (http-connection-pool-stats pool) :idle-count))
+           (http-kit/client:http-client-clear-connections client)
+           (ensure-equal 0 (getf (http-connection-pool-stats pool) :idle-count))
+           (ensure-equal 1 (length closed-streams))
+           (http-kit/client:http-client-clear-connections client)
+           (ensure-equal 1 (length closed-streams))
+           (ensure-equal
+            200
+            (http-response-status
+             (http-client-send client "GET" "http://clear.test/second")))
+           (ensure-equal 2 opened)
+           (ensure-equal 1 (getf (http-connection-pool-stats pool) :idle-count))
+           (http-kit/client:http-client-clear-connections client)
+           (ensure-equal 2 (length closed-streams))
+           (ensure-equal 0 (getf (http-connection-pool-stats pool) :idle-count)))
+      (http-kit/client:http-client-clear-connections client))))
+#+sbcl
+(deftest client-clear-connections-clears-native-http2-manager
+  (let* ((http-kit/client::*proxy-environment-function*
+           (lambda (name) (declare (ignore name)) nil))
+         (open-stream-symbol 'http-kit/client::%client-native-open-stream)
+         (tls-upgrade-symbol 'http-kit/client::%client-native-tls-upgrade)
+         (original-open-stream (symbol-function open-stream-symbol))
+         (original-tls-upgrade (symbol-function tls-upgrade-symbol))
+         (wire
+           (concatenate-octets
+            (h2-frame 4 0 0 (octets))
+            (h2-frame 1 5 1 (h2-header-block (cons ":status" "200")))))
+         (streams nil)
+         (opened 0))
+    (unwind-protect
+         (progn
+           (setf (symbol-function open-stream-symbol)
+                 (lambda ()
+                   (lambda (request &key timeout deadline proxy-plan proxy
+                                   &allow-other-keys)
+                     (declare (ignore request timeout deadline proxy-plan proxy))
+                     (incf opened)
+                     (let ((stream
+                             (make-instance 'binary-test-stream :input wire)))
+                       (push stream streams)
+                       stream))))
+           (setf (symbol-function tls-upgrade-symbol)
+                 (lambda ()
+                   (lambda (stream uri &key timeout deadline &allow-other-keys)
+                     (declare (ignore uri timeout deadline))
+                     (values stream "h2"))))
+           (let ((client (make-http-client :cache nil)))
+             (unwind-protect
+                  (progn
+                    (ensure-equal
+                     200
+                     (http-response-status
+                      (http-client-send
+                       client "GET" "https://clear.test/first")))
+                    (ensure-equal 1 opened)
+                    (http-kit/client:http-client-clear-connections client)
+                    (ensure-true (not (open-stream-p (first streams))))
+                    (http-kit/client:http-client-clear-connections client)
+                    (ensure-equal 1 opened)
+                    (ensure-equal
+                     200
+                     (http-response-status
+                      (http-client-send
+                       client "GET" "https://clear.test/second")))
+                    (ensure-equal 2 opened)
+                    (ensure-true (open-stream-p (first streams)))
+                    (ensure-true (not (open-stream-p (second streams))))
+                    (http-kit/client:http-client-clear-connections client)
+                    (ensure-true (not (open-stream-p (first streams))))
+                    (ensure-true (not (open-stream-p (second streams)))))
+               (http-kit/client:http-client-clear-connections client))))
+      (setf (symbol-function open-stream-symbol) original-open-stream)
+      (setf (symbol-function tls-upgrade-symbol) original-tls-upgrade))))
 #+sbcl (deftest client-native-alpn-pending-stream-closes-on-http2-transport-error
   (let* ((sender-symbol
            (find-symbol "SEND-HTTP2-REQUEST-OVER-CONNECTION-MANAGER" "HTTP-KIT/HTTP2"))

@@ -328,6 +328,7 @@ character in that range is a decimal digit, apart from an optional sign when
   ;; plus :ALTERNATIVE-SERVICE.
   http3-transport-function
   connection-pool
+  clear-connections-function
   (default-headers nil)
   cookie-jar
   cookie-partition-key

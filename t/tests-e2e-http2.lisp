@@ -323,3 +323,479 @@
           (ignore-errors (uiop:wait-process process)))
         (ignore-errors (uiop:delete-directory-tree directory :validate t))))))
 
+#+sbcl
+(deftest e2e-http2-single-request-callers-share-one-multiplexed-connection-with-reentrant-callback
+  (multiple-value-bind (listener port)
+      (%network-test-listener)
+    (let ((server-thread nil)
+          (server-socket nil)
+          (server-stream nil)
+          (client-stream nil)
+          (connection nil)
+          (caller-threads (make-array 3 :initial-element nil))
+          (responses (make-array 3 :initial-element nil))
+          (caller-errors (make-array 3 :initial-element nil))
+          (stream-ids (make-array 3 :initial-element nil))
+          (ping-payload (ascii "pingtest"))
+          (callback-count 0)
+          (server-error nil)
+          (nested-response nil)
+          (nested-error nil)
+          (nested-stream-id nil)
+          (ping-response nil)
+          (ping-ack-sent-p nil)
+          (late-data-sent-p nil)
+          (partial-data-flow-credit-seen-p nil)
+          (late-data-flow-credit-seen-p nil)
+          (timeout-entry nil)
+          (timeout-body-chunk-seen-p nil)
+          (timeout-reset-seen-p nil)
+          (nested-request-seen-p nil)
+          (both-requests-before-response-p nil)
+          (lock (sb-thread:make-mutex :name "HTTP/2 scheduler E2E"))
+          (waitqueue (sb-thread:make-waitqueue :name "HTTP/2 scheduler E2E")))
+      (labels ((check-prewrite-deadline ()
+                 (let* ((clock (lambda () 1))
+                        (probe-connection
+                          (make-http2-connection
+                           :stream (make-string-output-stream)))
+                        (request
+                          (make-http-request
+                           :method "GET"
+                           :uri "http://example.test/prewrite"))
+                        (active-entry
+                          (http-kit/http2::%make-h2-batch-entry
+                           :request request :stream-id 1))
+                        (timeout-seen-p nil))
+                   (setf (http-kit/http2::%http2-connection-session-started-p
+                          probe-connection) t
+                         (http-kit/http2::%http2-connection-next-stream-id
+                          probe-connection) 3
+                         (http-kit/http2::%http2-connection-scheduler-last-opened-stream-id
+                          probe-connection) 1
+                         (http-kit/http2::%http2-connection-scheduler-entries
+                          probe-connection) (list active-entry))
+                   (handler-case
+                       (http-kit/http2::%h2-scheduler-open-entry
+                        probe-connection request nil nil
+                        (http-kit/http2::%http2-connection-max-header-bytes
+                         probe-connection)
+                        (http-kit/http2::%http2-connection-max-fields
+                         probe-connection)
+                        (http-kit/http2::%http2-connection-max-body-bytes
+                         probe-connection)
+                        0 clock nil nil nil t nil
+                        (lambda (wire)
+                          (declare (ignore wire))
+                          (http-kit::%check-deadline 0 clock :write)))
+                     (http-kit:http-timeout ()
+                       (setf timeout-seen-p t)))
+                   (ensure-true timeout-seen-p)
+                   (ensure-equal
+                    (list active-entry)
+                    (http-kit/http2::%http2-connection-scheduler-entries
+                     probe-connection))
+                   (ensure-equal
+                    5
+                    (http-kit/http2::%http2-connection-next-stream-id
+                     probe-connection))
+                   (ensure-equal
+                    1
+                    (http-kit/http2::%http2-connection-scheduler-last-opened-stream-id
+                     probe-connection))
+                   (ensure-true
+                    (http-kit/http2::http2-connection-open-p probe-connection))
+                   (ensure-true
+                    (http-kit/http2::%http2-connection-session-started-p
+                     probe-connection))))
+               (wait-for-callers (count)
+                 (let ((deadline (+ (http-kit::%monotonic-time) 5)))
+                   (sb-thread:with-mutex (lock)
+                     (loop while (< callback-count count)
+                           for remaining =
+                             (- deadline (http-kit::%monotonic-time))
+                           do (when (<= remaining 0)
+                                (return))
+                              (sb-thread:condition-wait
+                               waitqueue lock :timeout remaining)))
+                   (sb-thread:with-mutex (lock)
+                     (ensure-equal count callback-count))))
+               (start-caller
+                   (index path timeout &optional information-callback body-callback)
+                 (setf (aref caller-threads index)
+                       (sb-thread:make-thread
+                        (lambda ()
+                          (handler-case
+                              (setf (aref responses index)
+                                    (send-http2-request-over-connection
+                                     connection
+                                     (make-http-request
+                                      :method "GET"
+                                      :uri (format nil
+                                                   "http://127.0.0.1:~D/~A"
+                                                   port path))
+                                     :timeout timeout
+                                     :on-information information-callback
+                                     :on-body-chunk body-callback
+                                     :on-stream-open
+                                     (lambda (stream-id &rest ignored)
+                                       (declare (ignore ignored))
+                                       (sb-thread:with-mutex (lock)
+                                         (setf (aref stream-ids index)
+                                               stream-id)
+                                         (when (= index 2)
+                                           (sb-thread:with-mutex
+                                               ((http-kit/http2::%http2-connection-scheduler-lock
+                                                 connection))
+                                             (setf timeout-entry
+                                                   (http-kit/http2::%h2-scheduler-entry-for-stream
+                                                    connection stream-id))))
+                                         (incf callback-count)
+                                         (sb-thread:condition-broadcast
+                                          waitqueue))))
+                            (error (condition)
+                              (setf (aref caller-errors index) condition))))
+                        :name (format nil "HTTP/2 E2E caller ~D" index)))))
+        (unwind-protect
+             (progn
+               (check-prewrite-deadline)
+               (setf server-thread
+                     (sb-thread:make-thread
+                      (lambda ()
+                        (unwind-protect
+                             (handler-case
+                                 (progn
+                                   (setf server-socket
+                                         (sb-bsd-sockets:socket-accept listener)
+                                         server-stream
+                                         (sb-bsd-sockets:socket-make-stream
+                                          server-socket
+                                          :input t
+                                          :output t
+                                          :element-type '(unsigned-byte 8)
+                                          :buffering :full))
+                                   (let* ((preface
+                                            (make-array
+                                             (length
+                                              http-kit/http2::+http2-connection-preface+)
+                                             :element-type '(unsigned-byte 8)))
+                                          (position 0))
+                                     (loop while (< position (length preface))
+                                           for next =
+                                             (read-sequence preface server-stream
+                                                            :start position)
+                                           do (when (= next position)
+                                                (error "The HTTP/2 client closed before its preface."))
+                                              (setf position next))
+                                     (unless (equalp
+                                              preface
+                                              http-kit/http2::+http2-connection-preface+)
+                                       (error "The HTTP/2 client sent an invalid preface.")))
+                                   (let* ((reader
+                                            (http-kit/http2::%h2-reader-for
+                                             server-stream))
+                                          (deadline
+                                            (+ (http-kit::%monotonic-time) 5))
+                                          (request-streams nil))
+                                     (loop while (< (length request-streams) 3)
+                                           for frame =
+                                             (http-kit/http2::%h2-read-frame
+                                              reader
+                                              http-kit/http2::+http2-default-max-frame-size+
+                                              deadline
+                                              #'http-kit::%monotonic-time)
+                                           do (when (eq frame :eof)
+                                                (error "The HTTP/2 client closed before opening three streams."))
+                                              (when (= (http-kit/http2::%h2-frame-type frame)
+                                                       http-kit/http2::+http2-headers-type+)
+                                                (push
+                                                 (http-kit/http2::%h2-frame-stream-id frame)
+                                                 request-streams)))
+                                     (wait-for-callers 3)
+                                     (setf both-requests-before-response-p t)
+                                     (let* ((information-headers
+                                              (http-kit/http2::%h2-encode-header-block
+                                               '((":status" . "103"))))
+                                            (headers
+                                              (http-kit/http2::%h2-encode-header-block
+                                               '((":status" . "200"))))
+                                            (empty-payload
+                                              (make-array
+                                               0
+                                               :element-type '(unsigned-byte 8)))
+                                            (initial-stream-ids
+                                              (loop for stream-id across stream-ids
+                                                    collect stream-id)))
+                                       (write-sequence
+                                        (http-kit/http2::%h2-frame-wire
+                                         http-kit/http2::+http2-settings-type+
+                                         0 0 empty-payload)
+                                        server-stream)
+                                       (write-sequence
+                                        (http-kit/http2::%h2-frame-wire
+                                         http-kit/http2::+http2-headers-type+
+                                         http-kit/http2::+http2-end-headers-flag+
+                                         (aref stream-ids 0)
+                                         information-headers)
+                                        server-stream)
+                                       (write-sequence
+                                        (http-kit/http2::%h2-frame-wire
+                                         http-kit/http2::+http2-headers-type+
+                                         http-kit/http2::+http2-end-headers-flag+
+                                         (aref stream-ids 2)
+                                         headers)
+                                        server-stream)
+                                       (write-sequence
+                                        (http-kit/http2::%h2-frame-wire
+                                         http-kit/http2::+http2-data-type+
+                                         0
+                                         (aref stream-ids 2)
+                                         (ascii "partial-timeout-body"))
+                                        server-stream)
+                                       (finish-output server-stream)
+                                       (loop until (and nested-request-seen-p
+                                                        timeout-reset-seen-p
+                                                        partial-data-flow-credit-seen-p)
+                                             for frame =
+                                               (http-kit/http2::%h2-read-frame
+                                                reader
+                                                http-kit/http2::+http2-default-max-frame-size+
+                                                deadline
+                                                #'http-kit::%monotonic-time)
+                                             do (when (eq frame :eof)
+                                                  (error "The HTTP/2 client closed before the nested request and stream reset."))
+                                                (cond
+                                                  ((= (http-kit/http2::%h2-frame-type frame)
+                                                      http-kit/http2::+http2-headers-type+)
+                                                   (let ((stream-id
+                                                           (http-kit/http2::%h2-frame-stream-id frame)))
+                                                     (unless (member stream-id initial-stream-ids)
+                                                       (setf nested-stream-id stream-id
+                                                             nested-request-seen-p t))))
+                                                  ((and (= (http-kit/http2::%h2-frame-type frame)
+                                                           http-kit/http2::+http2-rst-stream-type+)
+                                                        (= (http-kit/http2::%h2-frame-stream-id frame)
+                                                           (aref stream-ids 2)))
+                                                   (setf timeout-reset-seen-p t))
+                                                  ((= (http-kit/http2::%h2-frame-type frame)
+                                                      http-kit/http2::+http2-ping-type+)
+                                                   (unless (and
+                                                            (zerop
+                                                             (http-kit/http2::%h2-frame-stream-id
+                                                              frame))
+                                                            (= (length
+                                                                (http-kit/http2::%h2-frame-payload
+                                                                 frame))
+                                                               8)
+                                                            (zerop
+                                                             (logand
+                                                              (http-kit/http2::%h2-frame-flags
+                                                               frame)
+                                                              http-kit/http2::+http2-ack-flag+)))
+                                                     (error "The client sent an invalid HTTP/2 PING."))
+                                                   (write-sequence
+                                                    (http-kit/http2::%h2-frame-wire
+                                                     http-kit/http2::+http2-ping-type+
+                                                     http-kit/http2::+http2-ack-flag+
+                                                     0
+                                                     (http-kit/http2::%h2-frame-payload
+                                                      frame))
+                                                    server-stream)
+                                                   (finish-output server-stream)
+                                                   (setf ping-ack-sent-p t))
+                                                  ((and
+                                                    (= (http-kit/http2::%h2-frame-type frame)
+                                                       http-kit/http2::+http2-window-update-type+)
+                                                    (zerop
+                                                     (http-kit/http2::%h2-frame-stream-id
+                                                      frame)))
+                                                   (when (and
+                                                          (= (length
+                                                              (http-kit/http2::%h2-frame-payload
+                                                               frame))
+                                                             4)
+                                                          (= (http-kit/http2::%h2-u32
+                                                              (http-kit/http2::%h2-frame-payload
+                                                               frame)
+                                                              0)
+                                                             (length
+                                                              (ascii "partial-timeout-body"))))
+                                                     (setf partial-data-flow-credit-seen-p
+                                                           t)))))
+                                       (write-sequence
+                                        (http-kit/http2::%h2-frame-wire
+                                         http-kit/http2::+http2-headers-type+
+                                         http-kit/http2::+http2-end-headers-flag+
+                                         (aref stream-ids 2)
+                                         headers)
+                                        server-stream)
+                                       (write-sequence
+                                        (http-kit/http2::%h2-frame-wire
+                                         http-kit/http2::+http2-data-type+
+                                         http-kit/http2::+http2-end-stream-flag+
+                                         (aref stream-ids 2)
+                                         (ascii "late-timeout-body"))
+                                        server-stream)
+                                       (finish-output server-stream)
+                                       (setf late-data-sent-p t)
+                                       (loop until late-data-flow-credit-seen-p
+                                             for frame =
+                                               (http-kit/http2::%h2-read-frame
+                                                reader
+                                                http-kit/http2::+http2-default-max-frame-size+
+                                                deadline
+                                                #'http-kit::%monotonic-time)
+                                             do (when (eq frame :eof)
+                                                  (error "The HTTP/2 client closed before returning late DATA flow credit."))
+                                                (when (and
+                                                       (= (http-kit/http2::%h2-frame-type frame)
+                                                          http-kit/http2::+http2-window-update-type+)
+                                                       (zerop
+                                                        (http-kit/http2::%h2-frame-stream-id
+                                                         frame))
+                                                       (= (length
+                                                           (http-kit/http2::%h2-frame-payload
+                                                            frame))
+                                                          4)
+                                                       (= (http-kit/http2::%h2-u32
+                                                           (http-kit/http2::%h2-frame-payload
+                                                            frame)
+                                                           0)
+                                                          (length
+                                                           (ascii "late-timeout-body"))))
+                                                  (setf late-data-flow-credit-seen-p
+                                                        t)))
+                                       (dolist (stream-id
+                                                (list nested-stream-id
+                                                      (aref stream-ids 1)
+                                                      (aref stream-ids 0)))
+                                         (write-sequence
+                                          (http-kit/http2::%h2-frame-wire
+                                           http-kit/http2::+http2-headers-type+
+                                           http-kit/http2::+http2-end-headers-flag+
+                                           stream-id headers)
+                                          server-stream))
+                                       (write-sequence
+                                        (http-kit/http2::%h2-frame-wire
+                                         http-kit/http2::+http2-data-type+
+                                         0
+                                         (aref stream-ids 1)
+                                         (ascii "response-"))
+                                        server-stream)
+                                       (write-sequence
+                                        (http-kit/http2::%h2-frame-wire
+                                         http-kit/http2::+http2-data-type+
+                                         http-kit/http2::+http2-end-stream-flag+
+                                         nested-stream-id
+                                         (ascii "nested-response"))
+                                        server-stream)
+                                       (write-sequence
+                                        (http-kit/http2::%h2-frame-wire
+                                         http-kit/http2::+http2-data-type+
+                                         http-kit/http2::+http2-end-stream-flag+
+                                         (aref stream-ids 0)
+                                         (ascii "response-first"))
+                                        server-stream)
+                                       (write-sequence
+                                        (http-kit/http2::%h2-frame-wire
+                                         http-kit/http2::+http2-data-type+
+                                         http-kit/http2::+http2-end-stream-flag+
+                                         (aref stream-ids 1)
+                                         (ascii "second"))
+                                        server-stream)
+                                       (finish-output server-stream)))
+                               (error (condition)
+                                 (setf server-error condition)))
+                          (%network-test-close-stream server-stream)
+                          (%network-test-close-socket server-socket))
+                      :name "HTTP/2 scheduler E2E server"))
+               (setf client-stream
+                     (open-http-tcp-stream
+                      (make-http-request
+                       :method "GET"
+                       :uri (format nil "http://127.0.0.1:~D/first" port))
+                      :timeout 5)
+                     connection
+                     (make-http2-connection
+                      :stream client-stream
+                      :close-stream #'close))
+               (start-caller
+                0 "first" 6
+                (lambda (information-response)
+                  (when (= (http-response-status information-response) 103)
+                    (handler-case
+                        (progn
+                          (setf ping-response
+                                (ping-http2-connection
+                                 connection :payload ping-payload :timeout 4))
+                          (setf nested-response
+                                (send-http2-request-over-connection
+                                 connection
+                                 (make-http-request
+                                  :method "GET"
+                                  :uri (format nil "http://127.0.0.1:~D/nested" port))
+                                 :timeout 4)))
+                      (error (condition)
+                        (setf nested-error condition))))))
+               (wait-for-callers 1)
+               (start-caller 1 "second" 6)
+               (wait-for-callers 2)
+               (start-caller
+                2 "timeout" 2 nil
+                (lambda (payload)
+                  (when (equalp payload (ascii "partial-timeout-body"))
+                    (setf timeout-body-chunk-seen-p t))))
+               (wait-for-callers 3)
+               (loop for thread across caller-threads
+                     when thread do (sb-thread:join-thread thread))
+               (sb-thread:join-thread server-thread)
+               (ensure-equal nil server-error)
+               (ensure-equal nil (aref caller-errors 0))
+               (ensure-equal nil (aref caller-errors 1))
+               (ensure-true (typep (aref caller-errors 2) 'http-kit:http-timeout))
+               (ensure-equal nil nested-error)
+               (ensure-true both-requests-before-response-p)
+               (ensure-true nested-request-seen-p)
+               (ensure-true ping-ack-sent-p)
+               (ensure-true late-data-sent-p)
+               (ensure-true partial-data-flow-credit-seen-p)
+               (ensure-true late-data-flow-credit-seen-p)
+               (ensure-true timeout-body-chunk-seen-p)
+               (ensure-true timeout-reset-seen-p)
+               (ensure-true timeout-entry)
+               (ensure-equal
+                0
+                (length
+                 (http-kit/http2::%h2-batch-entry-body-vector timeout-entry)))
+               (ensure-equal
+                0
+                (http-kit/http2::%h2-batch-entry-body-length timeout-entry))
+               (ensure-equal nil
+                             (http-kit/http2::%h2-batch-entry-response timeout-entry))
+               (ensure-equal nil
+                             (http-kit/http2::%h2-scheduler-entry-for-stream
+                              connection (aref stream-ids 2)))
+               (ensure-octets-equal ping-payload ping-response)
+               (ensure-equal 200 (http-response-status (aref responses 0)))
+               (ensure-equal 200 (http-response-status (aref responses 1)))
+               (ensure-equal 200 (http-response-status nested-response))
+               (ensure-octets-equal
+                (ascii "response-first")
+                (http-response-body (aref responses 0)))
+               (ensure-octets-equal
+                (ascii "response-second")
+                (http-response-body (aref responses 1)))
+               (ensure-octets-equal
+                (ascii "nested-response")
+                (http-response-body nested-response)))
+          (when connection
+            (ignore-errors (close-http2-connection connection)))
+          (%network-test-close-stream client-stream)
+          (%network-test-close-stream server-stream)
+          (%network-test-close-socket server-socket)
+          (%network-test-close-socket listener)
+          (when server-thread
+            (ignore-errors (sb-thread:join-thread server-thread)))
+          (loop for thread across caller-threads
+                when thread do (ignore-errors (sb-thread:join-thread thread)))))))))))
+
