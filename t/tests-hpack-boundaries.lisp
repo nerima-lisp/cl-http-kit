@@ -166,7 +166,7 @@
               (list (octets #x1f #xff #xff #xff #xff #x10) 0 5
                     "An HPACK integer is too large." #x1000001e)
               (list (octets #x1f #xff #xff #xff #xff #x0f) 0 5
-                    "An HPACK integer is too large." #x10000001e)))
+                    "An HPACK integer is too large." #x1000001e)))
       (destructuring-bind (wire position prefix-bits message detail) case
         (assert-error
          (capture
