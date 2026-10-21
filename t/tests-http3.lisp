@@ -2173,6 +2173,9 @@
            (make-http-request :method "GET" :uri "https://example.test/"))
          (client
            (http-kit/http3::%make-http3-client
+            :qpack-encoder-context
+            (http-message-kit:make-qpack-context
+             :max-table-capacity 0 :table-capacity 0 :huffman nil)
             :qpack-decoder-context owned-table
             :qpack-http3-decoder-context owned-adapter
             :open-stream
