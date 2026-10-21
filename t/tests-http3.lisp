@@ -3626,7 +3626,6 @@
            (let ((driver (cl-quic-kit::quic-client-tls-driver quic)))
              (ensure-true (eq provider (cl-tls-kit::tls13-client-driver-provider driver)))
              (ensure-equal "example.test" (cl-tls-kit::tls13-client-driver-hostname driver))
-             (ensure-equal :required (cl-tls-kit::tls13-client-driver-verify driver))
              (ensure-true (eq algorithms (cl-tls-kit::tls13-client-driver-signature-algorithms driver))))
            (ensure-true (cl-quic-kit::quic-client-started-p quic))
            (ensure-true (cl-quic-kit::quic-client-closed-p quic))

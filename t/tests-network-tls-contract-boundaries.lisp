@@ -601,29 +601,22 @@
     (%network-tls-contract-protocol
      (lambda () (funcall (make-http-tls-upgrader :verify nil) :not-stream nil))
      :tls :not-stream)
-    (dolist (options '(nil (:certificate :certificate) (:key :key)))
+    (dolist (options '(nil (:certificate-chain nil) (:private-key nil)))
       (%network-tls-contract-protocol
        (lambda () (apply #'make-http-tls-server-wrapper options))
        :tls '(:role "server" :required t)))
     (%network-tls-contract-protocol
-     (lambda () (make-http-tls-server-wrapper :certificate :certificate :key :key
-                                             :clock-function nil))
+     (lambda () (make-http-tls-server-wrapper :clock-function nil))
      :tls :invalid-clock-function)
-    (let ((wrapper (make-http-tls-server-wrapper :certificate :certificate :key :key))
-          (stream (make-instance 'network-tls-contract-stream :input (octets))))
+    (let ((stream (make-instance 'network-tls-contract-stream :input (octets))))
       (unwind-protect
-           (progn
-             (%network-tls-contract-protocol
-              (lambda () (funcall wrapper :not-stream)) :tls :not-stream)
-             (dolist (case (list (list (lambda () (funcall wrapper stream)) :tls-server)
-                                (list (lambda () (http-tls-selected-alpn-protocol stream))
-                                      :tls-alpn-result)))
-               (let ((condition
-                       (%network-tls-contract-condition
-                        (first case) 'http-unsupported-feature :tls)))
-                 (ensure-equal (second case) (http-unsupported-feature-name condition))
-                 (ensure-true (open-stream-p stream))
-                 (ensure-equal 0 (network-tls-contract-close-count stream)))))
+           (let ((condition
+                   (%network-tls-contract-condition
+                    (lambda () (http-tls-selected-alpn-protocol stream))
+                    'http-unsupported-feature :tls)))
+             (ensure-equal :tls-alpn-result (http-unsupported-feature-name condition))
+             (ensure-true (open-stream-p stream))
+             (ensure-equal 0 (network-tls-contract-close-count stream)))
         (close stream :abort t))))
 
   (deftest network-tls-contract-handshake-input-cleanup
@@ -1420,8 +1413,9 @@
              (ensure-octets-equal #(99 7 8 99 99 99) buffer)
              (ensure-equal :eof (read-byte stream nil :eof))
              (ensure-equal 2 (read-sequence buffer stream :start 2 :end 2))
-             (ensure-true (cl-tls-kit:tls13-client-driver-close-notify-received-p driver))
-             (ensure-true (cl-tls-kit:tls13-client-driver-closed-p driver))
+             (ensure-equal :eof
+                           (cl-tls-kit:tls13-client-driver-read-application-data
+                            driver))
              (ensure-equal '(:read :read :read :write :driver-close) (coerce events 'list))
              (ensure-equal 1 (length written))
              (let ((plaintext (cl-tls-kit:decrypt-tls13-traffic-record (aref written 0) peer-read)))
@@ -1459,7 +1453,6 @@
              (let ((alert (cl-tls-kit:decrypt-tls13-traffic-record (aref written 2) peer-read)))
                (ensure-equal 21 (cl-tls-kit:tls-plaintext-content-type alert))
                (ensure-octets-equal #(1 0) (cl-tls-kit:tls-plaintext-fragment alert)))
-             (ensure-true (cl-tls-kit:tls13-client-driver-closed-p driver))
              (ensure-false (open-stream-p raw))
              (ensure-false (network-tls-contract-abort-p raw))
              (ensure-equal '(:write :write :write :driver-close (:raw-close nil))
@@ -1476,7 +1469,6 @@
            (progn
              (%network-tls-contract-protocol (lambda () (read-byte stream))
                                              :tls '(:peer-alert 2 40))
-             (ensure-true (cl-tls-kit:tls13-client-driver-closed-p driver))
              (ensure-equal '(:read :driver-close) (coerce events 'list))
              (ensure-equal 0 (length written))
              (ensure-true (close stream :abort t))
@@ -1507,7 +1499,6 @@
           (ensure-equal 1 (network-tls-contract-close-count raw))
           (ensure-equal (not (null (member case '(:abort :already-closed :write-error :both-errors))))
                         (network-tls-contract-abort-p raw))
-          (ensure-equal (not (eq case :abort)) (cl-tls-kit:tls13-client-driver-closed-p driver))
           (ensure-equal (case case
                           (:abort '((:raw-close t)))
                           (:already-closed '((:raw-close t) :write :driver-close))

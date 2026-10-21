@@ -119,11 +119,13 @@
   :author "nerima-lisp"
   :license "MIT"
   :version "0.4.1"
-  :depends-on ("cl-http-kit/network" (:version "cl-tls-kit" "0.1.2")
+  :depends-on ("cl-http-kit/network" "cl-http-kit/http2"
+               (:version "cl-tls-kit" "0.1.0")
                "cl-crypto-kit")
   :pathname "network"
   :serial t
-  :components ((:file "tls")))
+  :components ((:file "tls")
+               (:file "server")))
 
 (asdf:defsystem "cl-http-kit/http3"
   :description "Optional HTTP/3 framing, QPACK, and injected QUIC transport boundary."
@@ -226,6 +228,8 @@
                (:file "tests-runtime-coverage-boundaries")
                (:file "tests-network")
                (:file "tests-network-tls-contract-boundaries")
+               (:file "tests-network-tls-server")
+               (:file "tests-https-listener")
                (:file "runner"))
   :perform (asdf:test-op (op c)
              (declare (ignore op c))
