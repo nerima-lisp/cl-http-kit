@@ -4932,8 +4932,23 @@
      204
      (http-response-status
       (funcall transport request :max-header-bytes 512)))
-    (signals http-protocol-error
-      (funcall transport request :max-header-bytes 1))
+    (let ((caught
+            (handler-case
+                (progn
+                  (funcall transport request :max-header-bytes 1)
+                  nil)
+              (http-connection-error (condition) condition))))
+      (ensure-true (typep caught 'http-connection-error))
+      (when (typep caught 'http-connection-error)
+        (let* ((cause (http-connection-error-cause caught))
+               (detail (http-protocol-error-detail cause))
+               (size-error (second detail)))
+          (ensure-true (typep cause 'http-protocol-error))
+          (ensure-equal :qpack-decompression-failed (first detail))
+          (ensure-true (typep size-error 'http-size-limit-exceeded))
+          (ensure-equal :headers (http-size-limit-exceeded-kind size-error))
+          (ensure-equal 1 (http-size-limit-exceeded-limit size-error))
+          (ensure-true (> (http-size-limit-exceeded-observed size-error) 1)))))
     (ensure-equal 1 opened)
     (signals http-size-limit-exceeded
       (funcall transport request :max-fields 1))
