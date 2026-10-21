@@ -558,7 +558,9 @@
          (opener (make-http-proxy-stream-opener
                   (lambda (seen &key timeout deadline proxy-plan proxy)
                     (ensure-true (eq request seen))
-                    (ensure-true (eq plan proxy-plan))
+                    (ensure-true
+                     (and (eq (getf proxy-plan :mode) :connect)
+                          (eq (getf proxy-plan :proxy) proxy)))
                     (ensure-equal "proxy.test" (http-proxy-host proxy))
                     (ensure-equal 3 timeout)
                     (ensure-equal 10 deadline)
@@ -632,7 +634,7 @@
       (unwind-protect
            (progn
              (ensure-true (eq stream (funcall opener request :timeout 3 :deadline 10
-                                             :proxy-plan plan :proxy proxy)))
+                                             :proxy-plan plan)))
              (ensure-equal 1 opened)
              (ensure-equal 0 closed)
              (ensure-true (open-stream-p stream))
