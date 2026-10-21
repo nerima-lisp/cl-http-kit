@@ -2902,12 +2902,16 @@ is NIL if parsing failed before the request model was constructed."
                                               on-qpack-section-acknowledgment
                                               acknowledged-stream-id))
                                            max-header-bytes max-fields)
-                                          (http-message-kit:qpack-decode-header-block
-                                           payload
-                                           :context qpack-decoder-context
-                                           :stream-id stream-id
-                                           :max-header-bytes max-header-bytes
-                                           :max-fields max-fields))))
+                                          (mapcar
+                                           (lambda (header)
+                                             (cons (http-message-kit:http-header-name header)
+                                                   (http-message-kit:http-header-content header)))
+                                           (http-message-kit:qpack-decode-header-block
+                                            payload
+                                            :context qpack-decoder-context
+                                            :stream-id stream-id
+                                            :max-header-bytes max-header-bytes
+                                            :max-fields max-fields)))))
                                 (if (not request-headers-seen-p)
                                     (progn
                                       (multiple-value-bind
