@@ -210,6 +210,6 @@
                     8)
               (list (octets #x1e)
                     "An HPACK Huffman string has invalid padding."
-                    #x1e)))
+                    6)))
       (destructuring-bind (wire message detail) case
         (assert-error (decode-error wire) message detail)))))
