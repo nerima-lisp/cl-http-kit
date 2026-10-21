@@ -871,6 +871,9 @@
            :write-stream
            (lambda (stream bytes &key fin-p timeout deadline)
              (declare (ignore stream bytes fin-p timeout deadline)))
+           :close-stream
+           (lambda (stream &key condition)
+             (declare (ignore stream condition)))
            :qpack-encoder-context encoder-context
            :qpack-decoder-context decoder-context
            :qpack-http3-decoder-context adapter))
