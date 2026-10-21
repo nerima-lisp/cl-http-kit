@@ -95,10 +95,9 @@
   (qpack-max-instruction-bytes
    +http3-default-qpack-max-instruction-bytes+ :type integer)
   (qpack-max-buffer-bytes +http3-default-qpack-max-buffer-bytes+ :type integer)
-  qpack-encoder-table
-  qpack-decoder-table
+  qpack-encoder-context
   qpack-decoder-context
-  qpack-decoder-state
+  qpack-http3-decoder-context
   (serialize (lambda (thunk) (funcall thunk)) :type function)
   (max-frame-size #x4000 :type integer)
   (max-header-bytes 65536 :type integer)
@@ -109,6 +108,7 @@
   (cancelled-push-ids '())
   (consumed-push-ids '())
   (qpack-settings nil)
+  (peer-qpack-settings-applied-p nil :type boolean)
   (open-p t))
 
 (defun make-http3-client
@@ -259,11 +259,10 @@ only supplies the HTTP/3 stream and codec layer."
                    (or (cdr (assoc +http3-setting-qpack-blocked-streams+
                                    settings))
                        0))
-                 (encoder-table
-                   (make-qpack-dynamic-table :max-capacity 0 :capacity 0))
-                 (decoder-table
-                   (make-qpack-dynamic-table
-                    :max-capacity decoder-capacity :capacity 0)))
+                 (encoder-context
+                   (http-message-kit:make-qpack-context :max-table-capacity 0 :table-capacity 0 :max-blocked-streams 0 :huffman nil))
+                 (decoder-context
+                   (http-message-kit:make-qpack-context :max-table-capacity decoder-capacity :table-capacity 0 :max-blocked-streams blocked-stream-limit :max-header-list-size max-header-bytes :huffman nil)))
           (%make-http3-client
            :open-stream open-stream
            :write-stream write-stream
@@ -275,18 +274,15 @@ only supplies the HTTP/3 stream and codec layer."
            :qpack-decoder-stream qpack-decoder-stream
            :peer-control-stream peer-control-stream
            :peer-control-state (make-http3-control-state :peer-role :server)
-           :peer-control-buffer (make-array 0 :element-type '(unsigned-byte 8))
+           :peer-control-buffer (make-array 0 :element-type (quote (unsigned-byte 8)))
            :peer-control-prefix-seen-p nil
            :peer-control-fin-p nil
-           :peer-qpack-encoder-buffer (make-array 0 :element-type '(unsigned-byte 8))
-           :peer-qpack-decoder-buffer (make-array 0 :element-type '(unsigned-byte 8))
-           :qpack-encoder-table encoder-table
-           :qpack-decoder-table decoder-table
-           :qpack-decoder-context
-           (make-http3-qpack-decoder-context
-            decoder-table :blocked-stream-limit blocked-stream-limit)
-           :qpack-decoder-state
-           (make-qpack-decoder-stream-state encoder-table)
+           :peer-qpack-encoder-buffer (make-array 0 :element-type (quote (unsigned-byte 8)))
+           :peer-qpack-decoder-buffer (make-array 0 :element-type (quote (unsigned-byte 8)))
+           :qpack-encoder-context encoder-context
+           :qpack-decoder-context decoder-context
+           :qpack-http3-decoder-context
+           (http-message-kit:qpack-make-http3-decoder-context decoder-context :max-blocked-streams blocked-stream-limit)
            :serialize serialize
            :max-frame-size max-frame-size
            :max-header-bytes max-header-bytes
@@ -297,11 +293,12 @@ only supplies the HTTP/3 stream and codec layer."
            :qpack-max-instruction-bytes qpack-max-instruction-bytes
            :qpack-max-buffer-bytes qpack-max-buffer-bytes
            :max-push-id max-push-id
-           :promised-push-ids '()
-           :push-promises '()
-           :cancelled-push-ids '()
-           :consumed-push-ids '()
+           :promised-push-ids (quote ())
+           :push-promises (quote ())
+           :cancelled-push-ids (quote ())
+           :consumed-push-ids (quote ())
            :qpack-settings settings
+           :peer-qpack-settings-applied-p nil
            :open-p t)))
       (error (condition)
         (dolist (stream (remove nil (list control-stream
@@ -562,26 +559,40 @@ critical stream becomes readable again."
        (push push-id (http3-client-cancelled-push-ids client)))))
   client)
 
-(defun close-http3-client (client &key condition)
-  (unless (http3-client-p client)
-    (%h3-transport-error "CLOSE-HTTP3-CLIENT requires an HTTP/3 client."
-                         (type-of client)))
-  (when (http3-client-open-p client)
-    (setf (http3-client-open-p client) nil)
-    (dolist (stream
-              (remove-duplicates
-               (remove nil
-                       (list (http3-client-control-stream client)
-                             (http3-client-qpack-encoder-stream client)
-                             (http3-client-qpack-decoder-stream client)
-                             (http3-client-peer-control-stream client)
-                             (http3-client-peer-qpack-encoder-stream client)
-                             (http3-client-peer-qpack-decoder-stream client)))
-               :test #'eq))
-      (funcall (http3-client-close-stream client)
-               stream
-               :condition condition)))
-  t)
+(progn
+  (defun %close-http3-client-serialized (client condition)
+    (when (http3-client-open-p client)
+      (let ((decoder (http3-client-qpack-http3-decoder-context client)))
+        (when decoder
+          (http-kit::%with-http-cleanup
+            (http-message-kit:qpack-close-http3-decoder-context decoder))))
+      (setf (http3-client-open-p client) nil
+            (http3-client-qpack-encoder-context client) nil
+            (http3-client-qpack-decoder-context client) nil
+            (http3-client-qpack-http3-decoder-context client) nil)
+      (dolist (stream
+                (remove-duplicates
+                 (remove nil
+                         (list (http3-client-control-stream client)
+                               (http3-client-qpack-encoder-stream client)
+                               (http3-client-qpack-decoder-stream client)
+                               (http3-client-peer-control-stream client)
+                               (http3-client-peer-qpack-encoder-stream client)
+                               (http3-client-peer-qpack-decoder-stream client)))
+                 :test (function eq)))
+        (funcall (http3-client-close-stream client)
+                 stream
+                 :condition condition)))
+    t)
+  (defun close-http3-client (client &key condition)
+    (unless (http3-client-p client)
+      (%h3-transport-error "CLOSE-HTTP3-CLIENT requires an HTTP/3 client."
+                           (type-of client)))
+    (%call-http3-serialized
+     client
+     (lambda ()
+       (%close-http3-client-serialized client condition)))
+    t))
 
 (defun %h3-consume-control-prefix (buffer prefix-seen-p)
   (if prefix-seen-p
@@ -682,23 +693,34 @@ HTTP3-CLIENT-PEER-CONTROL-STATE."
                  :max-frame-size (http3-client-max-frame-size client))
               (setf events new-events
                     buffer frame-remainder))))
-        (when (http3-control-state-settings-received-p
-               (http3-client-peer-control-state client))
+        (when (and (http3-control-state-settings-received-p
+                    (http3-client-peer-control-state client))
+                   (not (http3-client-peer-qpack-settings-applied-p client)))
           (%call-http3-serialized
            client
            (lambda ()
-             (setf (qpack-dynamic-table-max-capacity
-                    (http3-client-qpack-encoder-table client))
-                   (or (cdr (assoc +http3-setting-qpack-max-table-capacity+
-                                   (http3-control-state-settings
-                                    (http3-client-peer-control-state client))))
-                       0)
-                   (qpack-decoder-stream-state-blocked-stream-limit
-                    (http3-client-qpack-decoder-state client))
-                   (or (cdr (assoc +http3-setting-qpack-blocked-streams+
-                                   (http3-control-state-settings
-                                    (http3-client-peer-control-state client))))
-                       0)))))
+             (let* ((settings
+                      (http3-control-state-settings
+                       (http3-client-peer-control-state client)))
+                    (blocked-stream-limit
+                      (or (cdr (assoc +http3-setting-qpack-blocked-streams+
+                                      settings))
+                          0))
+                    (encoder-context
+                      (http-message-kit:make-qpack-context
+                       :max-table-capacity 0
+                       :table-capacity 0
+                       :max-blocked-streams blocked-stream-limit
+                       :huffman nil)))
+               (http-message-kit:qpack-context-set-max-table-capacity
+                encoder-context
+                (or (cdr (assoc +http3-setting-qpack-max-table-capacity+
+                                settings))
+                    0))
+               (setf (http3-client-qpack-encoder-context client)
+                     encoder-context
+                     (http3-client-peer-qpack-settings-applied-p client)
+                     t)))))
         (when ended-p
           (unless (http3-client-peer-control-prefix-seen-p client)
             (%http3-control-error
@@ -717,46 +739,70 @@ HTTP3-CLIENT-PEER-CONTROL-STATE."
         (setf (http3-client-peer-control-buffer client) buffer)
         (values events ended-p)))))
 
+(defun %h3-write-client-qpack-transaction
+    (client prepare write result-function)
+  (let ((failure nil)
+        (result nil))
+    (%call-http3-serialized
+     client
+     (lambda ()
+       (multiple-value-bind (octets transaction) (funcall prepare)
+         (handler-case
+             (funcall write octets)
+           (error (condition)
+             (setf failure condition)
+             (http-kit::%with-http-cleanup
+               (http-message-kit:qpack-abort-encoding transaction))
+             (http-kit::%with-http-cleanup
+               (%close-http3-client-serialized client condition))))
+         (unless failure
+           (handler-case
+               (progn
+                 (http-message-kit:qpack-commit-encoding transaction)
+                 (setf result (funcall result-function)))
+             (error (condition)
+               (setf failure condition)
+               (http-kit::%with-http-cleanup
+                 (%close-http3-client-serialized client condition))))))))
+    (when failure
+      (error failure))
+    result))
+
 (defun http3-client-set-qpack-capacity
     (client capacity &key timeout deadline)
-  "Set CLIENT's encoder capacity and notify the peer over its QPACK stream."
+  "Set the encoder capacity for the client and notify the peer over its QPACK stream."
   (unless (and (http3-client-p client) (http3-client-open-p client))
     (%h3-transport-error "A live HTTP/3 client is required."))
-  (%call-http3-serialized
+  (%h3-write-client-qpack-transaction
    client
    (lambda ()
-     (let ((stream (http3-client-qpack-encoder-stream client))
-           (table (http3-client-qpack-encoder-table client)))
-       (qpack-dynamic-table-set-capacity
-        (copy-qpack-dynamic-table table) capacity)
-       (let ((instruction (qpack-encode-set-dynamic-table-capacity capacity)))
-         (funcall (http3-client-write-stream client)
-                  stream instruction :fin-p nil
-                  :timeout timeout :deadline deadline))
-       (qpack-dynamic-table-set-capacity table capacity)
-       client))))
+     (http-message-kit:qpack-prepare-set-capacity
+      (http3-client-qpack-encoder-context client)
+      capacity))
+   (lambda (octets)
+     (funcall (http3-client-write-stream client)
+              (http3-client-qpack-encoder-stream client)
+              octets :fin-p nil :timeout timeout :deadline deadline))
+   (lambda () client)))
 
 (defun http3-client-insert-qpack-field
     (client name value &key timeout deadline)
-  "Insert NAME and VALUE into CLIENT's encoder table and notify the peer."
+  "Insert a field for the peer and return the committed insert count."
   (unless (and (http3-client-p client) (http3-client-open-p client))
     (%h3-transport-error "A live HTTP/3 client is required."))
-  (%call-http3-serialized
+  (%h3-write-client-qpack-transaction
    client
    (lambda ()
-     (let ((stream (http3-client-qpack-encoder-stream client))
-           (table (http3-client-qpack-encoder-table client)))
-       (qpack-dynamic-table-insert
-        (copy-qpack-dynamic-table table) name value)
-       (let ((instruction (qpack-encode-insert-with-literal-name name value)))
-         (funcall (http3-client-write-stream client)
-                  stream instruction :fin-p nil
-                  :timeout timeout :deadline deadline))
-       (let ((entry (qpack-dynamic-table-insert table name value)))
-         (qpack-decoder-stream-state-note-insertions-sent
-          (http3-client-qpack-decoder-state client)
-          (qpack-dynamic-table-insert-count table))
-         entry)))))
+     (http-message-kit:qpack-prepare-insert-with-literal-name
+      (http3-client-qpack-encoder-context client)
+      name value))
+   (lambda (octets)
+     (funcall (http3-client-write-stream client)
+              (http3-client-qpack-encoder-stream client)
+              octets :fin-p nil :timeout timeout :deadline deadline))
+   (lambda ()
+     (http-message-kit:qpack-context-insert-count
+      (http3-client-qpack-encoder-context client)))))
 
 (defun attach-http3-peer-qpack-encoder-stream (client stream)
   "Attach the peer's single QPACK encoder stream to CLIENT."
@@ -797,52 +843,55 @@ HTTP3-CLIENT-PEER-CONTROL-STATE."
           (%call-http3-serialized
            client
            (lambda ()
-         (let ((buffer (http3-client-peer-qpack-encoder-buffer client))
-               (events '())
-               (ended-p (or fin-p (null chunk))))
-           (when chunk
-             (unless (%http3-octet-vector-p chunk)
-               (%h3-transport-error "QPACK stream reads must return octets."))
-             (setf buffer (%http3-concatenate-octets buffer chunk))
-             (%h3-check-state-bytes client))
-           (multiple-value-bind (seen-p remainder)
-               (%h3-consume-stream-prefix
-                buffer
-                (http3-client-peer-qpack-encoder-prefix-seen-p client)
-                +http3-qpack-encoder-stream-type+
-                :qpack-encoder-stream-error)
-             (setf (http3-client-peer-qpack-encoder-prefix-seen-p client) seen-p
-                   buffer remainder)
-             (when seen-p
-               (handler-case
-                   (multiple-value-bind (new-events consumed)
-                       (qpack-process-encoder-stream
-                        (http3-client-qpack-decoder-table client)
-                        buffer :allow-incomplete-p t
-                        :max-instruction-bytes
-                        (http3-client-qpack-max-instruction-bytes client)
-                        :max-buffer-bytes
-                        (http3-client-qpack-max-buffer-bytes client))
-                     (setf events new-events
-                           buffer (subseq buffer consumed)))
-                 (http-protocol-error (condition)
-                   (%h3-qpack-stream-error condition
-                                           :qpack-encoder-stream-error)))))
-           (when ended-p
-             (setf (http3-client-peer-qpack-encoder-fin-p client) t)
-             (when (or (not (http3-client-peer-qpack-encoder-prefix-seen-p client))
-                       (plusp (length buffer)))
-               (%h3-transport-error
-                "The peer QPACK encoder stream ended with truncated input."
-                :qpack-encoder-stream-error))
-             (%h3-transport-error
-              "The peer closed the QPACK encoder stream."
-              :h3-closed-critical-stream))
-           (setf (http3-client-peer-qpack-encoder-buffer client) buffer)
-           (%h3-check-state-bytes client)
-             (values events ended-p
-                     (%http3-qpack-detach-ready-streams
-                      (http3-client-qpack-decoder-context client))))))
+             (let ((buffer (http3-client-peer-qpack-encoder-buffer client))
+                   (events '())
+                   (ended-p (or fin-p (null chunk))))
+               (when chunk
+                 (unless (%http3-octet-vector-p chunk)
+                   (%h3-transport-error "QPACK stream reads must return octets."))
+                 (setf buffer (%http3-concatenate-octets buffer chunk))
+                 (%h3-check-state-bytes client))
+               (multiple-value-bind (seen-p remainder)
+                   (%h3-consume-stream-prefix
+                    buffer
+                    (http3-client-peer-qpack-encoder-prefix-seen-p client)
+                    +http3-qpack-encoder-stream-type+
+                    :qpack-encoder-stream-error)
+                 (setf (http3-client-peer-qpack-encoder-prefix-seen-p client)
+                       seen-p
+                       buffer remainder)
+                 (when seen-p
+                   (handler-case
+                       (multiple-value-bind (new-events consumed)
+                           (http-message-kit:qpack-decode-encoder-stream
+                            (http3-client-qpack-decoder-context client)
+                            buffer
+                            :allow-incomplete-p t
+                            :max-instruction-bytes
+                            (http3-client-qpack-max-instruction-bytes client)
+                            :max-buffer-bytes
+                            (http3-client-qpack-max-buffer-bytes client))
+                         (setf events new-events
+                               buffer (subseq buffer consumed)))
+                     (http-protocol-error (condition)
+                       (%h3-qpack-stream-error
+                        condition :qpack-encoder-stream-error)))))
+               (when ended-p
+                 (setf (http3-client-peer-qpack-encoder-fin-p client) t)
+                 (when (or (not (http3-client-peer-qpack-encoder-prefix-seen-p
+                                 client))
+                           (plusp (length buffer)))
+                   (%h3-transport-error
+                    "The peer QPACK encoder stream ended with truncated input."
+                    :qpack-encoder-stream-error))
+                 (%h3-transport-error
+                  "The peer closed the QPACK encoder stream."
+                  :h3-closed-critical-stream))
+               (setf (http3-client-peer-qpack-encoder-buffer client) buffer)
+               (%h3-check-state-bytes client)
+               (values events ended-p
+                       (http-message-kit:qpack-take-ready-streams
+                        (http3-client-qpack-http3-decoder-context client))))))
         (values (nconc events
                        (mapcar (lambda (blocked)
                                  (list :qpack-stream-unblocked blocked))
@@ -874,23 +923,25 @@ HTTP3-CLIENT-PEER-CONTROL-STATE."
                 (http3-client-peer-qpack-decoder-prefix-seen-p client)
                 +http3-qpack-decoder-stream-type+
                 :qpack-decoder-stream-error)
-             (setf (http3-client-peer-qpack-decoder-prefix-seen-p client) seen-p
+             (setf (http3-client-peer-qpack-decoder-prefix-seen-p client)
+                   seen-p
                    buffer remainder)
              (when seen-p
                (handler-case
                    (multiple-value-bind (new-events consumed)
-                       (qpack-process-decoder-stream
-                        buffer :allow-incomplete-p t
+                       (http-message-kit:qpack-decode-decoder-stream
+                        (http3-client-qpack-encoder-context client)
+                        buffer
+                        :allow-incomplete-p t
                         :max-instruction-bytes
                         (http3-client-qpack-max-instruction-bytes client)
                         :max-buffer-bytes
-                        (http3-client-qpack-max-buffer-bytes client)
-                        :state (http3-client-qpack-decoder-state client))
+                        (http3-client-qpack-max-buffer-bytes client))
                      (setf events new-events
                            buffer (subseq buffer consumed)))
                  (http-protocol-error (condition)
-                   (%h3-qpack-stream-error condition
-                                           :qpack-decoder-stream-error)))))
+                   (%h3-qpack-stream-error
+                    condition :qpack-decoder-stream-error)))))
            (when ended-p
              (setf (http3-client-peer-qpack-decoder-fin-p client) t)
              (when (or (not (http3-client-peer-qpack-decoder-prefix-seen-p client))
@@ -1296,70 +1347,145 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
           (%h3-invalid-header
            "content-length" "content-length does not match the response body."))))))
 
+(defun %h3-write-client-qpack-section-ack-serialized
+    (client stream-id timeout deadline)
+  (let ((stream (http3-client-qpack-decoder-stream client)))
+    (unless stream
+      (%h3-transport-error "The client QPACK decoder stream is unavailable."))
+    (handler-case
+        (funcall (http3-client-write-stream client)
+                 stream
+                 (http-message-kit:qpack-encode-section-ack stream-id)
+                 :fin-p nil :timeout timeout :deadline deadline)
+      (error (condition)
+        (http-kit::%with-http-cleanup
+          (%close-http3-client-serialized client condition))
+        (error condition)))))
+
 (defun %h3-decode-dynamic-field-section
-    (payload context stream-id await-qpack serialize
-     max-header-bytes max-fields)
-  (let ((decoded nil)
-        (decoded-p nil))
-    (flet ((section-decoded (fields)
-             ;; QPACK consumes a ready token before invoking its decode callback.
-             (setf decoded fields
-                   decoded-p t)))
-      (let ((result
-              (decode-http3-qpack-field-section
-               payload context stream-id
-               :serialize serialize
-               :on-decoded #'section-decoded
-               :max-header-bytes max-header-bytes
-               :max-fields max-fields)))
-        (when (http3-qpack-blocked-stream-p result)
-          (funcall await-qpack result))
-        (unless decoded-p
-          (%h3-transport-error
-           "The QPACK await callback returned before decoding completed."
-           stream-id))
-        decoded))))
+    (payload context stream-id await-qpack serialize role
+     on-section-acknowledgment max-header-bytes max-fields
+     &key serialize-whole-operation-p serialize-guard)
+  (let* ((inside-operation-p (list nil))
+         (serialized-decode
+           (if serialize-whole-operation-p
+               (lambda (thunk)
+                 (if (car inside-operation-p)
+                     (progn
+                       (when serialize-guard
+                         (funcall serialize-guard))
+                       (funcall thunk))
+                     (funcall
+                      serialize
+                      (lambda ()
+                        (when serialize-guard
+                          (funcall serialize-guard))
+                        (funcall thunk)))))
+               serialize))
+         (serialized-acknowledgment
+           (if (and serialize-whole-operation-p
+                    on-section-acknowledgment)
+               (lambda (acknowledged-stream-id)
+                 (if (car inside-operation-p)
+                     (progn
+                       (when serialize-guard
+                         (funcall serialize-guard))
+                       (funcall on-section-acknowledgment
+                                acknowledged-stream-id))
+                     (funcall
+                      serialize
+                      (lambda ()
+                        (when serialize-guard
+                          (funcall serialize-guard))
+                        (funcall on-section-acknowledgment
+                                 acknowledged-stream-id)))))
+               on-section-acknowledgment))
+         (decode
+           (lambda ()
+             (if serialize-whole-operation-p
+                 (unwind-protect
+                      (progn
+                        (setf (car inside-operation-p) t)
+                        (when serialize-guard
+                          (funcall serialize-guard))
+                        (http-message-kit:qpack-decode-http3-field-section
+                         payload context stream-id
+                         :role role
+                         :serialize serialized-decode
+                         :on-section-acknowledgment
+                         serialized-acknowledgment
+                         :max-header-bytes max-header-bytes
+                         :max-fields max-fields))
+                   (setf (car inside-operation-p) nil))
+                 (http-message-kit:qpack-decode-http3-field-section
+                  payload context stream-id
+                  :role role
+                  :serialize serialized-decode
+                  :on-section-acknowledgment
+                  serialized-acknowledgment
+                  :max-header-bytes max-header-bytes
+                  :max-fields max-fields))))
+         (result
+           (if serialize-whole-operation-p
+               (funcall serialize decode)
+               (funcall decode))))
+    (when (http-message-kit:qpack-blocked-stream-p result)
+      (unless (functionp await-qpack)
+        (%h3-transport-error
+         "A blocked QPACK field section requires an await-qpack callback."
+         stream-id))
+      (setf result (funcall await-qpack result))
+      (unless (listp result)
+        (%h3-transport-error
+         "The await-qpack callback must return decoded headers."
+         stream-id)))
+    result))
 
 (defun %h3-decode-response-field-section
-    (client payload qpack-decoder-table
-     &key qpack-decoder-context stream-id await-qpack max-header-bytes max-fields)
+    (client payload qpack-http3-decoder-context
+     &key stream-id await-qpack role max-header-bytes max-fields
+       timeout deadline)
   (let ((header-limit
           (min (or max-header-bytes most-positive-fixnum)
                (http3-client-max-header-bytes client)))
         (field-limit
           (min (or max-fields most-positive-fixnum)
                (http3-client-max-fields client))))
-    (if qpack-decoder-context
-        (%h3-decode-dynamic-field-section
-         payload qpack-decoder-context stream-id await-qpack
-         (http3-client-serialize client)
-         header-limit field-limit)
-        (flet ((decode ()
-                 (qpack-decode-field-section
-                  payload
-                  :max-header-bytes header-limit
-                  :max-fields field-limit
-                  :dynamic-table qpack-decoder-table)))
-          (if (eq qpack-decoder-table
-                  (http3-client-qpack-decoder-table client))
-              (%call-http3-serialized client #'decode)
-              (decode))))))
+    (unless (and (integerp stream-id) (>= stream-id 0))
+      (%h3-transport-error
+       "Dynamic QPACK field decoding requires a numeric stream ID."
+       stream-id))
+    (%h3-decode-dynamic-field-section
+     payload qpack-http3-decoder-context stream-id await-qpack
+     (http3-client-serialize client) role
+     (lambda (acknowledged-stream-id)
+       (unless (= acknowledged-stream-id stream-id)
+         (%h3-transport-error
+          "QPACK Section Acknowledgment used the wrong stream ID."
+          acknowledged-stream-id))
+       (%h3-write-client-qpack-section-ack-serialized
+        client acknowledged-stream-id timeout deadline))
+     header-limit field-limit
+     :serialize-whole-operation-p t
+     :serialize-guard
+     (lambda ()
+       (unless (and (http3-client-open-p client)
+                    (eq qpack-http3-decoder-context
+                        (http3-client-qpack-http3-decoder-context client)))
+         (%h3-transport-error
+          "A live HTTP/3 client with its own QPACK decoder context is required."))))))
 
 (defun %h3-read-response
     (client stream &key on-body-chunk on-information collect-body-p
             (max-body-bytes http-kit::*default-max-body-bytes*)
             max-header-bytes max-fields
-            qpack-decoder-table qpack-decoder-context stream-id await-qpack
+            qpack-http3-decoder-context stream-id await-qpack
             request-method on-push-promise timeout deadline)
-  (when qpack-decoder-context
+  (when qpack-http3-decoder-context
     (unless (and (integerp stream-id) (>= stream-id 0))
       (%h3-transport-error
        "Dynamic QPACK response decoding requires a numeric stream ID."
-       stream-id))
-    (unless (functionp await-qpack)
-      (%h3-transport-error
-       "Dynamic QPACK response decoding requires an await-qpack callback."
-       await-qpack)))
+       stream-id)))
   (let ((buffer (make-array 0 :element-type '(unsigned-byte 8)))
         (status nil)
         (headers nil)
@@ -1376,10 +1502,11 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
                ((= type +http3-headers-type+)
                 (let ((fields
                         (%h3-decode-response-field-section
-                         client payload qpack-decoder-table
-                         :qpack-decoder-context qpack-decoder-context
+                         client payload qpack-http3-decoder-context
+                         :role (if final-response-p :trailers :response)
                          :stream-id stream-id
                          :await-qpack await-qpack
+                         :timeout timeout :deadline deadline
                          :max-header-bytes max-header-bytes
                          :max-fields max-fields)))
                   (multiple-value-bind (new-status new-headers)
@@ -1445,10 +1572,11 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
                     (let ((fields
                             (%h3-decode-response-field-section
                              client (subseq payload field-position)
-                             qpack-decoder-table
-                             :qpack-decoder-context qpack-decoder-context
+                             qpack-http3-decoder-context
+                             :role :request
                              :stream-id stream-id
                              :await-qpack await-qpack
+                             :timeout timeout :deadline deadline
                              :max-header-bytes max-header-bytes
                              :max-fields max-fields)))
                       (multiple-value-call #'list
@@ -1526,56 +1654,62 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
             (return (finish-response))))))))
 
 (defun %h3-write-request-field-section
-    (client stream fields encoder-table encoder-state stream-id huffman-p
+    (client stream fields encoder-context stream-id huffman-p
      &key fin-p timeout deadline)
-  (if (eq encoder-table (http3-client-qpack-encoder-table client))
-      (%call-http3-serialized
-       client
-       (lambda ()
-         (multiple-value-bind (section registration)
-             (%qpack-prepare-field-section
-              fields
-              :dynamic-table encoder-table
-              :decoder-stream-state encoder-state
-              :stream-id stream-id
-              :huffman-p huffman-p)
-           (%h3-write-frame
-            client stream
-            (make-http3-frame :type +http3-headers-type+ :payload section)
-            :fin-p fin-p :timeout timeout :deadline deadline)
-           (%qpack-commit-field-section registration))))
-      (%h3-write-frame
-       client stream
-       (make-http3-frame
-        :type +http3-headers-type+
-        :payload
-        (qpack-encode-field-section
-         fields :dynamic-table encoder-table :huffman-p huffman-p))
-       :fin-p fin-p :timeout timeout :deadline deadline)))
+  (let ((use-dynamic-p
+          (plusp
+           (http-message-kit:qpack-context-dynamic-entry-count
+            encoder-context))))
+    (when (and use-dynamic-p
+               (not (and (integerp stream-id) (>= stream-id 0))))
+      (%h3-transport-error
+       "Dynamic QPACK field encoding requires a numeric stream ID."
+       stream-id))
+    (%h3-write-client-qpack-transaction
+     client
+     (lambda ()
+       (http-message-kit:qpack-prepare-header-block
+        fields :context encoder-context
+        :use-dynamic-p use-dynamic-p
+        :huffman huffman-p
+        :stream-id stream-id))
+     (lambda (octets)
+       (%h3-write-frame
+        client stream
+        (make-http3-frame :type +http3-headers-type+ :payload octets)
+        :fin-p fin-p :timeout timeout :deadline deadline))
+     (lambda () stream))))
 
 (defun send-http3-request
     (client request &key on-body-chunk on-information (collect-body-p t)
             max-header-bytes max-fields
             (max-body-bytes http-kit::*default-max-body-bytes*)
             request-body-function request-body-length
-            qpack-encoder-table qpack-decoder-table qpack-decoder-context
+            qpack-encoder-context qpack-decoder-context qpack-http3-decoder-context
             await-qpack (huffman-p nil) on-stream-open on-push-promise
             timeout deadline)
   "Send REQUEST on a new HTTP/3 bidirectional stream and read its response.
 
 The in-memory request and response bodies are represented as octet vectors.
 REQUEST-BODY-FUNCTION, when supplied, receives the maximum chunk size and
-returns non-empty octet arrays until it returns NIL.  REQUEST-BODY-LENGTH may
-declare the producer's exact length.  When ON-BODY-CHUNK is supplied it
-receives each response DATA payload; the payload is still collected when
-COLLECT-BODY-P is true.  QPACK-ENCODER-TABLE and
-QPACK-DECODER-TABLE, when supplied, are caller-owned dynamic tables used for
-request and response field sections.  HUFFMAN-P enables Huffman encoding for
-newly emitted field values and names.  QPACK-DECODER-CONTEXT enables blocked
-field sections; AWAIT-QPACK must wait for and resume the token before returning.
-ON-PUSH-PROMISE receives the push ID and decoded request field pairs after
-the promise has passed HTTP/3 request-field validation.  ON-INFORMATION
-receives each validated informational response in wire order."
+returns non-empty octet arrays until it returns NIL. REQUEST-BODY-LENGTH may
+declare the exact producer length. ON-BODY-CHUNK receives each response DATA
+payload when supplied; the payload is still collected when COLLECT-BODY-P is
+true.
+
+The client uses its connection-owned QPACK contexts and HTTP/3 decoder adapter
+by default. QPACK-ENCODER-CONTEXT selects the message-kit context for outgoing
+request field sections. For custom response decoding, supply
+QPACK-DECODER-CONTEXT and its QPACK-HTTP3-DECODER-CONTEXT adapter. The client
+writes Section Ack instructions on its decoder stream after dynamic response
+sections decode and pass role validation. AWAIT-QPACK receives an opaque
+blocked token, waits for inserts, resumes it with QPACK-RESUME-BLOCKED-STREAM,
+and returns the decoded headers. HUFFMAN-P enables Huffman encoding for newly
+emitted field values and names.
+
+ON-PUSH-PROMISE receives the push ID and decoded request fields after the
+promise passes HTTP/3 request-field validation. ON-INFORMATION receives each
+validated informational response in wire order."
   (unless (http3-client-p client)
     (%h3-transport-error "SEND-HTTP3-REQUEST requires an HTTP/3 client."
                          (type-of client)))
@@ -1620,16 +1754,26 @@ receives each validated informational response in wire order."
          (request-fields nil)
          (declared-body-length nil)
          (trailer-fields (%h3-trailer-fields request))
-         (encoder-table
-           (or qpack-encoder-table (http3-client-qpack-encoder-table client)))
-         (decoder-table
-           (or qpack-decoder-table (http3-client-qpack-decoder-table client)))
+         (encoder-context
+           (or qpack-encoder-context (http3-client-qpack-encoder-context client)))
          (decoder-context
-           (or qpack-decoder-context
-               (and await-qpack
-                    (eq decoder-table
-                        (http3-client-qpack-decoder-table client))
-                    (http3-client-qpack-decoder-context client))))
+           (or qpack-decoder-context (http3-client-qpack-decoder-context client)))
+         (http3-decoder-context
+           (progn
+             (when (and qpack-decoder-context
+                        (not (eq qpack-decoder-context
+                                 (http3-client-qpack-decoder-context client))))
+               (%h3-transport-error
+                "A custom QPACK decoder context must be the client-owned context."
+                qpack-decoder-context))
+             (when (and qpack-http3-decoder-context
+                        (not (eq qpack-http3-decoder-context
+                                 (http3-client-qpack-http3-decoder-context client))))
+               (%h3-transport-error
+                "A custom HTTP/3 decoder adapter must be the client-owned adapter."
+                qpack-http3-decoder-context))
+             (or qpack-http3-decoder-context
+                 (http3-client-qpack-http3-decoder-context client))))
          (stream nil)
          (stream-id nil)
          (failure nil))
@@ -1666,34 +1810,18 @@ receives each validated informational response in wire order."
                      (%h3-transport-error
                       "The peer GOAWAY excludes this HTTP/3 request stream."
                       :h3-request-rejected))))
-               (when decoder-context
-                 (unless (and (integerp stream-id) (>= stream-id 0))
-                   (%h3-transport-error
-                    "Dynamic QPACK response decoding requires a numeric stream ID."
-                    stream-id))
-                 (unless (functionp await-qpack)
-                   (%h3-transport-error
-                    "Dynamic QPACK response decoding requires an await-qpack callback."
-                    await-qpack)))
+               (when (and decoder-context (null http3-decoder-context))
+                 (%h3-transport-error
+                  "A QPACK HTTP/3 decoder context is required with the decoder context."
+                  decoder-context))
                (when on-stream-open
                  (funcall on-stream-open stream stream-id
                           (lambda (&key (error-code #x10c))
                             (cancel-http3-stream
                              client stream :error-code error-code
                              :timeout timeout :deadline deadline))))
-               (when (and (eq encoder-table
-                              (http3-client-qpack-encoder-table client))
-                          (plusp (qpack-dynamic-table-insert-count encoder-table))
-                          (not (and (integerp stream-id) (>= stream-id 0))))
-                 (%h3-transport-error
-                  "OPEN-STREAM must return a numeric stream ID when dynamic QPACK entries exist."))
-               (let ((encoder-state
-                     (and (integerp stream-id)
-                          (eq encoder-table
-                              (http3-client-qpack-encoder-table client))
-                          (http3-client-qpack-decoder-state client))))
-                (%h3-write-request-field-section
-                 client stream request-fields encoder-table encoder-state
+               (progn (%h3-write-request-field-section
+                 client stream request-fields encoder-context
                  stream-id huffman-p
                  :fin-p nil
                  :timeout timeout :deadline deadline)
@@ -1757,19 +1885,18 @@ receives each validated informational response in wire order."
                         :fin-p t :timeout timeout :deadline deadline))))
                (when trailer-fields
                  (%h3-write-request-field-section
-                  client stream trailer-fields encoder-table encoder-state
+                  client stream trailer-fields encoder-context
                   stream-id huffman-p
                   :fin-p t :timeout timeout :deadline deadline))
                (%h3-read-response
-               client stream
+                client stream
                 :on-body-chunk on-body-chunk
                 :on-information on-information
                 :collect-body-p collect-body-p
                 :max-header-bytes max-header-bytes
                 :max-fields max-fields
                 :max-body-bytes max-body-bytes
-                :qpack-decoder-table decoder-table
-                :qpack-decoder-context decoder-context
+                :qpack-http3-decoder-context http3-decoder-context
                 :stream-id stream-id
                 :await-qpack await-qpack
                 :request-method (http-kit:http-request-method request)
@@ -1789,8 +1916,8 @@ receives each validated informational response in wire order."
      &key on-error on-body-chunk on-information (collect-body-p t)
        max-header-bytes max-fields
        (max-body-bytes http-kit::*default-max-body-bytes*) request-body-function
-       request-body-length qpack-encoder-table qpack-decoder-table
-       qpack-decoder-context await-qpack (huffman-p nil) on-stream-open
+       request-body-length qpack-encoder-context qpack-decoder-context
+       qpack-http3-decoder-context await-qpack (huffman-p nil) on-stream-open
        on-push-promise timeout deadline)
   "Send REQUEST and deliver its response to ON-SUCCESS."
   (http-kit::%call-http-operation/cps
@@ -1805,9 +1932,9 @@ receives each validated informational response in wire order."
       :max-body-bytes max-body-bytes
       :request-body-function request-body-function
       :request-body-length request-body-length
-      :qpack-encoder-table qpack-encoder-table
-      :qpack-decoder-table qpack-decoder-table
+      :qpack-encoder-context qpack-encoder-context
       :qpack-decoder-context qpack-decoder-context
+      :qpack-http3-decoder-context qpack-http3-decoder-context
       :await-qpack await-qpack
       :huffman-p huffman-p
       :on-stream-open on-stream-open
@@ -2023,7 +2150,7 @@ receives each validated informational response in wire order."
     (client stream &key stream-id on-body-chunk (collect-body-p t)
             max-header-bytes max-fields
             (max-body-bytes http-kit::*default-max-body-bytes*)
-            qpack-decoder-table qpack-decoder-context
+            qpack-decoder-context qpack-http3-decoder-context
             await-qpack await-push-promise timeout deadline)
   "Read one server-initiated HTTP/3 push stream and return its push ID and response.
 
@@ -2036,8 +2163,21 @@ can be consumed only once."
                          (type-of client)))
   (unless (http3-client-open-p client)
     (%h3-transport-error "The HTTP/3 client is already closed."))
-  (unless stream
-    (%h3-transport-error "RECEIVE-HTTP3-PUSH requires a QUIC stream."))
+  (progn
+    (unless stream
+      (%h3-transport-error "RECEIVE-HTTP3-PUSH requires a QUIC stream."))
+    (when (and qpack-decoder-context
+               (not (eq qpack-decoder-context
+                        (http3-client-qpack-decoder-context client))))
+      (%h3-transport-error
+       "A custom QPACK decoder context must be the client-owned context."
+       qpack-decoder-context))
+    (when (and qpack-http3-decoder-context
+               (not (eq qpack-http3-decoder-context
+                        (http3-client-qpack-http3-decoder-context client))))
+      (%h3-transport-error
+       "A custom HTTP/3 decoder adapter must be the client-owned adapter."
+       qpack-http3-decoder-context)))
   (unless (or (null on-body-chunk) (functionp on-body-chunk))
     (%h3-transport-error "ON-BODY-CHUNK must be a function or NIL."
                          on-body-chunk))
@@ -2110,15 +2250,12 @@ can be consumed only once."
                  (let* ((original-reader (http3-client-read-stream client))
                         (first-read-p t)
                         (push-client (copy-http3-client client))
-                        (decoder-table
-                          (or qpack-decoder-table
-                              (http3-client-qpack-decoder-table client)))
                         (decoder-context
                           (or qpack-decoder-context
-                              (and await-qpack
-                                   (eq decoder-table
-                                       (http3-client-qpack-decoder-table client))
-                                   (http3-client-qpack-decoder-context client)))))
+                              (http3-client-qpack-decoder-context client)))
+                        (http3-decoder-context
+                          (or qpack-http3-decoder-context
+                              (http3-client-qpack-http3-decoder-context client))))
                    (setf (http3-client-read-stream push-client)
                          (lambda (read-stream &key timeout deadline)
                            (if first-read-p
@@ -2136,11 +2273,10 @@ can be consumed only once."
                      :max-header-bytes max-header-bytes
                      :max-fields max-fields
                      :max-body-bytes max-body-bytes
-                     :qpack-decoder-table decoder-table
-                     :qpack-decoder-context decoder-context
+                     :qpack-http3-decoder-context http3-decoder-context
                      :stream-id stream-id
                      :await-qpack await-qpack
-                     :request-method (cdr (assoc ":method" promise :test #'string=))
+                     :request-method (cdr (assoc ":method" promise :test (function string=)))
                      :timeout timeout
                      :deadline deadline))))))
            (error (condition)
@@ -2234,7 +2370,7 @@ can be consumed only once."
 (defun send-http3-push
     (request-stream promised-request response control-state
      &key push-id open-stream write-stream close-stream cancel-stream
-       (serialize (lambda (thunk) (funcall thunk))) qpack-encoder-table
+       (serialize (lambda (thunk) (funcall thunk))) qpack-encoder-context
        (max-frame-size +http3-default-max-frame-size+)
        (max-header-bytes 65536) (huffman-p nil) timeout deadline)
   "Promise and send one HTTP/3 server push over caller-supplied QUIC callbacks.
@@ -2312,10 +2448,11 @@ an opened push stream.  Returns the push ID and RESPONSE."
            (%h3-transport-error "The HTTP/3 push was cancelled."
                                 :h3-request-cancelled))
          (let* ((field-section
-                  (qpack-encode-field-section
+                  (http-message-kit:qpack-encode-header-block
                    (%h3-request-fields promised-request)
-                   :dynamic-table qpack-encoder-table
-                   :huffman-p huffman-p))
+                   :context qpack-encoder-context
+                   :use-dynamic-p nil
+                   :huffman huffman-p))
                 (payload
                   (%http3-concatenate-octets
                    (http3-varint-encode candidate) field-section)))
@@ -2351,7 +2488,7 @@ an opened push stream.  Returns the push ID and RESPONSE."
                         :fin-p nil :timeout timeout :deadline deadline)
                (%h3-server-send-response
                 push-stream write-stream response promised-request
-                max-frame-size max-header-bytes qpack-encoder-table huffman-p
+                max-frame-size max-header-bytes qpack-encoder-context huffman-p
                 timeout deadline)
                (values selected-push-id response))
            (error (condition)
@@ -2365,7 +2502,7 @@ an opened push stream.  Returns the push ID and RESPONSE."
 
 (defun %h3-server-send-information
     (stream write-stream response max-frame-size max-header-bytes
-            qpack-encoder-table huffman-p timeout deadline)
+            qpack-encoder-context huffman-p timeout deadline)
   (let* ((stream-response-p (http-kit:http-response-stream-p response))
          (ordinary-response-p (http-kit:http-response-p response))
          (status (if stream-response-p
@@ -2416,8 +2553,9 @@ an opened push stream.  Returns the push ID and RESPONSE."
     (%h3-response-content-length headers 0 :status status :no-body t)
     (let* ((fields (%h3-server-response-fields status headers))
            (header-block
-             (qpack-encode-field-section
-              fields :dynamic-table qpack-encoder-table :huffman-p huffman-p)))
+             (http-message-kit:qpack-encode-header-block
+              fields :context qpack-encoder-context
+              :use-dynamic-p nil :huffman huffman-p)))
       (when (> (length header-block) max-header-bytes)
         (%h3-size-error :headers max-header-bytes (length header-block)))
       (%h3-server-write-frame
@@ -2428,7 +2566,7 @@ an opened push stream.  Returns the push ID and RESPONSE."
 
 (defun %h3-server-send-response
     (stream write-stream response request max-frame-size max-header-bytes
-            qpack-encoder-table huffman-p timeout deadline)
+            qpack-encoder-context huffman-p timeout deadline)
   (let* ((stream-response-p (http-kit:http-response-stream-p response))
          (ordinary-response-p (http-kit:http-response-p response))
          (status (if stream-response-p
@@ -2498,18 +2636,20 @@ an opened push stream.  Returns the push ID and RESPONSE."
     (setf header-fields (%h3-server-response-fields status headers)
           trailer-fields (%h3-server-response-trailer-fields trailers)
           header-block
-            (qpack-encode-field-section
+            (http-message-kit:qpack-encode-header-block
              header-fields
-             :dynamic-table qpack-encoder-table
-             :huffman-p huffman-p))
+             :context qpack-encoder-context
+             :use-dynamic-p nil
+             :huffman huffman-p))
     (when (> (length header-block) max-header-bytes)
       (%h3-size-error :headers max-header-bytes (length header-block)))
     (when trailer-fields
       (setf trailer-block
-              (qpack-encode-field-section
+              (http-message-kit:qpack-encode-header-block
                trailer-fields
-               :dynamic-table qpack-encoder-table
-               :huffman-p huffman-p))
+               :context qpack-encoder-context
+               :use-dynamic-p nil
+               :huffman huffman-p))
       (when (> (length trailer-block) max-header-bytes)
         (%h3-size-error :headers max-header-bytes (length trailer-block))))
     (labels
@@ -2598,34 +2738,45 @@ an opened push stream.  Returns the push ID and RESPONSE."
             (max-frame-size +http3-default-max-frame-size+)
             (max-header-bytes 65536) (max-fields 256)
             (max-body-bytes http-kit::*default-max-body-bytes*)
-            (collect-body-p t) on-body-chunk qpack-decoder-table
-            qpack-decoder-context stream-id await-qpack
+            (collect-body-p t) on-body-chunk qpack-decoder-context
+            qpack-http3-decoder-context on-qpack-section-acknowledgment
+            stream-id await-qpack
             (qpack-serialize (lambda (thunk) (funcall thunk)))
-            qpack-encoder-table (huffman-p nil) (enable-connect-p nil)
+            qpack-encoder-context (huffman-p nil) (enable-connect-p nil)
             timeout deadline on-error)
   "Serve one HTTP/3 request stream over caller-supplied QUIC callbacks.
 
 READ-STREAM is called as (STREAM &KEY TIMEOUT DEADLINE) and returns an octet
-vector and a FIN boolean.  WRITE-STREAM is called as
-(STREAM OCTETS &KEY FIN-P TIMEOUT DEADLINE).  CLOSE-STREAM, when supplied, is
-called as (STREAM &KEY CONDITION) exactly once.  The callbacks own QUIC,
+vector and a FIN boolean. WRITE-STREAM is called as
+(STREAM OCTETS &KEY FIN-P TIMEOUT DEADLINE). CLOSE-STREAM, when supplied, is
+called as (STREAM &KEY CONDITION) exactly once. The callbacks own QUIC,
 TLS 1.3, ALPN, packet loss recovery, flow control, and socket behavior; this
-function owns the HTTP/3 request stream framing, QPACK field validation,
-request-body limits, and response framing.  QPACK-DECODER-TABLE and
-QPACK-ENCODER-TABLE are caller-owned dynamic tables for request and response
-field sections.  QPACK-DECODER-CONTEXT enables blocked request field sections;
-STREAM-ID identifies this request stream, AWAIT-QPACK waits for and resumes a
-blocked token, and QPACK-SERIALIZE protects the connection-wide context.
-HUFFMAN-P enables Huffman encoding for response fields.
+function owns HTTP/3 request framing, QPACK field validation, request-body
+limits, and response framing.
+
+QPACK-DECODER-CONTEXT is the message-kit context for incoming field sections;
+QPACK-HTTP3-DECODER-CONTEXT is its HTTP/3 adapter. When the adapter is supplied,
+ON-QPACK-SECTION-ACKNOWLEDGMENT is required. It receives STREAM-ID after a
+dynamic section has decoded and passed role validation. Static sections do not
+invoke it. Use QPACK-ENCODE-SECTION-ACK and the decoder-stream writer in this
+callback to send the acknowledgment. If decoding returns a blocked token, no
+Ack is sent yet. AWAIT-QPACK receives the opaque token, waits for inserts,
+resumes it with QPACK-RESUME-BLOCKED-STREAM, and returns the decoded header
+list. For a blocked section, the acknowledgment callback runs once after
+successful resume and validation. QPACK-SERIALIZE must call the message-kit
+serialization thunk exactly once while holding the connection-wide QPACK lock.
+
+If supplied, QPACK-ENCODER-CONTEXT is the message-kit outbound context. This
+server uses static-table references and literal field representations for
+responses. HUFFMAN-P enables Huffman encoding for response fields.
 
 HANDLER receives one HTTP request and must return an HTTP response or response
-stream as its first value.  Its optional second value is a list of informational
-HTTP responses sent before the final response.  ON-BODY-CHUNK, when supplied,
-receives each request DATA payload.  If
-COLLECT-BODY-P is false, handlers receive an empty request body while the
-body-length and Content-Length checks still use all received bytes.  ON-ERROR
-receives (CONDITION REQUEST), where REQUEST is NIL if parsing failed before the
-request model was constructed."
+stream as its first value. Its optional second value is a list of informational
+HTTP responses sent before the final response. ON-BODY-CHUNK, when supplied,
+receives each request DATA payload. If COLLECT-BODY-P is false, handlers receive
+an empty request body while the body-length and Content-Length checks still
+use all received bytes. ON-ERROR receives (CONDITION REQUEST), where REQUEST
+is NIL if parsing failed before the request model was constructed."
   (dolist (callback (list handler read-stream write-stream))
     (unless (functionp callback)
       (%h3-transport-error
@@ -2663,19 +2814,25 @@ request model was constructed."
     (%h3-transport-error
      "HTTP/3 server on-error must be a function or NIL."
      (type-of on-error)))
-  (when qpack-decoder-context
+  (progn
+  (when qpack-http3-decoder-context
     (unless (and (integerp stream-id) (>= stream-id 0))
       (%h3-transport-error
        "Dynamic QPACK request decoding requires a numeric stream ID."
        stream-id))
-    (unless (functionp await-qpack)
+    (unless (functionp on-qpack-section-acknowledgment)
       (%h3-transport-error
-       "Dynamic QPACK request decoding requires an await-qpack callback."
-       await-qpack))
+       "QPACK HTTP/3 request decoding requires an acknowledgment callback."
+       on-qpack-section-acknowledgment))
     (unless (functionp qpack-serialize)
       (%h3-transport-error
        "Dynamic QPACK request decoding requires a serializer."
        qpack-serialize)))
+  (when (not (eq (null qpack-decoder-context)
+                 (null qpack-http3-decoder-context)))
+    (%h3-transport-error
+     "A QPACK decoder context and its HTTP/3 adapter must be supplied together."
+     (list qpack-decoder-context qpack-http3-decoder-context))))
   (let ((closer (or close-stream
                     (lambda (ignored-stream &key condition)
                       (declare (ignore ignored-stream condition))
@@ -2714,16 +2871,28 @@ request model was constructed."
                            (cond
                              ((= type +http3-headers-type+)
                               (let ((fields
-                                      (if qpack-decoder-context
+                                      (if qpack-http3-decoder-context
                                           (%h3-decode-dynamic-field-section
-                                           payload qpack-decoder-context
+                                           payload qpack-http3-decoder-context
                                            stream-id await-qpack qpack-serialize
+                                           (if request-headers-seen-p
+                                               :trailers :request)
+                                           (lambda (acknowledged-stream-id)
+                                             (unless (= acknowledged-stream-id
+                                                        stream-id)
+                                               (%h3-transport-error
+                                                "QPACK Section Acknowledgment used the wrong stream ID."
+                                                acknowledged-stream-id))
+                                             (funcall
+                                              on-qpack-section-acknowledgment
+                                              acknowledged-stream-id))
                                            max-header-bytes max-fields)
-                                          (qpack-decode-field-section
+                                          (http-message-kit:qpack-decode-header-block
                                            payload
+                                           :context qpack-decoder-context
+                                           :stream-id stream-id
                                            :max-header-bytes max-header-bytes
-                                           :max-fields max-fields
-                                           :dynamic-table qpack-decoder-table))))
+                                           :max-fields max-fields))))
                                 (if (not request-headers-seen-p)
                                     (progn
                                       (multiple-value-bind
@@ -2795,12 +2964,12 @@ request model was constructed."
                        (dolist (informational-response information)
                          (%h3-server-send-information
                           stream write-stream informational-response
-                          max-frame-size max-header-bytes qpack-encoder-table
+                          max-frame-size max-header-bytes qpack-encoder-context
                           huffman-p timeout deadline))
                        (%h3-server-send-response
                         stream write-stream response request
                         max-frame-size max-header-bytes
-                        qpack-encoder-table huffman-p
+                        qpack-encoder-context huffman-p
                         timeout deadline))))))
            (error (condition)
              (setf failure condition)
@@ -2993,7 +3162,7 @@ owner-thread and non-reentrant."
        max-header-bytes max-fields
        (max-body-bytes http-kit::*default-max-body-bytes*)
        request-body-function request-body-length proxy proxy-plan
-       qpack-encoder-table qpack-decoder-table qpack-decoder-context
+       qpack-encoder-context qpack-decoder-context qpack-http3-decoder-context
        await-qpack (huffman-p nil) on-stream-open on-push-promise
        timeout deadline)
   "Send REQUEST through a reusable HTTP/3 connection manager."
@@ -3034,9 +3203,9 @@ owner-thread and non-reentrant."
                  :max-body-bytes max-body-bytes
                  :request-body-function request-body-function
                  :request-body-length request-body-length
-                 :qpack-encoder-table qpack-encoder-table
-                 :qpack-decoder-table qpack-decoder-table
+                 :qpack-encoder-context qpack-encoder-context
                  :qpack-decoder-context qpack-decoder-context
+                 :qpack-http3-decoder-context qpack-http3-decoder-context
                  :await-qpack await-qpack :huffman-p huffman-p
                  :on-stream-open on-stream-open
                  :on-push-promise on-push-promise

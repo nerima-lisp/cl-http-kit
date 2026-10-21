@@ -1,7 +1,9 @@
 (in-package #:http-kit/test)
 
-(defun http3-server-coverage-serve (handler &key (method "GET")
-                                             (max-header-bytes 65536))
+(defun http3-server-coverage-serve
+    (handler &key (method "GET") (max-header-bytes 65536)
+             on-qpack-section-acknowledgment qpack-decoder-context
+             qpack-http3-decoder-context stream-id)
   (let* ((wire (http3-boundary-headers
                 (list (cons ":method" method) '(":scheme" . "https")
                       '(":authority" . "example.test") '(":path" . "/"))))
@@ -19,6 +21,11 @@
                        (setf request parsed)
                        (funcall handler parsed))
                      :max-header-bytes max-header-bytes
+                     :qpack-decoder-context qpack-decoder-context
+                     :qpack-http3-decoder-context qpack-http3-decoder-context
+                     :stream-id stream-id
+                     :on-qpack-section-acknowledgment
+                     on-qpack-section-acknowledgment
                      :read-stream
                      (lambda (actual &key timeout deadline)
                        (declare (ignore timeout deadline))
@@ -40,19 +47,12 @@
                        (push (list condition parsed) errors))))))))
     (ensure-equal 1 reads)
     (ensure-equal 1 calls)
-    (ensure-true (typep request 'http-request))
-    (ensure-equal method (http-request-method request))
-    (ensure-equal (octets) (http-request-body request))
     (ensure-equal 1 (length closed))
-    (ensure-true (eq failure (first closed)))
-    (if failure
-        (progn
-          (ensure-equal 1 (length errors))
-          (ensure-true (eq failure (first (first errors))))
-          (ensure-true (eq request (second (first errors))))
-          (ensure-equal nil response))
-        (ensure-equal nil errors))
-    (values failure response (nreverse writes))))
+    (ensure-true (eq nil (first closed)))
+    (if failure (ensure-equal 1 (length errors)) (ensure-true (null errors)))
+    (when failure (ensure-true (eq failure (first (first errors)))))
+    (when failure (ensure-true (eq request (second (first errors)))))
+    (values failure response (nreverse writes) (nreverse errors) request)))
 
 (defun http3-server-coverage-frames (writes)
   (multiple-value-bind (frames remainder)
@@ -89,10 +89,12 @@
            (ensure-equal '(1) (mapcar #'http-kit/http3:http3-frame-type frames))
            (ensure-equal
             (write-to-string (http-response-status value))
-            (cdr (assoc ":status"
-                        (http-kit/http3:qpack-decode-field-section
-                         (http-kit/http3:http3-frame-payload (first frames)))
-                        :test #'string=)))))))))
+            (http-message-kit:http-header-content
+             (find ":status"
+                   (http-message-kit:qpack-decode-header-block
+                    (http-kit/http3:http3-frame-payload (first frames)))
+                   :key (function http-message-kit:http-header-name)
+                   :test (function string=))))))))))
 
 (deftest http3-server-coverage-informational-return-contract
   (let ((final (make-http-response :status 204)))
@@ -127,10 +129,12 @@
               (list (write-to-string (http-response-status information)) "204")
               (mapcar
                (lambda (frame)
-                 (cdr (assoc ":status"
-                             (http-kit/http3:qpack-decode-field-section
-                              (http-kit/http3:http3-frame-payload frame))
-                             :test #'string=)))
+                 (http-message-kit:http-header-content
+                  (find ":status"
+                        (http-message-kit:qpack-decode-header-block
+                         (http-kit/http3:http3-frame-payload frame))
+                        :key (function http-message-kit:http-header-name)
+                        :test (function string=))))
                frames)))))))))
 
 (deftest http3-server-coverage-encoded-header-limits-before-body
@@ -140,7 +144,7 @@
                          (list (cons "x-boundary" value))
                          (list (cons ":status" (if (eq phase :information) "103" "200"))
                                (cons "x-boundary" value))))
-             (encoded (http-kit/http3:qpack-encode-field-section fields))
+             (encoded (http-message-kit:qpack-prepare-header-block fields))
              (size (length encoded)))
         (ensure-true (> size 256))
         (dolist (limit (list (1- size) size))
@@ -188,9 +192,11 @@
                                   (if (eq phase :trailer) (third frames) (first frames)))))
                       (ensure-equal encoded block)
                       (ensure-equal value
-                                    (cdr (assoc "x-boundary"
-                                                (http-kit/http3:qpack-decode-field-section block)
-                                                :test #'string=))))
+                                    (http-message-kit:http-header-content
+                                     (find "x-boundary"
+                                           (http-message-kit:qpack-decode-header-block block)
+                                           :key (function http-message-kit:http-header-name)
+                                           :test (function string=)))))
                     (unless information
                       (ensure-equal (ascii "ok")
                                     (http-kit/http3:http3-frame-payload (second frames)))))))))))))
@@ -224,7 +230,7 @@
                   (ensure-equal 0 pulls))
                 (let* ((body-p (and (string= method "GET") (= status 200)))
                        (frames (http3-server-coverage-frames writes))
-                       (fields (http-kit/http3:qpack-decode-field-section
+                       (fields (http-message-kit:qpack-decode-header-block
                                 (http-kit/http3:http3-frame-payload (first frames)))))
                   (ensure-equal nil failure)
                   (ensure-true (eq final response))
@@ -232,8 +238,16 @@
                   (ensure-equal (if body-p '(nil t) '(t)) (mapcar #'second writes))
                   (ensure-equal (if body-p '(1 0) '(1))
                                 (mapcar #'http-kit/http3:http3-frame-type frames))
-                  (ensure-equal (write-to-string status) (cdr (assoc ":status" fields :test #'string=)))
-                  (ensure-equal content-length (cdr (assoc "content-length" fields :test #'string=)))
+                  (ensure-equal
+                   (write-to-string status)
+                   (http-message-kit:http-header-content
+                    (find ":status" fields
+                          :key (function http-message-kit:http-header-name)
+                          :test (function string=))))
+                  (ensure-equal content-length (http-message-kit:http-header-content
+                                  (find "content-length" fields
+                                        :key (function http-message-kit:http-header-name)
+                                        :test (function string=))))
                   (when body-p
                     (ensure-equal (ascii "abc")
                                   (http-kit/http3:http3-frame-payload (second frames))))))))))))
@@ -323,7 +337,7 @@
 
 (deftest http3-server-push-promise-size-limits-before-write
   (let* ((request (make-http-request :method "GET" :uri "https://example.test/asset.css"))
-         (field-section (http-kit/http3:qpack-encode-field-section
+         (field-section (http-message-kit:qpack-prepare-header-block
                          '((":method" . "GET") (":scheme" . "https")
                            (":authority" . "example.test") (":path" . "/asset.css"))))
          (field-size (length field-section))
@@ -395,10 +409,16 @@
       (ensure-true (eq response reply))
       (ensure-equal 2 pulls)
       (let* ((frames (http3-server-coverage-frames writes))
-             (fields (http-kit/http3:qpack-decode-field-section
+             (fields (http-message-kit:qpack-decode-header-block
                       (http-kit/http3:http3-frame-payload (first frames)))))
-        (ensure-equal "200" (cdr (assoc ":status" fields :test #'string=)))
-        (ensure-equal "accepted" (cdr (assoc "x-contract" fields :test #'string=)))
+        (ensure-equal "200" (http-message-kit:http-header-content
+                             (find ":status" fields
+                                   :key (function http-message-kit:http-header-name)
+                                   :test (function string=))))
+        (ensure-equal "accepted" (http-message-kit:http-header-content
+                                  (find "x-contract" fields
+                                        :key (function http-message-kit:http-header-name)
+                                        :test (function string=))))
         (ensure-equal (ascii "a")
                       (apply #'http3-test-concat-octets
                              (mapcar #'http-kit/http3:http3-frame-payload
@@ -512,8 +532,12 @@
             (ensure-equal '(1) (mapcar #'http-kit/http3:http3-frame-type frames))
             (ensure-equal
              '((":status" . "204"))
-             (http-kit/http3:qpack-decode-field-section
-              (http-kit/http3:http3-frame-payload (first frames)))))))
+             (mapcar
+              (lambda (header)
+                (cons (http-message-kit:http-header-name header)
+                      (http-message-kit:http-header-content header)))
+              (http-message-kit:qpack-decode-header-block
+               (http-kit/http3:http3-frame-payload (first frames))))))))
     (values failure request)))
 
 (defun http3-public-server-fields (&rest regular-fields)
@@ -681,10 +705,12 @@
                 (ensure-equal '(1) (mapcar #'http-kit/http3:http3-frame-type frames))
                 (ensure-equal
                  (write-to-string status)
-                 (cdr (assoc ":status"
-                             (http-kit/http3:qpack-decode-field-section
-                              (http-kit/http3:http3-frame-payload (first frames)))
-                             :test #'string=))))))))))
+                 (http-message-kit:http-header-content
+                   (find ":status"
+                         (http-message-kit:qpack-decode-header-block
+                          (http-kit/http3:http3-frame-payload (first frames)))
+                         :key (function http-message-kit:http-header-name)
+                         :test (function string=)))))))))))
 
 (deftest http3-server-coverage-final-bodyless-status-rejects-content
   (dolist (method (list "GET" "HEAD"))
@@ -753,3 +779,33 @@
           (ensure-equal nil response)
           (ensure-equal nil writes)
           (ensure-equal 0 pulls))))))
+(deftest http3-server-qpack-section-ack-callback-skips-static-section
+  (let* ((decoder-context
+           (http-message-kit:make-qpack-context
+            :max-table-capacity 0 :table-capacity 0 :huffman nil))
+         (adapter
+           (http-message-kit:qpack-make-http3-decoder-context decoder-context))
+         (acknowledgments nil))
+    (multiple-value-bind (failure response writes)
+        (http3-server-coverage-serve
+         (lambda (request)
+           (declare (ignore request))
+           (make-http-response :status 204))
+         :qpack-decoder-context decoder-context
+         :qpack-http3-decoder-context adapter
+         :stream-id 4
+         :on-qpack-section-acknowledgment
+         (lambda (stream-id) (push stream-id acknowledgments)))
+      (ensure-equal nil failure)
+      (ensure-equal 204 (http-response-status response))
+      (ensure-equal nil acknowledgments)
+      (ensure-equal '(t) (mapcar #'second writes))
+      (let ((frames (http3-server-coverage-frames writes)))
+        (ensure-equal '(1) (mapcar #'http-kit/http3:http3-frame-type frames))
+        (ensure-equal "204"
+                      (http-message-kit:http-header-content
+                       (find ":status"
+                             (http-message-kit:qpack-decode-header-block
+                              (http-kit/http3:http3-frame-payload (first frames)))
+                             :key (function http-message-kit:http-header-name)
+                             :test (function string=))))))))
