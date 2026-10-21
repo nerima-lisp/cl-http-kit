@@ -317,26 +317,32 @@ incoming encoder instructions and blocked tokens update that shared state;
 a different object signals an error. `receive-http3-push` applies the same
 checks before reading the stream or consuming the promised push ID.
 When the client's `SETTINGS_QPACK_BLOCKED_STREAMS` value is positive,
-`:await-qpack` is required before the client reads a response stream, even if
-the field section does not block. If a response section blocks, the callback
-must wait for inserts, resume the token with `qpack-resume-blocked-stream`, and
-return the decoded headers.
+`:await-qpack` must be supplied before the client starts reading a response
+stream, even if the field section does not block. This is a preflight check; it
+does not invoke `:await-qpack`. If decoding returns a blocked token, the client
+calls `:await-qpack` with that token. The callback must wait for the required
+inserts, resume that same token with `qpack-resume-blocked-stream`, and return
+the decoded headers.
 
-`serve-http3-request-stream` exposes the same hook as
-`:on-qpack-section-acknowledgment`. Build the adapter with
-`qpack-make-http3-decoder-context` from the same context passed as
+For server Section Ack handling, `serve-http3-request-stream` accepts
+`:on-qpack-section-acknowledgment`, which has the same stream-ID callback and
+write behavior described above under `:on-section-acknowledgment`. Build the
+adapter with `qpack-make-http3-decoder-context` from the same context passed as
 `:qpack-decoder-context`, then pass the context as `:qpack-decoder-context`
-and the returned adapter as `:qpack-http3-decoder-context`, with
-`:stream-id`; supplying only one part of the decoder pair signals an error.
-The callback receives the stream ID; call `qpack-encode-section-ack` with it
-and write the resulting octets to the decoder stream.
-The server requires both callbacks when the adapter is supplied. Static field
-sections do not invoke either callback. `:await-qpack` is required before the
-server reads the request stream, even if the field section does not block. If
-decoding returns a blocked token, it must wait for inserts, resume the token
-with `qpack-resume-blocked-stream`, and return the decoded headers. The
-acknowledgment callback runs after that resume succeeds and validates the field
-section.
+and the returned adapter as `:qpack-http3-decoder-context`, with `:stream-id`;
+supplying only one part of the decoder pair signals an error. The callback
+receives the stream ID; call `qpack-encode-section-ack` with it and write the
+resulting octets to the decoder stream.
+When the adapter is supplied, the server requires both `:await-qpack` and
+`:on-qpack-section-acknowledgment`. Static field sections invoke neither
+callback. `:await-qpack` must be supplied before the server starts reading the
+request stream, even if the field section does not block. This is a preflight
+check; it does not invoke `:await-qpack`. If decoding returns a blocked token,
+the server calls `:await-qpack` with that token. The `:await-qpack` callback
+must wait for the required inserts, resume that same token with
+`qpack-resume-blocked-stream`, and return the decoded headers. After resume and
+validation succeed, `:on-qpack-section-acknowledgment` runs once with the
+stream ID.
 
 If an external caller needs public state or behavior that the message-kit API
 does not expose, add that API to message-kit before migrating the caller. Do
