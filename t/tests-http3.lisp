@@ -1854,13 +1854,9 @@
       (ensure-true
        (eq token (first
                   (http-message-kit:qpack-take-ready-streams adapter))))
-      (let ((headers (http-message-kit:qpack-resume-blocked-stream token)))
-        (ensure-equal fields
-                      (mapcar
-                       (lambda (header)
-                         (cons (http-message-kit:http-header-name header)
-                               (http-message-kit:http-header-content header)))
-                       headers))))))
+      (let ((headers
+              (http-message-kit:qpack-resume-blocked-stream token)))
+        (ensure-equal fields headers)))))
 
 (deftest http3-qpack-malformed-section-is-not-blocked
   (let* ((decoder
