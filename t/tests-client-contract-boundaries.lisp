@@ -2863,7 +2863,7 @@
            (setf (symbol-function key-symbol)
                  (lambda (request proxy-plan)
                    (if http-kit/client::*client-http2-pending-stream*
-                       :mismatched-key
+                       '(:mismatched-key)
                        (funcall original-key request proxy-plan))))
            (let* ((transport
                     (http-kit/client::%client-transport-from-negotiated-connection-pool
