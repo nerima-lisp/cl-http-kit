@@ -27,44 +27,81 @@
             :operation :http2-read
             :detail (type-of input)))))
 
-(defun %h2-reader-read (reader count deadline clock-function &key allow-eof)
+(defun %h2-reader-read (reader count deadline clock-function
+                       &key allow-eof deadline-function on-first-byte)
   (unless (and (integerp count) (>= count 0))
     (error 'http-protocol-error
            :message "An HTTP/2 read length is invalid."
            :operation :http2-read
            :detail count))
   (let ((result (make-array count :element-type '(unsigned-byte 8)))
-        (position 0))
-    (loop while (< position count)
-          do (http-kit::%check-deadline deadline clock-function :read)
-             (if (%h2-reader-stream reader)
-                 (let ((end (read-sequence result (%h2-reader-stream reader)
-                                            :start position)))
-                   (when (= end position)
-                     (if (and allow-eof (zerop position))
-                         (return-from %h2-reader-read :eof)
-                         (error 'http-protocol-error
-                                :message "The HTTP/2 input ended before a complete frame was read."
-                                :operation :http2-read
-                                :detail count)))
-                   (setf position end))
-                 (let ((vector (%h2-reader-vector reader))
-                       (source-position (%h2-reader-position reader)))
-                   (when (>= source-position (length vector))
-                     (if (and allow-eof (zerop position))
-                         (return-from %h2-reader-read :eof)
-                         (error 'http-protocol-error
-                                :message "The HTTP/2 input ended before a complete frame was read."
-                                :operation :http2-read
-                                :detail count)))
-                   (let ((available (min (- count position)
-                                         (- (length vector) source-position))))
-                     (replace result vector :start1 position
-                              :start2 source-position
-                              :end2 (+ source-position available))
-                     (incf position available)
-                     (incf (%h2-reader-position reader) available)))))
-    result))
+        (position 0)
+        (first-byte-pending-p (not (null on-first-byte))))
+    (labels ((read-stream ()
+               (if first-byte-pending-p
+                   (read-sequence result (%h2-reader-stream reader)
+                                  :start position :end (1+ position))
+                   (read-sequence result (%h2-reader-stream reader)
+                                  :start position))))
+      (loop while (< position count)
+            do (let* ((active-deadline
+                        (if deadline-function
+                            (funcall deadline-function)
+                            deadline))
+                      (remaining
+                        (and active-deadline
+                             (max 0 (- active-deadline
+                                       (funcall clock-function))))))
+                 (http-kit::%check-deadline active-deadline
+                                            clock-function :read)
+                 (if (%h2-reader-stream reader)
+                     (let ((end nil))
+                       #+sbcl
+                       (setf end
+                             (if active-deadline
+                                 (handler-case
+                                     (sb-ext:with-timeout
+                                         remaining
+                                       (read-stream))
+                                   (sb-ext:timeout ()
+                                     (error 'http-kit:http-timeout
+                                            :message "The HTTP/2 read operation exceeded its deadline."
+                                            :operation :read
+                                            :kind :read)))
+                                 (read-stream)))
+                       #-sbcl
+                       (setf end (read-stream))
+                       (when (= end position)
+                         (if (and allow-eof (zerop position))
+                             (return-from %h2-reader-read :eof)
+                             (error 'http-protocol-error
+                                    :message "The HTTP/2 input ended before a complete frame was read."
+                                    :operation :http2-read
+                                    :detail count)))
+                       (setf position end))
+                     (let ((vector (%h2-reader-vector reader))
+                           (source-position (%h2-reader-position reader)))
+                       (when (>= source-position (length vector))
+                         (if (and allow-eof (zerop position))
+                             (return-from %h2-reader-read :eof)
+                             (error 'http-protocol-error
+                                    :message "The HTTP/2 input ended before a complete frame was read."
+                                    :operation :http2-read
+                                    :detail count)))
+                       (let ((available (min (- count position)
+                                             (- (length vector)
+                                                source-position)
+                                             (if first-byte-pending-p 1 count))))
+                         (replace result vector
+                                  :start1 position
+                                  :start2 source-position
+                                  :end2 (+ source-position available))
+                         (incf position available)
+                         (incf (%h2-reader-position reader) available))))
+                 (when first-byte-pending-p
+                   (setf first-byte-pending-p nil)
+                   (funcall on-first-byte))))
+      result)))
 
 (defun %h2-u24 (octets position)
   (logior (ash (aref octets position) 16)
@@ -118,8 +155,13 @@
       (replace wire payload :start1 9)
       wire)))
 
-(defun %h2-read-frame (reader max-frame-size deadline clock-function)
-  (let ((header (%h2-reader-read reader 9 deadline clock-function :allow-eof t)))
+(defun %h2-read-frame
+    (reader max-frame-size deadline clock-function
+     &key deadline-function on-first-byte on-header)
+  (let ((header (%h2-reader-read reader 9 deadline clock-function
+                                 :allow-eof t
+                                 :deadline-function deadline-function
+                                 :on-first-byte on-first-byte)))
     (when (eq header :eof)
       (return-from %h2-read-frame :eof))
     (let ((length (%h2-u24 header 0))
@@ -136,8 +178,12 @@
                :message "The reserved HTTP/2 stream identifier bit is set."
                :operation :http2-read
                :detail stream-word))
+      (when on-header
+        (funcall on-header length type flags stream-word))
       (%make-h2-frame :length length
                       :type type
                       :flags flags
                       :stream-id stream-word
-                      :payload (%h2-reader-read reader length deadline clock-function)))))
+                      :payload (%h2-reader-read
+                                reader length deadline clock-function
+                                :deadline-function deadline-function)))))

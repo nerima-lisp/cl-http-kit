@@ -1380,6 +1380,398 @@
         (ensure-equal 11
                       (http-kit/http2::%h2-u32
                        (http-kit/http2::%h2-frame-payload goaway) 4)))))
+  #+sbcl
+(progn
+  (defclass server-deadline-blocking-read-stream (binary-session-stream)
+    ((block-at :initarg :block-at :reader server-deadline-read-block-at)))
+
+  (defmethod sb-gray:stream-read-sequence :around
+      ((stream server-deadline-blocking-read-stream) sequence
+       &optional (start 0) end)
+    (declare (ignore sequence start end))
+    (when (>= (binary-session-input-position stream)
+              (server-deadline-read-block-at stream))
+      (sleep 10))
+    (call-next-method))
+
+  (defclass server-deadline-blocking-write-stream (binary-session-stream)
+    ((write-calls :initform 0 :accessor server-deadline-write-calls)))
+
+  (defmethod sb-gray:stream-write-sequence :around
+      ((stream server-deadline-blocking-write-stream) sequence
+       &optional (start 0) end)
+    (declare (ignore sequence start end))
+    (when (>= (server-deadline-write-calls stream) 2)
+      (sleep 10))
+    (incf (server-deadline-write-calls stream))
+    (call-next-method))
+
+  (defun server-deadline-request-frame (stream-id flags)
+    (h2-frame
+     1 flags stream-id
+     (h2-header-block
+      (cons ":method" "GET")
+      (cons ":scheme" "https")
+      (cons ":authority" "example.test")
+      (cons ":path" "/deadline"))))
+
+  (deftest http2-server-request-timeout-late-handler-sends-no-response
+    (let* ((now 0)
+           (handler-calls 0)
+           (observed nil)
+           (input
+             (concatenate-octets
+              (h2-preface)
+              (h2-frame 4 0 0 (octets))
+              (server-deadline-request-frame 1 5)))
+           (stream (make-instance 'binary-session-stream :input input)))
+      (handler-case
+          (http-kit/http2:serve-http2-session
+           stream
+           (lambda (request)
+             (declare (ignore request))
+             (incf handler-calls)
+             (setf now 2)
+             (values (make-http-response :status 200)
+                     (list (make-http-response :status 103))))
+           :request-timeout 1
+           :clock-function (lambda () now)
+           :close-stream (lambda (closed-stream)
+                           (declare (ignore closed-stream))))
+        (http-timeout (condition)
+          (setf observed condition)))
+      (ensure-true (typep observed 'http-timeout))
+      (ensure-equal :write (http-timeout-kind observed))
+      (ensure-equal 1 handler-calls)
+      (ensure-equal
+       0
+       (count-if (lambda (frame)
+                   (= (http-kit/http2::%h2-frame-type frame) 1))
+                 (server-output-frames (binary-session-output stream))))))
+
+  (deftest http2-server-request-timeout-interrupts-frame-payload-read
+    (let* ((frame (server-deadline-request-frame 1 4))
+           (input
+             (concatenate-octets
+              (h2-preface)
+              (h2-frame 4 0 0 (octets))
+              (subseq frame 0 9)))
+           (stream
+             (make-instance 'server-deadline-blocking-read-stream
+                            :input input
+                            :block-at (length input)))
+           (handler-calls 0)
+           (observed nil))
+      (handler-case
+          (sb-ext:with-timeout 1
+            (http-kit/http2:serve-http2-session
+             stream
+             (lambda (request)
+               (declare (ignore request))
+               (incf handler-calls)
+               (make-http-response :status 204))
+             :request-timeout 0.05d0
+             :clock-function (lambda () 0)
+             :close-stream (lambda (closed-stream)
+                             (declare (ignore closed-stream)))))
+        (http-timeout (condition)
+          (setf observed condition)))
+      (ensure-true (typep observed 'http-timeout))
+      (ensure-equal :read (http-timeout-kind observed))
+      (ensure-equal 0 handler-calls)
+      (ensure-equal
+       0
+       (count-if (lambda (frame)
+                   (= (http-kit/http2::%h2-frame-type frame) 1))
+                 (server-output-frames (binary-session-output stream))))))
+
+  (deftest http2-server-request-timeout-interrupts-response-write
+    (let* ((input
+             (concatenate-octets
+              (h2-preface)
+              (h2-frame 4 0 0 (octets))
+              (server-deadline-request-frame 1 5)))
+           (stream
+             (make-instance 'server-deadline-blocking-write-stream
+                            :input input))
+           (handler-calls 0)
+           (observed nil))
+      (handler-case
+          (sb-ext:with-timeout 1
+            (http-kit/http2:serve-http2-session
+             stream
+             (lambda (request)
+               (declare (ignore request))
+               (incf handler-calls)
+               (make-http-response :status 204))
+             :request-timeout 0.05d0
+             :clock-function (lambda () 0)
+             :close-stream (lambda (closed-stream)
+                             (declare (ignore closed-stream)))))
+        (http-timeout (condition)
+          (setf observed condition)))
+      (ensure-true (typep observed 'http-timeout))
+      (ensure-equal :write (http-timeout-kind observed))
+      (ensure-equal 1 handler-calls)
+      (ensure-equal
+       0
+       (count-if (lambda (frame)
+                   (= (http-kit/http2::%h2-frame-type frame) 1))
+                 (server-output-frames (binary-session-output stream))))))
+
+  (deftest http2-server-idle-timeout-interrupts-initial-preface-read
+    (let* ((stream
+             (make-instance 'server-deadline-blocking-read-stream
+                            :input (octets)
+                            :block-at 0))
+           (handler-calls 0)
+           (observed nil))
+      (handler-case
+          (sb-ext:with-timeout 1
+            (http-kit/http2:serve-http2-session
+             stream
+             (lambda (request)
+               (declare (ignore request))
+               (incf handler-calls)
+               (make-http-response :status 204))
+             :idle-timeout 0.05d0
+             :clock-function (lambda () 0)
+             :close-stream (lambda (closed-stream)
+                             (declare (ignore closed-stream)))))
+        (http-timeout (condition)
+          (setf observed condition)))
+      (ensure-true (typep observed 'http-timeout))
+      (ensure-equal :read (http-timeout-kind observed))
+      (ensure-equal 0 handler-calls)
+      (ensure-equal 0 (length (binary-session-output stream)))))
+
+  (deftest http2-server-idle-timeout-interrupts-initial-settings-read
+    (let* ((preface (h2-preface))
+           (stream
+             (make-instance 'server-deadline-blocking-read-stream
+                            :input preface
+                            :block-at (length preface)))
+           (handler-calls 0)
+           (observed nil))
+      (handler-case
+          (sb-ext:with-timeout 1
+            (http-kit/http2:serve-http2-session
+             stream
+             (lambda (request)
+               (declare (ignore request))
+               (incf handler-calls)
+               (make-http-response :status 204))
+             :idle-timeout 0.05d0
+             :clock-function (lambda () 0)
+             :close-stream (lambda (closed-stream)
+                             (declare (ignore closed-stream)))))
+        (http-timeout (condition)
+          (setf observed condition)))
+      (ensure-true (typep observed 'http-timeout))
+      (ensure-equal :read (http-timeout-kind observed))
+      (ensure-equal 0 handler-calls)
+      (ensure-equal 0 (length (binary-session-output stream)))))
+
+  (deftest http2-server-idle-timeout-interrupts-next-frame-read
+    (let* ((input
+             (concatenate-octets
+              (h2-preface)
+              (h2-frame 4 0 0 (octets))
+              (server-deadline-request-frame 1 5)))
+           (stream
+             (make-instance 'server-deadline-blocking-read-stream
+                            :input input
+                            :block-at (length input)))
+           (handler-calls 0)
+           (observed nil))
+      (handler-case
+          (sb-ext:with-timeout 1
+            (http-kit/http2:serve-http2-session
+             stream
+             (lambda (request)
+               (declare (ignore request))
+               (incf handler-calls)
+               (make-http-response :status 204))
+             :idle-timeout 0.05d0
+             :clock-function (lambda () 0)
+             :close-stream (lambda (closed-stream)
+                             (declare (ignore closed-stream)))))
+        (http-timeout (condition)
+          (setf observed condition)))
+      (ensure-true (typep observed 'http-timeout))
+      (ensure-equal :read (http-timeout-kind observed))
+      (ensure-equal 1 handler-calls)
+      (ensure-equal
+       1
+       (count-if (lambda (frame)
+                   (and (= (http-kit/http2::%h2-frame-type frame) 1)
+                        (= (http-kit/http2::%h2-frame-stream-id frame) 1)))
+                 (server-output-frames (binary-session-output stream))))))
+
+  (deftest http2-server-shutdown-drains-active-stream-and-rejects-newer-streams
+    (let* ((headers
+             (server-deadline-request-frame 1 4))
+           (first-request-prefix
+             (concatenate-octets
+              (h2-preface)
+              (h2-frame 4 0 0 (octets))
+              headers))
+           (data-frame (h2-frame 0 1 1 (octets)))
+           (newer-request (server-deadline-request-frame 3 5))
+           (input (concatenate-octets
+                   first-request-prefix data-frame newer-request))
+           (stream (make-instance 'binary-session-stream :input input))
+           (stop-position (length first-request-prefix))
+           (handler-calls 0))
+      (multiple-value-bind (count reason)
+          (http-kit/http2:serve-http2-session
+           stream
+           (lambda (request)
+             (declare (ignore request))
+             (incf handler-calls)
+             (make-http-response :status 204))
+           :shutdown-p
+           (lambda ()
+             (>= (binary-session-input-position stream) stop-position))
+           :close-stream (lambda (closed-stream)
+                           (declare (ignore closed-stream))))
+        (let* ((frames (server-output-frames (binary-session-output stream)))
+               (goaway (find-if
+                        (lambda (frame)
+                          (= (http-kit/http2::%h2-frame-type frame) 7))
+                        frames)))
+          (ensure-equal 1 count)
+          (ensure-equal :goaway reason)
+          (ensure-equal 1 handler-calls)
+          (ensure-true goaway)
+          (ensure-equal
+           1
+           (http-kit/http2::%h2-u32
+            (http-kit/http2::%h2-frame-payload goaway) 0))
+          (ensure-equal
+           1
+           (count-if (lambda (frame)
+                       (and (= (http-kit/http2::%h2-frame-type frame) 1)
+                            (= (http-kit/http2::%h2-frame-stream-id frame) 1)))
+                     frames))
+          (ensure-equal
+           0
+           (count-if (lambda (frame)
+                       (and (= (http-kit/http2::%h2-frame-type frame) 1)
+                            (= (http-kit/http2::%h2-frame-stream-id frame) 3)))
+                     frames)
+          (ensure-equal
+           (+ stop-position (length data-frame))
+           (binary-session-input-position stream))))))))
+  #+sbcl
+(progn
+  (deftest http2-server-request-timeout-interrupts-frame-header-read
+    (let* ((frame (server-deadline-request-frame 1 5))
+           (input
+             (concatenate-octets
+              (h2-preface)
+              (h2-frame 4 0 0 (octets))
+              (subseq frame 0 1)))
+           (stream
+             (make-instance 'server-deadline-blocking-read-stream
+                            :input input
+                            :block-at (length input)))
+           (handler-calls 0)
+           (observed nil))
+      (handler-case
+          (sb-ext:with-timeout 1
+            (http-kit/http2:serve-http2-session
+             stream
+             (lambda (request)
+               (declare (ignore request))
+               (incf handler-calls)
+               (make-http-response :status 204))
+             :request-timeout 0.05d0
+             :clock-function (lambda () 0)
+             :close-stream (lambda (closed-stream)
+                             (declare (ignore closed-stream)))))
+        (http-timeout (condition)
+          (setf observed condition)))
+      (ensure-true (typep observed 'http-timeout))
+      (ensure-equal :read (http-timeout-kind observed))
+      (ensure-equal 0 handler-calls)
+      (ensure-equal
+       0
+       (count-if (lambda (frame)
+                   (= (http-kit/http2::%h2-frame-type frame) 1))
+                 (server-output-frames (binary-session-output stream)))))))
+  #+sbcl
+(progn
+  (defclass server-deadline-idle-boundary-stream (binary-session-stream)
+    ((frame-start-position
+      :initarg :frame-start-position
+      :reader server-deadline-idle-frame-start-position)
+     (clock-value
+      :initform 0
+      :accessor server-deadline-idle-clock-value)
+     (waited-p
+      :initform nil
+      :accessor server-deadline-idle-waited-p)))
+
+  (defmethod sb-gray:stream-read-sequence :around
+      ((stream server-deadline-idle-boundary-stream) sequence
+       &optional (start 0) end)
+    (declare (ignore sequence start end))
+    (let ((position (binary-session-input-position stream)))
+      (cond
+        ((= position (server-deadline-idle-frame-start-position stream))
+         (setf (server-deadline-idle-clock-value stream) 0.04d0))
+        ((and (= position
+                 (1+ (server-deadline-idle-frame-start-position stream)))
+              (not (server-deadline-idle-waited-p stream)))
+         (setf (server-deadline-idle-clock-value stream) 0.06d0
+               (server-deadline-idle-waited-p stream) t)
+         (sleep 0.1d0))))
+    (call-next-method))
+
+  (deftest http2-server-idle-expiry-does-not-cap-new-request-timeout
+    (let* ((first-frame (server-deadline-request-frame 1 5))
+           (second-frame (server-deadline-request-frame 3 5))
+           (frame-start-position
+             (+ (length (h2-preface))
+                (length (h2-frame 4 0 0 (octets)))
+                (length first-frame)))
+           (input
+             (concatenate-octets
+              (h2-preface)
+              (h2-frame 4 0 0 (octets))
+              first-frame
+              second-frame))
+           (stream
+             (make-instance 'server-deadline-idle-boundary-stream
+                            :input input
+                            :frame-start-position frame-start-position))
+           (handler-calls 0)
+           (observed nil)
+           (result-count nil)
+           (termination nil))
+      (handler-case
+          (sb-ext:with-timeout 1
+            (multiple-value-setq (result-count termination)
+              (http-kit/http2:serve-http2-session
+               stream
+               (lambda (request)
+                 (declare (ignore request))
+                 (incf handler-calls)
+                 (make-http-response :status 204))
+               :request-timeout 1
+               :idle-timeout 0.05d0
+               :clock-function
+               (lambda () (server-deadline-idle-clock-value stream))
+               :close-stream (lambda (closed-stream)
+                               (declare (ignore closed-stream))))))
+        (http-timeout (condition)
+          (setf observed condition)))
+      (ensure-true (null observed))
+      (ensure-equal 0.06d0 (server-deadline-idle-clock-value stream))
+      (ensure-equal 2 result-count)
+      (ensure-equal :eof termination)
+      (ensure-equal 2 handler-calls))))
 
 #+sbcl
 (progn
