@@ -8,7 +8,7 @@
   ;; &OPTIONAL and &KEY in the lambda list (which some implementations warn
   ;; about).  A keyword immediately after the callback means that collection
   ;; keeps its default value.
-  (let ((on-body-chunk nil)
+  (let ((on-body-chunk nil) (on-information nil)
         (collect-body-p t)
         (expected-stream-id 1)
         (hpack-context nil)
@@ -46,6 +46,7 @@
                 (setf read-initial-settings-p value))
                (:peer-max-frame-size (setf peer-max-frame-size value))
                (:initial-frames (setf initial-frames value))
+               (:on-information (setf on-information value))
                (:on-peer-settings (setf on-peer-settings value))
                (:control-handler (setf control-handler value))
                (:budget-owner (setf budget-owner value))
@@ -116,13 +117,20 @@
                      :operation :http2-read
                      :detail :protocol-error))
              ((= type +http2-headers-type+)
-              (multiple-value-bind (new-status new-headers response)
+              (multiple-value-bind (new-status new-headers response information-status information-headers)
                   (%h2-process-headers-frame
                    frame reader max-frame-size deadline clock-function
                    max-header-bytes context status headers body body-length
                    request-method expected-stream-id max-fields)
-                (setf status new-status
-                      headers new-headers)
+                (progn
+                  (setf status new-status
+                        headers new-headers)
+                  (when (and information-status on-information)
+                    (funcall on-information
+                             (http-kit:make-http-response
+                              :status information-status
+                              :headers information-headers
+                              :protocol-version "HTTP/2"))))
                 (when response
                   (return-from %h2-read-response response))))
              ((= type +http2-data-type+)

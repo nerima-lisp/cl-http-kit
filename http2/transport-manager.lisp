@@ -112,11 +112,13 @@ when a caller needs several concurrent streams on one connection."
   (mapcar #'%http2-managed-connection-connection
           (%http2-connection-manager-entries manager)))
 
-(defun %h2-manager-request-key (request)
+(defun %h2-manager-request-key (request proxy-plan proxy)
   (let ((uri (http-kit:http-request-uri request)))
     (list (http-kit:http-uri-scheme uri)
           (http-kit:http-uri-host uri)
-          (http-kit:http-uri-port uri))))
+          (http-kit:http-uri-port uri)
+          proxy-plan
+          proxy)))
 
 (defun %h2-manager-entry-usable-p (entry)
   (let ((connection (%http2-managed-connection-connection entry)))
@@ -192,7 +194,7 @@ when a caller needs several concurrent streams on one connection."
   entry)
 
 (defun %h2-manager-open-entry
-    (manager request key timeout deadline)
+    (manager request key timeout deadline proxy-plan proxy)
   (%h2-manager-prune manager)
   (when (>= (length (%http2-connection-manager-entries manager))
             (%http2-connection-manager-max-connections manager))
@@ -200,10 +202,17 @@ when a caller needs several concurrent streams on one connection."
       (when oldest
         (%h2-manager-discard-entry manager oldest))))
   (let ((connection
-          (funcall (%http2-connection-manager-open-connection manager)
-                   request
-                   :timeout timeout
-                   :deadline deadline)))
+          (if (or proxy-plan proxy)
+              (funcall (%http2-connection-manager-open-connection manager)
+                       request
+                       :timeout timeout
+                       :deadline deadline
+                       :proxy-plan proxy-plan
+                       :proxy proxy)
+              (funcall (%http2-connection-manager-open-connection manager)
+                       request
+                       :timeout timeout
+                       :deadline deadline))))
     (unless (http2-connection-p connection)
       (error 'http-kit:http-protocol-error
              :message "The HTTP/2 manager open callback returned a non-connection."
@@ -223,7 +232,8 @@ when a caller needs several concurrent streams on one connection."
       entry)))
 
 (defun %h2-manager-connection-for
-    (manager request connection-key connection-key-supplied-p timeout deadline)
+    (manager request connection-key connection-key-supplied-p timeout deadline
+     proxy-plan proxy)
   (unless (http2-connection-manager-p manager)
     (error 'http-kit:http-protocol-error
            :message "An HTTP/2 request requires an HTTP2-CONNECTION-MANAGER."
@@ -237,13 +247,13 @@ when a caller needs several concurrent streams on one connection."
   (http-kit::%check-http-request request)
   (let* ((key (if connection-key-supplied-p
                   connection-key
-                  (%h2-manager-request-key request)))
+                  (%h2-manager-request-key request proxy-plan proxy)))
          (entry nil))
     (%h2-manager-prune manager)
     (setf entry (%h2-manager-entry-for-key manager key))
     (unless entry
       (setf entry (%h2-manager-open-entry
-                   manager request key timeout deadline)))
+                   manager request key timeout deadline proxy-plan proxy)))
     (%h2-manager-touch manager entry)
     (values (%http2-managed-connection-connection entry) entry)))
 
@@ -267,7 +277,8 @@ when a caller needs several concurrent streams on one connection."
      &key (connection-key nil connection-key-supplied-p)
        timeout deadline max-header-bytes max-fields max-body-bytes clock-function
        request-body-function request-body-length
-       on-body-chunk (collect-body-p t) (huffman-p nil))
+       on-body-chunk on-information (collect-body-p t) (huffman-p nil)
+       proxy-plan proxy)
   "Send REQUEST through a reusable HTTP/2 connection manager."
   (loop
     with retried-p = nil
@@ -275,7 +286,7 @@ when a caller needs several concurrent streams on one connection."
        (multiple-value-bind (connection entry)
            (%h2-manager-connection-for
             manager request connection-key connection-key-supplied-p
-            timeout deadline)
+            timeout deadline proxy-plan proxy)
          (handler-case
              (let ((response
                      (send-http2-request-over-connection
@@ -289,6 +300,7 @@ when a caller needs several concurrent streams on one connection."
                       :request-body-function request-body-function
                       :request-body-length request-body-length
                       :on-body-chunk on-body-chunk
+                      :on-information on-information
                       :collect-body-p collect-body-p
                       :huffman-p huffman-p)))
                (%h2-manager-finish-entry manager entry)
@@ -315,9 +327,7 @@ when a caller needs several concurrent streams on one connection."
            :operation :http2-manager
            :detail requests))
   (multiple-value-bind (connection entry)
-      (%h2-manager-connection-for
-       manager (first requests) connection-key connection-key-supplied-p
-       timeout deadline)
+      (%h2-manager-connection-for manager (first requests) connection-key connection-key-supplied-p timeout deadline nil nil)
     (handler-case
         (let ((responses
                 (send-http2-requests-over-connection
@@ -350,8 +360,9 @@ when a caller needs several concurrent streams on one connection."
   (lambda (request
            &key timeout deadline max-header-bytes max-fields max-body-bytes clock-function
              request-body-function request-body-length
-             on-body-chunk (collect-body-p t) (huffman-p nil)
+             on-body-chunk on-information (collect-body-p t) (huffman-p nil)
              (connection-key nil connection-key-supplied-p)
+             proxy-plan proxy
              &allow-other-keys)
     (if connection-key-supplied-p
         (send-http2-request-over-connection-manager
@@ -366,8 +377,11 @@ when a caller needs several concurrent streams on one connection."
          :request-body-function request-body-function
          :request-body-length request-body-length
          :on-body-chunk on-body-chunk
+         :on-information on-information
          :collect-body-p collect-body-p
-         :huffman-p huffman-p)
+         :huffman-p huffman-p
+         :proxy-plan proxy-plan
+         :proxy proxy)
         (send-http2-request-over-connection-manager
          manager request
          :timeout timeout
@@ -379,8 +393,11 @@ when a caller needs several concurrent streams on one connection."
          :request-body-function request-body-function
          :request-body-length request-body-length
          :on-body-chunk on-body-chunk
+         :on-information on-information
          :collect-body-p collect-body-p
-         :huffman-p huffman-p))))
+         :huffman-p huffman-p
+         :proxy-plan proxy-plan
+         :proxy proxy))))
 
 (defun close-http2-connection-manager (manager)
   "Close every retained connection and make MANAGER unusable."

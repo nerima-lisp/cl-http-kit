@@ -1,5 +1,7 @@
 (in-package #:http-kit/client)
 
+(defvar *proxy-tls-upgrade-p* nil)
+
 (defun %proxy-monotonic-time ()
   (/ (float (get-internal-real-time))
      internal-time-units-per-second))
@@ -213,19 +215,21 @@
                :proxy proxy)))
 
 (defun %proxy-upgrade
-    (stream tls-upgrade uri timeout deadline)
+    (stream tls-upgrade uri timeout deadline &key proxy-tls-p)
   (unless tls-upgrade
     (error 'http-unsupported-feature
            :message "A TLS upgrade function is required for this proxied HTTPS connection."
            :operation :proxy
            :detail uri
            :feature :tls-upgrade))
-  (let ((upgraded (funcall tls-upgrade stream uri
-                           :timeout timeout
-                           :deadline deadline)))
+  (multiple-value-bind (upgraded negotiated-alpn)
+      (let ((*proxy-tls-upgrade-p* proxy-tls-p))
+        (funcall tls-upgrade stream uri
+                 :timeout timeout
+                 :deadline deadline))
     (unless (streamp upgraded)
       (%proxy-error "The TLS upgrade function did not return a stream." upgraded))
-    upgraded))
+    (values upgraded negotiated-alpn)))
 
 (defun %proxy-connect
     (stream proxy-plan timeout deadline clock-function)
@@ -263,61 +267,64 @@
     (open-stream close-stream request proxy-plan proxy tls-upgrade resolve-host
                  resolve-host-style timeout deadline clock-function)
   (let* ((mode (or (getf proxy-plan :mode) :direct))
-         (proxy (or proxy (getf proxy-plan :proxy)))
+         (proxy (if proxy-plan (getf proxy-plan :proxy) proxy))
          (target (or (getf proxy-plan :target)
                      (http-request-uri request)))
          (stream (%proxy-open-raw open-stream request timeout deadline
                                   proxy-plan proxy))
+         (negotiated-alpn nil)
          (retained-p nil))
     (unwind-protect
          (progn
            (unless (streamp stream)
              (%proxy-error "The proxy stream opener did not return a stream." stream))
-           (setf stream
-                 (case mode
-                   (:direct
-                    (if (string= (http-uri-scheme target) "https")
-                        (%proxy-upgrade stream tls-upgrade target timeout deadline)
-                        stream))
-                   (:forward
-                    (when (eq (http-proxy-scheme proxy) :https)
-                      (setf stream
-                            (%proxy-upgrade
-                             stream tls-upgrade
-                             (%proxy-uri-for :https (http-proxy-host proxy)
-                                             (http-proxy-port proxy))
-                             timeout deadline)))
-                    stream)
-                   (:connect
-                    (when (eq (http-proxy-scheme proxy) :https)
-                      (setf stream
-                            (%proxy-upgrade
-                             stream tls-upgrade
-                             (%proxy-uri-for :https (http-proxy-host proxy)
-                                             (http-proxy-port proxy))
-                             timeout deadline)))
-                    (multiple-value-bind (connected response)
-                        (%proxy-connect stream proxy-plan timeout deadline
-                                        clock-function)
-                      (if response
-                          (return-from %proxy-open-plan-once
-                            (values nil response))
-                          (if (string= (http-uri-scheme target) "https")
-                              (%proxy-upgrade connected tls-upgrade target
-                                              timeout deadline)
-                              connected))))
-                   (:socks5
-                   (%proxy-socks-negotiate stream proxy-plan timeout deadline
-                                            clock-function resolve-host
-                                            resolve-host-style)
-                    (if (string= (http-uri-scheme target) "https")
-                        (%proxy-upgrade stream tls-upgrade target
-                                        timeout deadline)
-                        stream))
-                   (otherwise
-                    (%proxy-error "The proxy plan contains an unsupported mode." mode))))
+           (case mode
+             (:direct
+              (when (string= (http-uri-scheme target) "https")
+                (multiple-value-setq (stream negotiated-alpn)
+                  (%proxy-upgrade stream tls-upgrade target timeout deadline))))
+             (:forward
+              (when (eq (http-proxy-scheme proxy) :https)
+                (setf stream
+                      (nth-value
+                       0
+                       (%proxy-upgrade
+                        stream tls-upgrade
+                        (%proxy-uri-for :https (http-proxy-host proxy)
+                                        (http-proxy-port proxy))
+                        timeout deadline :proxy-tls-p t)))))
+             (:connect
+              (when (eq (http-proxy-scheme proxy) :https)
+                (setf stream
+                      (nth-value
+                       0
+                       (%proxy-upgrade
+                        stream tls-upgrade
+                        (%proxy-uri-for :https (http-proxy-host proxy)
+                                        (http-proxy-port proxy))
+                        timeout deadline :proxy-tls-p t))))
+              (multiple-value-bind (connected response)
+                  (%proxy-connect stream proxy-plan timeout deadline
+                                  clock-function)
+                (when response
+                  (return-from %proxy-open-plan-once
+                    (values nil response nil)))
+                (if (string= (http-uri-scheme target) "https")
+                    (multiple-value-setq (stream negotiated-alpn)
+                      (%proxy-upgrade connected tls-upgrade target
+                                      timeout deadline))
+                    (setf stream connected))))
+             (:socks5
+              (%proxy-socks-negotiate stream proxy-plan timeout deadline
+                                      clock-function resolve-host
+                                      resolve-host-style)
+              (when (string= (http-uri-scheme target) "https")
+                (multiple-value-setq (stream negotiated-alpn)
+                  (%proxy-upgrade stream tls-upgrade target timeout deadline))))
+             (otherwise
+              (%proxy-error "The proxy plan contains an unsupported mode." mode)))
            (setf retained-p t)
-           stream)
+           (values stream nil negotiated-alpn))
       (unless retained-p
         (when (streamp stream)
           (http-kit::%with-http-cleanup
@@ -339,12 +346,12 @@
   (let ((plan proxy-plan)
         (challenge-count 0))
     (loop
-      (multiple-value-bind (stream response)
+      (multiple-value-bind (stream response negotiated-alpn)
           (%proxy-open-plan-once
            open-stream close-stream request plan proxy tls-upgrade resolve-host
            resolve-host-style timeout deadline clock-function)
         (when stream
-          (return stream))
+          (return (values stream negotiated-alpn)))
         (let* ((challenge-values
                  (and (= (http-response-status response) 407)
                       (http-header-values

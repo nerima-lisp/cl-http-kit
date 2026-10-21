@@ -395,6 +395,39 @@
                (ensure-equal 0 acks)))
         (http-kit/http2:close-http2-connection connection))
       (ensure-equal 1 closed))))
+#+sbcl
+(deftest http2-public-contract-boundary-information-validation-before-io
+  (let* ((stream (make-instance 'binary-session-stream
+                                :input (h2-response-wire (octets 7))))
+         (closed 0)
+         (connection
+           (http-kit/http2:make-http2-connection
+            :stream stream
+            :close-stream (lambda (received)
+                            (ensure-true (eq stream received))
+                            (incf closed)
+                            (close received))))
+         (initial-input-position (binary-session-input-position stream))
+         (initial-output (copy-seq (binary-session-output stream))))
+    (unwind-protect
+         (let ((condition
+                 (handler-case
+                     (progn
+                       (http-kit/http2:send-http2-request-over-connection
+                        connection
+                        (make-http-request :method "GET" :uri "https://example.com/")
+                        :on-information 17)
+                       nil)
+                   (http-protocol-error (error) error))))
+           (ensure-true (typep condition 'http-protocol-error))
+           (ensure-equal :http2-client (http-error-operation condition))
+           (ensure-equal 17 (http-protocol-error-detail condition))
+           (ensure-equal initial-input-position (binary-session-input-position stream))
+           (ensure-equal initial-output (binary-session-output stream))
+           (ensure-true (http-kit/http2:http2-connection-open-p connection))
+           (ensure-equal 0 closed))
+      (http-kit/http2:close-http2-connection connection))
+    (ensure-equal 1 closed)))
 
 #+sbcl
 (deftest http2-public-contract-completed-stream-window-update
