@@ -3048,6 +3048,7 @@
              :payload
              (http3-test-qpack-encode response-fields
               :context response-table
+              :stream-id 0
               :huffman t))))
          (response-data
            (http-kit/http3:encode-http3-frame
@@ -3074,7 +3075,7 @@
                    (ensure-true (http-request-p request))
                    (setf request-stream stream))
                  (push stream opened-streams)
-                 stream))
+                 (values stream 0)))
              (write-stream (stream octets &key fin-p timeout deadline)
                (declare (ignore timeout deadline))
                (push (list (subseq octets 0) fin-p)
