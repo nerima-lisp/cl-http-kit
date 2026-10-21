@@ -2702,16 +2702,24 @@
                  (list (subseq wire 5) t)))
          (closed '())
          (client
-           (http-kit/http3::%make-http3-client
-            :push-promises (list (cons 2 promised-fields))
-            :read-stream
-            (lambda (stream &key timeout deadline)
-              (declare (ignore stream timeout deadline))
-              (let ((read (pop reads)))
-                (values (first read) (second read))))
-            :close-stream
-            (lambda (stream &key condition)
-              (push (list stream condition) closed)))))
+           (let* ((decoder-context
+                    (http-message-kit:make-qpack-context
+                     :max-table-capacity 0 :table-capacity 0 :huffman nil))
+                  (decoder-adapter
+                    (http-message-kit:qpack-make-http3-decoder-context
+                     decoder-context :max-blocked-streams 1)))
+             (http-kit/http3::%make-http3-client
+              :qpack-decoder-context decoder-context
+              :qpack-http3-decoder-context decoder-adapter
+              :push-promises (list (cons 2 promised-fields))
+              :read-stream
+              (lambda (stream &key timeout deadline)
+                (declare (ignore stream timeout deadline))
+                (let ((read (pop reads)))
+                  (values (first read) (second read))))
+              :close-stream
+              (lambda (stream &key condition)
+                (push (list stream condition) closed))))))
     (multiple-value-bind (push-id response)
         (http-kit/http3:receive-http3-push client :push-stream :stream-id 0)
       (ensure-equal 2 push-id)
