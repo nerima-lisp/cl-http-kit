@@ -694,4 +694,123 @@
           (ensure-equal :name (http-invalid-header-reason failure))
           (ensure-equal nil actual)
           (ensure-equal nil writes))))))
-
+(deftest http3-codec-qpack-reregistered-stream-rejects-stale-token
+  (multiple-value-bind (fields decoder-context section instruction)
+      (http3-test-qpack-blocked-fixture)
+    (let* ((adapter
+             (http-message-kit:qpack-make-http3-decoder-context
+              decoder-context :max-blocked-streams 1))
+           (first-token
+             (http-message-kit:qpack-decode-http3-field-section
+              section adapter 0 :role :trailers))
+           (second-token
+             (http-message-kit:qpack-decode-http3-field-section
+              section adapter 0 :role :trailers))
+           (events nil)
+           (consumed nil))
+      (ensure-true (http-message-kit:qpack-blocked-stream-p first-token))
+      (ensure-true (http-message-kit:qpack-blocked-stream-p second-token))
+      (ensure-true (not (eq first-token second-token)))
+      (multiple-value-setq (events consumed)
+        (http-message-kit:qpack-decode-encoder-stream
+         decoder-context instruction))
+      (ensure-equal '((:set-capacity 256) (:insert "x-blocked" "ready"))
+                    events)
+      (ensure-equal (length instruction) consumed)
+      (let ((ready (http-message-kit:qpack-take-ready-streams adapter)))
+        (ensure-equal 1 (length ready))
+        (ensure-true (eq second-token (first ready)))
+        (let ((failure
+                (handler-case
+                    (progn
+                      (http-message-kit:qpack-resume-blocked-stream first-token)
+                      nil)
+                  (http-message-kit:http-connection-error (condition)
+                    condition))))
+          (ensure-true
+           (typep failure 'http-message-kit:http-connection-error))
+          (ensure-equal
+           "QPACK blocked-stream token is not resumable."
+           (http-error-message failure)))
+        (ensure-equal
+         fields
+         (mapcar
+          (lambda (header)
+            (cons (http-message-kit:http-header-name header)
+                  (http-message-kit:http-header-content header)))
+          (http-message-kit:qpack-resume-blocked-stream (first ready))))))))
+(deftest http3-codec-qpack-failed-shrink-preserves-entry-identity-and-value
+  (let ((context
+          (http-message-kit:make-qpack-context
+           :max-table-capacity 34 :table-capacity 34 :huffman nil)))
+    (http-message-kit:qpack-encode-insert-with-literal-name
+     context "x" "y" :huffman nil)
+    (let* ((section
+             (http-message-kit:qpack-encode-header-block
+              (list (http-message-kit:make-http-header "x" "y"))
+              :context context :use-dynamic-p t :stream-id 4 :huffman nil))
+           (table-before
+             (http-message-kit::qpack-context-dynamic-table context))
+           (entry-before
+             (first
+              (http-message-kit::qpack-dynamic-table-entries table-before)))
+           (failure
+             (handler-case
+                 (progn
+                   (http-message-kit:qpack-context-set-capacity context 0)
+                   nil)
+               (http-protocol-error (condition) condition)))
+           (table-after
+             (http-message-kit::qpack-context-dynamic-table context))
+           (entry-after
+             (first
+              (http-message-kit::qpack-dynamic-table-entries table-after))))
+      (ensure-true (typep failure 'http-protocol-error))
+      (ensure-equal
+       "QPACK cannot evict an entry referenced by a field section."
+       (http-error-message failure))
+      (ensure-equal 34 (http-message-kit:qpack-context-table-capacity context))
+      (ensure-equal 34 (http-message-kit:qpack-context-table-size context))
+      (ensure-equal 1 (http-message-kit:qpack-context-dynamic-entry-count context))
+      (ensure-true (eq entry-before entry-after))
+      (ensure-equal "x" (http-message-kit::qpack-dynamic-entry-name entry-after))
+      (ensure-equal "y" (http-message-kit::qpack-dynamic-entry-value entry-after))
+      (ensure-equal
+       '(("x" . "y"))
+       (mapcar
+        (lambda (header)
+          (cons (http-message-kit:http-header-name header)
+                (http-message-kit:http-header-content header)))
+        (http-message-kit:qpack-decode-header-block section :context context))))))
+(deftest http3-codec-qpack-malformed-section-preserves-blocked-registration
+  (multiple-value-bind (fields decoder-context section instruction)
+      (http3-test-qpack-blocked-fixture)
+    (let* ((adapter
+             (http-message-kit:qpack-make-http3-decoder-context
+              decoder-context :max-blocked-streams 1))
+           (token
+             (http-message-kit:qpack-decode-http3-field-section
+              section adapter 0 :role :trailers))
+           (failure
+             (handler-case
+                 (progn
+                   (http-message-kit:qpack-decode-http3-field-section
+                    (octets) adapter 0 :role :trailers)
+                   nil)
+               (http-message-kit:http-connection-error (condition)
+                 condition))))
+      (ensure-true (http-message-kit:qpack-blocked-stream-p token))
+      (ensure-true
+       (typep failure 'http-message-kit:http-connection-error))
+      (ensure-equal :http3-transport (http-error-operation failure))
+      (ensure-equal "HTTP/3 QPACK decompression failed."
+                    (http-error-message failure))
+      (ensure-equal nil (http-message-kit:qpack-take-ready-streams adapter))
+      (ensure-equal
+       fields
+       (mapcar
+        (lambda (header)
+          (cons (http-message-kit:http-header-name header)
+                (http-message-kit:http-header-content header)))
+        (http3-test-decode-inserts-and-resume
+         adapter decoder-context instruction token))))))
