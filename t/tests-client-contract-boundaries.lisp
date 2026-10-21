@@ -1051,6 +1051,56 @@
       (ensure-equal 0 (getf (http-connection-pool-stats pool) :idle-count))
       (ensure-equal 0 (http-connection-pool-clear pool))
       (ensure-equal 0 closes))))
+(deftest client-contract-pool-open-wraps-unexpected-errors
+  (let* ((original (make-condition (quote simple-error)
+                                   :format-control "Raw opener failure."))
+         (pool (http-kit/client::%make-http-connection-pool
+                :open-stream (lambda (&rest arguments)
+                               (declare (ignore arguments))
+                               (error original))))
+         (caught (handler-case
+                     (http-kit/client::%pool-open pool nil)
+                   (http-connection-error (condition) condition))))
+    (ensure-true (typep caught 'http-connection-error))
+    (ensure-equal :connect (http-error-operation caught))
+    (ensure-equal "The connection pool opener signaled an error."
+                  (http-error-message caught))
+    (ensure-true (eq original (http-connection-error-cause caught)))))
+(deftest client-contract-pool-clear-runs-callbacks-before-signaling-first-error
+  (let* ((first-condition
+           (make-condition (quote simple-error)
+                           :format-control "First callback failure."))
+         (second-condition
+           (make-condition (quote simple-error)
+                           :format-control "Second callback failure."))
+         (seen-errors nil)
+         (events nil)
+         (pool (make-http-connection-pool
+                :open-stream (lambda (&rest arguments)
+                               (declare (ignore arguments))
+                               (error "The opener is not used.")))))
+    (http-kit/client::%http-connection-pool-register-clear-callback
+     pool (lambda () (push :observer events)))
+    (http-kit/client::%http-connection-pool-register-clear-callback
+     pool (lambda ()
+            (push :first events)
+            (push first-condition seen-errors)
+            (error first-condition)))
+    (http-kit/client::%http-connection-pool-register-clear-callback
+     pool (lambda ()
+            (push :second events)
+            (push second-condition seen-errors)
+            (error second-condition)))
+    (let ((caught (handler-case
+                      (http-connection-pool-clear pool)
+                    (simple-error (condition) condition))))
+      (ensure-true (typep caught 'simple-error))
+      (ensure-equal 2 (length seen-errors))
+      (ensure-true (eq caught (car (last seen-errors))))
+      (ensure-equal 3 (length events))
+      (ensure-true (member :observer events))
+      (ensure-true (member :first events))
+      (ensure-true (member :second events)))))
 
 (deftest client-contract-strict-alt-svc-parameter-state
   (dolist (case '(("ma=30; persist=1" t t)
