@@ -2165,10 +2165,10 @@
                             (http-connection-error (condition) condition))))
              (ensure-true (typep caught 'http-connection-error))
              (ensure-equal :connect (http-error-operation caught))
-             (ensure-equal "The connection pool opener signaled an error." (http-error-message caught))
+             (ensure-equal "The default connection pool key could not be derived." (http-error-message caught))
              (ensure-true (typep (http-connection-error-cause caught) 'type-error))
-             ;; Unknown opener failures must not permit an unsafe replay.
-             (ensure-true (http-connection-error-request-sent-p caught))
+             ;; Key derivation happens before the stream opener can send a request.
+             (ensure-false (http-connection-error-request-sent-p caught))
              (ensure-equal '(:mode . 17) plan)
              (ensure-equal nil events)
              (ensure-equal 0 (getf (http-connection-pool-stats pool) :idle-count))

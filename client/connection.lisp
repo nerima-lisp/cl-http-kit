@@ -309,8 +309,9 @@ be used concurrently from multiple threads."
               (or key (%pool-default-key request effective-proxy-plan proxy))
             (type-error (condition)
               (error 'http-connection-error
-                     :message "The connection pool opener signaled an error."
+                     :message "The default connection pool key could not be derived."
                      :operation :connect
+                     :request-sent-p nil
                      :cause condition))))
          (stream nil)
          (opened-at nil)
