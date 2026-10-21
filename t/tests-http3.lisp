@@ -3090,12 +3090,19 @@
                (setf (http3-test-stream-closed-p stream) t)))
       (let ((client
               (http-kit/http3:make-http3-client
+               :qpack-settings
+               (list (cons http-kit/http3:+http3-setting-qpack-max-table-capacity+ 256))
                :open-stream #'open-stream
                :write-stream #'write-stream
                :read-stream #'read-stream
                :close-stream #'close-stream
                :max-push-id 3)))
         (ensure-true (http-kit/http3:http3-client-open-p client))
+        (setf (http-kit/http3::http3-client-qpack-decoder-context client)
+              response-table
+              (http-kit/http3::http3-client-qpack-http3-decoder-context client)
+              (http-message-kit:qpack-make-http3-decoder-context
+               response-table :max-blocked-streams 0))
         (let ((response
                 (http-kit/http3:send-http3-request
                  client
