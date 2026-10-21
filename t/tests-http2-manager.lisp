@@ -1058,3 +1058,617 @@
      (list (list "uncached" 1)
            (list "callback-error" 3))
      (reverse transient-events))))
+#+sbcl
+(deftest http2-connection-manager-validates-retirement-callbacks-and-clear-input
+  (let ((opener (lambda (request &key timeout deadline)
+                  (declare (ignore request timeout deadline))
+                  nil)))
+    (signals http-protocol-error
+      (http-kit/http2:make-http2-connection-manager
+       :open-connection opener
+       :on-evict 1))
+    (signals http-protocol-error
+      (http-kit/http2:make-http2-connection-manager
+       :open-connection opener
+       :on-transient-close 1))
+    (signals http-protocol-error
+      (http-kit/http2:clear-http2-connection-manager nil))))
+#+sbcl
+(deftest http2-connection-manager-rejects-selection-after-close
+  (let* ((open-calls 0)
+         (manager
+           (http-kit/http2:make-http2-connection-manager
+            :open-connection
+            (lambda (request &key timeout deadline)
+              (declare (ignore request timeout deadline))
+              (incf open-calls)
+              nil))))
+    (ensure-true (http-kit/http2:http2-connection-manager-open-p manager))
+    (ensure-equal 0
+                  (http-kit/http2:http2-connection-manager-connection-count
+                   manager))
+    (http-kit/http2:close-http2-connection-manager manager)
+    (signals http-connection-error
+      (http-kit/http2:send-http2-request-over-connection-manager
+       manager
+       (make-http-request
+        :method "GET"
+        :uri "https://closed.test/")))
+    (ensure-equal 0 open-calls)
+    (signals http-connection-error
+      (http-kit/http2::%h2-manager-select-entry manager "closed" nil))))
+#+sbcl
+(deftest http2-connection-manager-retirement-continues-after-errors
+  (let* ((closed 0)
+        (evicted nil)
+        (condition nil)
+        (request
+          (make-http-request :method "GET" :uri "https://retire-errors.test/"))
+        (manager
+          (http-kit/http2:make-http2-connection-manager
+           :open-connection
+           (lambda (request &key timeout deadline)
+             (declare (ignore request timeout deadline))
+             (let ((stream (make-instance 'binary-session-stream :input (octets))))
+               (http-kit/http2:make-http2-connection
+                :stream stream
+                :close-stream
+                (lambda (closed-stream)
+                  (ensure-equal stream closed-stream)
+                  (incf closed)
+                  (error "Retirement close failed.")))))
+           :on-evict
+           (lambda (key)
+             (push key evicted)
+             (error "Retirement callback failed.")))))
+    (multiple-value-bind (connection entry)
+        (http-kit/http2::%h2-manager-connection-for
+         manager request "retire" t nil nil nil nil)
+      (declare (ignore connection))
+      (http-kit/http2::%h2-manager-finish-entry manager entry))
+    (handler-case
+        (http-kit/http2:clear-http2-connection-manager manager)
+      (simple-error (caught)
+        (setf condition caught)))
+    (ensure-true condition)
+    (ensure-true
+     (search "Retirement callback failed." (princ-to-string condition)))
+    (ensure-equal '("retire") (reverse evicted))
+    (ensure-equal 1 closed)
+    (ensure-equal 0
+                  (http-kit/http2:http2-connection-manager-connection-count
+                   manager))
+    (http-kit/http2:close-http2-connection-manager manager)))
+#+sbcl
+(deftest http2-connection-manager-closes-connection-completed-after-manager-close
+  (let ((opened 0)
+        (closed 0)
+        (manager nil))
+    (setf manager
+          (http-kit/http2:make-http2-connection-manager
+           :open-connection
+           (lambda (request &key timeout deadline)
+             (declare (ignore request timeout deadline))
+             (incf opened)
+             (http-kit/http2:close-http2-connection-manager manager)
+             (let ((stream (make-instance 'binary-session-stream :input (octets))))
+               (http-kit/http2:make-http2-connection
+                :stream stream
+                :close-stream
+                (lambda (closed-stream)
+                  (ensure-equal stream closed-stream)
+                  (incf closed)))))))
+    (signals http-connection-error
+      (http-kit/http2:send-http2-request-over-connection-manager
+       manager
+       (make-http-request :method "GET" :uri "https://closed-open.test/")))
+    (ensure-equal 1 opened)
+    (ensure-equal 1 closed)
+    (ensure-equal 0
+                  (http-kit/http2:http2-connection-manager-connection-count
+                   manager))
+    (ensure-false (http-kit/http2:http2-connection-manager-open-p manager))))
+#+sbcl
+(deftest http2-connection-manager-same-key-concurrent-open-reuses-retained-connection
+  (let* ((open-entered (sb-thread:make-semaphore :count 0))
+         (release-first (sb-thread:make-semaphore :count 0))
+         (first-done (sb-thread:make-semaphore :count 0))
+         (second-done (sb-thread:make-semaphore :count 0))
+         (open-lock (sb-thread:make-mutex :name "same-key open counter"))
+         (opened 0)
+         (closed 0)
+         (connections (make-array 2 :initial-element nil))
+         (request
+           (make-http-request :method "GET" :uri "https://same-open.test/"))
+         (manager
+           (http-kit/http2:make-http2-connection-manager
+            :open-connection
+            (lambda (request &key timeout deadline)
+              (declare (ignore request timeout deadline))
+              (let ((index
+                      (sb-thread:with-mutex (open-lock)
+                        (prog1 opened
+                          (incf opened)))))
+                (when (zerop index)
+                  (sb-thread:signal-semaphore open-entered)
+                  (unless (sb-thread:wait-on-semaphore
+                           release-first :timeout 5)
+                    (error "Timed out waiting to release the first same-key open")))
+                (let ((stream (make-instance 'binary-session-stream :input (octets))))
+                  (setf (aref connections index)
+                        (http-kit/http2:make-http2-connection
+                         :stream stream
+                         :close-stream
+                         (lambda (closed-stream)
+                           (ensure-equal stream closed-stream)
+                           (incf closed))))
+                  (aref connections index))))))
+         (first-thread nil)
+         (second-thread nil)
+         (first-error nil)
+         (second-error nil)
+         (first-connection nil)
+         (first-entry nil)
+         (second-connection nil)
+         (second-entry nil)
+         (second-entry-identity nil))
+    (unwind-protect
+         (progn
+           (setf first-thread
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (unwind-protect
+                         (handler-case
+                             (sb-ext:with-timeout 10
+                               (multiple-value-setq (first-connection first-entry)
+                                 (http-kit/http2::%h2-manager-connection-for
+                                  manager request "same-key" t nil nil nil nil)))
+                           (error (condition)
+                             (setf first-error condition)))
+                      (sb-thread:signal-semaphore first-done)))))
+           (ensure-true
+            (sb-thread:wait-on-semaphore open-entered :timeout 5))
+           (setf second-thread
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (unwind-protect
+                         (handler-case
+                             (sb-ext:with-timeout 10
+                               (multiple-value-setq
+                                   (second-connection second-entry)
+                                 (http-kit/http2::%h2-manager-connection-for
+                                  manager request "same-key" t nil nil nil nil)))
+                           (error (condition)
+                             (setf second-error condition)))
+                      (sb-thread:signal-semaphore second-done)))))
+           (ensure-true
+            (sb-thread:wait-on-semaphore second-done :timeout 12))
+           (sb-thread:join-thread second-thread)
+           (setf second-thread nil)
+           (ensure-true (null second-error))
+           (ensure-true second-entry)
+           (setf second-entry-identity second-entry)
+           (http-kit/http2::%h2-manager-finish-entry manager second-entry)
+           (setf second-entry nil)
+           (sb-thread:signal-semaphore release-first)
+           (ensure-true
+            (sb-thread:wait-on-semaphore first-done :timeout 12))
+           (sb-thread:join-thread first-thread)
+           (setf first-thread nil)
+           (ensure-true (null first-error))
+           (ensure-true (eq second-connection first-connection))
+           (ensure-true (eq first-connection (aref connections 1)))
+           (ensure-true (eq second-entry-identity first-entry))
+           (ensure-equal 2 opened)
+           (ensure-equal 1 closed)
+           (ensure-false
+            (http-kit/http2:http2-connection-open-p (aref connections 0)))
+           (ensure-equal
+            1
+            (http-kit/http2:http2-connection-manager-connection-count manager))
+           (http-kit/http2::%h2-manager-finish-entry manager first-entry)
+           (setf first-entry nil)
+           (http-kit/http2:close-http2-connection-manager manager))
+      (sb-thread:signal-semaphore release-first)
+      (when first-thread
+        (sb-thread:join-thread first-thread))
+      (when second-thread
+        (sb-thread:join-thread second-thread))
+      (when first-entry
+        (http-kit/http2::%h2-manager-finish-entry manager first-entry))
+      (when second-entry
+        (http-kit/http2::%h2-manager-finish-entry manager second-entry))
+      (http-kit/http2:close-http2-connection-manager manager))
+    (ensure-equal 2 closed)))
+#+sbcl
+(deftest http2-connection-manager-opening-at-capacity-retires-idle-entry
+  (let* ((open-entered (sb-thread:make-semaphore :count 0))
+         (release-first (sb-thread:make-semaphore :count 0))
+         (first-done (sb-thread:make-semaphore :count 0))
+         (occupant-done (sb-thread:make-semaphore :count 0))
+         (open-lock (sb-thread:make-mutex :name "capacity open counter"))
+         (opened 0)
+         (closed 0)
+         (connections (make-array 2 :initial-element nil))
+         (manager
+           (http-kit/http2:make-http2-connection-manager
+            :max-connections 1
+            :open-connection
+            (lambda (request &key timeout deadline)
+              (declare (ignore request timeout deadline))
+              (let ((index
+                      (sb-thread:with-mutex (open-lock)
+                        (prog1 opened
+                          (incf opened)))))
+                (when (zerop index)
+                  (sb-thread:signal-semaphore open-entered)
+                  (unless (sb-thread:wait-on-semaphore
+                           release-first :timeout 5)
+                    (error "Timed out waiting to release the first capacity open")))
+                (let ((stream (make-instance 'binary-session-stream :input (octets))))
+                  (setf (aref connections index)
+                        (http-kit/http2:make-http2-connection
+                         :stream stream
+                         :close-stream
+                         (lambda (closed-stream)
+                           (ensure-equal stream closed-stream)
+                           (incf closed))))
+                  (aref connections index))))))
+         (opening-request
+           (make-http-request :method "GET" :uri "https://opening.test/"))
+         (occupant-request
+           (make-http-request :method "GET" :uri "https://occupant.test/"))
+         (first-thread nil)
+         (occupant-thread nil)
+         (first-error nil)
+         (occupant-error nil)
+         (first-connection nil)
+         (first-entry nil)
+         (occupant-connection nil)
+         (occupant-entry nil))
+    (unwind-protect
+         (progn
+           (setf first-thread
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (unwind-protect
+                         (handler-case
+                             (sb-ext:with-timeout 10
+                               (multiple-value-setq (first-connection first-entry)
+                                 (http-kit/http2::%h2-manager-connection-for
+                                  manager opening-request "opening" t nil nil nil nil)))
+                           (error (condition)
+                             (setf first-error condition)))
+                      (sb-thread:signal-semaphore first-done)))))
+           (ensure-true
+            (sb-thread:wait-on-semaphore open-entered :timeout 5))
+           (setf occupant-thread
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (unwind-protect
+                         (handler-case
+                             (sb-ext:with-timeout 10
+                               (multiple-value-setq
+                                   (occupant-connection occupant-entry)
+                                 (http-kit/http2::%h2-manager-connection-for
+                                  manager occupant-request "occupant" t nil nil nil nil)))
+                           (error (condition)
+                             (setf occupant-error condition)))
+                      (sb-thread:signal-semaphore occupant-done)))))
+           (ensure-true
+            (sb-thread:wait-on-semaphore occupant-done :timeout 12))
+           (sb-thread:join-thread occupant-thread)
+           (setf occupant-thread nil)
+           (ensure-true (null occupant-error))
+           (ensure-true occupant-entry)
+           (http-kit/http2::%h2-manager-finish-entry manager occupant-entry)
+           (setf occupant-entry nil)
+           (ensure-equal
+            1
+            (http-kit/http2:http2-connection-manager-connection-count manager))
+           (sb-thread:signal-semaphore release-first)
+           (ensure-true
+            (sb-thread:wait-on-semaphore first-done :timeout 12))
+           (sb-thread:join-thread first-thread)
+           (setf first-thread nil)
+           (ensure-true (null first-error))
+           (ensure-true (eq (aref connections 0) first-connection))
+           (ensure-false
+            (http-kit/http2:http2-connection-open-p occupant-connection))
+           (ensure-equal 1 closed)
+           (ensure-equal
+            1
+            (http-kit/http2:http2-connection-manager-connection-count manager))
+           (http-kit/http2::%h2-manager-finish-entry manager first-entry)
+           (setf first-entry nil)
+           (http-kit/http2:close-http2-connection-manager manager))
+      (sb-thread:signal-semaphore release-first)
+      (when first-thread
+        (sb-thread:join-thread first-thread))
+      (when occupant-thread
+        (sb-thread:join-thread occupant-thread))
+      (when first-entry
+        (http-kit/http2::%h2-manager-finish-entry manager first-entry))
+      (when occupant-entry
+        (http-kit/http2::%h2-manager-finish-entry manager occupant-entry))
+      (http-kit/http2:close-http2-connection-manager manager))
+    (ensure-equal 2 opened)
+    (ensure-equal 2 closed)))
+#+sbcl
+(deftest http2-connection-manager-finish-reports-clock-failure-after-release
+  (let* ((now 0)
+        (fail-clock-p nil)
+        (manager
+          (http-kit/http2:make-http2-connection-manager
+           :idle-timeout 10
+           :clock-function
+           (lambda ()
+             (if fail-clock-p
+                 (error "Manager clock failed.")
+                 now))
+           :open-connection
+           (lambda (request &key timeout deadline)
+             (declare (ignore request timeout deadline))
+             (http-kit/http2:make-http2-connection
+              :stream (make-instance 'binary-session-stream :input (octets)))))))
+    (multiple-value-bind (connection entry)
+        (http-kit/http2::%h2-manager-connection-for
+         manager
+         (make-http-request :method "GET" :uri "https://clock-finish.test/")
+         "clock" t nil nil nil nil)
+      (declare (ignore connection))
+      (setf fail-clock-p t)
+      (signals simple-error
+        (http-kit/http2::%h2-manager-finish-entry manager entry))
+      (ensure-equal
+       0
+       (http-kit/http2::%http2-managed-connection-active-count entry))
+      (ensure-equal
+       1
+       (http-kit/http2:http2-connection-manager-connection-count manager)))
+    (http-kit/http2:close-http2-connection-manager manager)))
+#+sbcl
+(deftest http2-connection-manager-transient-release-retires-unusable-retained-entry
+  (let* ((opened 0)
+        (closed 0)
+        (evicted nil)
+        (transient-closes nil)
+        (request
+          (make-http-request :method "GET" :uri "https://transient-unusable.test/"))
+        (manager
+          (http-kit/http2:make-http2-connection-manager
+           :max-connections 1
+           :open-connection
+           (lambda (request &key timeout deadline)
+             (declare (ignore request timeout deadline))
+             (incf opened)
+             (let ((stream (make-instance 'binary-session-stream :input (octets))))
+               (http-kit/http2:make-http2-connection
+                :stream stream
+                :close-stream
+                (lambda (closed-stream)
+                  (ensure-equal stream closed-stream)
+                  (incf closed)))))
+           :on-evict
+           (lambda (key)
+             (push key evicted))
+           :on-transient-close
+           (lambda (key)
+             (push key transient-closes))))
+        (retained-connection nil)
+        (retained-entry nil)
+        (transient-entry nil))
+    (unwind-protect
+         (progn
+           (multiple-value-setq (retained-connection retained-entry)
+             (http-kit/http2::%h2-manager-connection-for
+              manager request "shared-key" t nil nil nil nil))
+           (multiple-value-bind (connection entry)
+               (http-kit/http2::%h2-manager-connection-for
+                manager request "shared-key" t nil nil nil nil)
+             (declare (ignore connection))
+             (setf transient-entry entry))
+           (http-kit/http2:close-http2-connection retained-connection)
+           (http-kit/http2::%h2-manager-finish-entry manager transient-entry)
+           (setf transient-entry nil)
+           (ensure-equal '("shared-key") (reverse evicted))
+           (ensure-equal '("shared-key") (reverse transient-closes))
+           (ensure-equal 2 closed)
+           (ensure-equal
+            0
+            (http-kit/http2:http2-connection-manager-connection-count manager))
+           (http-kit/http2::%h2-manager-finish-entry manager retained-entry)
+           (setf retained-entry nil))
+      (when transient-entry
+        (http-kit/http2::%h2-manager-finish-entry manager transient-entry))
+      (when retained-entry
+        (http-kit/http2::%h2-manager-finish-entry manager retained-entry))
+      (http-kit/http2:close-http2-connection-manager manager))
+    (ensure-equal 2 opened)
+    (ensure-equal 2 closed)))
+#+sbcl
+(deftest http2-connection-manager-transient-release-retires-expired-retained-entry
+  (let* ((now 0)
+        (opened 0)
+        (closed 0)
+        (evicted nil)
+        (transient-closes nil)
+        (request
+          (make-http-request :method "GET" :uri "https://transient-expired.test/"))
+        (manager
+          (http-kit/http2:make-http2-connection-manager
+           :max-connections 1
+           :idle-timeout 5
+           :clock-function (lambda () now)
+           :open-connection
+           (lambda (request &key timeout deadline)
+             (declare (ignore request timeout deadline))
+             (incf opened)
+             (let ((stream (make-instance 'binary-session-stream :input (octets))))
+               (http-kit/http2:make-http2-connection
+                :stream stream
+                :close-stream
+                (lambda (closed-stream)
+                  (ensure-equal stream closed-stream)
+                  (incf closed)))))
+           :on-evict
+           (lambda (key)
+             (push key evicted))
+           :on-transient-close
+           (lambda (key)
+             (push key transient-closes))))
+        (retained-entry nil)
+        (transient-entry nil))
+    (unwind-protect
+         (progn
+           (multiple-value-bind (connection entry)
+               (http-kit/http2::%h2-manager-connection-for
+                manager request "shared-key" t nil nil nil nil)
+             (declare (ignore connection))
+             (setf retained-entry entry))
+           (multiple-value-bind (connection entry)
+               (http-kit/http2::%h2-manager-connection-for
+                manager request "shared-key" t nil nil nil nil)
+             (declare (ignore connection))
+             (setf transient-entry entry))
+           (setf now 5)
+           (http-kit/http2::%h2-manager-finish-entry manager transient-entry)
+           (setf transient-entry nil)
+           (ensure-equal '("shared-key") (reverse evicted))
+           (ensure-equal '("shared-key") (reverse transient-closes))
+           (ensure-equal 1 closed)
+           (http-kit/http2::%h2-manager-finish-entry manager retained-entry)
+           (setf retained-entry nil)
+           (ensure-equal 2 closed)
+           (ensure-equal
+            0
+            (http-kit/http2:http2-connection-manager-connection-count manager)))
+      (when transient-entry
+        (http-kit/http2::%h2-manager-finish-entry manager transient-entry))
+      (when retained-entry
+        (http-kit/http2::%h2-manager-finish-entry manager retained-entry))
+      (http-kit/http2:close-http2-connection-manager manager))
+    (ensure-equal 2 opened)
+    (ensure-equal 2 closed)))
+#+sbcl
+(deftest http2-connection-manager-clear-defers-close-error-until-lease-release
+  (let* ((close-attempts 0)
+        (manager
+          (http-kit/http2:make-http2-connection-manager
+           :open-connection
+           (lambda (request &key timeout deadline)
+             (declare (ignore request timeout deadline))
+             (let ((stream (make-instance 'binary-session-stream :input (octets))))
+               (http-kit/http2:make-http2-connection
+                :stream stream
+                :close-stream
+                (lambda (closed-stream)
+                  (ensure-equal stream closed-stream)
+                  (incf close-attempts)
+                  (error "Deferred close failed."))))))))
+    (multiple-value-bind (connection entry)
+        (http-kit/http2::%h2-manager-connection-for
+         manager
+         (make-http-request :method "GET" :uri "https://clear-close-error.test/")
+         "clear-close" t nil nil nil nil)
+      (ensure-true (http-kit/http2:http2-connection-open-p connection))
+      (ensure-true
+       (eq manager (http-kit/http2:clear-http2-connection-manager manager)))
+      (ensure-equal
+       0
+       (http-kit/http2:http2-connection-manager-connection-count manager))
+      (ensure-equal 0 close-attempts)
+      (signals simple-error
+        (http-kit/http2::%h2-manager-finish-entry manager entry))
+      (ensure-equal 1 close-attempts)
+      (ensure-false (http-kit/http2:http2-connection-open-p connection)))
+    (http-kit/http2:close-http2-connection-manager manager)))
+#+sbcl
+(deftest http2-connection-manager-expires-on-final-release-after-max-age
+  (let* ((now 0)
+        (closed 0)
+        (manager
+          (http-kit/http2:make-http2-connection-manager
+           :max-connection-age 5
+           :clock-function (lambda () now)
+           :open-connection
+           (lambda (request &key timeout deadline)
+             (declare (ignore request timeout deadline))
+             (http-kit/http2:make-http2-connection
+              :stream (make-instance 'binary-session-stream :input (octets))
+              :close-stream
+              (lambda (stream)
+                (declare (ignore stream))
+                (incf closed)))))))
+    (multiple-value-bind (connection entry)
+        (http-kit/http2::%h2-manager-connection-for
+         manager
+         (make-http-request :method "GET" :uri "https://final-expiry.test/")
+         "expiry" t nil nil nil nil)
+      (declare (ignore connection))
+      (setf now 5)
+      (http-kit/http2::%h2-manager-finish-entry manager entry)
+      (ensure-equal 1 closed)
+      (ensure-equal
+       0
+       (http-kit/http2:http2-connection-manager-connection-count manager)))
+    (http-kit/http2:close-http2-connection-manager manager)))
+#+sbcl
+(deftest http2-connection-manager-transient-close-error-still-notifies
+  (let* ((opened 0)
+        (closed 0)
+        (transient-events nil)
+        (manager
+          (http-kit/http2:make-http2-connection-manager
+           :max-connections 1
+           :open-connection
+           (lambda (request &key timeout deadline)
+             (declare (ignore request timeout deadline))
+             (let ((index (incf opened))
+                   (stream (make-instance 'binary-session-stream :input (octets))))
+               (http-kit/http2:make-http2-connection
+                :stream stream
+                :close-stream
+                (lambda (closed-stream)
+                  (ensure-equal stream closed-stream)
+                  (incf closed)
+                  (when (= index 2)
+                    (error "Transient close failed.")))))
+           :on-transient-close
+           (lambda (key)
+             (push key transient-events)))))
+        (retained-entry nil)
+        (transient-entry nil))
+    (unwind-protect
+         (progn
+           (multiple-value-bind (connection entry)
+               (http-kit/http2::%h2-manager-connection-for
+                manager
+                (make-http-request :method "GET" :uri "https://held.test/")
+                "held" t nil nil nil nil)
+             (declare (ignore connection))
+             (setf retained-entry entry))
+           (multiple-value-bind (connection entry)
+               (http-kit/http2::%h2-manager-connection-for
+                manager
+                (make-http-request :method "GET" :uri "https://transient.test/")
+                "transient" t nil nil nil nil)
+             (declare (ignore connection))
+             (setf transient-entry entry))
+           (signals simple-error
+             (http-kit/http2::%h2-manager-finish-entry manager transient-entry))
+           (setf transient-entry nil)
+           (ensure-equal '("transient") (reverse transient-events))
+           (ensure-equal 1 closed)
+           (ensure-equal
+            1
+            (http-kit/http2:http2-connection-manager-connection-count manager))
+           (http-kit/http2::%h2-manager-finish-entry manager retained-entry)
+           (setf retained-entry nil))
+      (when transient-entry
+        (http-kit/http2::%h2-manager-finish-entry manager transient-entry))
+      (when retained-entry
+        (http-kit/http2::%h2-manager-finish-entry manager retained-entry))
+      (http-kit/http2:close-http2-connection-manager manager))
+    (ensure-equal 2 opened)
+    (ensure-equal 2 closed)))
