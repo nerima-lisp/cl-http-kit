@@ -5059,7 +5059,7 @@
                (error "Invalid request bodies must not reach response reading.")))
       (let ((client
               (http-kit/http3:make-http3-client
-               :max-frame-size 2
+               :max-frame-size 64
                :open-stream #'open-stream
                :write-stream #'write-stream
                :read-stream #'read-stream)))
@@ -5096,7 +5096,7 @@
            (make-http-request :method "POST" :uri "https://example.test/")
            :request-body-function (lambda (maximum-size)
                                     (declare (ignore maximum-size))
-                                    #(1 2 3))))
+                                    (make-array 65 :initial-element 1))))
         (ensure-equal 2 opened)))))
 
 (deftest http3-server-sends-informational-responses-before-final-response
