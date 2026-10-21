@@ -1747,10 +1747,7 @@
       (ensure-true
        (eq token (first
                   (http-message-kit:qpack-take-ready-streams adapter))))
-      (ensure-equal "x-blocked"
-                    (http-message-kit:http-header-name
-                     (first
-                      (http-message-kit:qpack-resume-blocked-stream token))))
+      (ensure-equal "x-blocked" (car (first (http-message-kit:qpack-resume-blocked-stream token))))
       (signals http-message-kit:http-protocol-error
         (http-message-kit:qpack-resume-blocked-stream token)))))
 
