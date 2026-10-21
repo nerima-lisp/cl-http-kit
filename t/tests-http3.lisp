@@ -5316,10 +5316,8 @@
    (http-kit/http3:make-http3-frame
     :type http-kit/http3:+http3-headers-type+
     :payload (http-message-kit:qpack-prepare-header-block
-             (mapcar (lambda (field)
-                       (make-http-header (car field) (cdr field)))
-                     fields)
-             :huffman nil))))
+              (http3-test-qpack-headers fields)
+              :huffman nil))))
 
 (defun http3-boundary-data (text)
   (http-kit/http3:encode-http3-frame
