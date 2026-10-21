@@ -5211,6 +5211,12 @@
                   (client
                     (http-kit/http3::%make-http3-client
                      :open-p t
+                     :qpack-encoder-context
+                     (http-message-kit:make-qpack-context
+                      :max-table-capacity 0
+                      :table-capacity 0
+                      :max-blocked-streams 0
+                      :huffman nil)
                      :qpack-max-instruction-bytes max-instruction-bytes
                      :qpack-max-buffer-bytes max-buffer-bytes
                      :read-stream
@@ -5224,9 +5230,9 @@
              (http-kit/http3:read-http3-qpack-decoder-stream client))))
     (multiple-value-bind (events ended-p)
         (read-decoder-stream
-         (http-message-kit:qpack-encode-section-ack 0)
+         (http-message-kit:qpack-encode-stream-cancellation 0)
          1 2)
-      (ensure-equal '((:section-ack 0)) events)
+      (ensure-equal '((:stream-cancellation 0)) events)
       (ensure-equal nil ended-p))
     (signals http-protocol-error
       (read-decoder-stream
@@ -5234,9 +5240,9 @@
        1 2))
     (multiple-value-bind (events ended-p)
         (read-decoder-stream
-         (http-message-kit:qpack-encode-section-ack 0)
+         (http-message-kit:qpack-encode-stream-cancellation 0)
          2 1)
-      (ensure-equal '((:section-ack 0)) events)
+      (ensure-equal '((:stream-cancellation 0)) events)
       (ensure-equal nil ended-p))
     (signals http-protocol-error
       (read-decoder-stream
