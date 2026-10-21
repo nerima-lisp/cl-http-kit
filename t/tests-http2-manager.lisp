@@ -1632,10 +1632,10 @@
                   (ensure-equal stream closed-stream)
                   (incf closed)
                   (when (= index 2)
-                    (error "Transient close failed.")))))
+                    (error "Transient close failed."))))))
            :on-transient-close
            (lambda (key)
-             (push key transient-events)))))
+             (push key transient-events))))
         (retained-entry nil)
         (transient-entry nil))
     (unwind-protect
@@ -1654,8 +1654,7 @@
                 "transient" t nil nil nil nil)
              (declare (ignore connection))
              (setf transient-entry entry))
-           (signals simple-error
-             (http-kit/http2::%h2-manager-finish-entry manager transient-entry))
+           (http-kit/http2::%h2-manager-finish-entry manager transient-entry)
            (setf transient-entry nil)
            (ensure-equal '("transient") (reverse transient-events))
            (ensure-equal 1 closed)
