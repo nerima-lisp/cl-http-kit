@@ -68,14 +68,14 @@
     };
 
     cl-tls-kit = {
-      url = "github:nerima-lisp/cl-tls-kit/v0.1.2";
+      url = "github:nerima-lisp/cl-tls-kit/d6cf61a9ac2c0af16c7a29db3de1075962ba08f9";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.cl-weave.follows = "cl-weave";
       inputs.cl-crypto-kit.follows = "cl-crypto-kit";
     };
 
     cl-quic-kit = {
-      url = "github:nerima-lisp/cl-quic-kit/v0.1.1";
+      url = "github:nerima-lisp/cl-quic-kit/8ac08dbb764e7d50e6c387f1d245a6ce1510dff4";
       flake = false;
     };
 
@@ -162,6 +162,13 @@
           codec = cl-codec-kit.packages.${system}.default;
           deflate = cl-deflate-kit.packages.${system}.default;
           tls = cl-tls-kit.packages.${system}.default;
+          sbclDependencies = with pkgs.sbclPackages; [
+            alexandria
+            bordeaux-threads
+            global-vars
+            trivial-features
+            trivial-garbage
+          ];
           crypto = cl-crypto-kit;
           quic = cl-quic-kit;
           paredit = patchedParedit system;
@@ -191,24 +198,28 @@
               pkgs.python3Packages.mkdocs
               pkgs.python3Packages.mkdocs-material
               pkgs.python3Packages.pymdown-extensions
-            ];
+            ]
+            ++ sbclDependencies;
             shellHook = ''
               export HTTP_QUIC_PEER="${quicPeer pkgs}/bin/quic-peer"
               export CL_SOURCE_REGISTRY="''${CL_SOURCE_REGISTRY:-$PWD//:${
-                pkgs.lib.concatStringsSep ":" [
-                  "${clWeave}/share/common-lisp/source//"
-                  "${clHttpMessageKit}/share/common-lisp/source//"
-                  "${observability}//"
-                  "${concurrent}//"
-                  "${boundary}//"
-                  "${date}//"
-                  "${host}//"
-                  "${codec}//"
-                  "${deflate}//"
-                  "${tls}//"
-                  "${crypto}//"
-                  "${quic}//"
-                ]
+                pkgs.lib.concatStringsSep ":" (
+                  [
+                    "${clWeave}/share/common-lisp/source//"
+                    "${clHttpMessageKit}/share/common-lisp/source//"
+                    "${observability}//"
+                    "${concurrent}//"
+                    "${boundary}//"
+                    "${date}//"
+                    "${host}//"
+                    "${codec}//"
+                    "${deflate}//"
+                    "${tls}//"
+                    "${crypto}//"
+                    "${quic}//"
+                  ]
+                  ++ map (dependency: "${dependency}//") sbclDependencies
+                )
               }}"
             '';
           };
@@ -228,23 +239,33 @@
           codec = cl-codec-kit.packages.${system}.default;
           deflate = cl-deflate-kit.packages.${system}.default;
           tls = cl-tls-kit.packages.${system}.default;
+          sbclDependencies = with pkgs.sbclPackages; [
+            alexandria
+            bordeaux-threads
+            global-vars
+            trivial-features
+            trivial-garbage
+          ];
           crypto = cl-crypto-kit;
           quic = cl-quic-kit;
           paredit = patchedParedit system;
-          sourceRegistry = pkgs.lib.concatStringsSep ":" [
-            "${clWeave}/share/common-lisp/source//"
-            "${clHttpMessageKit}/share/common-lisp/source//"
-            "${observability}//"
-            "${concurrent}//"
-            "${boundary}//"
-            "${date}//"
-            "${host}//"
-            "${codec}//"
-            "${deflate}//"
-            "${tls}//"
-            "${crypto}//"
-            "${quic}//"
-          ];
+          sourceRegistry = pkgs.lib.concatStringsSep ":" (
+            [
+              "${clWeave}/share/common-lisp/source//"
+              "${clHttpMessageKit}/share/common-lisp/source//"
+              "${observability}//"
+              "${concurrent}//"
+              "${boundary}//"
+              "${date}//"
+              "${host}//"
+              "${codec}//"
+              "${deflate}//"
+              "${tls}//"
+              "${crypto}//"
+              "${quic}//"
+            ]
+            ++ map (dependency: "${dependency}//") sbclDependencies
+          );
           appMeta = {
             description = "Common Lisp HTTP client quality gate";
           };
@@ -297,9 +318,11 @@
               tls
               pkgs.nghttp2
               pkgs.caddy
+              pkgs.curl
               pkgs.openssl
               (quicPeer pkgs)
-            ];
+            ]
+            ++ sbclDependencies;
             text = ''
               test_cache="$(mktemp -d "''${TMPDIR:-/tmp}/cl-http-kit-test.XXXXXXXX")"
               export HTTP_QUIC_PEER="${quicPeer pkgs}/bin/quic-peer"
@@ -340,7 +363,8 @@
               pkgs.openssl
               pkgs.caddy
               (quicPeer pkgs)
-            ];
+            ]
+            ++ sbclDependencies;
             text = ''
               coverage_cache="$(mktemp -d "''${TMPDIR:-/tmp}/cl-http-kit-coverage.XXXXXXXX")"
               export HTTP_QUIC_PEER="${quicPeer pkgs}/bin/quic-peer"
@@ -480,24 +504,34 @@
           codec = cl-codec-kit.packages.${system}.default;
           deflate = cl-deflate-kit.packages.${system}.default;
           tls = cl-tls-kit.packages.${system}.default;
+          sbclDependencies = with pkgs.sbclPackages; [
+            alexandria
+            bordeaux-threads
+            global-vars
+            trivial-features
+            trivial-garbage
+          ];
           crypto = cl-crypto-kit;
           quic = cl-quic-kit;
           paredit = patchedParedit system;
           source = pkgs.lib.cleanSource ./.;
-          sourceRegistry = pkgs.lib.concatStringsSep ":" [
-            "${clWeave}/share/common-lisp/source//"
-            "${clHttpMessageKit}/share/common-lisp/source//"
-            "${observability}//"
-            "${concurrent}//"
-            "${boundary}//"
-            "${date}//"
-            "${host}//"
-            "${codec}//"
-            "${deflate}//"
-            "${tls}//"
-            "${crypto}//"
-            "${quic}//"
-          ];
+          sourceRegistry = pkgs.lib.concatStringsSep ":" (
+            [
+              "${clWeave}/share/common-lisp/source//"
+              "${clHttpMessageKit}/share/common-lisp/source//"
+              "${observability}//"
+              "${concurrent}//"
+              "${boundary}//"
+              "${date}//"
+              "${host}//"
+              "${codec}//"
+              "${deflate}//"
+              "${tls}//"
+              "${crypto}//"
+              "${quic}//"
+            ]
+            ++ map (dependency: "${dependency}//") sbclDependencies
+          );
         in
         {
           test-core =
@@ -563,7 +597,10 @@
           coverage-tools-asdf =
             pkgs.runCommand "cl-http-kit-coverage-tools-asdf"
               {
-                nativeBuildInputs = [ pkgs.sbcl clHttpMessageKit ];
+                nativeBuildInputs = [
+                  pkgs.sbcl
+                  clHttpMessageKit
+                ];
               }
               ''
                 export XDG_CACHE_HOME="$TMPDIR/cache"
@@ -595,11 +632,13 @@
                   host
                   deflate
                   tls
+                  pkgs.curl
                   pkgs.openssl
                   pkgs.nghttp2
                   pkgs.caddy
                   (quicPeer pkgs)
-                ];
+                ]
+                ++ sbclDependencies;
               }
               ''
                 export HTTP_QUIC_PEER="${quicPeer pkgs}/bin/quic-peer"
