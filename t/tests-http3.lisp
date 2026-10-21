@@ -2768,12 +2768,42 @@
                 :close-stream
                 (lambda (stream &key condition)
                   (declare (ignore stream condition))))))))
-    (signals http-size-limit-exceeded
-      (http-kit/http3:receive-http3-push
-       (funcall make-client) :push-stream :stream-id 0 :max-fields 1))
-    (signals http-size-limit-exceeded
-      (http-kit/http3:receive-http3-push
-       (funcall make-client) :push-stream :stream-id 0 :max-header-bytes 1))
+    (let ((caught
+            (handler-case
+                (progn
+                  (http-kit/http3:receive-http3-push
+                   (funcall make-client) :push-stream :stream-id 0 :max-fields 1)
+                  nil)
+              (http-connection-error (condition) condition))))
+      (ensure-true (typep caught 'http-connection-error))
+      (when (typep caught 'http-connection-error)
+        (let* ((cause (http-connection-error-cause caught))
+               (detail (http-protocol-error-detail cause))
+               (size-error (second detail)))
+          (ensure-true (typep cause 'http-protocol-error))
+          (ensure-equal :qpack-decompression-failed (first detail))
+          (ensure-true (typep size-error 'http-size-limit-exceeded))
+          (ensure-equal :fields (http-size-limit-exceeded-kind size-error))
+          (ensure-equal 1 (http-size-limit-exceeded-limit size-error))
+          (ensure-equal 2 (http-size-limit-exceeded-observed size-error)))))
+    (let ((caught
+            (handler-case
+                (progn
+                  (http-kit/http3:receive-http3-push
+                   (funcall make-client) :push-stream :stream-id 0 :max-header-bytes 1)
+                  nil)
+              (http-connection-error (condition) condition))))
+      (ensure-true (typep caught 'http-connection-error))
+      (when (typep caught 'http-connection-error)
+        (let* ((cause (http-connection-error-cause caught))
+               (detail (http-protocol-error-detail cause))
+               (size-error (second detail)))
+          (ensure-true (typep cause 'http-protocol-error))
+          (ensure-equal :qpack-decompression-failed (first detail))
+          (ensure-true (typep size-error 'http-size-limit-exceeded))
+          (ensure-equal :headers (http-size-limit-exceeded-kind size-error))
+          (ensure-equal 1 (http-size-limit-exceeded-limit size-error))
+          (ensure-true (> (http-size-limit-exceeded-observed size-error) 1)))))
     (signals http-protocol-error
       (http-kit/http3:receive-http3-push
        (funcall make-client) :push-stream :max-fields 0))
