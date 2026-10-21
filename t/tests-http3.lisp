@@ -2423,19 +2423,29 @@
     (http-kit/http3::%h3-response-content-length
      (list (make-http-header "content-length" "3")) 0
      :status 200 :request-method "HEAD" :no-body t)
-    (let* ((wire
+    (let* ((decoder-context
+             (http-message-kit:make-qpack-context
+              :max-table-capacity 0 :table-capacity 0
+              :max-blocked-streams 0 :huffman nil))
+           (adapter
+             (http-message-kit:qpack-make-http3-decoder-context
+              decoder-context :max-blocked-streams 0))
+           (wire
              (http3-test-concat-octets
               (http-kit/http3:encode-http3-frame
                (http-kit/http3:make-http3-frame
                 :type http-kit/http3:+http3-headers-type+
                 :payload
-                (http3-test-qpack-encode (list (cons ":status" "204")))))
+                (http3-test-qpack-encode
+                 (list (cons ":status" "204")))))
               (http-kit/http3:encode-http3-frame
                (http-kit/http3:make-http3-frame
                 :type http-kit/http3:+http3-data-type+
                 :payload (octets 1)))))
            (client
              (http-kit/http3::%make-http3-client
+              :qpack-decoder-context decoder-context
+              :qpack-http3-decoder-context adapter
               :peer-control-state
               (http-kit/http3:make-http3-control-state :peer-role :server)
               :read-stream
@@ -2444,20 +2454,31 @@
                 (values wire t)))))
       (signals http-protocol-error
         (http-kit/http3::%h3-read-response
-         client :stream :stream-id 0 :request-method "GET" :collect-body-p t)))
-  (let* ((wire
+         client :stream :qpack-http3-decoder-context adapter
+         :stream-id 0 :request-method "GET" :collect-body-p t)))
+  (let* ((decoder-context
+           (http-message-kit:make-qpack-context
+            :max-table-capacity 0 :table-capacity 0
+            :max-blocked-streams 0 :huffman nil))
+         (adapter
+           (http-message-kit:qpack-make-http3-decoder-context
+            decoder-context :max-blocked-streams 0))
+         (wire
            (http3-test-concat-octets
             (http-kit/http3:encode-http3-frame
              (http-kit/http3:make-http3-frame
               :type http-kit/http3:+http3-headers-type+
               :payload
-              (http3-test-qpack-encode (list (cons ":status" "200")))))
+              (http3-test-qpack-encode
+               (list (cons ":status" "200")))))
             (http-kit/http3:encode-http3-frame
              (http-kit/http3:make-http3-frame
               :type http-kit/http3:+http3-data-type+
               :payload (octets 1 2 3)))))
          (client
            (http-kit/http3::%make-http3-client
+            :qpack-decoder-context decoder-context
+            :qpack-http3-decoder-context adapter
             :peer-control-state
             (http-kit/http3:make-http3-control-state :peer-role :server)
             :read-stream
@@ -2471,7 +2492,8 @@
      (octets 1 2 3)
     (http-response-body
       (http-kit/http3::%h3-read-response
-       client :stream :stream-id 0 :request-method "CONNECT" :collect-body-p t)))))
+       client :stream :qpack-http3-decoder-context adapter
+       :stream-id 0 :request-method "CONNECT" :collect-body-p t)))))
 
 (deftest http3-disabled-server-push-is-id-error
   (let* ((wire
