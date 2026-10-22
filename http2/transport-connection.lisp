@@ -1394,6 +1394,25 @@ CONTINUATION frames must still be consumed contiguously from that queue."
           (delete entry (%http2-connection-scheduler-entries connection)
                   :test #'eq)))
 
+  (defun %h2-scheduler-close-goaway-retired-if-idle (connection)
+    (let ((close-p nil))
+      (%h2-with-scheduler-lock (connection)
+        (let ((last-stream-id
+                (%http2-connection-goaway-last-stream-id connection))
+              (highest-opened-stream-id
+                (max 0 (- (%http2-connection-next-stream-id connection) 2))))
+          (when (and (not (%http2-connection-closed-p connection))
+                     last-stream-id
+                     (> highest-opened-stream-id last-stream-id)
+                     (null (%http2-connection-scheduler-entries connection)))
+            (setf (%http2-connection-closed-p connection) t
+                  close-p t)
+            (%h2-scheduler-broadcast connection))))
+      (when close-p
+        (http-kit::%with-http-cleanup
+          (funcall (%http2-connection-close-stream connection)
+                   (%http2-connection-stream connection))))))
+
   (defun %h2-scheduler-mark-response (connection entry response)
     (%h2-with-scheduler-lock (connection)
       (if (%h2-batch-entry-local-retired-p entry)
@@ -1527,7 +1546,8 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                              +http2-end-stream-flag+)))
       (%h2-with-scheduler-lock (connection)
         (%h2-scheduler-remove-entry connection entry)
-        (%h2-scheduler-broadcast connection))))
+        (%h2-scheduler-broadcast connection))
+      (%h2-scheduler-close-goaway-retired-if-idle connection)))
 
   (defun %h2-scheduler-previously-opened-client-stream-p
       (connection stream-id)
@@ -1576,7 +1596,9 @@ CONTINUATION frames must still be consumed contiguously from that queue."
       (cond
         ((%h2-control-frame-p type)
          (%h2-with-scheduler-lock (connection)
-           (%h2-scheduler-control-frame connection frame control-writer)))
+           (%h2-scheduler-control-frame connection frame control-writer))
+         (when (= type +http2-goaway-type+)
+           (%h2-scheduler-close-goaway-retired-if-idle connection)))
         ((= type +http2-headers-type+)
          (let ((entry
                  (%h2-with-scheduler-lock (connection)
@@ -2079,6 +2101,7 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                                        (null (%h2-batch-entry-callback-events entry)))
                               (%h2-batch-entry-response entry)))))
                     (when response
+                      (%h2-scheduler-close-goaway-retired-if-idle connection)
                       (return response)))))
             (error (condition)
               (let ((timeout-p (typep condition 'http-kit:http-timeout))
@@ -2097,6 +2120,7 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                     (t
                      (%h2-with-scheduler-lock (connection)
                        (%h2-scheduler-remove-entry connection entry)))))
+                (%h2-scheduler-close-goaway-retired-if-idle connection)
                 (unless (or timeout-p peer-reset-p
                             (and entry (%h2-batch-entry-local-retired-p entry)))
                   (%h2-scheduler-fail-connection connection condition))
@@ -2577,8 +2601,14 @@ sent in successive multiplexed waves under the same deadline."
                   (setf (%http2-connection-session-started-p connection) t)
                   (mapcar #'%h2-batch-entry-response entries)))
             (error (condition)
-              (unless (%h2-peer-stream-reset-condition-p condition)
-                (close-http2-connection connection))
+              (let ((stream-reset-p
+                      (and (%h2-peer-stream-reset-condition-p condition)
+                           (eq (first
+                                (http-kit:http-connection-error-cause
+                                 condition))
+                               :rst-stream))))
+                (unless stream-reset-p
+                  (close-http2-connection connection)))
               (error condition))))))))
 
 (defun send-http2-requests-over-connection/cps
