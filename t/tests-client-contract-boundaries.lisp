@@ -3256,6 +3256,54 @@
              (ensure-false (search "Proxy-Authorization: Basic YTph" wire))))
       (when (open-stream-p stream)
         (close stream :abort t)))))
+(deftest client-contract-proxy-auth-provider-not-forwarded-to-mismatched-explicit-proxy
+  (dolist (mismatch '(:host :port))
+    (let* ((plan-proxy
+             (make-http-proxy :scheme :http :host "plan-proxy.test" :port 8080
+                              :username "user" :password "secret"))
+           (explicit-proxy
+             (make-http-proxy
+              :scheme :http
+              :host (if (eq mismatch :host) "other-proxy.test" "plan-proxy.test")
+              :port (if (eq mismatch :port) 9090 8080)
+              :username "user" :password "secret"))
+           (request (make-http-request
+                     :method "GET" :uri "https://origin.test/resource"))
+           (plan (http-proxy-plan plan-proxy (http-request-uri request)))
+           (provider (lambda (&rest arguments)
+                       (declare (ignore arguments))
+                       "unused"))
+           (stream
+             (make-instance
+              'binary-test-stream
+              :input (ascii "HTTP/1.1 200 Connection Established|CRLF||CRLF|")))
+           (seen-plan nil)
+           (opener
+             (make-http-proxy-stream-opener
+              (lambda (received &key proxy-plan proxy &allow-other-keys)
+                (ensure-true (eq request received))
+                (ensure-true (eq explicit-proxy proxy))
+                (setf seen-plan proxy-plan)
+                stream)
+              (lambda (received)
+                (ensure-true (eq stream received))
+                (when (open-stream-p received)
+                  (close received :abort t)))
+              :tls-upgrade
+              (lambda (received target &key &allow-other-keys)
+                (declare (ignore target))
+                (ensure-true (eq stream received))
+                (values received nil)))))
+      (setf (getf plan :proxy-challenge-auth-provider) provider)
+      (unwind-protect
+           (multiple-value-bind (opened negotiated-alpn)
+               (funcall opener request :proxy-plan plan :proxy explicit-proxy)
+             (ensure-true (eq stream opened))
+             (ensure-false negotiated-alpn)
+             (ensure-true (eq explicit-proxy (getf seen-plan :proxy)))
+             (ensure-false (getf seen-plan :proxy-challenge-auth-provider)))
+        (when (open-stream-p stream)
+          (close stream :abort t))))))
 (deftest client-contract-proxy-explicit-http-overrides-socks-plan
   (let* ((plan-proxy (make-http-proxy :scheme :socks5
                                       :host "socks-proxy.test" :port 1080))
