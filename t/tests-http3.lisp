@@ -7028,7 +7028,8 @@
           (http-message-kit:make-qpack-context
            :max-table-capacity 0 :table-capacity 0 :huffman nil))
          (adapter
-          (http-message-kit:qpack-make-http3-decoder-context decoder))
+          (http-message-kit:qpack-make-http3-decoder-context
+            decoder :max-blocked-streams 0))
          (condition
           (handler-case
               (http-message-kit:qpack-decode-http3-field-section

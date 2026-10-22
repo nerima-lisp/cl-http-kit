@@ -795,7 +795,8 @@
            (http-message-kit:make-qpack-context
             :max-table-capacity 0 :table-capacity 0 :huffman nil))
          (adapter
-           (http-message-kit:qpack-make-http3-decoder-context decoder-context))
+           (http-message-kit:qpack-make-http3-decoder-context
+             decoder-context :max-blocked-streams 0))
          (acknowledgments nil))
     (multiple-value-bind (failure response writes)
         (http3-server-coverage-serve
