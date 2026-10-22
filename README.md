@@ -23,9 +23,9 @@ The client uses cl-deflate-kit for compression, and the client and HTTPS
 listener use cl-tls-kit 0.1.0 or later for TLS 1.3.
 TLS certificate-chain, hostname, and trust verification is required by
 default. `:verify :optional` has the same verification policy as `:required`;
-`:verify nil` skips those certificate-policy checks but still requires the
-peer's CertificateVerify signature. Use `nil` only for deliberately
-unauthenticated test connections.
+`:verify nil` is rejected because the pinned cl-tls-kit client driver does not
+provide a supported certificate-verification bypass. Use a trusted test
+certificate when exercising HTTPS clients.
 
 ## Quick Start
 
@@ -119,8 +119,9 @@ outside the framing boundary. The optional
 service on SBCL. The optional `cl-http-kit/tls` system adds an HTTPS listener
 that negotiates HTTP/2 or HTTP/1.1 with ALPN and uses the shared handler
 contract `(request) -> (values response informational-responses)`. It bounds
-concurrent connections and handshakes, HTTP/2 streams, request sizes, and the
-time spent in handshakes, requests, idle waits, and shutdown.
+concurrent connections and handshakes, HTTP/2 streams, request sizes, aggregate
+buffered request bodies, and the time spent in handshakes, requests, idle waits,
+and shutdown.
 Applications can pass the same ticket-key store to multiple server instances
 to share TLS resumption keys. The listener supports HTTPS only; HTTP/3 server
 acceptance remains outside this boundary. The default origin client offers

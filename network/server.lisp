@@ -32,6 +32,7 @@
   max-header-bytes
   max-fields
   max-body-bytes
+  max-buffered-body-bytes
   on-event
   on-error
   (state :created)
@@ -41,7 +42,8 @@
   supervisor
   (connection-count 0)
   (handshake-count 0)
-  (connections (make-hash-table :test #'eq))
+  (buffered-body-bytes 0)
+  (connections (make-hash-table :test (function eq)))
   (failure-value nil)
   started-event-emitted-p
   stopping-event-emitted-p
@@ -123,18 +125,21 @@
 
 (defun make-http-server
     (&key (transport :https)
-          host port handler certificate-chain private-key ticket-key-store
-          (max-connections 128)
-          (max-handshakes 32)
-          (max-concurrent-streams 100)
-          (handshake-timeout 10)
-          (request-timeout 30)
-          (idle-timeout 60)
-          (graceful-timeout 30)
-          (max-header-bytes 65536)
-          (max-fields 100)
-          (max-body-bytes 16777216)
-          on-event on-error)
+      host port handler certificate-chain private-key ticket-key-store
+      (max-connections 128)
+      (max-handshakes 32)
+      (max-concurrent-streams 100)
+      (handshake-timeout 10)
+      (request-timeout 30)
+      (idle-timeout 60)
+      (graceful-timeout 30)
+      (max-header-bytes 65536)
+      (max-fields 100)
+      (max-body-bytes 16777216)
+      (max-buffered-body-bytes
+       (max (* 64 1024 1024)
+            (* 2 (if (integerp max-body-bytes) max-body-bytes 0))))
+      on-event on-error)
   (unless (eq transport :https)
     (%http-server-configuration-error :unsupported-transport))
   (unless (and (stringp host) (plusp (length host)))
@@ -154,7 +159,8 @@
                (%http-server-positive-integer-p max-concurrent-streams)
                (%http-server-positive-integer-p max-header-bytes)
                (%http-server-positive-integer-p max-fields)
-               (%http-server-positive-integer-p max-body-bytes))
+               (%http-server-positive-integer-p max-body-bytes)
+               (%http-server-positive-integer-p max-buffered-body-bytes))
     (%http-server-configuration-error :invalid-limit))
   (unless (<= max-handshakes max-connections)
     (%http-server-configuration-error :invalid-handshake-limit))
@@ -190,6 +196,7 @@
      :max-header-bytes max-header-bytes
      :max-fields max-fields
      :max-body-bytes max-body-bytes
+     :max-buffered-body-bytes max-buffered-body-bytes
      :on-event on-event
      :on-error on-error)))
 
@@ -427,7 +434,26 @@
     (server connection stream protocol reported-p)
   (let ((on-error (%http-server-session-error-callback
                    server connection protocol reported-p))
-        (shutdown-p (lambda () (%http-server-shutdown-p server))))
+        (shutdown-p (lambda () (%http-server-shutdown-p server)))
+        (reserve-body-bytes
+          (lambda (amount)
+            (%with-http-server-lock (server)
+              (let ((observed (+ (http-server-buffered-body-bytes server)
+                                 amount)))
+                (http-kit::%check-limit
+                 :body observed (http-server-max-buffered-body-bytes server)
+                 :operation :https-listener)
+                (incf (http-server-buffered-body-bytes server) amount)))))
+        (release-body-bytes
+          (lambda (amount)
+            (%with-http-server-lock (server)
+              (unless (and (integerp amount)
+                           (<= 0 amount
+                               (http-server-buffered-body-bytes server)))
+                (error 'http-server-error
+                       :reason-code :body-buffer-accounting
+                       :phase :session))
+              (decf (http-server-buffered-body-bytes server) amount)))))
     (if (eq protocol :http2)
         (http-kit/http2:serve-http2-session
          stream
@@ -436,6 +462,9 @@
          :max-header-bytes (http-server-max-header-bytes server)
          :max-fields (http-server-max-fields server)
          :max-body-bytes (http-server-max-body-bytes server)
+         :max-aggregate-body-bytes (* 2 (http-server-max-body-bytes server))
+         :reserve-body-bytes reserve-body-bytes
+         :release-body-bytes release-body-bytes
          :request-timeout (http-server-request-timeout server)
          :idle-timeout (http-server-idle-timeout server)
          :shutdown-p shutdown-p
@@ -447,6 +476,8 @@
          :max-header-bytes (http-server-max-header-bytes server)
          :max-fields (http-server-max-fields server)
          :max-body-bytes (http-server-max-body-bytes server)
+         :reserve-body-bytes reserve-body-bytes
+         :release-body-bytes release-body-bytes
          :request-timeout (http-server-request-timeout server)
          :idle-timeout (http-server-idle-timeout server)
          :shutdown-p shutdown-p

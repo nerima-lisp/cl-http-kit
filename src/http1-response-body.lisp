@@ -14,12 +14,19 @@
     (loop for octet across chunk
           do (vector-push-extend octet collector))))
 
-(defun %finish-body-collector (collector)
+(defun %finish-body-collector
+    (collector &key reserve-body-bytes release-body-bytes)
   (if collector
-      (let ((result (make-array (length collector)
-                                :element-type '(unsigned-byte 8))))
-        (replace result collector)
-        result)
+      (let ((length (length collector)))
+        (when (and reserve-body-bytes (plusp length))
+          (funcall reserve-body-bytes length))
+        (let ((result (make-array length
+                                  :element-type '(unsigned-byte 8))))
+          (replace result collector)
+          (setf collector nil)
+          (when (and release-body-bytes (plusp length))
+            (funcall release-body-bytes length))
+          result))
       (make-array 0 :element-type '(unsigned-byte 8))))
 
 (defun %read-body-segment

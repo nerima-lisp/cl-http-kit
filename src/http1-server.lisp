@@ -262,35 +262,42 @@
         target)))))
 
 (defun %read-request-body-segment
-    (source length deadline clock-function detail collector on-body-chunk)
+    (source length deadline clock-function detail collector on-body-chunk
+     reserve-body-bytes)
   (loop with remaining = length
         while (plusp remaining)
-        do (let* ((size (min remaining *http-body-read-chunk-size*))
-                  (chunk (make-array size :element-type '(unsigned-byte 8))))
-             (loop for index below size
-                   do (setf (aref chunk index)
-                            (%read-required-byte source deadline clock-function detail
-                                                 :operation :request-parse)))
-             (%append-body-chunk collector chunk)
-             (when on-body-chunk
-               (funcall on-body-chunk chunk))
-             (decf remaining size)))
+        do (let ((size (min remaining *http-body-read-chunk-size*)))
+             (when (and collector reserve-body-bytes)
+               (funcall reserve-body-bytes size))
+             (let ((chunk (make-array size :element-type '(unsigned-byte 8))))
+               (loop for index below size
+                     do (setf (aref chunk index)
+                              (%read-required-byte source deadline clock-function detail
+                                                   :operation :request-parse)))
+               (%append-body-chunk collector chunk)
+               (when on-body-chunk
+                 (funcall on-body-chunk chunk))
+               (decf remaining size))))
   collector)
 
 (defun %read-request-exact-body
     (source length deadline clock-function max-body-bytes
-     &key on-body-chunk (collect-body-p t))
+     &key on-body-chunk reserve-body-bytes release-body-bytes
+       (collect-body-p t))
   (%check-limit :body length max-body-bytes :operation :request-parse)
   (values
    (%finish-body-collector
     (%read-request-body-segment source length deadline clock-function :body
                                 (%make-body-collector collect-body-p)
-                                on-body-chunk))
+                                on-body-chunk reserve-body-bytes)
+    :reserve-body-bytes reserve-body-bytes
+    :release-body-bytes release-body-bytes)
    length))
 
 (defun %read-request-chunked-body
     (source deadline clock-function max-header-bytes max-fields max-body-bytes header-used
-     &key on-body-chunk (collect-body-p t))
+     &key on-body-chunk reserve-body-bytes release-body-bytes
+       (collect-body-p t))
   (let ((body (%make-body-collector collect-body-p))
         (trailers '())
         (bytes header-used)
@@ -321,7 +328,8 @@
                   (%check-limit :body body-length max-body-bytes
                                 :operation :request-parse)
                   (%read-request-body-segment source size deadline clock-function
-                                              :chunk-data body on-body-chunk)
+                                              :chunk-data body on-body-chunk
+                                              reserve-body-bytes)
                   (%read-framing-crlf source deadline clock-function
                                       :operation :request-parse)
                   ;; Chunk data itself is body bytes, but the CRLF framing is
@@ -329,11 +337,16 @@
                   (incf bytes 2)
                   (%check-limit :headers bytes max-header-bytes
                                 :operation :request-parse)))))))
-    (values (%finish-body-collector body) trailers body-length)))
+    (values (%finish-body-collector
+             body
+             :reserve-body-bytes reserve-body-bytes
+             :release-body-bytes release-body-bytes)
+            trailers body-length)))
 
 (defun parse-http-request
     (input &key timeout deadline max-header-bytes max-fields max-body-bytes
-             default-authority on-body-chunk (collect-body-p t)
+             default-authority on-body-chunk reserve-body-bytes release-body-bytes
+             (collect-body-p t)
              on-expect-continue (clock-function #'%monotonic-time)
              allow-eof-p)
   "Parse one HTTP/1.0 or HTTP/1.1 request from INPUT.
@@ -362,10 +375,14 @@ read."
       (%request-parse-error
        "The request body limit must be a non-negative integer."
        body-limit))
-    (when (and on-body-chunk (not (functionp on-body-chunk)))
+    (unless (and (or (null on-body-chunk) (functionp on-body-chunk))
+                 (or (and (null reserve-body-bytes)
+                          (null release-body-bytes))
+                     (and (functionp reserve-body-bytes)
+                          (functionp release-body-bytes))))
       (%request-parse-error
-       "ON-BODY-CHUNK must be a function or NIL."
-       on-body-chunk))
+       "ON-BODY-CHUNK and body-buffer callbacks must be functions or NIL."
+       (list on-body-chunk reserve-body-bytes release-body-bytes)))
     (when (and on-expect-continue (not (functionp on-expect-continue)))
       (%request-parse-error
        "ON-EXPECT-CONTINUE must be a function or NIL."
@@ -428,12 +445,16 @@ read."
                         body-limit
                         final-header-bytes
                         :on-body-chunk on-body-chunk
+                        :reserve-body-bytes reserve-body-bytes
+                        :release-body-bytes release-body-bytes
                         :collect-body-p collect-body-p)))
                     (content-length
                      (multiple-value-setq (body wire-body-length)
                        (%read-request-exact-body
                         source content-length absolute-deadline clock-function
                         body-limit :on-body-chunk on-body-chunk
+                        :reserve-body-bytes reserve-body-bytes
+                        :release-body-bytes release-body-bytes
                         :collect-body-p collect-body-p))
                      (setf trailers '()))
                     (t
@@ -1166,7 +1187,8 @@ body is never written to the wire."
 
 (defun serve-http1-session
     (stream handler &key timeout deadline max-header-bytes max-fields max-body-bytes
-             default-authority on-body-chunk (collect-body-p t)
+             default-authority on-body-chunk reserve-body-bytes
+             release-body-bytes (collect-body-p t)
              (on-expect-continue :automatic)
              max-requests on-error on-upgrade (close-stream #'close)
              (clock-function #'%monotonic-time)
@@ -1222,9 +1244,14 @@ response."
         (%http1-session-error
          "HTTP/1 session request and idle timeouts must be non-negative reals or NIL."
          entry)))
-    (unless (or (null shutdown-p) (functionp shutdown-p))
-      (%http1-session-error "HTTP/1 session shutdown-p must be a function or NIL."
-                           (type-of shutdown-p)))
+    (unless (and (or (null shutdown-p) (functionp shutdown-p))
+                 (or (and (null reserve-body-bytes)
+                          (null release-body-bytes))
+                     (and (functionp reserve-body-bytes)
+                          (functionp release-body-bytes))))
+      (%http1-session-error
+       "HTTP/1 session callbacks are invalid or body-buffer callbacks are unpaired."
+       (list shutdown-p reserve-body-bytes release-body-bytes)))
     (let* ((expect-continue-callback
              (cond
                ((eq on-expect-continue :automatic)
@@ -1242,6 +1269,17 @@ response."
                                  :deadline absolute-deadline
                                  :clock-function clock-function)))
            (count 0)
+           (reserved-body-bytes 0)
+           (release-reserved-body
+             (lambda (&optional amount)
+               (let ((release-amount (or amount reserved-body-bytes)))
+                 (when (plusp release-amount)
+                   (unless (<= release-amount reserved-body-bytes)
+                     (%http1-session-error
+                      "HTTP/1 request body accounting became inconsistent."
+                      release-amount))
+                   (funcall release-body-bytes release-amount)
+                   (decf reserved-body-bytes release-amount)))))
            (termination :running)
            (handed-off-p nil))
       (labels
@@ -1256,6 +1294,15 @@ response."
                         :max-body-bytes max-body-bytes
                         :default-authority default-authority
                         :on-body-chunk on-body-chunk
+                        :reserve-body-bytes
+                        (and reserve-body-bytes
+                             (lambda (amount)
+                               (funcall reserve-body-bytes amount)
+                               (incf reserved-body-bytes amount)))
+                        :release-body-bytes
+                        (and release-body-bytes
+                             (lambda (amount)
+                               (funcall release-reserved-body amount)))
                         :collect-body-p collect-body-p
                         :on-expect-continue expect-continue-callback
                         :clock-function clock-function
@@ -1311,7 +1358,9 @@ response."
                           ((and shutdown-p (funcall shutdown-p))
                            (setf termination :close))
                           (t
-                           (let ((request nil)
+                           (let ((request (progn
+                                           (funcall release-reserved-body)
+                                           nil))
                                  (request-deadline nil))
                              (handler-case
                                  (multiple-value-bind (parsed parsed-deadline)
@@ -1359,5 +1408,7 @@ response."
                                    (funcall on-error caught-condition request))
                                  (error caught-condition)))))))
                (values count termination))
-          (when (and close-stream (not handed-off-p))
-            (funcall close-stream stream)))))))
+          (progn
+            (funcall release-reserved-body)
+            (when (and close-stream (not handed-off-p))
+              (funcall close-stream stream))))))))

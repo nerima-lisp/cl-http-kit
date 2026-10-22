@@ -1,4 +1,55 @@
 (in-package #:http-kit/test-core)
+(deftest http1-session-bounds-retained-request-body
+  (let ((charged 0)
+        (events nil))
+    (ensure-http1-session-run
+     (ascii "POST /budget HTTP/1.1|CRLF|Host: example.test|CRLF|Content-Length: 3|CRLF||CRLF|abc")
+     (lambda (request)
+       (ensure-equal "abc" (octets-as-string (http-request-body request)))
+       (ensure-equal 3 charged)
+       (make-http-response :status 204))
+     1 :eof
+     :reserve-body-bytes
+     (lambda (amount)
+       (incf charged amount)
+       (push (list :reserve amount) events))
+     :release-body-bytes
+     (lambda (amount)
+       (decf charged amount)
+       (push (list :release amount) events))
+     :close-stream nil)
+    (ensure-equal 0 charged)
+    (ensure-true
+     (equal (reverse events)
+            (list (list :reserve 3)
+                  (list :reserve 3)
+                  (list :release 3)
+                  (list :release 3)))))
+  (let ((charged 0)
+        (events nil)
+        (handled 0))
+    (signals http-protocol-error
+      (ensure-http1-session-run
+       (ascii "POST /truncated HTTP/1.1|CRLF|Host: example.test|CRLF|Content-Length: 4|CRLF||CRLF|ab")
+       (lambda (request)
+         (declare (ignore request))
+         (incf handled)
+         (make-http-response :status 204))
+       0 :eof
+       :reserve-body-bytes
+       (lambda (amount)
+         (incf charged amount)
+         (push (list :reserve amount) events))
+       :release-body-bytes
+       (lambda (amount)
+         (decf charged amount)
+         (push (list :release amount) events))
+       :close-stream nil))
+    (ensure-equal 0 handled)
+    (ensure-equal 0 charged)
+    (ensure-true
+     (equal (reverse events)
+            (list (list :reserve 4) (list :release 4))))))
 
 (deftest core-coverage-http1-session-argument-errors
   (dolist (case '((:stream 7) (:handler 7) (:max-requests -1)
