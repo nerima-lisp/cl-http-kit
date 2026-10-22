@@ -4204,6 +4204,63 @@
      (ascii
       "GET /one HTTP/1.1|CRLF|Host: example.test|CRLF|Content-Length: 0|CRLF||CRLF|GET /two HTTP/1.1|CRLF|Host: example.test|CRLF|Content-Length: 0|CRLF||CRLF|")
      (binary-test-output stream))))
+#+sbcl
+(deftest client-connection-pool-clear-retires-active-stream
+  (let* ((first-stream
+           (make-instance
+            'binary-test-stream
+            :input
+            (ascii
+             "HTTP/1.1 103 Early Hints|CRLF||CRLF|HTTP/1.1 200 OK|CRLF|Content-Length: 3|CRLF||CRLF|abc")))
+         (second-stream
+           (make-instance
+            'binary-test-stream
+            :input
+            (ascii
+             "HTTP/1.1 200 OK|CRLF|Content-Length: 3|CRLF||CRLF|def")))
+         (opened 0)
+         (closed-streams nil)
+         (pool
+           (make-http-connection-pool
+            :open-stream
+            (lambda (request &key timeout deadline proxy-plan proxy
+                              &allow-other-keys)
+              (declare (ignore request timeout deadline proxy-plan proxy))
+              (incf opened)
+              (if (= opened 1) first-stream second-stream))
+            :close-stream
+            (lambda (closed-stream)
+              (push closed-stream closed-streams))))
+         (client (make-http-client :cache nil
+                                   :automatic-decompression-p nil
+                                   :connection-pool pool)))
+    (multiple-value-bind (response effective)
+        (http-client-send
+         client
+         (http-client-request client "GET" "http://example.test/first")
+         :on-information
+         (lambda (information)
+           (ensure-equal 103 (http-response-status information))
+           (ensure-equal 0 (http-connection-pool-clear pool))
+           (ensure-false (member first-stream closed-streams :test #'eq))))
+      (declare (ignore effective))
+      (ensure-equal 200 (http-response-status response))
+      (ensure-equal "abc" (octets-as-string (http-response-body response))))
+    (ensure-equal 1 opened)
+    (ensure-true (member first-stream closed-streams :test #'eq))
+    (ensure-equal 0
+                  (getf (http-connection-pool-stats pool) :idle-count))
+    (multiple-value-bind (response effective)
+        (http-client-send
+         client
+         (http-client-request client "GET" "http://example.test/second"))
+      (declare (ignore effective))
+      (ensure-equal 200 (http-response-status response))
+      (ensure-equal "def" (octets-as-string (http-response-body response))))
+    (ensure-equal 2 opened)
+    (ensure-false (member second-stream closed-streams :test #'eq))
+    (ensure-equal 1 (http-connection-pool-clear pool))
+    (ensure-true (member second-stream closed-streams :test #'eq))))
 
 #+sbcl
 (deftest client-connection-pool-closes-non-reusable-stream

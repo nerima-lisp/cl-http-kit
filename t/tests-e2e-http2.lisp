@@ -452,10 +452,9 @@
                                                     connection stream-id))))
                                          (incf callback-count)
                                          (sb-thread:condition-broadcast
-                                          waitqueue))))
+                                          waitqueue)))))
                             (error (condition)
-                              (setf (aref caller-errors index) condition))))
-                        :name (format nil "HTTP/2 E2E caller ~D" index)))))
+                              (setf (aref caller-errors index) condition))))))))
         (unwind-protect
              (progn
                (check-prewrite-deadline)
@@ -703,12 +702,12 @@
                                          (aref stream-ids 1)
                                          (ascii "second"))
                                         server-stream)
-                                       (finish-output server-stream)))
+                                       (finish-output server-stream))))
                                (error (condition)
                                  (setf server-error condition)))
-                          (%network-test-close-stream server-stream)
-                          (%network-test-close-socket server-socket))
-                      :name "HTTP/2 scheduler E2E server"))
+                          (when server-error
+                            (%network-test-close-stream server-stream)
+                            (%network-test-close-socket server-socket)))))))
                (setf client-stream
                      (open-http-tcp-stream
                       (make-http-request
@@ -797,5 +796,5 @@
           (when server-thread
             (ignore-errors (sb-thread:join-thread server-thread)))
           (loop for thread across caller-threads
-                when thread do (ignore-errors (sb-thread:join-thread thread)))))))))))
+                when thread do (ignore-errors (sb-thread:join-thread thread)))))))
 
