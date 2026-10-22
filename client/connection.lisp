@@ -273,7 +273,29 @@ be used concurrently from multiple threads."
           :max-connection-age
           (%http-connection-pool-max-connection-age pool))))
 
-"Clear idle entries in POOL and run its registered clear callbacks. Return the number of idle entries removed."
+(defun http-connection-pool-clear (pool)
+  "Close idle entries in POOL and invoke its clear callbacks. Return the number of idle entries removed."
+  (%pool-ensure-pool pool)
+  (let ((entries nil)
+        (callbacks nil)
+        (callback-error nil))
+    (%with-client-lock ((%http-connection-pool-lock pool))
+      (incf (%http-connection-pool-generation pool))
+      (setf entries (%http-connection-pool-entries pool)
+            callbacks (copy-list
+                       (%http-connection-pool-clear-callbacks pool))
+            (%http-connection-pool-entries pool) nil))
+    (dolist (entry entries)
+      (%pool-close pool (%http-pooled-connection-stream entry)))
+    (dolist (callback callbacks)
+      (handler-case
+          (funcall callback)
+        (error (condition)
+          (unless callback-error
+            (setf callback-error condition)))))
+    (when callback-error
+      (error callback-error))
+    (length entries)))
 
 (defun %http-connection-pool-send-with-alpn-handoff
     (pool request &key key timeout deadline max-header-bytes max-fields max-body-bytes
