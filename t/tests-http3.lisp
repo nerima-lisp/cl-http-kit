@@ -7343,16 +7343,70 @@
                                    (quote http-message-kit:http-incomplete-message))
                             (http-message-kit:http-incomplete-message-available
                              condition))))
-                (t (http-message-kit:http-protocol-error-detail condition)))))))
+                (t (http-message-kit:http-protocol-error-detail condition))))))
+         (check-request-field (wire name &optional reason)
+           (let* ((decoder
+                    (http-message-kit:make-qpack-context
+                     :max-table-capacity 0 :table-capacity 0 :huffman nil))
+                  (adapter
+                    (http-message-kit:qpack-make-http3-decoder-context
+                     decoder :max-blocked-streams 0))
+                  (condition
+                    (handler-case
+                        (http-message-kit:qpack-decode-http3-field-section
+                         wire adapter 0 :role :request)
+                      (http-protocol-error (condition) condition))))
+             (ensure-true (typep condition 'http-invalid-header))
+             (ensure-equal :http/3 (http-error-operation condition))
+             (ensure-equal name (http-invalid-header-name condition))
+             (when reason
+               (ensure-equal reason
+                             (http-invalid-header-reason condition)))
+             (ensure-equal nil (http-protocol-error-detail condition))))
+         (check-request-qpack-error (wire detail)
+           (let* ((decoder
+                    (http-message-kit:make-qpack-context
+                     :max-table-capacity 0 :table-capacity 0 :huffman nil))
+                  (adapter
+                    (http-message-kit:qpack-make-http3-decoder-context
+                     decoder :max-blocked-streams 0))
+                  (condition
+                    (handler-case
+                        (http-message-kit:qpack-decode-http3-field-section
+                         wire adapter 0 :role :request)
+                      (http-message-kit:http-connection-error (condition)
+                        condition)))
+                  (cause
+                    (and (typep condition
+                                'http-message-kit:http-connection-error)
+                         (http-message-kit:http-connection-error-cause
+                          condition)))
+                  (decompression-detail
+                    (and (typep cause 'http-protocol-error)
+                         (http-protocol-error-detail cause)))
+                  (qpack-error
+                    (and (consp decompression-detail)
+                         (eq (first decompression-detail)
+                             :qpack-decompression-failed)
+                         (second decompression-detail))))
+             (ensure-true (typep condition 'http-message-kit:http-connection-error))
+             (ensure-equal :http3-transport (http-error-operation condition))
+             (ensure-true (typep cause 'http-protocol-error))
+             (ensure-equal :http3-transport (http-error-operation cause))
+             (ensure-true (typep qpack-error 'http-protocol-error))
+             (ensure-equal :qpack (http-error-operation qpack-error))
+             (ensure-equal detail
+                           (http-protocol-error-detail qpack-error)))))
     (dolist (case (list (list (octets 0) nil)
                        (list (octets 0 #x80) 0)
                        (list (octets 0 0 #xff 36) 99)
                        (list (octets 0 0 #x80) -1)
                        (list (octets 0 0 #x21 #x78) (list :incomplete-message-available 4))
-                       (list (octets 0 0 #x21 #x78 2 #x61) (list :incomplete-message-available 6))
-                       (list (octets 0 0 #x21 #x58 0) "X")
-                       (list (octets 0 0 #x21 #x78 0 #xc1) ":path")))
+                       (list (octets 0 0 #x21 #x78 2 #x61) (list :incomplete-message-available 6))))
       (check (first case) (second case)))
+    (check-request-qpack-error (octets 0 0 #x21 #x58 0) "X")
+    (check-request-field (octets 0 0 #x21 #x78 0 #xc1)
+                         ":path" :pseudo-after-regular)
     (ensure-equal '(("x" . "a"))
                   (http3-test-qpack-decode (octets 0 0 #x21 #x78 1 #x61)))
     (let ((table (http-message-kit:make-qpack-context :max-table-capacity 64 :table-capacity 64 :huffman nil)))
