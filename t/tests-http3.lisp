@@ -7245,10 +7245,12 @@
 (deftest http3-qpack-behavior-required-count-wrap
   (let* ((encoder
            (http-message-kit:make-qpack-context
-            :max-table-capacity 64 :table-capacity 0 :huffman nil))
+            :max-table-capacity 64 :table-capacity 0
+            :max-blocked-streams 1 :huffman nil))
          (decoder
            (http-message-kit:make-qpack-context
-            :max-table-capacity 64 :table-capacity 0 :huffman nil))
+            :max-table-capacity 64 :table-capacity 0
+            :max-blocked-streams 1 :huffman nil))
          (empty-decoder
            (http-message-kit:make-qpack-context
             :max-table-capacity 64 :table-capacity 0 :huffman nil)))
