@@ -240,14 +240,14 @@
 
 #+sbcl
 (deftest http2-public-single-blocked-upload-errors
-  (dolist (case (list (list (h2-frame 1 5 1 (octets #x88)) '(1 1 5) nil 0)
-                     (list (h2-frame 4 1 0 (octets)) '(4 0 1) nil 0)
-                     (list (concatenate-octets
+  (dolist (case (list (list :input (h2-frame 1 5 1 (octets #x88)) :detail '(1 1 5) :eof-p nil :expected-acks 0 :expected-callbacks 0)
+                     (list :input (h2-frame 4 1 0 (octets)) :detail '(4 0 1) :eof-p nil :expected-acks 0 :expected-callbacks 0)
+                     (list :input (concatenate-octets
                             (h2-frame 4 0 0 (octets))
                             (h2-frame 1 4 1 (octets #x88))
                             (h2-frame 0 1 1 (octets 9)))
-                           :eof t 1)))
-    (destructuring-bind (input detail eof-p expected-acks) case
+                           :detail :eof :eof-p t :expected-acks 1 :expected-callbacks 1)))
+    (destructuring-bind (&key input detail eof-p expected-acks expected-callbacks) case
       (let* ((body (make-array 65536 :element-type '(unsigned-byte 8) :initial-element 7))
              (stream (make-instance 'binary-session-stream :input input))
              (closes 0)
@@ -277,7 +277,7 @@
                (ensure-equal :http2-read (http-error-operation failure))
                (ensure-equal detail (if eof-p (http-connection-error-cause failure)
                                        (http-protocol-error-detail failure)))
-               (ensure-equal 0 callbacks)
+               (ensure-equal expected-callbacks callbacks)
                (ensure-equal (length input) (binary-session-input-position stream))
                (multiple-value-bind (sent count ack) (h2-output-data-summary stream)
                  (ensure-equal 65535 (length sent))
