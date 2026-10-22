@@ -268,11 +268,8 @@ CLOSE-HTTP2-CONNECTION-MANAGER also prevents future calls."
               (error (condition)
                      (record-failure condition))))
           (when close-now-p
-            (handler-case
-                (%h2-manager-close-connection
-                 (%http2-managed-connection-connection entry))
-              (error (condition)
-                     (record-failure condition))))))
+            (%h2-manager-close-connection
+             (%http2-managed-connection-connection entry)))))
       (when failure
         (error failure))))
   manager)
@@ -494,31 +491,29 @@ CLOSE-HTTP2-CONNECTION-MANAGER also prevents future calls."
                              (when (zerop (%http2-managed-connection-active-count entry))
                                (cond
                                 ((%http2-managed-connection-transient-p entry)
-                                 (unless (%http2-managed-connection-close-started-p entry)
-                                   (let ((retained
-                                          (%h2-manager-same-key-entry-locked
-                                           manager
-                                           (%http2-managed-connection-key entry))))
-                                     (when (and retained
-                                                (or (not (%h2-manager-entry-usable-p retained))
-                                                    (and now
-                                                         (%h2-manager-entry-expired-p
-                                                          manager retained now))))
-                                       (setf actions
-                                             (list
-                                              (%h2-manager-retire-entry-locked manager retained))
-                                             retained nil))
-                                     (setf (%http2-managed-connection-close-started-p entry) t
-                                           transient-connection-to-close
-                                           (%http2-managed-connection-connection entry)
-                                           transient-close-key
-                                           (%http2-managed-connection-key entry)
-                                           notify-transient-close-p (null retained)))))
-                                ((%http2-managed-connection-retired-p entry)
-                                 (unless (%http2-managed-connection-close-started-p entry)
+                                 (let ((retained
+                                        (%h2-manager-same-key-entry-locked
+                                         manager
+                                         (%http2-managed-connection-key entry))))
+                                   (when (and retained
+                                              (or (not (%h2-manager-entry-usable-p retained))
+                                                  (and now
+                                                       (%h2-manager-entry-expired-p
+                                                        manager retained now))))
+                                     (setf actions
+                                           (list
+                                            (%h2-manager-retire-entry-locked manager retained))
+                                           retained nil))
                                    (setf (%http2-managed-connection-close-started-p entry) t
-                                         connection-to-close
-                                         (%http2-managed-connection-connection entry))))
+                                         transient-connection-to-close
+                                         (%http2-managed-connection-connection entry)
+                                         transient-close-key
+                                         (%http2-managed-connection-key entry)
+                                         notify-transient-close-p (null retained))))
+                                ((%http2-managed-connection-retired-p entry)
+                                 (setf (%http2-managed-connection-close-started-p entry) t
+                                       connection-to-close
+                                       (%http2-managed-connection-connection entry)))
                                 ((not (%h2-manager-entry-usable-p entry))
                                  (setf actions
                                        (list
@@ -539,16 +534,10 @@ CLOSE-HTTP2-CONNECTION-MANAGER also prevents future calls."
         (error (condition)
                (record-failure condition)))
       (when connection-to-close
-        (handler-case
-            (%h2-manager-close-connection connection-to-close)
-          (error (condition)
-                 (record-failure condition))))
+        (%h2-manager-close-connection connection-to-close))
       (when transient-connection-to-close
-        (handler-case
-            (%h2-manager-close-connection
-             transient-connection-to-close)
-          (error (condition)
-                 (record-failure condition)))
+        (%h2-manager-close-connection
+         transient-connection-to-close)
         (when (and notify-transient-close-p
                    (%http2-connection-manager-on-transient-close manager))
           (handler-case

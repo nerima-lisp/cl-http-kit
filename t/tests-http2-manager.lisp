@@ -1670,3 +1670,277 @@
       (http-kit/http2:close-http2-connection-manager manager))
     (ensure-equal 2 opened)
     (ensure-equal 2 closed)))
+#+sbcl
+(deftest http2-connection-manager-lock-expansion-and-entry-usability
+  (multiple-value-bind (expansion expanded-p)
+      (macroexpand-1
+       '(http-kit/http2::%h2-manager-with-lock (manager) :locked))
+    (ensure-true expanded-p)
+    (ensure-equal 'sb-thread:with-mutex (first expansion))
+    (ensure-equal
+     '(http-kit/http2::%http2-connection-manager-lock manager)
+     (first (second expansion)))
+    (ensure-equal :locked (third expansion)))
+  (let* ((manager
+           (http-kit/http2:make-http2-connection-manager
+            :open-connection
+            (lambda (request &key timeout deadline)
+              (declare (ignore request timeout deadline))
+              (http-kit/http2:make-http2-connection
+               :stream (make-instance 'binary-session-stream :input (octets))))))
+         (entry nil))
+    (unwind-protect
+         (multiple-value-bind (connection managed-entry)
+             (http-kit/http2::%h2-manager-connection-for
+              manager
+              (make-http-request :method "GET" :uri "https://usable.test/")
+              "usable" t nil nil nil nil)
+           (declare (ignore connection))
+           (setf entry managed-entry)
+           (ensure-true
+            (http-kit/http2::%h2-manager-entry-usable-p entry))
+           (setf (http-kit/http2::%http2-managed-connection-retired-p entry) t)
+           (ensure-false
+            (http-kit/http2::%h2-manager-entry-usable-p entry))
+           (setf (http-kit/http2::%http2-managed-connection-retired-p entry) nil
+                 (http-kit/http2::%http2-managed-connection-close-started-p entry) t)
+           (ensure-false
+            (http-kit/http2::%h2-manager-entry-usable-p entry))
+           (setf (http-kit/http2::%http2-managed-connection-close-started-p entry) nil)
+           (http-kit/http2::%h2-manager-finish-entry manager entry)
+           (http-kit/http2::%h2-manager-finish-entry manager entry)
+           (setf entry nil))
+      (when entry
+        (http-kit/http2::%h2-manager-finish-entry manager entry))
+      (http-kit/http2:close-http2-connection-manager manager))))
+(deftest http2-connection-manager-clear-closes-after-final-active-release
+  (let* ((closed 0)
+         (manager
+           (http-kit/http2:make-http2-connection-manager
+            :open-connection
+            (lambda (request &key timeout deadline)
+              (declare (ignore request timeout deadline))
+              (let ((stream (make-instance 'binary-session-stream :input (octets))))
+                (http-kit/http2:make-http2-connection
+                 :stream stream
+                 :close-stream
+                 (lambda (closed-stream)
+                   (ensure-equal stream closed-stream)
+                   (incf closed)))))))
+         (entry nil))
+    (unwind-protect
+         (progn
+           (multiple-value-bind (connection managed-entry)
+               (http-kit/http2::%h2-manager-connection-for
+                manager
+                (make-http-request :method "GET" :uri "https://leases.test/")
+                "leases" t nil nil nil nil)
+             (declare (ignore connection))
+             (setf entry managed-entry))
+           (incf (http-kit/http2::%http2-managed-connection-active-count entry))
+           (http-kit/http2:clear-http2-connection-manager manager)
+           (ensure-equal 0 closed)
+           (http-kit/http2::%h2-manager-finish-entry manager entry)
+           (ensure-equal
+            1
+            (http-kit/http2::%http2-managed-connection-active-count entry))
+           (ensure-equal 0 closed)
+           (http-kit/http2::%h2-manager-finish-entry manager entry)
+           (ensure-equal
+            0
+            (http-kit/http2::%http2-managed-connection-active-count entry))
+           (ensure-equal 1 closed)
+           (setf entry nil))
+      (when entry
+        (http-kit/http2::%h2-manager-finish-entry manager entry))
+      (http-kit/http2:close-http2-connection-manager manager))))
+(deftest http2-connection-manager-retirement-is-idempotent-by-entry-identity
+  (let* ((manager
+           (http-kit/http2:make-http2-connection-manager
+            :max-connections 3
+            :open-connection
+            (lambda (request &key timeout deadline)
+              (declare (ignore request timeout deadline))
+              (http-kit/http2:make-http2-connection
+               :stream (make-instance 'binary-session-stream :input (octets))))))
+         (entries nil))
+    (unwind-protect
+         (progn
+           (dolist (key '("first" "middle" "last"))
+             (multiple-value-bind (connection entry)
+                 (http-kit/http2::%h2-manager-connection-for
+                  manager
+                  (make-http-request
+                   :method "GET"
+                   :uri "https://retire-identity.test/")
+                  key t nil nil nil nil)
+               (declare (ignore connection))
+               (push entry entries)
+               (http-kit/http2::%h2-manager-finish-entry manager entry)))
+           (dolist (entry (list (third entries) (second entries)))
+             (let ((action
+                     (http-kit/http2::%h2-manager-with-lock (manager)
+                       (http-kit/http2::%h2-manager-retire-entry-locked
+                        manager entry))))
+               (ensure-true action)
+               (http-kit/http2::%h2-manager-run-retirements
+                manager (list action))))
+           (ensure-false
+            (http-kit/http2::%h2-manager-with-lock (manager)
+              (http-kit/http2::%h2-manager-retire-entry-locked
+               manager (third entries))))
+           (ensure-equal
+            1
+            (http-kit/http2:http2-connection-manager-connection-count manager)))
+      (http-kit/http2:close-http2-connection-manager manager))))
+(deftest http2-connection-manager-close-during-post-open-prune-closes-new-connection
+  (let ((now 0)
+        (opened 0)
+        (closed 0)
+        (manager nil)
+        (entry nil))
+    (setf manager
+          (http-kit/http2:make-http2-connection-manager
+           :max-connections 2
+           :idle-timeout 5
+           :clock-function (lambda () now)
+           :open-connection
+           (lambda (request &key timeout deadline)
+             (declare (ignore request timeout deadline))
+             (when (= (incf opened) 2)
+               (setf now 5))
+             (let ((stream (make-instance 'binary-session-stream :input (octets))))
+               (http-kit/http2:make-http2-connection
+                :stream stream
+                :close-stream
+                (lambda (closed-stream)
+                  (ensure-equal stream closed-stream)
+                  (incf closed)))))
+           :on-evict
+           (lambda (key)
+             (declare (ignore key))
+             (http-kit/http2:close-http2-connection-manager manager))))
+    (unwind-protect
+         (progn
+           (multiple-value-bind (connection managed-entry)
+               (http-kit/http2::%h2-manager-connection-for
+                manager
+                (make-http-request :method "GET" :uri "https://aging.test/")
+                "aging" t nil nil nil nil)
+             (declare (ignore connection))
+             (setf entry managed-entry))
+           (http-kit/http2::%h2-manager-finish-entry manager entry)
+           (setf entry nil)
+           (signals http-connection-error
+             (http-kit/http2::%h2-manager-connection-for
+              manager
+              (make-http-request :method "GET" :uri "https://new.test/")
+              "new" t nil nil nil nil))
+           (ensure-equal 2 opened)
+           (ensure-equal 2 closed)
+           (ensure-equal
+            0
+            (http-kit/http2:http2-connection-manager-connection-count manager))
+           (ensure-false
+            (http-kit/http2:http2-connection-manager-open-p manager)))
+      (when entry
+        (http-kit/http2::%h2-manager-finish-entry manager entry))
+      (http-kit/http2:close-http2-connection-manager manager))))
+(deftest http2-connection-manager-open-retires-idle-entry-after-lease-release
+  (let ((opened 0)
+        (closed 0)
+        (evicted nil)
+        (manager nil)
+        (old-entry nil))
+    (setf manager
+          (http-kit/http2:make-http2-connection-manager
+           :max-connections 1
+           :open-connection
+           (lambda (request &key timeout deadline)
+             (declare (ignore request timeout deadline))
+             (let ((index (incf opened))
+                   (stream (make-instance 'binary-session-stream :input (octets))))
+               (when (and (= index 2) old-entry)
+                 (http-kit/http2::%h2-manager-finish-entry manager old-entry))
+               (http-kit/http2:make-http2-connection
+                :stream stream
+                :close-stream
+                (lambda (closed-stream)
+                  (ensure-equal stream closed-stream)
+                  (incf closed)))))
+           :on-evict
+           (lambda (key)
+             (push key evicted)
+             (error "Retirement callback failed."))))
+    (unwind-protect
+         (progn
+           (multiple-value-bind (connection entry)
+               (http-kit/http2::%h2-manager-connection-for
+                manager
+                (make-http-request :method "GET" :uri "https://leased.test/")
+                "old-key" t nil nil nil nil)
+             (declare (ignore connection))
+             (setf old-entry entry))
+           (signals simple-error
+             (http-kit/http2::%h2-manager-connection-for
+              manager
+              (make-http-request :method "GET" :uri "https://replacement.test/")
+              "new-key" t nil nil nil nil))
+           (ensure-equal 2 opened)
+           (ensure-equal '("old-key") (reverse evicted))
+           (ensure-equal 2 closed)
+           (ensure-equal
+            0
+            (http-kit/http2:http2-connection-manager-connection-count manager))
+           (setf old-entry nil))
+      (when old-entry
+        (http-kit/http2::%h2-manager-finish-entry manager old-entry))
+      (http-kit/http2:close-http2-connection-manager manager))))
+(deftest http2-connection-manager-finish-reports-retirement-error-after-release
+  (let ((now 0)
+        (closed 0)
+        (evicted nil)
+        (manager nil)
+        (entry nil))
+    (setf manager
+          (http-kit/http2:make-http2-connection-manager
+           :max-connection-age 5
+           :clock-function (lambda () now)
+           :open-connection
+           (lambda (request &key timeout deadline)
+             (declare (ignore request timeout deadline))
+             (let ((stream (make-instance 'binary-session-stream :input (octets))))
+               (http-kit/http2:make-http2-connection
+                :stream stream
+                :close-stream
+                (lambda (closed-stream)
+                  (ensure-equal stream closed-stream)
+                  (incf closed)))))
+           :on-evict
+           (lambda (key)
+             (push key evicted)
+             (error "Retirement callback failed."))))
+    (unwind-protect
+         (progn
+           (multiple-value-bind (connection managed-entry)
+               (http-kit/http2::%h2-manager-connection-for
+                manager
+                (make-http-request :method "GET" :uri "https://finish-expired.test/")
+                "expired-key" t nil nil nil nil)
+             (declare (ignore connection))
+             (setf entry managed-entry))
+           (setf now 5)
+           (signals simple-error
+             (http-kit/http2::%h2-manager-finish-entry manager entry))
+           (ensure-equal
+            0
+            (http-kit/http2::%http2-managed-connection-active-count entry))
+           (ensure-equal '("expired-key") (reverse evicted))
+           (ensure-equal 1 closed)
+           (ensure-equal
+            0
+            (http-kit/http2:http2-connection-manager-connection-count manager))
+           (setf entry nil))
+      (when entry
+        (http-kit/http2::%h2-manager-finish-entry manager entry))
+      (http-kit/http2:close-http2-connection-manager manager))))
