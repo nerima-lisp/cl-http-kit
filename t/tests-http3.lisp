@@ -7293,7 +7293,9 @@
                (ensure-equal :qpack
                              (http-message-kit:http-error-operation failure))
                (ensure-equal detail
-                             (http-message-kit:http-protocol-error-detail failure)))))
+                             (if (typep failure (quote http-message-kit:http-qpack-blocked))
+                               (http-message-kit:http-qpack-blocked-required-insert-count failure)
+                               (http-message-kit:http-protocol-error-detail failure))))))
       (check (octets 5 0) decoder 5)
       (check (octets 1 0) empty-decoder 1)
       (check (octets 2 0) empty-decoder 1))
