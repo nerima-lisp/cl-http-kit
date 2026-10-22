@@ -7200,10 +7200,12 @@
 (deftest http3-qpack-behavior-sensitive-dynamic-name
   (let* ((encoder
            (http-message-kit:make-qpack-context
-            :max-table-capacity 128 :table-capacity 0 :huffman nil))
+            :max-table-capacity 128 :table-capacity 0
+            :max-blocked-streams 1 :huffman nil))
          (decoder
            (http-message-kit:make-qpack-context
-            :max-table-capacity 128 :table-capacity 0 :huffman nil)))
+            :max-table-capacity 128 :table-capacity 0
+            :max-blocked-streams 1 :huffman nil)))
     (multiple-value-bind (instruction transaction)
         (http-message-kit:qpack-prepare-set-capacity encoder 128)
       (http-message-kit:qpack-commit-encoding transaction)
