@@ -3349,3 +3349,57 @@
            (ensure-true (eq proxy-b (second opened-proxies)))
            (ensure-equal 2 (http-connection-pool-clear pool)))
       (http-connection-pool-clear pool))))
+(deftest client-native-alpn-manager-rejects-unsupported-reconnect
+  (let* ((http-kit/client::*proxy-environment-function*
+           (lambda (name) (declare (ignore name)) nil))
+         (wire
+           (concatenate-octets
+            (h2-frame 4 0 0 (octets))
+            (h2-frame 1 5 1 (h2-header-block (cons ":status" "200")))
+            (h2-frame 7 0 0 (octets 0 0 0 1 0 0 0 0))))
+         (h2-stream (make-instance 'binary-test-stream :input wire))
+         (unsupported-stream (make-instance 'binary-test-stream))
+         (opened 0)
+         (upgraded 0)
+         (closed-streams nil)
+         (pool
+           (make-http-connection-pool
+            :open-stream
+            (lambda (request &key timeout deadline &allow-other-keys)
+              (declare (ignore request timeout deadline))
+              (incf opened)
+              (if (= opened 1) h2-stream unsupported-stream))
+            :tls-upgrade
+            (lambda (stream uri &key timeout deadline)
+              (declare (ignore uri timeout deadline))
+              (incf upgraded)
+              (values stream (if (= upgraded 1) "h2" "h3")))
+            :close-stream
+            (lambda (stream)
+              (push stream closed-streams)
+              (when (open-stream-p stream)
+                (close stream :abort t)))))
+         (transport
+           (http-kit/client::%client-transport-from-negotiated-connection-pool
+            pool))
+         (client (make-http-client :transport-function transport :cache nil)))
+    (unwind-protect
+         (progn
+           (ensure-equal
+            200
+            (http-response-status
+             (http-client-send client "GET" "https://alpn-reconnect.test/first")))
+           (signals http-protocol-error
+             (http-client-send
+              client "GET" "https://alpn-reconnect.test/unsupported"))
+           (ensure-equal 2 opened)
+           (ensure-equal 2 upgraded))
+      (http-client-clear-connections client))
+    (ensure-equal 2 (length closed-streams))
+    (ensure-true (member h2-stream closed-streams :test #'eq))
+    (ensure-true (member unsupported-stream closed-streams :test #'eq))
+    (ensure-false (open-stream-p h2-stream))
+    (ensure-false (open-stream-p unsupported-stream))))
+(deftest client-clear-connections-rejects-non-client
+  (signals http-protocol-error
+    (http-client-clear-connections nil)))
