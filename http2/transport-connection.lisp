@@ -838,17 +838,16 @@ concurrent streams should use SEND-HTTP2-REQUESTS-OVER-CONNECTION."
            :message "ON-BODY-CHUNK must be a function or NIL."
            :operation :http2-client
            :detail on-body-chunk))
-  (progn
-    (when (and on-information (not (functionp on-information)))
-      (error 'http-kit:http-protocol-error
-             :message "ON-INFORMATION must be a function or NIL."
-             :operation :http2-client
-             :detail on-information))
-    (when (and on-stream-open (not (functionp on-stream-open)))
-      (error 'http-kit:http-protocol-error
-             :message "ON-STREAM-OPEN must be a function or NIL."
-             :operation :http2-client
-             :detail on-stream-open)))
+  (when (and on-information (not (functionp on-information)))
+    (error 'http-kit:http-protocol-error
+           :message "ON-INFORMATION must be a function or NIL."
+           :operation :http2-client
+           :detail on-information))
+  (when (and on-stream-open (not (functionp on-stream-open)))
+    (error 'http-kit:http-protocol-error
+           :message "ON-STREAM-OPEN must be a function or NIL."
+           :operation :http2-client
+           :detail on-stream-open))
   (unless (member collect-body-p '(nil t))
     (error 'http-kit:http-protocol-error
            :message "COLLECT-BODY-P must be NIL or T."

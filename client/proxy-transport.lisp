@@ -266,12 +266,33 @@
 (defun %proxy-open-plan-once
     (open-stream close-stream request proxy-plan proxy tls-upgrade resolve-host
                  resolve-host-style timeout deadline clock-function)
-  (let* ((mode (or (getf proxy-plan :mode) :direct))
-         (proxy (if proxy-plan (getf proxy-plan :proxy) proxy))
-         (target (or (getf proxy-plan :target)
-                     (http-request-uri request)))
+  (let* ((requested-target (http-request-uri request))
+         (effective-plan
+           (if proxy
+               (let* ((plan (http-proxy-plan proxy requested-target))
+                      (plan-proxy (getf proxy-plan :proxy))
+                      (effective-proxy (getf plan :proxy))
+                      (provider (getf proxy-plan
+                                      :proxy-challenge-auth-provider)))
+                 (when (and provider plan-proxy effective-proxy
+                            (eq (http-proxy-scheme plan-proxy)
+                                (http-proxy-scheme effective-proxy))
+                            (string-equal (http-proxy-host plan-proxy)
+                                          (http-proxy-host effective-proxy))
+                            (eql (http-proxy-port plan-proxy)
+                                 (http-proxy-port effective-proxy))
+                            (equal (http-proxy-username plan-proxy)
+                                   (http-proxy-username effective-proxy))
+                            (equal (http-proxy-password plan-proxy)
+                                   (http-proxy-password effective-proxy)))
+                   (setf (getf plan :proxy-challenge-auth-provider) provider))
+                 plan)
+               proxy-plan))
+         (mode (or (getf effective-plan :mode) :direct))
+         (effective-proxy (getf effective-plan :proxy))
+         (target (or (getf effective-plan :target) requested-target))
          (stream (%proxy-open-raw open-stream request timeout deadline
-                                  proxy-plan proxy))
+                                  effective-plan effective-proxy))
          (negotiated-alpn nil)
          (retained-p nil))
     (unwind-protect
@@ -284,38 +305,38 @@
                 (multiple-value-setq (stream negotiated-alpn)
                   (%proxy-upgrade stream tls-upgrade target timeout deadline))))
              (:forward
-              (when (eq (http-proxy-scheme proxy) :https)
+              (when (eq (http-proxy-scheme effective-proxy) :https)
                 (setf stream
                       (nth-value
                        0
                        (%proxy-upgrade
                         stream tls-upgrade
-                        (%proxy-uri-for :https (http-proxy-host proxy)
-                                        (http-proxy-port proxy))
+                        (%proxy-uri-for :https (http-proxy-host effective-proxy)
+                                        (http-proxy-port effective-proxy))
                         timeout deadline :proxy-tls-p t)))))
              (:connect
-              (when (eq (http-proxy-scheme proxy) :https)
+              (when (eq (http-proxy-scheme effective-proxy) :https)
                 (setf stream
                       (nth-value
                        0
                        (%proxy-upgrade
                         stream tls-upgrade
-                        (%proxy-uri-for :https (http-proxy-host proxy)
-                                        (http-proxy-port proxy))
+                        (%proxy-uri-for :https (http-proxy-host effective-proxy)
+                                        (http-proxy-port effective-proxy))
                         timeout deadline :proxy-tls-p t))))
               (multiple-value-bind (connected response)
-                  (%proxy-connect stream proxy-plan timeout deadline
+                  (%proxy-connect stream effective-plan timeout deadline
                                   clock-function)
                 (when response
                   (return-from %proxy-open-plan-once
-                    (values nil response nil)))
+                    (values nil response nil effective-plan)))
                 (if (string= (http-uri-scheme target) "https")
                     (multiple-value-setq (stream negotiated-alpn)
                       (%proxy-upgrade connected tls-upgrade target
                                       timeout deadline))
                     (setf stream connected))))
              (:socks5
-              (%proxy-socks-negotiate stream proxy-plan timeout deadline
+              (%proxy-socks-negotiate stream effective-plan timeout deadline
                                       clock-function resolve-host
                                       resolve-host-style)
               (when (string= (http-uri-scheme target) "https")
@@ -324,7 +345,7 @@
              (otherwise
               (%proxy-error "The proxy plan contains an unsupported mode." mode)))
            (setf retained-p t)
-           (values stream nil negotiated-alpn))
+           (values stream nil negotiated-alpn effective-plan))
       (unless retained-p
         (when (streamp stream)
           (http-kit::%with-http-cleanup
@@ -344,12 +365,15 @@
     (open-stream close-stream request proxy-plan proxy tls-upgrade resolve-host
                  resolve-host-style timeout deadline clock-function)
   (let ((plan proxy-plan)
+        (proxy-override proxy)
         (challenge-count 0))
     (loop
-      (multiple-value-bind (stream response negotiated-alpn)
+      (multiple-value-bind (stream response negotiated-alpn effective-plan)
           (%proxy-open-plan-once
-           open-stream close-stream request plan proxy tls-upgrade resolve-host
-           resolve-host-style timeout deadline clock-function)
+           open-stream close-stream request plan proxy-override tls-upgrade
+           resolve-host resolve-host-style timeout deadline clock-function)
+        (setf plan effective-plan
+              proxy-override nil)
         (when stream
           (return (values stream negotiated-alpn)))
         (let* ((challenge-values

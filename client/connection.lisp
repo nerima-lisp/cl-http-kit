@@ -21,15 +21,14 @@
   max-connection-age
   clock-function
   lock
+  (clear-callbacks nil)
   (entries nil))
 
-(progn
-  (defvar *client-preopened-http-stream* nil)
-  (define-condition %http-client-alpn-handoff (error)
-    ((stream :initarg :stream :reader %http-client-alpn-handoff-stream)
-     (protocol :initarg :protocol :reader %http-client-alpn-handoff-protocol))))
+(defvar *client-preopened-http-stream* nil)
 
-(defun %pool-monotonic-time ()
+(define-condition %http-client-alpn-handoff (error)
+  ((stream :initarg :stream :reader %http-client-alpn-handoff-stream)))
+  (defun %pool-monotonic-time ()
   (/ (float (get-internal-real-time))
      internal-time-units-per-second))
 
@@ -50,6 +49,17 @@
      "The connection pool must be an HTTP-CONNECTION-POOL."
      pool))
   pool)
+
+(defun %http-connection-pool-register-clear-callback (pool callback)
+  (%pool-ensure-pool pool)
+  (%pool-ensure-function
+   callback
+   "A connection pool clear callback must be a function.")
+  (%with-client-lock ((%http-connection-pool-lock pool))
+    (pushnew callback
+             (%http-connection-pool-clear-callbacks pool)
+             :test (function eq)))
+  callback)
 
 (defun %pool-now (pool)
   (let ((now (funcall (%http-connection-pool-clock-function pool))))
@@ -176,8 +186,23 @@ be used concurrently from multiple threads."
   "Return POOL's optional host resolver function."
   (%http-connection-pool-resolve-host (%pool-ensure-pool pool)))
 
-(defun %pool-default-key (request)
-  (http-uri-origin (http-request-uri request)))
+(defun %pool-default-key (request proxy-plan proxy)
+  (let ((effective-proxy (or proxy (and proxy-plan (getf proxy-plan :proxy))))
+        (origin (http-uri-origin (http-request-uri request))))
+    (list origin
+          (and proxy-plan (getf proxy-plan :mode))
+          (and proxy-plan (getf proxy-plan :connect-host))
+          (and proxy-plan (getf proxy-plan :connect-port))
+          (and proxy-plan (getf proxy-plan :proxy-host))
+          (and proxy-plan (getf proxy-plan :proxy-port))
+          (and proxy-plan (getf proxy-plan :remote-dns-p))
+          (and proxy-plan (getf proxy-plan :proxy-authorization))
+          (when effective-proxy
+            (list (http-proxy-scheme effective-proxy)
+                  (http-proxy-host effective-proxy)
+                  (http-proxy-port effective-proxy)
+                  (http-proxy-username effective-proxy)
+                  (http-proxy-password effective-proxy))))))
 
 (defun %pool-take (pool key)
   (let ((entry (find key
@@ -247,13 +272,128 @@ be used concurrently from multiple threads."
 (defun http-connection-pool-clear (pool)
   "Close and remove every idle connection in POOL, returning its count."
   (%pool-ensure-pool pool)
-  (let ((entries
-          (%with-client-lock ((%http-connection-pool-lock pool))
-            (prog1 (%http-connection-pool-entries pool)
-              (setf (%http-connection-pool-entries pool) nil)))))
+  (let ((entries nil)
+        (callbacks nil)
+        (callback-error nil))
+    (%with-client-lock ((%http-connection-pool-lock pool))
+      (setf entries (%http-connection-pool-entries pool)
+            callbacks (copy-list
+                       (%http-connection-pool-clear-callbacks pool))
+            (%http-connection-pool-entries pool) nil))
     (dolist (entry entries)
       (%pool-close pool (%http-pooled-connection-stream entry)))
+    (dolist (callback callbacks)
+      (handler-case
+          (funcall callback)
+        (error (condition)
+          (unless callback-error
+            (setf callback-error condition)))))
+    (when callback-error
+      (error callback-error))
     (length entries)))
+
+(defun %http-connection-pool-send-with-alpn-handoff
+    (pool request &key key timeout deadline max-header-bytes max-fields max-body-bytes
+          proxy-plan proxy request-target request-body-function
+          request-body-length on-body-chunk on-information
+          (collect-body-p t))
+  (%pool-ensure-pool pool)
+  (unless (http-request-p request)
+    (%pool-protocol-error "The pooled request must be an HTTP-REQUEST." request))
+  (let* ((effective-proxy-plan
+          (if proxy
+              (http-proxy-plan proxy (http-request-uri request))
+            proxy-plan))
+         (key
+          (handler-case
+              (or key (%pool-default-key request effective-proxy-plan proxy))
+            (type-error (condition)
+              (error 'http-connection-error
+                     :message "The default connection pool key could not be derived."
+                     :operation :connect
+                     :request-sent-p nil
+                     :cause condition))))
+         (stream nil)
+         (opened-at nil)
+         (retained-p nil))
+    (handler-case
+        (with-http-deadline
+         (absolute-deadline timeout
+                            :inherited deadline
+                            :clock-function #'%pool-monotonic-time)
+         (let ((entry
+                (unless *client-preopened-http-stream*
+                  (%with-client-lock ((%http-connection-pool-lock pool))
+                                     (%pool-purge-expired pool)
+                                     (%pool-take pool key)))))
+           (cond
+            (*client-preopened-http-stream*
+             (setf stream (prog1 *client-preopened-http-stream*
+                            (setf *client-preopened-http-stream* nil))
+                   opened-at (%pool-now pool)))
+            (entry
+             (setf stream (%http-pooled-connection-stream entry)
+                   opened-at (%http-pooled-connection-opened-at entry)))
+            (t
+             (setf opened-at (%pool-now pool))
+             (multiple-value-bind (opened-stream negotiated-alpn)
+                 (%pool-open pool request
+                             :timeout timeout
+                             :deadline absolute-deadline
+                             :proxy-plan proxy-plan
+                             :proxy proxy)
+               (setf stream opened-stream)
+               (cond
+                ((equal negotiated-alpn "h2")
+                 (setf stream nil)
+                 (error '%http-client-alpn-handoff
+                        :stream opened-stream))
+                ((or (null negotiated-alpn)
+    (equal negotiated-alpn "http/1.1"))
+                 nil)
+                (t
+                 (%pool-protocol-error
+                  "The TLS opener selected an unsupported ALPN protocol."
+                  negotiated-alpn))))))
+           (multiple-value-bind (response reusable-p)
+               (send-http-request-over-open-stream
+                request
+                stream
+                :deadline absolute-deadline
+                :max-header-bytes max-header-bytes
+                :max-fields max-fields
+                :max-body-bytes max-body-bytes
+                :request-target
+                (or request-target
+                    (and (eq (getf effective-proxy-plan :mode) :forward)
+                         (getf effective-proxy-plan :request-target)))
+                :request-body-function request-body-function
+                :request-body-length request-body-length
+                :on-body-chunk on-body-chunk
+                :on-information on-information
+                :collect-body-p collect-body-p
+                :clock-function #'%pool-monotonic-time)
+             (if reusable-p
+                 (progn
+                   (%with-client-lock ((%http-connection-pool-lock pool))
+                                      (%pool-retain pool key stream opened-at (%pool-now pool)))
+                   (setf retained-p t))
+               (%pool-close pool stream))
+             (setf stream nil)
+             response)))
+      (%http-client-alpn-handoff (condition)
+                                 (error condition))
+      (http-error (condition)
+                  (unless retained-p
+                    (%pool-close pool stream))
+                  (error condition))
+      (error (condition)
+             (unless retained-p
+               (%pool-close pool stream))
+             (error 'http-connection-error
+                    :message "The pooled HTTP exchange signaled an error."
+                    :operation :transport
+                    :cause condition)))))
 
 (defun http-connection-pool-send
     (pool request &key key timeout deadline max-header-bytes max-fields max-body-bytes
@@ -265,89 +405,33 @@ be used concurrently from multiple threads."
 The request is never retried automatically after a transport failure. A stream
 is retained only when the core parser proves that the response is self-delimited
 and neither side requested connection closure."
-  (%pool-ensure-pool pool)
-  (unless (http-request-p request)
-    (%pool-protocol-error "The pooled request must be an HTTP-REQUEST." request))
-  (let ((key (or key (%pool-default-key request)))
-        (stream nil)
-        (opened-at nil)
-        (retained-p nil))
-    (handler-case
-        (with-http-deadline
-            (absolute-deadline timeout
-                               :inherited deadline
-                               :clock-function #'%pool-monotonic-time)
-          (let ((entry
-                  (unless *client-preopened-http-stream*
-                    (%with-client-lock ((%http-connection-pool-lock pool))
-                      (%pool-purge-expired pool)
-                      (%pool-take pool key)))))
-            (cond
-              (*client-preopened-http-stream*
-               (setf stream (prog1 *client-preopened-http-stream*
-                              (setf *client-preopened-http-stream* nil))
-                     opened-at (%pool-now pool)))
-              (entry
-               (setf stream (%http-pooled-connection-stream entry)
-                     opened-at (%http-pooled-connection-opened-at entry)))
-              (t
-               (setf opened-at (%pool-now pool))
-               (multiple-value-bind (opened-stream negotiated-alpn)
-                   (%pool-open pool request
-                               :timeout timeout
-                               :deadline absolute-deadline
-                               :proxy-plan proxy-plan
-                               :proxy proxy)
-                 (setf stream opened-stream)
-                 (when (equal negotiated-alpn "h2")
-                   (setf stream nil)
-                   (error '%http-client-alpn-handoff
-                          :stream opened-stream
-                          :protocol :http2)))))
-            (multiple-value-bind (response reusable-p)
-                (send-http-request-over-open-stream
-                 request
-                 stream
-                 :deadline absolute-deadline
-                 :max-header-bytes max-header-bytes
-                 :max-fields max-fields
-                 :max-body-bytes max-body-bytes
-                 :request-target
-                 (or request-target
-                     (and (eq (getf proxy-plan :mode) :forward)
-                          (getf proxy-plan :request-target)))
-                 :request-body-function request-body-function
-                 :request-body-length request-body-length
-                 :on-body-chunk on-body-chunk
-                 :on-information on-information
-                 :collect-body-p collect-body-p
-                 :clock-function #'%pool-monotonic-time)
-              (if reusable-p
-                  (progn
-                    (%with-client-lock ((%http-connection-pool-lock pool))
-                      (%pool-retain pool key stream opened-at (%pool-now pool)))
-                    (setf retained-p t))
-                  (%pool-close pool stream))
-              (setf stream nil)
-              response)))
-      (%http-client-alpn-handoff (condition)
-        (error condition))
-      (http-error (condition)
-        (unless retained-p
-          (%pool-close pool stream))
-        (error condition))
-      (error (condition)
-        (unless retained-p
-          (%pool-close pool stream))
-        (error 'http-connection-error
-               :message "The pooled HTTP exchange signaled an error."
-               :operation :transport
-               :cause condition)))))
+  (handler-case
+      (%http-connection-pool-send-with-alpn-handoff
+       pool request
+       :key key
+       :timeout timeout
+       :deadline deadline
+       :max-header-bytes max-header-bytes
+       :max-fields max-fields
+       :max-body-bytes max-body-bytes
+       :proxy-plan proxy-plan
+       :proxy proxy
+       :request-target request-target
+       :request-body-function request-body-function
+       :request-body-length request-body-length
+       :on-body-chunk on-body-chunk
+       :on-information on-information
+       :collect-body-p collect-body-p)
+    (%http-client-alpn-handoff (condition)
+      (%pool-close pool (%http-client-alpn-handoff-stream condition))
+      (%pool-protocol-error
+       "HTTP/2 ALPN requires the negotiated client transport."
+       :http2))))
 
 (defun %http-connection-pool-send-on-stream
     (pool request stream &rest arguments)
   (let ((*client-preopened-http-stream* stream))
     (unwind-protect
-         (apply #'http-connection-pool-send pool request arguments)
+         (apply #'%http-connection-pool-send-with-alpn-handoff pool request arguments)
       (when *client-preopened-http-stream*
         (%pool-close pool *client-preopened-http-stream*)))))

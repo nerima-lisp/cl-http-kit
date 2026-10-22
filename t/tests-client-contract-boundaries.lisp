@@ -1051,6 +1051,56 @@
       (ensure-equal 0 (getf (http-connection-pool-stats pool) :idle-count))
       (ensure-equal 0 (http-connection-pool-clear pool))
       (ensure-equal 0 closes))))
+(deftest client-contract-pool-open-wraps-unexpected-errors
+  (let* ((original (make-condition (quote simple-error)
+                                   :format-control "Raw opener failure."))
+         (pool (http-kit/client::%make-http-connection-pool
+                :open-stream (lambda (&rest arguments)
+                               (declare (ignore arguments))
+                               (error original))))
+         (caught (handler-case
+                     (http-kit/client::%pool-open pool nil)
+                   (http-connection-error (condition) condition))))
+    (ensure-true (typep caught 'http-connection-error))
+    (ensure-equal :connect (http-error-operation caught))
+    (ensure-equal "The connection pool opener signaled an error."
+                  (http-error-message caught))
+    (ensure-true (eq original (http-connection-error-cause caught)))))
+(deftest client-contract-pool-clear-runs-callbacks-before-signaling-first-error
+  (let* ((first-condition
+           (make-condition (quote simple-error)
+                           :format-control "First callback failure."))
+         (second-condition
+           (make-condition (quote simple-error)
+                           :format-control "Second callback failure."))
+         (seen-errors nil)
+         (events nil)
+         (pool (make-http-connection-pool
+                :open-stream (lambda (&rest arguments)
+                               (declare (ignore arguments))
+                               (error "The opener is not used.")))))
+    (http-kit/client::%http-connection-pool-register-clear-callback
+     pool (lambda () (push :observer events)))
+    (http-kit/client::%http-connection-pool-register-clear-callback
+     pool (lambda ()
+            (push :first events)
+            (push first-condition seen-errors)
+            (error first-condition)))
+    (http-kit/client::%http-connection-pool-register-clear-callback
+     pool (lambda ()
+            (push :second events)
+            (push second-condition seen-errors)
+            (error second-condition)))
+    (let ((caught (handler-case
+                      (http-connection-pool-clear pool)
+                    (simple-error (condition) condition))))
+      (ensure-true (typep caught 'simple-error))
+      (ensure-equal 2 (length seen-errors))
+      (ensure-true (eq caught (car (last seen-errors))))
+      (ensure-equal 3 (length events))
+      (ensure-true (member :observer events))
+      (ensure-true (member :first events))
+      (ensure-true (member :second events)))))
 
 (deftest client-contract-strict-alt-svc-parameter-state
   (dolist (case '(("ma=30; persist=1" t t)
@@ -2165,10 +2215,10 @@
                             (http-connection-error (condition) condition))))
              (ensure-true (typep caught 'http-connection-error))
              (ensure-equal :connect (http-error-operation caught))
-             (ensure-equal "The connection pool opener signaled an error." (http-error-message caught))
+             (ensure-equal "The default connection pool key could not be derived." (http-error-message caught))
              (ensure-true (typep (http-connection-error-cause caught) 'type-error))
-             ;; Unknown opener failures must not permit an unsafe replay.
-             (ensure-true (http-connection-error-request-sent-p caught))
+             ;; Key derivation happens before the stream opener can send a request.
+             (ensure-false (http-connection-error-request-sent-p caught))
              (ensure-equal '(:mode . 17) plan)
              (ensure-equal nil events)
              (ensure-equal 0 (getf (http-connection-pool-stats pool) :idle-count))
@@ -2887,3 +2937,517 @@
       (setf (symbol-function key-symbol) original-key)
       (http-connection-pool-clear pool))))
 
+#+sbcl
+(deftest client-public-client-single-instance-allows-overlapping-requests
+  (let* ((arrived (sb-thread:make-semaphore :count 0))
+         (release (sb-thread:make-semaphore :count 0))
+         (first-response nil)
+         (second-response nil)
+         (first-error nil)
+         (second-error nil)
+         (client
+           (make-http-client
+            :cache nil
+            :transport-function
+            (lambda (request &key &allow-other-keys)
+              (sb-thread:signal-semaphore arrived)
+              (sb-thread:wait-on-semaphore release)
+              (make-http-response
+               :status 200
+               :body (ascii (http-uri-path (http-request-uri request)))))))
+         (first-thread nil)
+         (second-thread nil))
+    (unwind-protect
+         (progn
+           (setf first-thread
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (handler-case
+                        (setf first-response
+                              (http-client-send
+                               client "GET" "http://parallel.test/first"))
+                      (error (condition)
+                        (setf first-error condition))))))
+           (setf second-thread
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (handler-case
+                        (setf second-response
+                              (http-client-send
+                               client "GET" "http://parallel.test/second"))
+                      (error (condition)
+                        (setf second-error condition))))))
+           (let ((both-entered-p
+                   (and (sb-thread:wait-on-semaphore arrived :timeout 5)
+                        (sb-thread:wait-on-semaphore arrived :timeout 5))))
+             (sb-thread:signal-semaphore release)
+             (sb-thread:signal-semaphore release)
+             (ensure-true both-entered-p))
+           (sb-thread:join-thread first-thread)
+           (setf first-thread nil)
+           (sb-thread:join-thread second-thread)
+           (setf second-thread nil)
+           (ensure-true (null first-error))
+           (ensure-true (null second-error))
+           (ensure-equal 200 (http-response-status first-response))
+           (ensure-equal 200 (http-response-status second-response))
+           (ensure-equal
+            "/first"
+            (octets-as-string (http-response-body first-response)))
+           (ensure-equal
+            "/second"
+            (octets-as-string (http-response-body second-response))))
+      (sb-thread:signal-semaphore release)
+      (sb-thread:signal-semaphore release)
+      (when first-thread
+        (ignore-errors (sb-thread:join-thread first-thread)))
+      (when second-thread
+        (ignore-errors (sb-thread:join-thread second-thread))))))
+
+#+sbcl
+(deftest client-contract-public-pool-alpn-handoff-is-translated-and-closed
+  (let* ((stream (make-instance 'binary-test-stream))
+         (opened 0)
+         (upgraded 0)
+         (closed 0)
+         (pool
+           (make-http-connection-pool
+            :open-stream
+            (lambda (request &key timeout deadline &allow-other-keys)
+              (declare (ignore request timeout deadline))
+              (incf opened)
+              stream)
+            :tls-upgrade
+            (lambda (seen uri &key timeout deadline)
+              (declare (ignore uri timeout deadline))
+              (ensure-true (eq stream seen))
+              (incf upgraded)
+              (values seen "h2"))
+            :close-stream
+            (lambda (seen)
+              (ensure-true (eq stream seen))
+              (incf closed)
+              (when (open-stream-p seen)
+                (close seen :abort t)))))
+         (request
+           (make-http-request
+            :method "GET"
+            :uri "https://handoff.test/public-pool")))
+    (unwind-protect
+         (let ((caught
+                 (handler-case
+                     (http-connection-pool-send pool request :timeout 5)
+                   (http-protocol-error (condition) condition))))
+           (ensure-true (typep caught 'http-protocol-error))
+           (ensure-equal :connection-pool (http-error-operation caught))
+           (ensure-equal 1 opened)
+           (ensure-equal 1 upgraded))
+      (http-connection-pool-clear pool))
+    (ensure-equal 1 closed)
+    (ensure-false (open-stream-p stream))
+    (ensure-equal 0 (length (binary-test-output stream)))))
+
+#+sbcl
+(deftest client-native-alpn-rejects-unsupported-selected-protocol
+  (let* ((runtime-symbol 'http-kit/client::%client-runtime-function)
+         (original-runtime (symbol-function runtime-symbol))
+         (offers nil)
+         (stream (make-instance 'binary-test-stream))
+         (opened 0)
+         (upgraded 0)
+         (closed 0)
+         (pool
+           (make-http-connection-pool
+            :open-stream
+            (lambda (request &key timeout deadline &allow-other-keys)
+              (declare (ignore request timeout deadline))
+              (incf opened)
+              stream)
+            :tls-upgrade
+            (http-kit/client::%client-native-tls-upgrade)
+            :close-stream
+            (lambda (seen)
+              (ensure-true (eq stream seen))
+              (incf closed)
+              (when (open-stream-p seen)
+                (close seen :abort t)))))
+         (transport
+           (http-kit/client::%client-transport-from-negotiated-connection-pool
+            pool))
+         (client
+           (make-http-client :transport-function transport :cache nil))
+         (caught nil))
+    (unwind-protect
+         (progn
+           (setf (symbol-function runtime-symbol)
+                 (lambda (package-name function-name)
+                   (cond
+                     ((and (string= package-name "HTTP-KIT/TLS")
+                           (string= function-name "MAKE-HTTP-TLS-UPGRADER"))
+                      (lambda (&key alpn-protocols)
+                        (push alpn-protocols offers)
+                        (lambda (seen uri &key timeout deadline)
+                          (declare (ignore uri timeout deadline))
+                          (ensure-true (eq stream seen))
+                          (incf upgraded)
+                          seen)))
+                     ((and (string= package-name "HTTP-KIT/TLS")
+                           (string= function-name
+                                    "HTTP-TLS-SELECTED-ALPN-PROTOCOL"))
+                      (lambda (seen)
+                        (declare (ignore seen))
+                        "h3"))
+                     (t nil))))
+           (setf caught
+                 (handler-case
+                     (http-client-send client "GET" "https://alpn.test/unsupported")
+                   (http-error (condition) condition))))
+      (setf (symbol-function runtime-symbol) original-runtime)
+      (http-connection-pool-clear pool))
+    (ensure-true (typep caught 'http-protocol-error))
+    (ensure-equal '(("h2" "http/1.1")) (nreverse offers))
+    (ensure-equal 1 opened)
+    (ensure-equal 1 upgraded)
+    (ensure-equal 1 closed)
+    (ensure-false (open-stream-p stream))
+    (ensure-equal 0 (length (binary-test-output stream)))))
+
+(deftest client-contract-pool-send-explicit-proxy-overrides-plan-proxy
+  (let* ((plan-proxy (make-http-proxy :scheme :http
+                                      :host "plan-proxy.test" :port 8080))
+         (explicit-proxy (make-http-proxy :scheme :http
+                                          :host "explicit-proxy.test" :port 9090))
+         (request (make-http-request
+                   :method "GET" :uri "http://origin.test/resource"))
+         (plan (http-proxy-plan plan-proxy (http-request-uri request)))
+         (response-body (ascii "through-explicit-proxy"))
+         (stream
+           (make-instance
+            'binary-test-stream
+            :input (ascii "HTTP/1.1 200 OK|CRLF|Content-Length: 22|CRLF||CRLF|through-explicit-proxy")))
+         (seen-proxy nil)
+         (seen-plan nil)
+         (closed 0)
+         (pool
+           (make-http-connection-pool
+            :open-stream
+            (lambda (received &key proxy-plan proxy &allow-other-keys)
+              (ensure-true (eq request received))
+              (setf seen-proxy proxy
+                    seen-plan proxy-plan)
+              stream)
+            :close-stream
+            (lambda (received)
+              (ensure-true (eq stream received))
+              (incf closed)
+              (when (open-stream-p received)
+                (close received :abort t))))))
+    (unwind-protect
+         (let ((response (http-connection-pool-send
+                          pool request
+                          :proxy-plan plan
+                          :proxy explicit-proxy)))
+           (ensure-equal 200 (http-response-status response))
+           (ensure-octets-equal response-body (http-response-body response))
+           (ensure-true (eq explicit-proxy seen-proxy))
+           (ensure-false (eq plan seen-plan))
+           (ensure-equal :forward (getf seen-plan :mode))
+           (ensure-true (eq explicit-proxy (getf seen-plan :proxy)))
+           (ensure-true (eq plan-proxy (getf plan :proxy)))
+           (ensure-true
+            (search "GET http://origin.test/resource HTTP/1.1"
+                    (octets-as-string (binary-test-output stream))))
+           (ensure-equal 1 (http-connection-pool-clear pool))
+           (ensure-equal 1 closed)
+           (ensure-false (open-stream-p stream)))
+      (http-connection-pool-clear pool))))
+(deftest client-contract-pool-send-explicit-http-proxy-overrides-socks-plan-uses-absolute-form
+  (let* ((plan-proxy (make-http-proxy :scheme :socks5
+                                      :host "socks-proxy.test" :port 1080))
+         (explicit-proxy (make-http-proxy :scheme :http
+                                          :host "http-proxy.test" :port 9090))
+         (request (make-http-request
+                   :method "GET" :uri "http://origin.test/resource"))
+         (plan (http-proxy-plan plan-proxy (http-request-uri request)))
+         (response-body (ascii "through-explicit-proxy"))
+         (stream
+           (make-instance
+            'binary-test-stream
+            :input (ascii "HTTP/1.1 200 OK|CRLF|Content-Length: 22|CRLF||CRLF|through-explicit-proxy")))
+         (seen-proxy nil)
+         (seen-plan nil)
+         (closed 0)
+         (pool
+           (make-http-connection-pool
+            :open-stream
+            (lambda (received &key proxy-plan proxy &allow-other-keys)
+              (ensure-true (eq request received))
+              (setf seen-proxy proxy
+                    seen-plan proxy-plan)
+              stream)
+            :close-stream
+            (lambda (received)
+              (ensure-true (eq stream received))
+              (incf closed)
+              (when (open-stream-p received)
+                (close received :abort t))))))
+    (unwind-protect
+         (let ((response
+                 (http-connection-pool-send
+                  pool request :proxy-plan plan :proxy explicit-proxy)))
+           (ensure-equal 200 (http-response-status response))
+           (ensure-octets-equal response-body (http-response-body response))
+           (ensure-equal :socks5 (getf plan :mode))
+           (ensure-true (eq explicit-proxy (getf seen-plan :proxy)))
+           (ensure-true (eq explicit-proxy seen-proxy))
+           (let ((wire (octets-as-string (binary-test-output stream))))
+             (ensure-true
+              (search "GET http://origin.test/resource HTTP/1.1" wire))
+             (ensure-false (search "GET /resource HTTP/1.1" wire)))
+           (ensure-equal 1 (http-connection-pool-clear pool))
+           (ensure-equal 1 closed)
+           (ensure-false (open-stream-p stream)))
+      (http-connection-pool-clear pool))))
+(deftest client-contract-proxy-explicit-auth-proxy-overrides-plan
+  (let* ((plan-proxy (make-http-proxy :scheme :http
+                                      :host "plan-proxy.test" :port 8080
+                                      :username "a" :password "a"))
+         (explicit-proxy (make-http-proxy :scheme :http
+                                          :host "explicit-proxy.test" :port 9090
+                                          :username "b" :password "b"))
+         (request (make-http-request
+                   :method "GET" :uri "https://origin.test/resource"))
+         (plan (http-proxy-plan plan-proxy (http-request-uri request)))
+         (stream
+           (make-instance
+            'binary-test-stream
+            :input (ascii "HTTP/1.1 200 Connection Established|CRLF||CRLF|")))
+         (seen-plan nil)
+         (seen-proxy nil)
+         (opener
+           (make-http-proxy-stream-opener
+            (lambda (received &key proxy-plan proxy &allow-other-keys)
+              (ensure-true (eq request received))
+              (setf seen-plan proxy-plan
+                    seen-proxy proxy)
+              stream)
+            (lambda (received)
+              (ensure-true (eq stream received))
+              (when (open-stream-p received)
+                (close received :abort t)))
+            :tls-upgrade
+            (lambda (received target &key &allow-other-keys)
+              (declare (ignore target))
+              (ensure-true (eq stream received))
+              (values received nil)))))
+    (unwind-protect
+         (multiple-value-bind (opened negotiated-alpn)
+             (funcall opener request :proxy-plan plan :proxy explicit-proxy)
+           (ensure-true (eq stream opened))
+           (ensure-false negotiated-alpn)
+           (ensure-equal "Basic YTph" (getf plan :proxy-authorization))
+           (ensure-equal :connect (getf seen-plan :mode))
+           (ensure-true (eq explicit-proxy seen-proxy))
+           (ensure-true (eq explicit-proxy (getf seen-plan :proxy)))
+           (ensure-equal "Basic Yjpi" (getf seen-plan :proxy-authorization))
+           (let ((wire (octets-as-string (binary-test-output stream))))
+             (ensure-true (search "CONNECT origin.test:443 HTTP/1.1" wire))
+             (ensure-true (search "Proxy-Authorization: Basic Yjpi" wire))
+             (ensure-false (search "Proxy-Authorization: Basic YTph" wire))))
+      (when (open-stream-p stream)
+        (close stream :abort t)))))
+(deftest client-contract-proxy-auth-provider-not-forwarded-to-mismatched-explicit-proxy
+  (dolist (mismatch '(:host :port))
+    (let* ((plan-proxy
+             (make-http-proxy :scheme :http :host "plan-proxy.test" :port 8080
+                              :username "user" :password "secret"))
+           (explicit-proxy
+             (make-http-proxy
+              :scheme :http
+              :host (if (eq mismatch :host) "other-proxy.test" "plan-proxy.test")
+              :port (if (eq mismatch :port) 9090 8080)
+              :username "user" :password "secret"))
+           (request (make-http-request
+                     :method "GET" :uri "https://origin.test/resource"))
+           (plan (http-proxy-plan plan-proxy (http-request-uri request)))
+           (provider (lambda (&rest arguments)
+                       (declare (ignore arguments))
+                       "unused"))
+           (stream
+             (make-instance
+              'binary-test-stream
+              :input (ascii "HTTP/1.1 200 Connection Established|CRLF||CRLF|")))
+           (seen-plan nil)
+           (opener
+             (make-http-proxy-stream-opener
+              (lambda (received &key proxy-plan proxy &allow-other-keys)
+                (ensure-true (eq request received))
+                (ensure-true (eq explicit-proxy proxy))
+                (setf seen-plan proxy-plan)
+                stream)
+              (lambda (received)
+                (ensure-true (eq stream received))
+                (when (open-stream-p received)
+                  (close received :abort t)))
+              :tls-upgrade
+              (lambda (received target &key &allow-other-keys)
+                (declare (ignore target))
+                (ensure-true (eq stream received))
+                (values received nil)))))
+      (setf (getf plan :proxy-challenge-auth-provider) provider)
+      (unwind-protect
+           (multiple-value-bind (opened negotiated-alpn)
+               (funcall opener request :proxy-plan plan :proxy explicit-proxy)
+             (ensure-true (eq stream opened))
+             (ensure-false negotiated-alpn)
+             (ensure-true (eq explicit-proxy (getf seen-plan :proxy)))
+             (ensure-false (getf seen-plan :proxy-challenge-auth-provider)))
+        (when (open-stream-p stream)
+          (close stream :abort t))))))
+(deftest client-contract-proxy-explicit-http-overrides-socks-plan
+  (let* ((plan-proxy (make-http-proxy :scheme :socks5
+                                      :host "socks-proxy.test" :port 1080))
+         (explicit-proxy (make-http-proxy :scheme :http
+                                          :host "http-proxy.test" :port 9090))
+         (request (make-http-request
+                   :method "GET" :uri "https://origin.test/resource"))
+         (plan (http-proxy-plan plan-proxy (http-request-uri request)))
+         (stream
+           (make-instance
+            'binary-test-stream
+            :input (ascii "HTTP/1.1 200 Connection Established|CRLF||CRLF|")))
+         (seen-plan nil)
+         (seen-proxy nil)
+         (opener
+           (make-http-proxy-stream-opener
+            (lambda (received &key proxy-plan proxy &allow-other-keys)
+              (ensure-true (eq request received))
+              (setf seen-plan proxy-plan
+                    seen-proxy proxy)
+              stream)
+            (lambda (received)
+              (ensure-true (eq stream received))
+              (when (open-stream-p received)
+                (close received :abort t)))
+            :tls-upgrade
+            (lambda (received target &key &allow-other-keys)
+              (declare (ignore target))
+              (ensure-true (eq stream received))
+              (values received nil)))))
+    (unwind-protect
+         (multiple-value-bind (opened negotiated-alpn)
+             (funcall opener request :proxy-plan plan :proxy explicit-proxy)
+           (ensure-true (eq stream opened))
+           (ensure-false negotiated-alpn)
+           (ensure-equal :socks5 (getf plan :mode))
+           (ensure-equal :connect (getf seen-plan :mode))
+           (ensure-true (eq explicit-proxy seen-proxy))
+           (ensure-true (eq explicit-proxy (getf seen-plan :proxy)))
+           (let ((wire-bytes (binary-test-output stream)))
+             (ensure-true
+              (search "CONNECT origin.test:443 HTTP/1.1"
+                      (octets-as-string wire-bytes)))
+             (ensure-equal 67 (aref wire-bytes 0))
+             (ensure-equal 79 (aref wire-bytes 1))
+             (ensure-equal 78 (aref wire-bytes 2))))
+      (when (open-stream-p stream)
+        (close stream :abort t)))))
+(deftest client-contract-pool-send-opens-per-explicit-proxy
+  (let* ((response-text
+           (concatenate
+            (quote string)
+            "HTTP/1.1 200 OK|CRLF|Content-Length: 0|CRLF|Connection: keep-alive|CRLF||CRLF|"
+            "HTTP/1.1 200 OK|CRLF|Content-Length: 0|CRLF|Connection: keep-alive|CRLF||CRLF|"))
+         (proxy-a (make-http-proxy :scheme :http
+                                   :host "proxy-a.test" :port 8080))
+         (proxy-b (make-http-proxy :scheme :http
+                                   :host "proxy-b.test" :port 9090))
+         (request (make-http-request
+                   :method "GET" :uri "http://origin.test/resource"))
+         (stream-a
+           (make-instance (quote binary-test-stream)
+                          :input (ascii response-text)))
+         (stream-b
+           (make-instance (quote binary-test-stream)
+                          :input (ascii response-text)))
+         (opened-proxies nil)
+         (pool
+           (make-http-connection-pool
+            :open-stream
+            (lambda (received &key proxy &allow-other-keys)
+              (ensure-true (eq request received))
+              (setf opened-proxies (append opened-proxies (list proxy)))
+              (cond
+                ((eq proxy proxy-a) stream-a)
+                ((eq proxy proxy-b) stream-b)
+                (t (error "Unexpected proxy."))))
+            :close-stream
+            (lambda (stream)
+              (when (open-stream-p stream)
+                (close stream :abort t))))))
+    (unwind-protect
+         (let* ((response-a (http-connection-pool-send
+                             pool request :proxy proxy-a))
+                (response-b (http-connection-pool-send
+                             pool request :proxy proxy-b)))
+           (ensure-equal 200 (http-response-status response-a))
+           (ensure-equal 200 (http-response-status response-b))
+           (ensure-equal 2 (length opened-proxies))
+           (ensure-true (eq proxy-a (first opened-proxies)))
+           (ensure-true (eq proxy-b (second opened-proxies)))
+           (ensure-equal 2 (http-connection-pool-clear pool)))
+      (http-connection-pool-clear pool))))
+(deftest client-native-alpn-manager-rejects-unsupported-reconnect
+  (let* ((http-kit/client::*proxy-environment-function*
+           (lambda (name) (declare (ignore name)) nil))
+         (wire
+           (concatenate-octets
+            (h2-frame 4 0 0 (octets))
+            (h2-frame 1 5 1 (h2-header-block (cons ":status" "200")))
+            (h2-frame 7 0 0 (octets 0 0 0 1 0 0 0 0))))
+         (h2-stream (make-instance 'binary-test-stream :input wire))
+         (unsupported-stream (make-instance 'binary-test-stream))
+         (opened 0)
+         (upgraded 0)
+         (closed-streams nil)
+         (pool
+           (make-http-connection-pool
+            :open-stream
+            (lambda (request &key timeout deadline &allow-other-keys)
+              (declare (ignore request timeout deadline))
+              (incf opened)
+              (if (= opened 1) h2-stream unsupported-stream))
+            :tls-upgrade
+            (lambda (stream uri &key timeout deadline)
+              (declare (ignore uri timeout deadline))
+              (incf upgraded)
+              (values stream (if (= upgraded 1) "h2" "h3")))
+            :close-stream
+            (lambda (stream)
+              (push stream closed-streams)
+              (when (open-stream-p stream)
+                (close stream :abort t)))))
+         (transport
+           (http-kit/client::%client-transport-from-negotiated-connection-pool
+            pool))
+         (client (make-http-client :transport-function transport :cache nil)))
+    (unwind-protect
+         (progn
+           (ensure-equal
+            200
+            (http-response-status
+             (http-client-send client "GET" "https://alpn-reconnect.test/first")))
+           (signals http-protocol-error
+             (http-client-send
+              client "GET" "https://alpn-reconnect.test/unsupported"))
+           (ensure-equal 2 opened)
+           (ensure-equal 2 upgraded))
+      (http-client-clear-connections client))
+    (ensure-equal 2 (length closed-streams))
+    (ensure-true (member h2-stream closed-streams :test #'eq))
+    (ensure-true (member unsupported-stream closed-streams :test #'eq))
+    (ensure-false (open-stream-p h2-stream))
+    (ensure-false (open-stream-p unsupported-stream))))
+(deftest client-clear-connections-rejects-non-client
+  (signals http-protocol-error
+    (http-client-clear-connections nil)))

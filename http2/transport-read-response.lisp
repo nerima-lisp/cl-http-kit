@@ -122,15 +122,14 @@
                    frame reader max-frame-size deadline clock-function
                    max-header-bytes context status headers body body-length
                    request-method expected-stream-id max-fields)
-                (progn
-                  (setf status new-status
-                        headers new-headers)
-                  (when (and information-status on-information)
-                    (funcall on-information
-                             (http-kit:make-http-response
-                              :status information-status
-                              :headers information-headers
-                              :protocol-version "HTTP/2"))))
+                (setf status new-status
+                      headers new-headers)
+                (when (and information-status on-information)
+                  (funcall on-information
+                           (http-kit:make-http-response
+                            :status information-status
+                            :headers information-headers
+                            :protocol-version "HTTP/2")))
                 (when response
                   (return-from %h2-read-response response))))
              ((= type +http2-data-type+)
