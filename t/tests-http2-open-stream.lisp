@@ -1395,6 +1395,97 @@
     (ensure-true (http-kit/http2:http2-connection-open-p connection))
     (ensure-true (http-kit/http2:http2-connection-draining-p connection))
     (http-kit/http2:close-http2-connection connection)))
+(deftest http2-public-control-goaway-serializes-with-scheduled-stream-open
+  (let* ((stream
+           (make-instance
+            'binary-session-stream
+            :input (concatenate-octets
+                    (h2-frame 4 0 0 (octets))
+                    (h2-frame 1 5 1 (octets #x88))
+                    (h2-frame 1 5 3 (octets #x88)))))
+         (connection (http-kit/http2:make-http2-connection :stream stream))
+         (goaway-started (sb-thread:make-semaphore :count 0))
+         (goaway-completed (sb-thread:make-semaphore :count 0))
+         (request-started (sb-thread:make-semaphore :count 0))
+         (goaway-thread nil)
+         (request-thread nil)
+         (goaway-error nil)
+         (request-error nil)
+         (request-response nil)
+         (goaway-started-p nil)
+         (request-started-p nil)
+         (goaway-completed-while-locked-p nil))
+    (unwind-protect
+         (progn
+           (http-kit/http2:send-http2-request-over-connection
+            connection
+            (make-http-request :method "GET" :uri "https://127.0.0.1/first"))
+           (sb-thread:with-mutex
+               ((http-kit/http2::%http2-connection-scheduler-lock connection))
+             (setf goaway-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (sb-thread:signal-semaphore goaway-started)
+                      (handler-case
+                          (http-kit/http2:send-http2-goaway connection)
+                        (error (condition)
+                          (setf goaway-error condition)))
+                      (sb-thread:signal-semaphore goaway-completed))))
+             (setf goaway-started-p
+                   (sb-thread:wait-on-semaphore goaway-started :timeout 5)
+                   goaway-completed-while-locked-p
+                   (sb-thread:wait-on-semaphore goaway-completed :timeout 0.05)
+                   request-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (sb-thread:signal-semaphore request-started)
+                      (handler-case
+                          (setf request-response
+                                (http-kit/http2:send-http2-request-over-connection
+                                 connection
+                                 (make-http-request
+                                  :method "GET"
+                                  :uri "https://127.0.0.1/second")))
+                        (error (condition)
+                          (setf request-error condition)))))
+                   request-started-p
+                   (sb-thread:wait-on-semaphore request-started :timeout 5)))
+           (sb-thread:join-thread goaway-thread)
+           (setf goaway-thread nil)
+           (sb-thread:join-thread request-thread)
+           (setf request-thread nil)
+           (ensure-true goaway-started-p)
+           (ensure-true request-started-p)
+           (ensure-true (not goaway-completed-while-locked-p))
+           (ensure-true (null goaway-error))
+           (ensure-true (http-kit/http2:http2-connection-draining-p connection))
+           (let* ((frames (h2-output-frames stream))
+                  (request-headers
+                    (find-if (lambda (frame)
+                               (and (= 1 (http-kit/http2::%h2-frame-type frame))
+                                    (= 3 (http-kit/http2::%h2-frame-stream-id frame))))
+                             frames))
+                  (goaway
+                    (find-if (lambda (frame)
+                               (= 7 (http-kit/http2::%h2-frame-type frame)))
+                             frames))
+                  (last-stream-id
+                    (http-kit/http2::%h2-u32
+                     (http-kit/http2::%h2-frame-payload goaway) 0)))
+             (ensure-true goaway)
+             (if request-headers
+                 (progn
+                   (ensure-true (null request-error))
+                   (ensure-equal 200 (http-response-status request-response))
+                   (ensure-true (>= last-stream-id 3)))
+                 (progn
+                   (ensure-true (typep request-error 'http-protocol-error))
+                   (ensure-equal 1 last-stream-id)))))
+      (when goaway-thread
+        (sb-thread:join-thread goaway-thread))
+      (when request-thread
+        (sb-thread:join-thread request-thread))
+      (http-kit/http2:close-http2-connection connection))))
 
 #+sbcl
 (deftest http2-public-control-priority-wire-boundaries
