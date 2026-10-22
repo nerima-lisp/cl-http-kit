@@ -7330,15 +7330,26 @@
                      (http-protocol-error (condition) condition))))
              (ensure-true (typep condition 'http-protocol-error))
              (ensure-equal :qpack (http-error-operation condition))
-             (ensure-equal detail (if (typep condition (quote http-message-kit:http-qpack-blocked))
-                                    (http-message-kit:http-qpack-blocked-required-insert-count condition)
-                                    (http-message-kit:http-protocol-error-detail condition))))))
+             (ensure-equal
+              detail
+              (cond
+                ((typep condition (quote http-message-kit:http-qpack-blocked))
+                 (http-message-kit:http-qpack-blocked-required-insert-count
+                  condition))
+                ((and (consp detail)
+                      (eq (first detail) :incomplete-message-available))
+                 (list :incomplete-message-available
+                       (and (typep condition
+                                   (quote http-message-kit:http-incomplete-message))
+                            (http-message-kit:http-incomplete-message-available
+                             condition))))
+                (t (http-message-kit:http-protocol-error-detail condition)))))))
     (dolist (case (list (list (octets 0) nil)
                        (list (octets 0 #x80) 0)
                        (list (octets 0 0 #xff 36) 99)
                        (list (octets 0 0 #x80) -1)
-                       (list (octets 0 0 #x21 #x78) 4)
-                       (list (octets 0 0 #x21 #x78 2 #x61) 2)
+                       (list (octets 0 0 #x21 #x78) (list :incomplete-message-available 4))
+                       (list (octets 0 0 #x21 #x78 2 #x61) (list :incomplete-message-available 6))
                        (list (octets 0 0 #x21 #x58 0) "X")
                        (list (octets 0 0 #x21 #x78 0 #xc1) ":path")))
       (check (first case) (second case)))
