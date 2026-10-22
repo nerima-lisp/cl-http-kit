@@ -122,7 +122,9 @@ limits, and error callbacks for a caller-owned listener.
 
 The optional `cl-http-kit/tls` system adapts cl-tls-kit's TLS 1.3 server driver
 to the native listener. It negotiates `h2` or `http/1.1` with ALPN, then passes
-the wrapped stream to the matching server session.
+the wrapped stream to the matching server session. The listener bounds body
+bytes retained by active HTTP/1 and HTTP/2 requests with a per-server aggregate
+budget; each HTTP/2 connection also has its own aggregate limit.
 HTTP/3 server acceptance and plaintext server startup through this high-level
 API remain outside the boundary.
 

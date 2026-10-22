@@ -286,8 +286,9 @@ framing. The serializer derives Host from the URI and validates body framing.
 Parse an HTTP/1.0 or HTTP/1.1 request from an octet vector or binary input
 stream. The signature is parse-http-request (input &key timeout deadline
 max-header-bytes max-fields max-body-bytes default-authority on-body-chunk
-(collect-body-p t) on-expect-continue clock-function allow-eof-p). MAX-FIELDS
-defaults to 256 and applies independently to request headers and trailers.
+reserve-body-bytes release-body-bytes (collect-body-p t) on-expect-continue
+clock-function allow-eof-p). MAX-FIELDS defaults to 256 and applies
+independently to request headers and trailers.
 
 ON-BODY-CHUNK is NIL or a function receiving each decoded body chunk as an
 octet vector; its return value is ignored. With COLLECT-BODY-P NIL, the parser
@@ -299,6 +300,11 @@ Content-Length; its return value is ignored. Body callbacks can run before
 chunk terminators and trailers have been validated, so receiving a chunk does
 not establish that parsing succeeded. ALLOW-EOF-P defaults to NIL. When true,
 EOF before a request line returns NIL; incomplete requests still signal an error.
+RESERVE-BODY-BYTES and RELEASE-BODY-BYTES are optional paired accounting
+callbacks. The parser reserves storage before allocating body chunks and the
+final body vector, then releases temporary collector storage after copying. A
+caller that uses these callbacks must release the returned body's charge when
+it no longer retains the request.
 
 ### `parse-http-response`
 
@@ -345,16 +351,20 @@ synchronous stream opener, not a CPS opener. `on-success` receives the response;
 Serve HTTP/1.0 and HTTP/1.1 requests on an already-open binary stream. The
 signature is serve-http1-session (stream handler &key timeout deadline
 max-header-bytes max-fields max-body-bytes default-authority on-body-chunk
-collect-body-p on-expect-continue max-requests on-error on-upgrade
-close-stream clock-function). The handler receives each parsed request and
+reserve-body-bytes release-body-bytes collect-body-p on-expect-continue
+max-requests on-error on-upgrade close-stream clock-function). The handler
+receives each parsed request and
 returns an HTTP response or response stream. Its optional second value is an
 ordered list of HTTP/1.1 informational responses (status 100-199 except 101)
 to send before the final response. Informational responses are not sent to
 HTTP/1.0 requests. The session supports request-body streaming, Expect:
 100-continue, trailers, protocol upgrades, and bounded request counts.
 MAX-FIELDS defaults to 256 and applies independently to request headers and
-request trailers. It returns the number of final responses written and one of
-`:eof`, `:close`, `:upgrade`, or `:max-requests`.
+request trailers. The optional RESERVE-BODY-BYTES and RELEASE-BODY-BYTES
+callbacks must be supplied together; the session uses them to account for
+collected request bodies and releases each charge after processing the request.
+It returns the number of final responses written and one of `:eof`, `:close`,
+`:upgrade`, or `:max-requests`.
 
 ### `recording-session`
 
@@ -714,9 +724,11 @@ snapshot and does not expose the manager's internal list structure.
 
 Serve HTTP/2 requests on a caller-supplied binary stream. The signature is
 serve-http2-session (stream handler &key timeout deadline max-frame-size
-max-header-bytes max-fields max-body-bytes max-concurrent-streams
+max-header-bytes max-fields max-body-bytes max-aggregate-body-bytes
+max-concurrent-streams
 max-reset-streams max-reset-window max-control-frames max-control-window
-max-hpack-table-size default-authority collect-body-p on-body-chunk max-requests
+max-hpack-table-size default-authority collect-body-p on-body-chunk
+reserve-body-bytes release-body-bytes max-requests
 on-error close-stream clock-function huffman-p enable-connect-p). The session
 owns the HTTP/2 preface, SETTINGS, HPACK, stream state, flow control, request
 body collection, and response framing, and returns a request count and
@@ -731,6 +743,10 @@ control-frame limit keywords are accepted by `make-http2-client` and
 optional second value is a list of informational responses, which are emitted
 in order before the final response; informational responses must use a status
 from 100 through 199 other than 101 and cannot carry a body or trailers.
+MAX-AGGREGATE-BODY-BYTES limits body bytes retained across the connection's
+streams and defaults to twice MAX-BODY-BYTES. The optional paired
+RESERVE-BODY-BYTES and RELEASE-BODY-BYTES callbacks let an outer listener
+account for those buffers across connections.
 
 ## HTTP/3 package
 
@@ -887,7 +903,8 @@ signature: `(&key (transport :https) host port handler
 certificate-chain private-key ticket-key-store max-connections
 max-handshakes max-concurrent-streams handshake-timeout request-timeout
 idle-timeout graceful-timeout max-header-bytes max-fields max-body-bytes
-on-event on-error)`. HOST, PORT, HANDLER, CERTIFICATE-CHAIN, and PRIVATE-KEY
+max-buffered-body-bytes on-event on-error)`. HOST, PORT, HANDLER,
+CERTIFICATE-CHAIN, and PRIVATE-KEY
 are required. `certificate-chain` is a list of DER-encoded certificate byte
 vectors with the leaf first; `private-key` is the matching P-256 ECDSA or
 Ed25519 key object. Construct it with `crypto-kit:make-ec-private-key` using
@@ -906,7 +923,12 @@ Defaults are 128 concurrent connections, 32 concurrent handshakes, 100 HTTP/2
 streams per connection, a 10-second handshake timeout, a 30-second request
 timeout, a 60-second idle timeout, and a 30-second graceful-stop timeout.
 Request headers are limited to 65,536 bytes and 100 fields; request bodies are
-limited to 16,777,216 bytes. Limits are finite and cannot be disabled with NIL.
+limited to 16,777,216 bytes per request. The aggregate buffered-body limit
+defaults to the larger of 64 MiB and twice MAX-BODY-BYTES. It applies across
+active HTTP/1 and HTTP/2 sessions, including temporary copies made while
+collecting a request. It does not account for application-owned copies or
+references retained after a handler returns. Limits are finite and cannot be
+disabled with NIL.
 The handshake timeout runs from accept through TLS negotiation. The request
 timeout covers request reads, handler execution, and response writes; the idle
 timeout bounds the initial request wait and each wait between requests,
@@ -947,19 +969,21 @@ enforces its own connection and handshake limits.
 
 The optional package name is HTTP-KIT/TLS and is provided by the
 `cl-http-kit/tls` system. MAKE-HTTP-TLS-UPGRADER returns a client upgrade
-callback backed by cl-tls-kit. Its VERIFY argument accepts NIL, :OPTIONAL, or
-:REQUIRED and defaults to :REQUIRED; the callback passes the request host as
-TLS SNI and accepts ALPN-PROTOCOLS, TIMEOUT, and DEADLINE values. Each ALPN
+callback backed by cl-tls-kit. Its VERIFY argument accepts :OPTIONAL or
+:REQUIRED and defaults to :REQUIRED; NIL signals HTTP-UNSUPPORTED-FEATURE
+with feature `:tls-certificate-verification-disable` because the pinned driver
+does not expose a supported verification bypass. The callback passes the
+request host as TLS SNI and accepts ALPN-PROTOCOLS, TIMEOUT, and DEADLINE
+values. Each ALPN
 protocol name must contain 1 to 255 ASCII characters. CERTIFICATE, KEY, and
 PASSWORD are reserved for a future client-certificate integration and currently
 signal an unsupported-feature condition when supplied. The client wrapper
 preserves the binary-stream boundary and applies handshake deadlines.
 :OPTIONAL applies the same certificate-chain, hostname, and trust checks as
-:REQUIRED. NIL skips those checks but still requires a valid CertificateVerify
-signature; use it only for deliberately unauthenticated test connections.
+:REQUIRED. Certificate verification remains enabled for every supported value.
 TRUST-ANCHORS accepts parsed X.509 certificate objects. When anchors are not
 supplied and VERIFY is :OPTIONAL or :REQUIRED, the upgrader loads PEM
-certificates from the CA file selected by cl-tls-kit: SSL_CERT_FILE takes
+certificates from the CA file selected by cl-tls-kit. SSL_CERT_FILE takes
 precedence over NIX_SSL_CERT_FILE, followed by an existing platform CA file.
 The wrapper rejects transport EOF without a peer close_notify instead of
 treating a truncated TLS stream as a completed HTTP response.
@@ -1478,9 +1502,9 @@ literals never match.
 Process the first Strict-Transport-Security field for an HTTPS URI.
 Malformed fields, HTTP URIs, and IP literals are ignored. The caller must
 ensure that TLS certificate verification succeeded: this function checks the
-URI scheme, not the transport's verification result. When using deliberately
-unauthenticated TLS or a custom transport without that guarantee, disable the
-client's store with `:strict-transport-store nil`.
+URI scheme, not the transport's verification result. When using a custom
+transport without that guarantee, disable the client's store with
+`:strict-transport-store nil`.
 Quoted `max-age` values are decoded before validating their digits. Empty
 directives and valid unknown directives are ignored; semicolons inside quoted
 values do not separate directives. A field without `max-age` does not change

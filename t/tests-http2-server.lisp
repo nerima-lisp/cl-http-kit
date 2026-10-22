@@ -841,6 +841,107 @@
         (ensure-equal 11
                       (http-kit/http2::%h2-u32
                        (http-kit/http2::%h2-frame-payload goaway) 4)))))
+  (deftest http2-server-bounds-aggregate-body-retention
+    (let* ((body-headers (h2-header-block
+                          (cons ":method" "POST")
+                          (cons ":scheme" "https")
+                          (cons ":authority" "example.com")
+                          (cons ":path" "/reset")
+                          (cons "content-length" "2")))
+           (get-headers (h2-header-block
+                         (cons ":method" "GET")
+                         (cons ":scheme" "https")
+                         (cons ":authority" "example.com")
+                         (cons ":path" "/after-reset")))
+           (input (concatenate-octets
+                   (h2-preface)
+                   (h2-frame 4 0 0 (octets))
+                   (h2-frame 1 4 1 body-headers)
+                   (h2-frame 0 0 1 (octets 97 98))
+                   (h2-frame 3 0 1 (octets 0 0 0 0))
+                   (h2-frame 1 5 3 get-headers)))
+           (stream (make-instance 'binary-session-stream :input input))
+           (charged 0)
+           (events nil)
+           (handled 0))
+      (multiple-value-bind (requests reason)
+          (http-kit/http2:serve-http2-session
+           stream
+           (lambda (request)
+             (incf handled)
+             (ensure-equal "/after-reset" (http-request-target request))
+             (make-http-response :status 204))
+           :max-body-bytes 8
+           :max-aggregate-body-bytes 2
+           :reserve-body-bytes
+           (lambda (amount)
+             (incf charged amount)
+             (push (list :reserve amount) events))
+           :release-body-bytes
+           (lambda (amount)
+             (decf charged amount)
+             (push (list :release amount) events))
+           :close-stream nil)
+        (ensure-equal 1 requests)
+        (ensure-equal :eof reason))
+      (ensure-equal 1 handled)
+      (ensure-equal 0 charged)
+      (ensure-true
+       (equal (reverse events)
+              (list (list :reserve 2) (list :release 2)))))
+    (let* ((first-headers (h2-header-block
+                           (cons ":method" "POST")
+                           (cons ":scheme" "https")
+                           (cons ":authority" "example.com")
+                           (cons ":path" "/first")
+                           (cons "content-length" "2")))
+           (second-headers (h2-header-block
+                            (cons ":method" "POST")
+                            (cons ":scheme" "https")
+                            (cons ":authority" "example.com")
+                            (cons ":path" "/second")
+                            (cons "content-length" "2")))
+           (input (concatenate-octets
+                   (h2-preface)
+                   (h2-frame 4 0 0 (octets))
+                   (h2-frame 1 4 1 first-headers)
+                   (h2-frame 0 0 1 (octets 97 98))
+                   (h2-frame 1 4 3 second-headers)
+                   (h2-frame 0 0 3 (octets 99 100))))
+           (stream (make-instance 'binary-session-stream :input input))
+           (charged 0)
+           (events nil)
+           (handled 0)
+           (request-count 0)
+           (reason nil))
+      (multiple-value-setq (request-count reason)
+        (http-kit/http2:serve-http2-session
+         stream
+         (lambda (request)
+           (declare (ignore request))
+           (incf handled)
+           (make-http-response :status 204))
+         :max-body-bytes 8
+         :max-aggregate-body-bytes 3
+         :reserve-body-bytes
+         (lambda (amount)
+           (incf charged amount)
+           (push (list :reserve amount) events))
+         :release-body-bytes
+         (lambda (amount)
+           (decf charged amount)
+           (push (list :release amount) events))
+         :close-stream nil))
+      (ensure-true
+       (typep reason 'http-size-limit-exceeded))
+      (ensure-equal 3 (http-size-limit-exceeded-limit reason))
+      (ensure-equal 4 (http-size-limit-exceeded-observed reason))
+      (ensure-equal 0 handled)
+      (ensure-equal 0 request-count)
+      (ensure-equal 0 charged)
+      (ensure-true
+       (equal (reverse events)
+              (list (list :reserve 2) (list :release 2))))))
 
 #+sbcl
 (deftest http2-server-response-stream-materializes-chunks-before-end-stream

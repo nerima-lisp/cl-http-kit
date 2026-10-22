@@ -580,8 +580,16 @@
        (lambda () (make-http-tls-upgrader :alpn-protocols (list protocol)))
        :tls :invalid-alpn))
     (dolist (protocol (list "h" (make-string 255 :initial-element #\a)))
-      (ensure-true (functionp (make-http-tls-upgrader :verify nil
-                                                    :alpn-protocols (list protocol)))))
+      (ensure-true (functionp (make-http-tls-upgrader :verify :optional
+                                                     :trust-anchors (list t)
+                                                     :alpn-protocols (list protocol)))))
+    (let ((condition
+            (%network-tls-contract-condition
+             (lambda () (make-http-tls-upgrader :verify nil))
+             'http-unsupported-feature :tls)))
+      (ensure-equal :tls-certificate-verification-disable
+                    (http-unsupported-feature-name condition))
+      (ensure-equal :disabled (http-protocol-error-detail condition)))
     (dolist (options '((:certificate :certificate) (:key :key)))
       (%network-tls-contract-protocol
        (lambda () (apply #'make-http-tls-upgrader options))
@@ -599,7 +607,10 @@
     (%network-tls-contract-protocol
      (lambda () (http-tls-selected-alpn-protocol :not-stream)) :tls :not-stream)
     (%network-tls-contract-protocol
-     (lambda () (funcall (make-http-tls-upgrader :verify nil) :not-stream nil))
+     (lambda ()
+       (funcall (make-http-tls-upgrader :verify :optional
+                                        :trust-anchors (list t))
+                :not-stream nil))
      :tls :not-stream)
     (dolist (options '(nil (:certificate-chain nil) (:private-key nil)))
       (%network-tls-contract-protocol
@@ -620,7 +631,7 @@
         (close stream :abort t))))
 
   (deftest network-tls-contract-handshake-input-cleanup
-    (dolist (case '((() :eof)
+    (dolist (case '((() :handshake-failed)
                     ((22 3) :truncated-record)
                     ((22 3 3 0 2 1) :truncated-record)
                     ((22 3 3 64 1) :record-overflow)))
@@ -631,7 +642,9 @@
              (progn
                (%network-tls-contract-protocol
                 (lambda ()
-                  (funcall (make-http-tls-upgrader :verify nil) stream
+                  (funcall (make-http-tls-upgrader :verify :optional
+                                   :trust-anchors (list t))
+                           stream
                            (http-request-uri
                             (make-http-request :method "GET" :uri "https://127.0.0.1/"))
                            :timeout 2))
@@ -651,7 +664,8 @@
            (let ((condition
                    (%network-tls-contract-condition
                     (lambda ()
-                      (funcall (make-http-tls-upgrader :verify nil
+                      (funcall (make-http-tls-upgrader :verify :optional
+                                                       :trust-anchors (list t)
                                                        :clock-function (lambda () 1))
                                stream (http-request-uri
                                        (make-http-request :method "GET"
@@ -884,9 +898,13 @@
                          (lambda ()
                            (let ((upgrader
                                    (if native-timeout-p
-                                       (make-http-tls-upgrader :verify nil)
                                        (make-http-tls-upgrader
-                                        :verify nil :clock-function (lambda () tick)))))
+                                        :verify :optional
+                                        :trust-anchors (list t))
+                                       (make-http-tls-upgrader
+                                        :verify :optional
+                                        :trust-anchors (list t)
+                                        :clock-function (lambda () tick)))))
                              (if native-timeout-p
                                  (funcall upgrader stream (parse-http-uri "https://127.0.0.1/")
                                           :timeout 0.02)
@@ -908,9 +926,12 @@
            (progn
              (%network-tls-contract-protocol
               (lambda ()
-                (funcall (make-http-tls-upgrader :verify nil) stream
+                (funcall (make-http-tls-upgrader
+                           :verify :optional
+                           :trust-anchors (list t))
+                         stream
                          (parse-http-uri "https://127.0.0.1/")))
-              :tls :eof)
+              :tls :handshake-failed)
              (ensure-false (open-stream-p stream))
              (ensure-equal 2 (network-tls-contract-close-count stream))
              (ensure-true (network-tls-contract-abort-p stream))

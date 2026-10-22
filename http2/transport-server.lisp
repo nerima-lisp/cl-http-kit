@@ -25,6 +25,8 @@
   target
   headers
   body
+  (body-buffered-bytes 0)
+  (request-body-bytes 0)
   expected-body-length
   body-length-seen
   trailers
@@ -203,20 +205,29 @@ pseudo-fields are kept separate because they are not ordinary HTTP headers.
               protocol
               regular))))
 
-(defun %h2-server-make-request (state collect-body-p)
+(defun %h2-server-make-request (state collect-body-p reserve-body-bytes)
   (let* ((target (%h2-server-stream-target state))
          (connect-p (string= (%h2-server-stream-method state) "CONNECT"))
          (authority-connect-p
            (and connect-p (null (%h2-server-stream-protocol state))))
          (path (if authority-connect-p "/" target))
-         (query-start (and (not authority-connect-p) (position #\? path)))
+         (query-start (and (not authority-connect-p)
+                           (position (code-char 63) path)))
          (uri-path (if query-start (subseq path 0 query-start) path))
          (query (and query-start (subseq path (1+ query-start))))
          (uri (http-kit:make-http-uri
                :scheme (%h2-server-stream-scheme state)
                :authority (%h2-server-stream-authority state)
                :path (if (string= uri-path "*") "/" uri-path)
-               :query query)))
+               :query query))
+         (body (if collect-body-p
+                   (progn
+                     (funcall reserve-body-bytes
+                              state :request
+                              (length (%h2-server-stream-body state)))
+                     (http-kit::%copy-octets
+                      (%h2-server-stream-body state)))
+                   (http-kit::%empty-octets))))
     (http-kit:make-http-request
      :method (%h2-server-stream-method state)
      :protocol (%h2-server-stream-protocol state)
@@ -225,9 +236,7 @@ pseudo-fields are kept separate because they are not ordinary HTTP headers.
      :protocol-version "HTTP/2"
      :headers (%h2-server-stream-headers state)
      :trailers (%h2-server-stream-trailers state)
-     :body (if collect-body-p
-               (http-kit::%copy-octets (%h2-server-stream-body state))
-               (http-kit::%empty-octets)))))
+     :body body)))
 
 (defun %h2-server-window-add (current increment kind)
   (unless (and (integerp increment) (plusp increment))
@@ -365,6 +374,8 @@ pseudo-fields are kept separate because they are not ordinary HTTP headers.
              (max-header-bytes http-kit::*default-max-header-bytes*)
              (max-fields 256)
              (max-body-bytes http-kit::*default-max-body-bytes*)
+             (max-aggregate-body-bytes
+              (* 2 (if (integerp max-body-bytes) max-body-bytes 0)))
              (max-concurrent-streams 100)
              (max-reset-streams 100)
              (max-reset-window 1.0d0)
@@ -374,6 +385,8 @@ pseudo-fields are kept separate because they are not ordinary HTTP headers.
              default-authority
              (collect-body-p t)
              on-body-chunk
+             reserve-body-bytes
+             release-body-bytes
              max-requests
              on-error
              (close-stream #'close)
@@ -411,11 +424,15 @@ values.
            :message "HTTP/2 on-error must be NIL or a function"
            :operation :http2-server
            :detail on-error))
-  (unless (or (null on-body-chunk) (functionp on-body-chunk))
+  (unless (and (or (null on-body-chunk) (functionp on-body-chunk))
+               (or (and (null reserve-body-bytes)
+                        (null release-body-bytes))
+                   (and (functionp reserve-body-bytes)
+                        (functionp release-body-bytes))))
     (error 'http-kit:http-protocol-error
-           :message "HTTP/2 on-body-chunk must be NIL or a function"
+           :message "HTTP/2 callbacks are invalid or body-buffer callbacks are unpaired"
            :operation :http2-server
-           :detail on-body-chunk))
+           :detail (list on-body-chunk reserve-body-bytes release-body-bytes)))
   (unless (or (null default-authority) (stringp default-authority))
     (error 'http-kit:http-protocol-error
            :message "HTTP/2 default-authority must be NIL or a string"
@@ -455,7 +472,10 @@ values.
   (%h2-validate-frame-size max-frame-size))
   (%h2-validate-limit :max-header-bytes max-header-bytes)
   (%h2-validate-limit :max-fields max-fields)
-  (%h2-validate-limit :max-body-bytes max-body-bytes :allow-zero t)
+  (progn
+    (%h2-validate-limit :max-body-bytes max-body-bytes :allow-zero t)
+    (%h2-validate-limit :max-aggregate-body-bytes
+                        max-aggregate-body-bytes :allow-zero t))
   (%h2-validate-limit :max-concurrent-streams max-concurrent-streams
                       :allow-zero t)
   (%h2-validate-limit :max-reset-streams max-reset-streams :allow-zero t)
@@ -474,10 +494,53 @@ values.
            :detail max-control-window))
   (%h2-validate-limit :max-hpack-table-size max-hpack-table-size
                       :allow-zero t)
-  (let ((request-count 0)
-        (termination :running)
-        (current-request nil)
-        (last-client-stream-id 0))
+  (let* ((request-count 0)
+         (termination :running)
+         (current-request nil)
+         (last-client-stream-id 0)
+         (session-body-bytes (list 0))
+         (reserve-state-body-bytes
+          (lambda (state charge-kind amount)
+            (when (plusp amount)
+              (let ((observed (+ (car session-body-bytes) amount)))
+                (http-kit::%check-limit
+                 :body observed max-aggregate-body-bytes
+                 :operation :http2-server)
+                (when reserve-body-bytes
+                  (funcall reserve-body-bytes amount))
+                (incf (car session-body-bytes) amount)
+                (ecase charge-kind
+                  (:body
+                   (incf (%h2-server-stream-body-buffered-bytes state) amount))
+                  (:request
+                   (incf (%h2-server-stream-request-body-bytes state) amount)))))))
+         (release-state-body-charge
+          (lambda (state charge-kind)
+            (let ((amount
+                    (ecase charge-kind
+                      (:body (%h2-server-stream-body-buffered-bytes state))
+                      (:request (%h2-server-stream-request-body-bytes state)))))
+              (when (plusp amount)
+                (unless (<= amount (car session-body-bytes))
+                  (%h2-server-error
+                   "HTTP/2 request body accounting became inconsistent" state))
+                (decf (car session-body-bytes) amount)
+                (ecase charge-kind
+                  (:body (setf (%h2-server-stream-body-buffered-bytes state) 0))
+                  (:request (setf (%h2-server-stream-request-body-bytes state) 0)))
+                (when release-body-bytes
+                  (funcall release-body-bytes amount))))))
+         (release-state-body
+          (lambda (state)
+            (funcall release-state-body-charge state :body)
+            (funcall release-state-body-charge state :request)))
+         (release-session-body
+          (lambda ()
+            (let ((amount (car session-body-bytes)))
+              (when (plusp amount)
+                (when release-body-bytes
+                  (funcall release-body-bytes amount))
+                (setf (car session-body-bytes) 0))))))
     (unwind-protect
          (handler-case
              (http-kit:with-http-deadline
@@ -855,12 +918,16 @@ values.
                                     reset-stream-count
                                     +http2-enhance-your-calm+))
                                  (when state
-                                   (setf (%h2-server-stream-reset-p state) t)
-                                   (remhash stream-id streams)
-                                   (remhash stream-id stream-deadlines)
-                                   (when (and interested-state
-                                              (eq state interested-state))
-                                     (return-from process-control-frame :reset))))
+  (setf (%h2-server-stream-reset-p state) t)
+  (if (and current-request
+           (eq (%h2-server-stream-request state) current-request))
+      (funcall release-state-body-charge state :body)
+      (funcall release-state-body state))
+  (remhash stream-id streams)
+  (remhash stream-id stream-deadlines)
+  (when (and interested-state
+             (eq state interested-state))
+    (return-from process-control-frame :reset))))
                                nil)
                               ((= type +http2-goaway-type+)
                                (unless (and (zerop stream-id)
@@ -1075,41 +1142,53 @@ values.
                              "TRACE requests must not contain content."
                              :trace-content))
                           (let ((request
-                                  (%h2-server-make-request state collect-body-p)))
-                            (setf (%h2-server-stream-request state) request
-                                  current-request request)
-                            (multiple-value-bind (response information)
-                                (funcall handler request)
-                              (http-kit::%check-deadline
-                               (gethash (%h2-server-stream-id state) stream-deadlines)
-                               clock-function :write)
-                              (unless (listp information)
-                                (%h2-server-error
-                                 "HTTP/2 informational responses must be supplied as a list"
-                                 information))
-                              (dolist (informational-response information)
-                                (send-information state informational-response))
-                              (let ((send-result (send-response state response)))
-                                (when (eq send-result :goaway)
-                                  (return-from finish-request :goaway))
-                                (when (eq send-result :reset)
-                                  (return-from finish-request :reset)))
-                              (setf (%h2-server-stream-responded-p state) t)
-                              (remhash (%h2-server-stream-id state) streams)
-                              (remhash (%h2-server-stream-id state) stream-deadlines)
-                              (incf request-count)
-                              (when (and max-requests
-                                         (>= request-count max-requests))
-                                (send-goaway)
-                                (return-from finish-request :max-requests))
-                              (when (and idle-timeout
-                                         (zerop (hash-table-count streams))
-                                         (zerop (hash-table-count stream-deadlines)))
-                                (setf idle-deadline
-                                      (http-kit:http-deadline
-                                       idle-timeout
-                                       :deadline absolute-deadline
-                                       :clock-function clock-function)))))))
+        (%h2-server-make-request state collect-body-p
+                                 reserve-state-body-bytes)))
+  (funcall release-state-body-charge state :body)
+  (setf (%h2-server-stream-request state) request
+        current-request request)
+  (multiple-value-bind (response information)
+      (funcall handler request)
+    (http-kit::%check-deadline
+     (gethash (%h2-server-stream-id state) stream-deadlines)
+     clock-function :write)
+    (unless (listp information)
+      (%h2-server-error
+       "HTTP/2 informational responses must be supplied as a list"
+       information))
+    (dolist (informational-response information)
+      (send-information state informational-response))
+    (let ((send-result (send-response state response)))
+      (when (eq send-result :goaway)
+        (return-from finish-request :goaway))
+      (when (eq send-result :reset)
+        (setf current-request nil
+              (%h2-server-stream-request state) nil
+              request nil)
+        (funcall release-state-body state)
+        (remhash (%h2-server-stream-id state) streams)
+        (remhash (%h2-server-stream-id state) stream-deadlines)
+        (return-from finish-request :reset)))
+    (setf (%h2-server-stream-responded-p state) t
+          current-request nil
+          (%h2-server-stream-request state) nil
+          request nil)
+    (funcall release-state-body state)
+    (remhash (%h2-server-stream-id state) streams)
+    (remhash (%h2-server-stream-id state) stream-deadlines)
+    (incf request-count)
+    (when (and max-requests
+               (>= request-count max-requests))
+      (send-goaway)
+      (return-from finish-request :max-requests))
+    (when (and idle-timeout
+               (zerop (hash-table-count streams))
+               (zerop (hash-table-count stream-deadlines)))
+      (setf idle-deadline
+            (http-kit:http-deadline
+             idle-timeout
+             :deadline absolute-deadline
+             :clock-function clock-function)))))))
                       (handle-headers (frame)
                         (let ((stream-id (%h2-frame-stream-id frame))
                               (flags (%h2-frame-flags frame)))
@@ -1217,7 +1296,10 @@ values.
                               (decf receive-connection-window frame-length)
                               (decf (%h2-server-stream-receive-window state)
                                     frame-length)
-                              (%h2-server-append-body state body collect-body-p)
+                              (progn
+  (when (and collect-body-p (plusp (length body)))
+    (funcall reserve-state-body-bytes state :body (length body)))
+  (%h2-server-append-body state body collect-body-p))
                               (incf (%h2-server-stream-body-length-seen state)
                                     (length body))
                               (when (and on-body-chunk (plusp (length body)))
@@ -1310,6 +1392,8 @@ values.
                       (null current-request))
                  (setf termination caught-condition)
                  (error caught-condition))))
-      (when close-stream
-        (funcall close-stream stream)))
+      (progn
+  (funcall release-session-body)
+  (when close-stream
+    (funcall close-stream stream))))
     (values request-count termination)))

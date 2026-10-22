@@ -13,6 +13,18 @@ historical release behavior, not the current API contract; see the
   `cl-websocket-kit` and SSE consumers to `sse-kit` from `cl-sse-kit`.
   See the
   [WebSocket and SSE migration guide](migration.md#websocket-and-sse-api-migration).
+- reject `:verify nil` because the pinned cl-tls-kit client driver does not
+  expose a supported way to disable certificate verification;
+
+### Added
+
+- add an HTTPS listener on SBCL with ALPN negotiation for HTTP/2 and HTTP/1.1,
+  bounded connection and request resources, lifecycle callbacks, and graceful
+  shutdown;
+
+### Changed
+
+- cap buffered request-body bytes across active HTTPS listener sessions;
 
 ### HTTP/2
 

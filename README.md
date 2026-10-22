@@ -23,9 +23,9 @@ The client uses cl-deflate-kit for compression, and the client and HTTPS
 listener use cl-tls-kit 0.1.0 or later for TLS 1.3.
 TLS certificate-chain, hostname, and trust verification is required by
 default. `:verify :optional` has the same verification policy as `:required`;
-`:verify nil` skips those certificate-policy checks but still requires the
-peer's CertificateVerify signature. Use `nil` only for deliberately
-unauthenticated test connections.
+`:verify nil` is rejected because the pinned cl-tls-kit client driver does not
+provide a supported certificate-verification bypass. Use a trusted test
+certificate when exercising HTTPS clients.
 
 ## Quick Start
 

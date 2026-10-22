@@ -1,4 +1,120 @@
 (in-package #:http-kit/test)
+#+sbcl
+(deftest https-listener-shares-body-budget-across-protocols
+  (let* ((context
+           (funcall (symbol-function '%make-https-listener-test-context)))
+         (originals
+           (mapcar #'fdefinition
+                   (funcall
+                    (symbol-function '%https-listener-test-symbols))))
+         (server nil))
+    (unwind-protect
+         (progn
+           (funcall
+            (symbol-function '%https-listener-test-install-stubs) context)
+           (let ((default-server
+                   (funcall
+                    (symbol-function '%https-listener-make-server))))
+             (ensure-equal
+              (* 64 1024 1024)
+              (http-kit::http-server-max-buffered-body-bytes
+               default-server)))
+           (let ((derived-server
+                   (funcall
+                    (symbol-function '%https-listener-make-server)
+                    :max-body-bytes 67108865)))
+             (ensure-equal
+              134217730
+              (http-kit::http-server-max-buffered-body-bytes
+               derived-server)))
+           (signals http-server-error
+             (funcall
+              (symbol-function '%https-listener-make-server)
+              :max-buffered-body-bytes nil))
+           (setf server
+                 (funcall
+                  (symbol-function '%https-listener-make-server)
+                  :max-buffered-body-bytes 5))
+           (start-http-server server)
+           (let ((client
+                   (funcall
+                    (symbol-function '%https-listener-connect) server)))
+             (close-http-tcp-stream client))
+           (funcall
+            (symbol-function '%https-listener-wait)
+            (lambda ()
+              (= 1
+                 (funcall
+                  (symbol-function '%https-listener-session-count) context))))
+           (funcall
+            (fdefinition
+             '(setf %https-listener-test-context-alpn))
+            "h2" context)
+           (let ((client
+                   (funcall
+                    (symbol-function '%https-listener-connect) server)))
+             (close-http-tcp-stream client))
+           (funcall
+            (symbol-function '%https-listener-wait)
+            (lambda ()
+              (and
+               (= 2
+                  (funcall
+                   (symbol-function '%https-listener-session-count)
+                   context))
+               (zerop
+                (funcall
+                 (symbol-function '%https-listener-connection-count) server)))))
+           (let* ((calls
+                    (sb-thread:with-mutex
+                        ((funcall
+                          (symbol-function '%https-listener-test-context-lock)
+                          context))
+                      (reverse
+                       (funcall
+                        (symbol-function
+                         '%https-listener-test-context-session-calls)
+                        context))))
+                  (first-call (first calls))
+                  (second-call (second calls))
+                  (first-options (third first-call))
+                  (second-options (third second-call))
+                  (reserve-first (getf first-options :reserve-body-bytes))
+                  (release-first (getf first-options :release-body-bytes))
+                  (reserve-second (getf second-options :reserve-body-bytes))
+                  (release-second (getf second-options :release-body-bytes)))
+             (ensure-equal 2 (length calls))
+             (ensure-equal :http1 (first first-call))
+             (ensure-equal :http2 (first second-call))
+             (funcall reserve-first 3)
+             (let ((observed
+                     (handler-case
+                         (progn
+                           (funcall reserve-second 3)
+                           nil)
+                       (http-size-limit-exceeded (condition) condition))))
+               (ensure-true
+                (typep observed 'http-size-limit-exceeded))
+               (ensure-equal
+                5 (http-size-limit-exceeded-limit observed))
+               (ensure-equal
+                6 (http-size-limit-exceeded-observed observed)))
+             (ensure-equal
+              3 (http-kit::http-server-buffered-body-bytes server))
+             (funcall release-first 3)
+             (ensure-equal
+              0 (http-kit::http-server-buffered-body-bytes server))
+             (funcall reserve-second 2)
+             (funcall release-second 2)
+             (ensure-equal
+              0 (http-kit::http-server-buffered-body-bytes server)))
+           (stop-http-server server :graceful-timeout 1)
+           (setf server nil))
+      (when server
+        (stop-http-server server :graceful-timeout 1))
+      (funcall
+       (symbol-function '%https-listener-test-restore-stubs)
+       originals))))
 
 #+sbcl
 (progn

@@ -138,9 +138,10 @@ The client creates native TCP, TLS 1.3, and pooling boundaries when no custom
 transport is supplied. The `cl-http-kit/tls` system uses cl-tls-kit for client
 certificate verification, trust-store loading, and handshake deadlines.
 Verification defaults to `:required`; `:optional` applies the same policy.
-Only `nil` skips certificate-chain, hostname, and trust checks, and it does
-not disable the TLS CertificateVerify signature check. The TLS stream
-requires a peer close_notify before treating transport EOF as clean closure.
+Passing `nil` to `make-http-tls-upgrader` is unsupported because the pinned
+cl-tls-kit client driver exposes no certificate-verification bypass. The TLS
+stream requires a peer close_notify before treating transport EOF as clean
+closure.
 The native HTTPS listener terminates TLS directly. A TLS-terminating proxy can
 forward cleartext HTTP/1.1 to `serve-http1-listener`; `make-http-server` accepts
 only HTTPS. Configure forwarded host and scheme according to the application's

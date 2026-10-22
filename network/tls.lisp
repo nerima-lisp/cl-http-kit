@@ -373,9 +373,11 @@
 The cl-tls-kit driver is TLS 1.3 only.  It owns record protection and the
 handshake, while this callback adapts an already-open binary stream to the
 driver's transport callbacks."
-  (unless (member verify '(nil :optional :required))
+  (when (null verify)
+    (%tls-unsupported :tls-certificate-verification-disable :disabled))
+  (unless (member verify '(:optional :required))
     (%tls-protocol-error
-     "TLS VERIFY must be NIL, :OPTIONAL, or :REQUIRED."
+     "TLS VERIFY must be :OPTIONAL or :REQUIRED."
      :invalid-verify))
   (unless (or (null alpn-protocols)
               (and (listp alpn-protocols)
@@ -408,7 +410,6 @@ driver's transport callbacks."
                      :alpn alpn-protocols
                      :supported-groups '(#x001d #x0017)
                      :trust-anchors trust-anchors
-                     :verify verify
                      :verify-signature #'crypto-kit:verify-signature)))
              (handler-case
                  (%call-with-tls-deadline
