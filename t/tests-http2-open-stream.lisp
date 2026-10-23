@@ -1809,7 +1809,7 @@
           (:unexpected-data
            (ensure-true (typep result 'http-protocol-error))
            (ensure-equal :http2-read (http-error-operation result))
-           (ensure-equal 3 (http-protocol-error-detail result)))))
+           (ensure-equal '(0 3) (http-protocol-error-detail result)))))
       (ensure-equal (if (eq mode :available) '(1 3) '(1))
                     (mapcar #'http-kit/http2::%h2-frame-stream-id
                             (remove-if-not
@@ -1872,6 +1872,220 @@
       (ensure-equal 1 closed))))
 
 #+sbcl
+(progn
+  (defun scheduled-ping-wire-p (sequence start end)
+    ;; A PING frame has nine bytes of header and eight bytes of payload.
+    ;; Offsets are zero-based: type is at 3, flags at 4, stream ID starts at 5.
+    (and (= (- end start) 17)
+         (= (aref sequence (+ start 3))
+            http-kit/http2::+http2-ping-type+)
+         (zerop (aref sequence (+ start 4)))
+         (zerop (http-kit/http2::%h2-u32 sequence (+ start 5)))))
+
+  (defclass scheduled-ping-eof-stream (binary-session-stream)
+    ((eof-started
+       :initarg :eof-started
+       :reader scheduled-ping-eof-started)
+     (eof-release
+       :initarg :eof-release
+       :reader scheduled-ping-eof-release)
+     (ping-write-started
+       :initarg :ping-write-started
+       :reader scheduled-ping-write-started)
+     (ping-write-release
+       :initarg :ping-write-release
+       :reader scheduled-ping-write-release)
+     (ping-write-failed
+       :initarg :ping-write-failed
+       :reader scheduled-ping-write-failed)
+     (ping-written
+       :initarg :ping-written
+       :reader scheduled-ping-written)
+     (defer-ping-write-p
+       :initarg :defer-ping-write-p
+       :reader scheduled-ping-defer-write-p)
+     (fail-ping-write-p
+       :initarg :fail-ping-write-p
+       :reader scheduled-ping-fail-write-p)
+     (closed-p
+       :initform nil
+       :accessor scheduled-ping-stream-closed-p)))
+
+  (defmethod sb-gray:stream-read-sequence
+      ((stream scheduled-ping-eof-stream) sequence &optional (start 0) end)
+    (when (>= (binary-session-input-position stream)
+              (length (binary-session-input stream)))
+      (sb-thread:signal-semaphore (scheduled-ping-eof-started stream))
+      (sb-thread:wait-on-semaphore (scheduled-ping-eof-release stream)))
+    (call-next-method))
+
+  (defmethod sb-gray:stream-write-sequence
+      ((stream scheduled-ping-eof-stream) sequence &optional (start 0) end)
+    (let ((end (or end (length sequence))))
+      (if (scheduled-ping-wire-p sequence start end)
+          (progn
+            (sb-thread:signal-semaphore
+             (scheduled-ping-write-started stream))
+            (when (scheduled-ping-defer-write-p stream)
+              (sb-thread:wait-on-semaphore
+               (scheduled-ping-write-release stream))
+              (when (scheduled-ping-fail-write-p stream)
+                (sb-thread:signal-semaphore
+                 (scheduled-ping-write-failed stream))
+                (error 'http-connection-error
+                       :message "The test stream failed the PING write."
+                       :operation :http2-write
+                       :cause :test-write-failure))
+              (when (scheduled-ping-stream-closed-p stream)
+                (error 'http-connection-error
+                       :message "The test stream closed before the PING write."
+                       :operation :http2-write
+                       :cause :closed)))
+            (prog1 (call-next-method)
+              (sb-thread:signal-semaphore (scheduled-ping-written stream))))
+          (call-next-method)))))
+
+#+sbcl
+(deftest http2-scheduler-ping-reader-eof-handoff
+  (dolist (mode '(:ping-written-before-eof
+                  :eof-recorded-before-ping-write-finishes
+                  :ping-write-fails-before-reader-eof))
+    (let* ((payload (octets 1 2 3 4 5 6 7 8))
+           (eof-started (sb-thread:make-semaphore :count 0))
+           (eof-release (sb-thread:make-semaphore :count 0))
+           (ping-write-started (sb-thread:make-semaphore :count 0))
+           (ping-write-release (sb-thread:make-semaphore :count 0))
+           (ping-write-failed (sb-thread:make-semaphore :count 0))
+           (ping-written (sb-thread:make-semaphore :count 0))
+           (stream
+             (make-instance 'scheduled-ping-eof-stream
+                            :input (h2-response-wire (octets))
+                            :eof-started eof-started
+                            :eof-release eof-release
+                            :ping-write-started ping-write-started
+                            :ping-write-release ping-write-release
+                            :ping-write-failed ping-write-failed
+                            :ping-written ping-written
+                            :defer-ping-write-p
+                            (member mode
+                                    '(:eof-recorded-before-ping-write-finishes
+                                      :ping-write-fails-before-reader-eof))
+                            :fail-ping-write-p
+                            (eq mode :ping-write-fails-before-reader-eof)))
+           (closed 0)
+           (connection
+             (http-kit/http2:make-http2-connection
+              :stream stream
+              :close-stream
+              (lambda (closed-stream)
+                (ensure-true (eq stream closed-stream))
+                (setf (scheduled-ping-stream-closed-p stream) t)
+                (incf closed))))
+           (request-thread nil)
+           (ping-thread nil)
+           (request-error nil)
+           (ping-error nil)
+           (eof-released-p nil)
+           (ping-write-released-p nil))
+      (unwind-protect
+           (progn
+             (ensure-equal
+              200
+              (http-response-status
+               (http-kit/http2:send-http2-request-over-connection
+                connection
+                (make-http-request :method "GET"
+                                   :uri "https://127.0.0.1/first"))))
+             (setf request-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (handler-case
+                          (http-kit/http2:send-http2-request-over-connection
+                           connection
+                           (make-http-request
+                            :method "GET"
+                            :uri "https://127.0.0.1/second"))
+                        (error (condition)
+                          (setf request-error condition))))))
+             (ensure-true
+              (sb-thread:wait-on-semaphore eof-started :timeout 5))
+             (setf ping-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (handler-case
+                          (http-kit/http2:ping-http2-connection
+                           connection :payload payload)
+                        (error (condition)
+                          (setf ping-error condition))))))
+             (ecase mode
+               (:ping-written-before-eof
+                (ensure-true
+                 (sb-thread:wait-on-semaphore ping-written :timeout 5))
+                (setf eof-released-p t)
+                (sb-thread:signal-semaphore eof-release)
+                (sb-thread:join-thread request-thread)
+                (setf request-thread nil)
+                (sb-thread:join-thread ping-thread)
+                (setf ping-thread nil))
+               (:eof-recorded-before-ping-write-finishes
+                (ensure-true
+                 (sb-thread:wait-on-semaphore ping-write-started :timeout 5))
+                (setf eof-released-p t)
+                (sb-thread:signal-semaphore eof-release)
+                (sb-thread:join-thread request-thread)
+                (setf request-thread nil)
+                (setf ping-write-released-p t)
+                (sb-thread:signal-semaphore ping-write-release)
+                (sb-thread:join-thread ping-thread)
+                (setf ping-thread nil))
+               (:ping-write-fails-before-reader-eof
+                (ensure-true
+                 (sb-thread:wait-on-semaphore ping-write-started :timeout 5))
+                (setf ping-write-released-p t)
+                (sb-thread:signal-semaphore ping-write-release)
+                (ensure-true
+                 (sb-thread:wait-on-semaphore ping-write-failed :timeout 5))
+                (sb-thread:join-thread ping-thread)
+                (setf ping-thread nil)
+                (setf eof-released-p t)
+                (sb-thread:signal-semaphore eof-release)
+                (sb-thread:join-thread request-thread)
+                (setf request-thread nil)))
+             (ensure-true (typep request-error 'http-connection-error))
+             (ensure-equal :http2-read (http-error-operation request-error))
+             (ensure-equal :eof (http-connection-error-cause request-error))
+             (if (eq mode :ping-write-fails-before-reader-eof)
+                 (progn
+                   (ensure-true (typep ping-error 'http-connection-error))
+                   (ensure-equal :http2-write (http-error-operation ping-error))
+                   (ensure-equal :test-write-failure
+                                 (http-connection-error-cause ping-error)))
+                 (progn
+                   (ensure-true (typep ping-error 'http-protocol-error))
+                   (ensure-equal :http2-client (http-error-operation ping-error))
+                   (ensure-equal :eof (http-protocol-error-detail ping-error))))
+             (ensure-equal 1 closed)
+             (ensure-true (not (http-kit/http2:http2-connection-open-p connection)))
+             (ensure-equal
+              (if (eq mode :ping-written-before-eof) 1 0)
+              (count-if
+               (lambda (frame)
+                 (and (= 6 (http-kit/http2::%h2-frame-type frame))
+                      (zerop (http-kit/http2::%h2-frame-flags frame))))
+               (h2-output-frames stream))))
+        (unless eof-released-p
+          (setf eof-released-p t)
+          (sb-thread:signal-semaphore eof-release))
+        (unless ping-write-released-p
+          (setf ping-write-released-p t)
+          (sb-thread:signal-semaphore ping-write-release))
+        (when request-thread
+          (sb-thread:join-thread request-thread))
+        (when ping-thread
+          (sb-thread:join-thread ping-thread))
+        (http-kit/http2:close-http2-connection connection)))))
+
+#+sbcl
 (deftest http2-public-runtime-boundary-batch-completed-stream
   (dolist (mode '(:headers :data :other-stream))
     (let* ((requests (list (make-http-request :method "GET" :uri "https://127.0.0.1/one")
@@ -1924,6 +2138,36 @@
                     (binary-session-input-position stream))
       (http-kit/http2:close-http2-connection connection)
       (ensure-equal 1 closed))))
+#+sbcl
+(deftest http2-scheduler-unknown-data-active-entry
+  (let* ((input
+           (concatenate-octets
+            (h2-frame 4 0 0 (octets))
+            (h2-frame 0 0 3 (octets 9))
+            (h2-frame 1 5 1
+                      (h2-header-block (cons ":status" "200")))))
+         (stream (make-instance 'binary-session-stream :input input))
+         (closed 0)
+         (connection
+           (http-kit/http2:make-http2-connection
+            :stream stream
+            :close-stream
+            (lambda (closed-stream)
+              (ensure-true (eq stream closed-stream))
+              (incf closed))))
+         (result
+           (handler-case
+               (http-kit/http2:send-http2-request-over-connection
+                connection
+                (make-http-request :method "GET"
+                                   :uri "https://127.0.0.1/active"))
+             (http-protocol-error (condition) condition))))
+    (ensure-true (typep result 'http-protocol-error))
+    (ensure-equal :http2-read (http-error-operation result))
+    (ensure-equal 3 (http-protocol-error-detail result))
+    (ensure-equal 1 closed)
+    (http-kit/http2:close-http2-connection connection)
+    (ensure-equal 1 closed)))
 
 #+sbcl
 (deftest http2-public-runtime-boundary-batch-goaway-last-stream
