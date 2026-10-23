@@ -443,6 +443,10 @@
                    (let ((state-before-cleanup
                            (http-kit::http-server-state server))
                          (failure-time (get-universal-time))
+                         (connection-count-before-cleanup
+                           (%https-listener-connection-count server))
+                         (handshake-count-before-cleanup
+                           (%https-listener-handshake-count server))
                          (network-diagnostics-before-cleanup
                            (%https-listener-network-diagnostics server))
                          (events-before-cleanup nil)
@@ -465,27 +469,44 @@
                                         server))))
                                    nil)
                                (error (condition) condition))))
-                       (multiple-value-bind (curl-version-output
-                                             curl-version-errors
-                                             curl-version-status)
-                           (uiop:run-program
-                            (list "curl" "--version")
-                            :output :string
-                            :error-output :string
-                            :ignore-error-status t)
-                         (error
-                          "curl ~A request failed (~D): ~A~%curl version (~D): stdout=~S stderr=~S~%failure time (UTC universal seconds): ~D~%listener config: handshake-timeout=~D max-connections=~D max-handshakes=~D~%listener state before cleanup: ~S~%listener events before cleanup: ~S~%listener errors before cleanup: ~S~%listener state after cleanup: ~S~%listener wait error: ~S~%listener network diagnostics at test start: ~S~%listener network diagnostics at failure: ~S"
-                          protocol status errors curl-version-status
-                          curl-version-output curl-version-errors
-                          failure-time
-                          (http-kit::http-server-handshake-timeout server)
-                          (http-kit::http-server-max-connections server)
-                          (http-kit::http-server-max-handshakes server)
-                          state-before-cleanup events-before-cleanup
-                          listener-errors-before-cleanup
-                          (http-kit::http-server-state server) wait-error
-                          start-network-diagnostics
-                          network-diagnostics-before-cleanup)))))
+                       (let ((connection-count-after-cleanup
+                               (%https-listener-connection-count server))
+                             (handshake-count-after-cleanup
+                               (%https-listener-handshake-count server))
+                             (events-after-cleanup nil)
+                             (listener-errors-after-cleanup nil))
+                         (sb-thread:with-mutex (observation-lock)
+                           (setf events-after-cleanup
+                                 (reverse (copy-list server-events))
+                                 listener-errors-after-cleanup
+                                 (reverse (copy-list server-errors))))
+                         (multiple-value-bind (curl-version-output
+                                               curl-version-errors
+                                               curl-version-status)
+                             (uiop:run-program
+                              (list "curl" "--version")
+                              :output :string
+                              :error-output :string
+                              :ignore-error-status t)
+                           (error
+                            "curl ~A request failed (~D): ~A~%curl version (~D): stdout=~S stderr=~S~%failure time (UTC universal seconds): ~D~%listener config: handshake-timeout=~D max-connections=~D max-handshakes=~D~%listener state before cleanup: ~S~%listener counts before cleanup: connections=~D handshakes=~D~%listener events before cleanup: ~S~%listener errors before cleanup: ~S~%listener state after cleanup: ~S~%listener counts after cleanup: connections=~D handshakes=~D~%listener events after cleanup: ~S~%listener errors after cleanup: ~S~%listener wait error: ~S~%listener network diagnostics at test start: ~S~%listener network diagnostics at failure: ~S"
+                            protocol status errors curl-version-status
+                            curl-version-output curl-version-errors
+                            failure-time
+                            (http-kit::http-server-handshake-timeout server)
+                            (http-kit::http-server-max-connections server)
+                            (http-kit::http-server-max-handshakes server)
+                            state-before-cleanup
+                            connection-count-before-cleanup
+                            handshake-count-before-cleanup
+                            events-before-cleanup listener-errors-before-cleanup
+                            (http-kit::http-server-state server)
+                            connection-count-after-cleanup
+                            handshake-count-after-cleanup
+                            events-after-cleanup listener-errors-after-cleanup
+                            wait-error
+                            start-network-diagnostics
+                            network-diagnostics-before-cleanup))))))
                  (ensure-equal 0 status)
                  (ensure-true (search "listener-ok" output))
                  (let ((version-start
