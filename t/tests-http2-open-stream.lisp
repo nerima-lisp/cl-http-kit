@@ -178,16 +178,10 @@
            (first-settings-ack
              (http-kit/http2::%h2-read-frame
               request-frames 16384 nil nil))
-           (first-stream-window-update
-             (http-kit/http2::%h2-read-frame
-              request-frames 16384 nil nil))
            (first-connection-window-update
              (http-kit/http2::%h2-read-frame
               request-frames 16384 nil nil))
            (second-request-frame
-             (http-kit/http2::%h2-read-frame
-              request-frames 16384 nil nil))
-           (second-stream-window-update
              (http-kit/http2::%h2-read-frame
               request-frames 16384 nil nil))
            (second-connection-window-update
@@ -210,12 +204,6 @@
                     (http-kit/http2::%h2-frame-stream-id first-settings-ack))
       (ensure-equal 8
                     (http-kit/http2::%h2-frame-type
-                     first-stream-window-update))
-      (ensure-equal 1
-                    (http-kit/http2::%h2-frame-stream-id
-                     first-stream-window-update))
-      (ensure-equal 8
-                    (http-kit/http2::%h2-frame-type
                      first-connection-window-update))
       (ensure-equal 0
                     (http-kit/http2::%h2-frame-stream-id
@@ -223,15 +211,6 @@
       (ensure-equal 3 (http-kit/http2::%h2-frame-stream-id second-request-frame))
       (ensure-equal 8
                     (http-kit/http2::%h2-frame-type
-                     second-stream-window-update))
-      (ensure-equal 3
-                    (http-kit/http2::%h2-frame-stream-id
-                     second-stream-window-update))
-      (ensure-equal (octets 0 0 0 5)
-                    (http-kit/http2::%h2-frame-payload
-                     second-stream-window-update))
-      (ensure-equal 8
-                    (http-kit/http2::%h2-frame-type
                      second-connection-window-update))
       (ensure-equal 0
                     (http-kit/http2::%h2-frame-stream-id
@@ -239,7 +218,11 @@
       (ensure-equal (octets 0 0 0 5)
                     (http-kit/http2::%h2-frame-payload
                      second-connection-window-update))
-      (http-kit/http2:close-http2-connection connection)
+      (progn
+        (ensure-equal :eof
+                      (http-kit/http2::%h2-read-frame
+                       request-frames 16384 nil nil))
+        (http-kit/http2:close-http2-connection connection))
       (ensure-true closed)
       (ensure-true
        (not (http-kit/http2:http2-connection-open-p connection)))))
