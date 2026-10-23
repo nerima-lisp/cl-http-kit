@@ -20,9 +20,29 @@
                 (let ((other (assoc (first record) two :test #'equal)))
                   (and other (equalp (cdr record) (cdr other))))) one)))
 
-(defun copy-payload (payload)
-  (with-standard-io-syntax
-    (let ((*read-eval* nil)) (read-from-string (prin1-to-string payload)))))
+(defun copy-payload (payload &key copy-marks)
+  (let* ((copy (copy-list payload))
+         (identity (copy-list (getf payload :identity)))
+         (loads (copy-list (getf payload :loads)))
+         (entries (mapcar #'copy-list (getf payload :entries))))
+    (when loads (setf (first loads) (copy-list (first loads))))
+    (setf (getf copy :identity) identity
+          (getf copy :loads) loads
+          (getf copy :entries) entries)
+    (dolist (entry entries)
+      (let ((metadata (getf entry :metadata))
+            (state (getf entry :state)))
+        (when metadata
+          (setf (getf entry :metadata) (copy-list metadata)))
+        (when state
+          (setf (getf entry :state)
+                (list* (first state) (copy-seq (second state))
+                       (if copy-marks (copy-seq (cddr state)) (cddr state)))))
+        (when (and copy-marks (getf entry :codes))
+          (setf (getf entry :codes)
+                (mapcar (lambda (code) (list (first code) (copy-seq (second code))))
+                        (getf entry :codes))))))
+    copy))
 
 (check (http-coverage-child-merge:supported-runtime-p) :verified-native-platform)
 (let ((*features* (remove :linux (remove :darwin *features*)))
@@ -41,8 +61,9 @@
   (check (equal identity (http-coverage-child-merge::runtime-identity))
          :actual-runtime-features-restored))
 
-(defun reject-control (payload request kind)
-  (let* ((bad (copy-payload payload))
+(defun reject-control (ticket kind)
+  (let* ((request (getf ticket :request))
+         (bad (copy-payload (http-coverage-child-merge::accepted-payload ticket)))
          (entry (find-if (lambda (entry) (getf (getf entry :metadata) :maps))
                          (getf bad :entries)))
          (before (sb-cover:save-coverage)))
@@ -83,7 +104,8 @@
 (defun reject-coherent-tampering (ticket collector)
   (let* ((original (getf ticket :result))
          (sealed (copy-seq (getf ticket :accepted-bytes)))
-         (bad (copy-payload (http-coverage-child-merge::accepted-payload ticket)))
+         (bad (copy-payload (http-coverage-child-merge::accepted-payload ticket)
+                      :copy-marks t))
          (pathname (merge-pathnames "coherent-tampering.sexp" *output*))
          (before (sb-cover:save-coverage))
          (changed 0))
@@ -216,29 +238,31 @@
             selected assertions))
   (let* ((collector http-coverage-child-merge:*collector*)
          (tickets (reverse (http-coverage-child-merge::collector-tickets collector)))
-         (payloads (mapcar (lambda (ticket)
-                            (http-coverage-child-merge::accepted-payload ticket)) tickets))
-         (copies (mapcar #'copy-payload payloads))
+         (payload-seal
+           (http-coverage-child-merge::hashes
+            (mapcar (lambda (ticket) (getf ticket :result)) tickets)))
          (before (sb-cover:save-coverage))
-         (inputs (loop for payload in payloads for ticket in tickets
-                       collect (http-coverage-child-merge::canonical-input
-                                payload (getf ticket :request) *roots*))))
+         (expected (mapcar (lambda (record)
+                             (list* (first record) (second record) (copy-seq (cddr record))))
+                           before)))
     (check (= 3 (length tickets)) :three-genuine-children)
     (check (every (lambda (ticket) (eql 0 (getf ticket :exit))) tickets) :child-exits)
     (check (plusp (length (http-coverage-child-merge::collector-manifest collector)))
            :nonempty-byte-manifest)
     (http-coverage-child-merge::write-form (merge-pathnames "tickets.sexp" *output*) tickets)
-    (dolist (kind '(:source :fasl :archive :load-count :path :marker :location :compiler :runtime :core :features :policy
-                   :missing-file :missing-marks))
-      (reject-control (first payloads) (getf (first tickets) :request) kind))
+    (dolist (kind '(:source :fasl :archive :load-count :path :marker :location :compiler
+                    :runtime :core :features :policy :missing-file :missing-marks))
+      (reject-control (first tickets) kind))
     (let ((*features* (cons :coverage-child-feature-drift *features*))
           (unchanged (sb-cover:save-coverage)))
-      (check (handler-case
-                 (progn (http-coverage-child-merge::canonical-input
-                         (first payloads) (getf (first tickets) :request) *roots*) nil)
-               (simple-error (condition)
-                 (search "Child coverage: payload identity"
-                         (princ-to-string condition)))) :actual-feature-drift-rejected)
+      (let ((ticket (first tickets)))
+        (check (handler-case
+                   (progn (http-coverage-child-merge::canonical-input
+                           (http-coverage-child-merge::accepted-payload ticket)
+                           (getf ticket :request) *roots*) nil)
+                 (simple-error (condition)
+                   (search "Child coverage: payload identity"
+                           (princ-to-string condition)))) :actual-feature-drift-rejected))
       (check (raw-equal unchanged (sb-cover:save-coverage)) :feature-drift-no-native-write))
     (reject-coherent-tampering (first tickets) collector)
     ;; Validate a missing completion before the official merge can change any bit.
@@ -251,21 +275,34 @@
       (check (raw-equal before (sb-cover:save-coverage)) :missing-child-no-native-write)
       (setf (getf ticket :exit) 0
             (http-coverage-child-merge::collector-failure collector) nil))
+    (dolist (ticket tickets)
+      (let ((input (http-coverage-child-merge::canonical-input
+                    (http-coverage-child-merge::accepted-payload ticket)
+                    (getf ticket :request) *roots*)))
+        (dolist (record expected)
+          (let ((child (assoc (first record) input :test #'equal)))
+            (when child (bit-ior (cddr record) (cddr child) (cddr record)))))))
     (http-coverage-child-merge::write-form (merge-pathnames "before.native" *output*) before)
     (sb-cover:report (merge-pathnames "before-report/" *output*))
     (http-coverage-child-merge:merge-pending)
-    (check (equalp copies payloads) :original-child-payloads-unchanged)
+    (check (and (equal payload-seal
+                         (http-coverage-child-merge::hashes
+                          (mapcar (lambda (ticket) (getf ticket :result)) tickets)))
+                    (every (lambda (ticket)
+                             (handler-case
+                                 (progn (http-coverage-child-merge::accepted-payload ticket) t)
+                               (error () nil)))
+                           tickets))
+           :original-child-payloads-unchanged)
     (let ((after (sb-cover:save-coverage)) (delta 0) (client-delta 0)
           (branches 0) (negative 0))
       (dolist (record before)
         (let* ((file (first record)) (old (cddr record))
                (new-record (assoc file after :test #'equal))
-               (new (cddr new-record)) (expected (copy-seq old)))
+               (new (cddr new-record))
+               (expected-bits (cddr (assoc file expected :test #'equal))))
           (check (equalp (second record) (second new-record)) :native-denominator-unchanged)
-          (dolist (input inputs)
-            (let ((child (assoc file input :test #'equal)))
-              (when child (bit-ior expected (cddr child) expected))))
-          (check (equalp expected new) :exact-official-native-union)
+          (check (equalp expected-bits new) :exact-official-native-union)
           (dotimes (index (length old))
             (when (and (= 0 (sbit old index)) (= 1 (sbit new index)))
               (incf delta)
@@ -284,14 +321,14 @@
                     (http-coverage-child-merge::hashes
                      (getf (getf (first tickets) :request) :paths))) :post-byte-manifest)
       (check (and (eq load-method (find-method #'asdf:perform '(:around)
-                                              (list (find-class 'asdf:load-op)
-                                                    (find-class 'asdf:cl-source-file)) nil))
-                  (eq compile-method (find-method #'asdf:perform '(:around)
-                                                 (list (find-class 'asdf:compile-op)
-                                                       (find-class 'asdf:cl-source-file)) nil))
-                  (eq input-method (find-method #'asdf:input-files '(:around)
                                                (list (find-class 'asdf:load-op)
                                                      (find-class 'asdf:cl-source-file)) nil))
+                  (eq compile-method (find-method #'asdf:perform '(:around)
+                                                  (list (find-class 'asdf:compile-op)
+                                                        (find-class 'asdf:cl-source-file)) nil))
+                  (eq input-method (find-method #'asdf:input-files '(:around)
+                                                (list (find-class 'asdf:load-op)
+                                                      (find-class 'asdf:cl-source-file)) nil))
                   (eq merge-function (fdefinition 'sb-cover:merge-coverage))
                   (eq report-function (fdefinition 'sb-cover:report))) :spies-restored-eq)
       (format t "RESULT version=~A selected=3 public-assertions=9 controls=~D delta=~D client=~D branches=~D raw-negative=~D manifests=EQ spies=EQ~%"
