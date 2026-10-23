@@ -1668,15 +1668,26 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                         connection entry response))))))))
         ((= type +http2-data-type+)
          (let ((entry nil)
-               (non-error-entry-p nil))
+               (non-error-entry-p nil)
+               (pending-ping-p nil))
            (%h2-with-scheduler-lock (connection)
              (setf entry (%h2-scheduler-entry-for-stream connection stream-id)
-                   non-error-entry-p (%h2-scheduler-has-non-error-entry-p connection)))
+                   non-error-entry-p (%h2-scheduler-has-non-error-entry-p connection)
+                   pending-ping-p
+                   (some (lambda (waiter)
+                           (and (not (%h2-scheduler-ping-waiter-acknowledged-p waiter))
+                                (not (%h2-scheduler-ping-waiter-failure waiter))))
+                         (%http2-connection-scheduler-ping-waiters connection))))
            (unless entry
              (if (%h2-scheduler-previously-opened-client-stream-p
                   connection stream-id)
-                 (%h2-scheduler-dispatch-retired-data
-                  connection nil frame clock-function)
+                 (if (and pending-ping-p (not non-error-entry-p))
+                     (error 'http-kit:http-protocol-error
+                            :message "The HTTP/2 PING received an unexpected frame."
+                            :operation :http2-client
+                            :detail frame)
+                     (%h2-scheduler-dispatch-retired-data
+                      connection nil frame clock-function))
                  (error 'http-kit:http-protocol-error
                         :message "The HTTP/2 scheduler received DATA for an unknown stream."
                         :operation :http2-read
