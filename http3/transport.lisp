@@ -1441,6 +1441,13 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
          stream-id)))
     result))
 
+(defun %h3-check-qpack-section-acknowledgment-stream-id
+    (expected-stream-id acknowledged-stream-id)
+  (unless (= acknowledged-stream-id expected-stream-id)
+    (%h3-transport-error
+     "QPACK Section Acknowledgment used the wrong stream ID."
+     acknowledged-stream-id)))
+
 (defun %h3-decode-response-field-section
     (client payload qpack-http3-decoder-context
      &key stream-id await-qpack role max-header-bytes max-fields
@@ -1459,10 +1466,8 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
      payload qpack-http3-decoder-context stream-id await-qpack
      (http3-client-serialize client) role
      (lambda (acknowledged-stream-id)
-       (unless (= acknowledged-stream-id stream-id)
-         (%h3-transport-error
-          "QPACK Section Acknowledgment used the wrong stream ID."
-          acknowledged-stream-id))
+       (%h3-check-qpack-section-acknowledgment-stream-id
+        stream-id acknowledged-stream-id)
        (%h3-write-client-qpack-section-ack-serialized
         client acknowledged-stream-id timeout deadline))
      header-limit field-limit
@@ -1818,7 +1823,13 @@ validated informational response in wire order."
                                 (< stream-id goaway-id))
                      (%h3-transport-error
                       "The peer GOAWAY excludes this HTTP/3 request stream."
-                      :h3-request-rejected))))
+                      :h3-request-rejected)))
+                 (when (and http3-decoder-context
+                            (not (and (integerp stream-id)
+                                      (>= stream-id 0))))
+                   (%h3-transport-error
+                    "Dynamic QPACK response decoding requires a numeric stream ID."
+                    stream-id)))
                (when (and decoder-context (null http3-decoder-context))
                  (%h3-transport-error
                   "A QPACK HTTP/3 decoder context is required with the decoder context."
@@ -2893,11 +2904,8 @@ is NIL if parsing failed before the request model was constructed."
                                            (if request-headers-seen-p
                                                :trailers :request)
                                            (lambda (acknowledged-stream-id)
-                                             (unless (= acknowledged-stream-id
-                                                        stream-id)
-                                               (%h3-transport-error
-                                                "QPACK Section Acknowledgment used the wrong stream ID."
-                                                acknowledged-stream-id))
+                                             (%h3-check-qpack-section-acknowledgment-stream-id
+                                              stream-id acknowledged-stream-id)
                                              (funcall
                                               on-qpack-section-acknowledgment
                                               acknowledged-stream-id))

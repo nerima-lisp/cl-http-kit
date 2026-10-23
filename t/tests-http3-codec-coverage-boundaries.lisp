@@ -375,7 +375,7 @@
          type)))))
 
 (defun http3-codec-server-serializer-check
-    (trailers-p replacement error-kind &optional reason)
+    (trailers-p replacement error-kind &optional reason expected-operation)
   (let* ((fields '((":method" . "GET") (":scheme" . "https")
                   (":authority" . "example.test") (":path" . "/")
                   ("x-before" . "kept")
@@ -462,16 +462,25 @@
           (ensure-equal 1 (length errors))
           (ensure-true (eq failure (first (first errors))))
           (ensure-equal nil (second (first errors)))
-          (if (eq error-kind :header)
-              (progn
-                (ensure-true (typep failure 'http-invalid-header))
-                (ensure-equal :http3-header (http-error-operation failure))
-                (ensure-equal (car replacement) (http-invalid-header-name failure))
-                (ensure-equal reason (http-invalid-header-reason failure)))
-              (http3-public-error-check failure reason
-                                        (if (eq error-kind :pair)
-                                            replacement
-                                            (car replacement)))))
+          (cond
+           ((eq error-kind :header)
+            (progn
+              (ensure-true (typep failure 'http-invalid-header))
+              (ensure-equal expected-operation (http-error-operation failure))
+              (ensure-equal (car replacement) (http-invalid-header-name failure))
+              (ensure-equal reason (http-invalid-header-reason failure))))
+           ((eq error-kind :pair)
+            (progn
+              (ensure-true (typep failure 'http-invalid-header))
+              (ensure-equal :header (http-error-operation failure))
+              (ensure-equal :type (http-invalid-header-reason failure))))
+           ((eq error-kind :order)
+            (progn
+              (ensure-true (typep failure 'http-invalid-header))
+              (ensure-equal expected-operation (http-error-operation failure))
+              (ensure-equal (car replacement) (http-invalid-header-name failure))
+              (ensure-equal reason (http-invalid-header-reason failure))))
+           (t (http3-public-error-check failure reason (car replacement)))))
         (progn
           (ensure-equal nil failure)
           (ensure-equal nil errors)
@@ -502,27 +511,24 @@
 (deftest http3-codec-server-serializer-revalidates-fields
   (dolist (trailers-p '(nil t))
     (http3-codec-server-serializer-check trailers-p nil nil)
-    (dolist (name '("" "X-check" "x check"))
-      (http3-codec-server-serializer-check
-       trailers-p (cons name "ok") :header
-       "HTTP/3 field names must be lowercase ASCII tokens.")))
+    (dolist (row '(("" :name :header)
+                   ("X-check" :uppercase-name :http/3)
+                   ("x check" :name :header)))
+      (destructuring-bind (name expected-reason expected-operation) row
+        (http3-codec-server-serializer-check
+         trailers-p (cons name "ok") :header
+         expected-reason expected-operation))))
   (http3-codec-server-serializer-check
-   nil (cons "x-check" (string #\Newline)) :header
-   "field values cannot contain controls.")
+   nil (cons "x-check" (string #\Newline)) :header :control :header)
   (http3-codec-server-serializer-check
    nil '(":method" . "POST") :order
-   "HTTP/3 pseudo-fields must precede regular fields."))
+   :pseudo-after-regular :http/3))
 
 (defun http3-codec-client-serializer-check (replacement error-kind)
   (let* ((fields '((":status" . "204") ("x-before" . "kept")
                    ("x-check" . "ok")))
          (wire (http3-boundary-headers fields))
          (before (copy-seq wire))
-         (context (http-message-kit:make-qpack-context
-                   :max-table-capacity 0 :table-capacity 0
-                   :max-blocked-streams 0 :huffman nil))
-         (adapter (http-message-kit:qpack-make-http3-decoder-context
-                   context :max-blocked-streams 0))
          (request (make-http-request :method "GET" :uri "https://example.test/"))
          (source (http3-qpack-contract-request-source request))
          (request-stream nil) (reads 0) (decoded-count 0) (closes nil)
@@ -566,16 +572,23 @@
            (handler-case
                (setf response
                      (http-kit/http3:send-http3-request
-                      client request
-                      :qpack-decoder-context context
-                      :qpack-http3-decoder-context adapter
-                      :await-qpack (lambda (token)
-                                     (declare (ignore token))
-                                     (error "Static fields must not block."))))
+                        client request
+                        :qpack-decoder-context
+                        (http-kit/http3::http3-client-qpack-decoder-context
+                         client)
+                        :qpack-http3-decoder-context
+                        (http-kit/http3::http3-client-qpack-http3-decoder-context
+                         client)
+                        :await-qpack (lambda (token)
+                                       (declare (ignore token))
+                                       (error "Static fields must not block."))))
              (http-protocol-error (condition) (setf failure condition)))
            (ensure-equal 1 reads)
            (ensure-equal 1 decoded-count)
-           (ensure-equal 0 (http-message-kit:qpack-context-insert-count context))
+           (ensure-equal 0
+                         (http-message-kit:qpack-context-insert-count
+                          (http-kit/http3::http3-client-qpack-decoder-context
+                           client)))
            (ensure-octets-equal before wire)
            (ensure-equal source (http3-qpack-contract-request-source request))
            (ensure-equal 1 (length closes))
@@ -594,7 +607,9 @@
                  ((eq error-kind :empty)
                   (ensure-equal nil response)
                   (ensure-true (typep failure 'http-invalid-header))
-                  (ensure-equal "" (http-invalid-header-name failure)))
+                  (ensure-equal :header (http-error-operation failure))
+                  (ensure-equal "" (http-invalid-header-name failure))
+                  (ensure-equal :name (http-invalid-header-reason failure)))
                  (t
                   (ensure-equal nil failure)
                   (ensure-equal 204 (http-response-status response))
@@ -714,7 +729,8 @@
       (multiple-value-setq (events consumed)
         (http-message-kit:qpack-decode-encoder-stream
          decoder-context instruction))
-      (ensure-equal '((:set-capacity 256) (:insert "x-blocked" "ready"))
+      (ensure-equal '((:set-capacity 256)
+                      (:insert "x-blocked" "ready" 0 :huffman nil))
                     events)
       (ensure-equal (length instruction) consumed)
       (let ((ready (http-message-kit:qpack-take-ready-streams adapter)))
@@ -725,24 +741,25 @@
                     (progn
                       (http-message-kit:qpack-resume-blocked-stream first-token)
                       nil)
-                  (http-message-kit:http-connection-error (condition)
+                  (http-message-kit:http-protocol-error (condition)
                     condition))))
           (ensure-true
-           (typep failure 'http-message-kit:http-connection-error))
+           (typep failure 'http-message-kit:http-protocol-error))
+          (ensure-equal
+           :qpack (http-message-kit:http-error-operation failure))
           (ensure-equal
            "QPACK blocked-stream token is not resumable."
-           (http-error-message failure)))
+           (http-message-kit:http-error-message failure)))
         (ensure-equal
          fields
-         (mapcar
-          (lambda (header)
-            (cons (http-message-kit:http-header-name header)
-                  (http-message-kit:http-header-content header)))
-          (http-message-kit:qpack-resume-blocked-stream (first ready))))))))
+         (http-message-kit:qpack-resume-blocked-stream (first ready)))))))
 (deftest http3-codec-qpack-failed-shrink-preserves-entry-identity-and-value
   (let ((context
           (http-message-kit:make-qpack-context
-           :max-table-capacity 34 :table-capacity 34 :huffman nil)))
+           :max-table-capacity 34
+           :table-capacity 34
+           :max-blocked-streams 1
+           :huffman nil)))
     (http-message-kit:qpack-encode-insert-with-literal-name
      context "x" "y" :huffman nil)
     (let* ((section
@@ -808,12 +825,8 @@
       (ensure-equal nil (http-message-kit:qpack-take-ready-streams adapter))
       (ensure-equal
        fields
-       (mapcar
-        (lambda (header)
-          (cons (http-message-kit:http-header-name header)
-                (http-message-kit:http-header-content header)))
-        (http3-test-decode-inserts-and-resume
-         adapter decoder-context instruction token))))))
+       (http3-test-decode-inserts-and-resume
+        adapter decoder-context instruction token)))))
 (deftest http3-codec-qpack-empty-table-rejects-negative-capacity
   (let ((context
           (http-message-kit:make-qpack-context
@@ -833,3 +846,86 @@
       (ensure-equal 0 (http-message-kit:qpack-context-table-size context))
       (ensure-equal 0 (http-message-kit:qpack-context-insert-count context))
       (ensure-equal 0 (http-message-kit:qpack-context-dynamic-entry-count context)))))
+(deftest http3-codec-client-rejects-non-numeric-stream-id-before-response-read
+  (dolist (stream-id '(nil :not-numeric))
+    (let* ((response-wire (http3-boundary-headers '((":status" . "204"))))
+           (request (make-http-request :method "GET" :uri "https://example.test/"))
+           (request-stream nil)
+           (request-opens 0)
+           (request-writes 0)
+           (reads 0)
+           (on-open-calls 0)
+           (request-close-condition nil)
+           (request-closes 0)
+           (client
+             (http-kit/http3:make-http3-client
+              :qpack-settings
+              (list
+               (cons http-kit/http3:+http3-setting-qpack-max-table-capacity+ 256)
+               (cons http-kit/http3:+http3-setting-qpack-blocked-streams+ 1))
+              :open-stream
+              (lambda (actual &key stream-type timeout deadline)
+                (declare (ignore timeout deadline))
+                (let ((stream (make-http3-test-stream :kind stream-type)))
+                  (when (eq stream-type :request)
+                    (ensure-true (eq request actual))
+                    (incf request-opens)
+                    (setf request-stream stream))
+                  (values stream (when (eq stream-type :request) stream-id))))
+              :write-stream
+              (lambda (stream bytes &key fin-p timeout deadline)
+                (declare (ignore bytes fin-p timeout deadline))
+                (when (eq stream request-stream)
+                  (incf request-writes)))
+              :read-stream
+              (lambda (stream &key timeout deadline)
+                (declare (ignore stream timeout deadline))
+                (incf reads)
+                (values response-wire t))
+              :close-stream
+              (lambda (stream &key condition)
+                (when (eq stream request-stream)
+                  (incf request-closes)
+                  (setf request-close-condition condition)
+                  (setf (http3-test-stream-closed-p stream) t)))))
+           (decoder-context
+             (http-kit/http3::http3-client-qpack-decoder-context client))
+           (decoder-adapter
+             (http-kit/http3::http3-client-qpack-http3-decoder-context client))
+           (failure nil))
+      (unwind-protect
+           (progn
+             (setf failure
+                   (handler-case
+                       (http-kit/http3:send-http3-request
+                        client request
+                        :qpack-decoder-context decoder-context
+                        :qpack-http3-decoder-context decoder-adapter
+                        :on-stream-open
+                        (lambda (stream stream-id cancel)
+                          (declare (ignore stream stream-id cancel))
+                          (incf on-open-calls)))
+                     (http-protocol-error (condition) condition)))
+             (http3-public-error-check
+              failure
+              "Dynamic QPACK response decoding requires a numeric stream ID."
+              stream-id)
+             (ensure-equal 1 request-opens)
+             (ensure-equal 0 request-writes)
+             (ensure-equal 0 reads)
+             (ensure-equal 0 on-open-calls)
+             (ensure-equal 1 request-closes)
+             (ensure-true (eq failure request-close-condition))
+             (ensure-true (http3-test-stream-closed-p request-stream))
+             (ensure-equal 0
+                           (http-kit/http3::http3-client-request-stream-count
+                            client))
+             (ensure-equal 0
+                           (http-message-kit:qpack-context-insert-count
+                            decoder-context))
+             (ensure-equal 0
+                           (http-message-kit:qpack-context-table-size
+                            decoder-context))
+             (ensure-true (http-kit/http3:http3-client-open-p client)))
+        (http-kit/http3:close-http3-client client))))
+)

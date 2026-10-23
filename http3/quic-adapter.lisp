@@ -91,6 +91,10 @@
       (when (plusp poll-interval)
         (sleep poll-interval)))))
 
+(defvar *http3-quic-adapter-handshake-sleep-function* #'sleep)
+
+(defvar *http3-quic-adapter-peer-control-sleep-function* #'sleep)
+
 (defun %http3-quic-adapter-await-established
     (quic-client &key timeout deadline)
   (let ((end (%http3-quic-adapter-deadline timeout deadline)))
@@ -119,7 +123,7 @@
                           "The TLS 1.3 client driver rejected the QUIC handshake: ~S."
                           reason)
                   reason))))
-           (sleep 0.005)
+           (funcall *http3-quic-adapter-handshake-sleep-function* 0.005)
         finally
            (%http3-quic-adapter-error
             "The QUIC TLS handshake did not complete."
@@ -149,7 +153,7 @@
               "The QUIC client closed before peer HTTP/3 control data arrived."
               (%http3-quic-adapter-close-detail quic-client)))
            (cl-quic-kit:client-poll quic-client)
-           (sleep 0.005)
+           (funcall *http3-quic-adapter-peer-control-sleep-function* 0.005)
         finally
            (%http3-quic-adapter-error
             "The peer HTTP/3 control stream did not become readable."
@@ -199,7 +203,7 @@
                             (plusp (cl-quic-kit:stream-readable-bytes control))
                             (cl-quic-kit:stream-finished-p control)))
                (read-http3-control-stream http3-client :deadline end)))
-           (sleep 0.005)
+           (funcall *http3-quic-adapter-peer-control-sleep-function* 0.005)
         finally
            (%http3-quic-adapter-error
             "The peer HTTP/3 SETTINGS did not arrive."

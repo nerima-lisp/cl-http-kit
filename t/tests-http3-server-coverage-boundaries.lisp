@@ -51,7 +51,7 @@
     (ensure-equal 1 reads)
     (ensure-equal 1 calls)
     (ensure-equal 1 (length closed))
-    (ensure-true (eq nil (first closed)))
+    (ensure-equal failure (first closed))
     (if failure (ensure-equal 1 (length errors)) (ensure-true (null errors)))
     (when failure (ensure-true (eq failure (first (first errors)))))
     (when failure (ensure-true (eq request (second (first errors)))))
@@ -255,10 +255,14 @@
                     (find ":status" fields
                           :key (function http-message-kit:http-header-name)
                           :test (function string=))))
-                  (ensure-equal content-length (http-message-kit:http-header-content
-                                  (find "content-length" fields
-                                        :key (function http-message-kit:http-header-name)
-                                        :test (function string=))))
+                  (let ((content-length-header
+                         (find "content-length" fields
+                               :key (function http-message-kit:http-header-name)
+                               :test (function string=))))
+                    (ensure-equal content-length
+                                  (when content-length-header
+                                    (http-message-kit:http-header-content
+                                     content-length-header))))
                   (when body-p
                     (ensure-equal (ascii "abc")
                                   (http-kit/http3:http3-frame-payload (second frames))))))))))))
@@ -604,6 +608,79 @@
     (ensure-equal "ok"
                   (http-header-value (http-request-trailers request) "x-checksum"))))
 
+(deftest http3-server-request-field-parser-boundaries
+  (dolist (field (list 17 (cons "x-field" 17)))
+    (let ((failure
+            (http3-boundary-error
+             (lambda ()
+               (http-kit/http3::%h3-server-parse-request-fields
+                (list field))))))
+      (http3-public-error-check
+       failure "HTTP/3 request fields must be name/value pairs." field)))
+  (let ((failure
+          (http3-boundary-error
+           (lambda ()
+             (http-kit/http3::%h3-server-parse-request-fields
+              (http3-public-server-fields (cons "" "empty")))))))
+    (http3-reachable-check-header-error
+     failure "" "HTTP/3 field names must be lowercase ASCII tokens."))
+  (let ((failure
+          (http3-boundary-error
+           (lambda ()
+             (http-kit/http3::%h3-server-parse-request-fields
+              (http3-public-server-fields
+               (cons "x-control" (format nil "bad~Cvalue" #\Return))))))))
+    (http3-reachable-check-header-error
+     failure "x-control" "field values cannot contain controls."))
+  (dolist (name '("X-uppercase" "x invalid"))
+    (let ((failure
+            (http3-boundary-error
+             (lambda ()
+               (http-kit/http3::%h3-server-parse-request-fields
+                (http3-public-server-fields (cons name "value")))))))
+      (http3-reachable-check-header-error
+       failure name "HTTP/3 field names must be lowercase ASCII tokens.")))
+  (let ((failure
+          (http3-boundary-error
+           (lambda ()
+             (http-kit/http3::%h3-server-parse-request-fields
+              '((":method" . "GET") (":scheme" . "https")
+                (":authority" . "example.test") ("x-first" . "value")
+                (":path" . "/late")))))))
+    (http3-public-error-check
+     failure "HTTP/3 pseudo-fields must precede regular fields." ":path")))
+
+(deftest http3-server-trailer-field-parser-boundaries
+  (dolist (field (list 17 (cons "x-trailer" 17)))
+    (let ((failure
+            (http3-boundary-error
+             (lambda ()
+               (http-kit/http3::%h3-server-parse-trailer-fields
+                (list field))))))
+      (http3-public-error-check
+       failure "HTTP/3 trailer fields must be name/value pairs." field)))
+  (dolist (name '("X-trailer" "x invalid"))
+    (let ((failure
+            (http3-boundary-error
+             (lambda ()
+               (http-kit/http3::%h3-server-parse-trailer-fields
+                (list (cons name "value")))))))
+      (http3-reachable-check-header-error
+       failure name "HTTP/3 field names must be lowercase ASCII tokens."))))
+
+(deftest http3-server-qpack-section-ack-stream-id-check
+  (ensure-equal
+   nil
+   (http-kit/http3::%h3-check-qpack-section-acknowledgment-stream-id
+    3 3))
+  (let ((failure
+          (http3-boundary-error
+           (lambda ()
+             (http-kit/http3::%h3-check-qpack-section-acknowledgment-stream-id
+              3 4)))))
+    (http3-public-error-check
+     failure "QPACK Section Acknowledgment used the wrong stream ID." 4)))
+
 (deftest http3-public-server-noncollecting-body-contract
   (dolist (collect-body-p '(nil t))
     (multiple-value-bind (failure request)
@@ -668,7 +745,7 @@
            (ensure-equal 2 (length received-fields))
            (ensure-equal '(2) (http-kit/http3:http3-client-promised-push-ids client))
            (multiple-value-bind (id response)
-               (http-kit/http3:receive-http3-push client push-stream)
+               (http-kit/http3:receive-http3-push client push-stream :stream-id 3)
              (ensure-equal 2 id)
              (ensure-equal 200 (http-response-status response))
              (ensure-octets-equal (ascii "abc") (http-response-body response)))
