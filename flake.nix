@@ -76,7 +76,7 @@
     };
 
     cl-quic-kit = {
-      url = "github:nerima-lisp/cl-quic-kit/8e85e63bf601ff5b004f15fe36818fba125663eb";
+      url = "github:nerima-lisp/cl-quic-kit/46bfeaccf2fa0854a434b06ffc291d71c9101323";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.cl-crypto-kit.follows = "cl-crypto-kit";
       inputs.cl-tls-kit.follows = "cl-tls-kit";
