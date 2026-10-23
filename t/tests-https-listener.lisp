@@ -292,6 +292,48 @@
                      (eq (getf event :reason-code) reason-code))))
           (%https-listener-events context)))
 
+  (defun %https-listener-socket-options (server)
+    (let* ((listener (http-kit::http-server-listener server))
+           (socket
+             (and listener
+                  (http-kit/network::http-network-listener-socket listener))))
+      (list :so-reuseaddr
+            (and socket (sb-bsd-sockets:sockopt-reuse-address socket))
+            :so-reuseport :not-configured-by-http-listener)))
+
+  (defun %https-listener-ss-snapshot (port)
+    (handler-case
+        (multiple-value-bind (output errors status)
+            (uiop:run-program
+             (list "ss" "-ltnp" (format nil "sport = :~D" port))
+             :output :string
+             :error-output :string
+             :ignore-error-status t)
+          (list :status status
+                :listening-socket-count
+                (with-input-from-string (stream output)
+                  (loop for line = (read-line stream nil nil)
+                        while line
+                        count (and (>= (length line) 6)
+                                   (string= line "LISTEN"
+                                            :end1 6
+                                            :end2 6))))
+                :output output
+                :errors errors))
+      (error (condition)
+        (list :status :unavailable
+              :error (princ-to-string condition)))))
+
+  (defun %https-listener-network-diagnostics (server)
+    (let* ((listener (http-kit::http-server-listener server))
+           (port (http-kit::http-server-port server)))
+      (list :address
+            (and listener
+                 (http-kit/network:http-network-listener-address listener))
+            :port port
+            :socket-options (%https-listener-socket-options server)
+            :same-port-sockets (%https-listener-ss-snapshot port))))
+
   (deftest https-listener-validates-finite-configuration
     (%with-https-listener-test-stubs (context)
       (let* ((server (%https-listener-make-server))
@@ -345,6 +387,7 @@
              (sb-thread:make-mutex :name "HTTPS listener observations"))
            (server-events nil)
            (server-errors nil)
+           (start-network-diagnostics nil)
            (server
              (make-http-server
               :host "127.0.0.1"
@@ -377,6 +420,10 @@
              (start-http-server server)
              (setf port (http-server-port server)
                    url (format nil "https://localhost:~D/" port))
+             (setf start-network-diagnostics
+                   (%https-listener-network-diagnostics server))
+             (format t "HTTPS listener diagnostics at test start: ~S~%"
+                     start-network-diagnostics)
              (dolist (protocol '("http/1.1" "h2"))
                (multiple-value-bind (output errors status)
                    (uiop:run-program
@@ -396,6 +443,8 @@
                    (let ((state-before-cleanup
                            (http-kit::http-server-state server))
                          (failure-time (get-universal-time))
+                         (network-diagnostics-before-cleanup
+                           (%https-listener-network-diagnostics server))
                          (events-before-cleanup nil)
                          (listener-errors-before-cleanup nil))
                      (sb-thread:with-mutex (observation-lock)
@@ -425,7 +474,7 @@
                             :error-output :string
                             :ignore-error-status t)
                          (error
-                          "curl ~A request failed (~D): ~A~%curl version (~D): stdout=~S stderr=~S~%failure time (UTC universal seconds): ~D~%listener config: handshake-timeout=~D max-connections=~D max-handshakes=~D~%listener state before cleanup: ~S~%listener events before cleanup: ~S~%listener errors before cleanup: ~S~%listener state after cleanup: ~S~%listener wait error: ~S"
+                          "curl ~A request failed (~D): ~A~%curl version (~D): stdout=~S stderr=~S~%failure time (UTC universal seconds): ~D~%listener config: handshake-timeout=~D max-connections=~D max-handshakes=~D~%listener state before cleanup: ~S~%listener events before cleanup: ~S~%listener errors before cleanup: ~S~%listener state after cleanup: ~S~%listener wait error: ~S~%listener network diagnostics at test start: ~S~%listener network diagnostics at failure: ~S"
                           protocol status errors curl-version-status
                           curl-version-output curl-version-errors
                           failure-time
@@ -434,7 +483,9 @@
                           (http-kit::http-server-max-handshakes server)
                           state-before-cleanup events-before-cleanup
                           listener-errors-before-cleanup
-                          (http-kit::http-server-state server) wait-error)))))
+                          (http-kit::http-server-state server) wait-error
+                          start-network-diagnostics
+                          network-diagnostics-before-cleanup)))))
                  (ensure-equal 0 status)
                  (ensure-true (search "listener-ok" output))
                  (let ((version-start
@@ -468,6 +519,8 @@
                          (failure-time (get-universal-time))
                          (connection-count-before-cleanup
                            (%https-listener-connection-count server))
+                         (network-diagnostics-before-cleanup
+                           (%https-listener-network-diagnostics server))
                          (events-before-cleanup nil)
                          (listener-errors-before-cleanup nil))
                      (sb-thread:with-mutex (observation-lock)
@@ -483,7 +536,7 @@
                           :error-output :string
                           :ignore-error-status t)
                        (error
-                        "openssl s_client for ALPN ~A failed (~D); OpenSSL version (~D): stdout=~S stderr=~S~%s_client stdout=~S stderr=~S~%failure time (UTC universal seconds): ~D~%listener config: handshake-timeout=~D max-connections=~D max-handshakes=~D~%listener state before cleanup: ~S~%listener connection count before cleanup: ~D~%listener events before cleanup: ~S~%listener errors before cleanup: ~S"
+                        "openssl s_client for ALPN ~A failed (~D); OpenSSL version (~D): stdout=~S stderr=~S~%s_client stdout=~S stderr=~S~%failure time (UTC universal seconds): ~D~%listener config: handshake-timeout=~D max-connections=~D max-handshakes=~D~%listener state before cleanup: ~S~%listener connection count before cleanup: ~D~%listener events before cleanup: ~S~%listener errors before cleanup: ~S~%listener network diagnostics at test start: ~S~%listener network diagnostics at failure: ~S"
                         protocol status version-status version-output
                         version-errors output errors failure-time
                         (http-kit::http-server-handshake-timeout server)
@@ -491,7 +544,9 @@
                         (http-kit::http-server-max-handshakes server)
                         state-before-cleanup
                         connection-count-before-cleanup events-before-cleanup
-                        listener-errors-before-cleanup))))
+                        listener-errors-before-cleanup
+                        start-network-diagnostics
+                        network-diagnostics-before-cleanup))))
                  (ensure-equal 0 status)
                  (unless
                      (or (search (format nil "ALPN protocol: ~A" protocol)
@@ -503,6 +558,8 @@
                          (failure-time (get-universal-time))
                          (connection-count-before-cleanup
                            (%https-listener-connection-count server))
+                         (network-diagnostics-before-cleanup
+                           (%https-listener-network-diagnostics server))
                          (events-before-cleanup nil)
                          (listener-errors-before-cleanup nil))
                      (sb-thread:with-mutex (observation-lock)
@@ -518,7 +575,7 @@
                           :error-output :string
                           :ignore-error-status t)
                        (error
-                        "openssl s_client did not report ALPN ~A; OpenSSL version (~D): stdout=~S stderr=~S~%s_client stdout=~S stderr=~S~%failure time (UTC universal seconds): ~D~%listener config: handshake-timeout=~D max-connections=~D max-handshakes=~D~%listener state before cleanup: ~S~%listener connection count before cleanup: ~D~%listener events before cleanup: ~S~%listener errors before cleanup: ~S"
+                        "openssl s_client did not report ALPN ~A; OpenSSL version (~D): stdout=~S stderr=~S~%s_client stdout=~S stderr=~S~%failure time (UTC universal seconds): ~D~%listener config: handshake-timeout=~D max-connections=~D max-handshakes=~D~%listener state before cleanup: ~S~%listener connection count before cleanup: ~D~%listener events before cleanup: ~S~%listener errors before cleanup: ~S~%listener network diagnostics at test start: ~S~%listener network diagnostics at failure: ~S"
                         protocol version-status version-output version-errors
                         output errors failure-time
                         (http-kit::http-server-handshake-timeout server)
@@ -526,7 +583,9 @@
                         (http-kit::http-server-max-handshakes server)
                         state-before-cleanup
                         connection-count-before-cleanup events-before-cleanup
-                        listener-errors-before-cleanup))))))
+                        listener-errors-before-cleanup
+                        start-network-diagnostics
+                        network-diagnostics-before-cleanup))))))
              (ensure-equal :stopped
                            (http-kit::http-server-state
                             (stop-http-server server :graceful-timeout 2))))
