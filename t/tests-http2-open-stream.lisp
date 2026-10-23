@@ -2836,9 +2836,9 @@
         (ensure-equal (if good (length (binary-session-input stream)) 0)
                       (binary-session-input-position stream))
         (let ((frames (h2-output-frames stream)))
-          (ensure-equal (if good '(4 1 0 0 4 8 8) '(4 1))
+          (ensure-equal (if good '(4 1 0 0 4 8) '(4 1))
                         (mapcar #'http-kit/http2::%h2-frame-type frames))
-          (ensure-equal (if good '(0 1 1 1 0 1 0) '(0 1))
+          (ensure-equal (if good '(0 1 1 1 0 0) '(0 1))
                         (mapcar #'http-kit/http2::%h2-frame-stream-id frames)))
         (when good
           (let ((last (car (last (remove-if-not
@@ -2847,7 +2847,7 @@
             (ensure-equal 0 (http-kit/http2::%h2-frame-type last))
             (ensure-equal 1 (http-kit/http2::%h2-frame-flags last))
             (ensure-equal (octets) (http-kit/http2::%h2-frame-payload last)))
-          (dolist (frame (last (h2-output-frames stream) 2))
+          (dolist (frame (last (h2-output-frames stream) 1))
             (ensure-equal 0 (http-kit/http2::%h2-frame-flags frame))
             (ensure-equal (octets 0 0 0 1) (http-kit/http2::%h2-frame-payload frame))))
         (ensure-equal (if good 0 1) closed)
