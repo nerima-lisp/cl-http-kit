@@ -442,6 +442,10 @@ The condition type for malformed or contradictory protocol data.
 ### `http-protocol-error-detail`
 
 Return structured protocol detail.
+For `:http2-read` errors caused by DATA on a client stream that has never been
+opened, the detail is the stream ID when another request on the connection is
+still in progress and has not failed; otherwise it is a two-element list with
+`0` (the DATA frame type) first and the stream ID second.
 
 ### `http-invalid-uri`
 
@@ -557,6 +561,9 @@ per decoded header or trailer section is 256.
 
 `cancel-http2-stream` emits `RST_STREAM` for an opened client stream.
 `ping-http2-connection` sends a PING and waits for the matching acknowledgement.
+If it receives a malformed PING while waiting, it signals
+`HTTP-PROTOCOL-ERROR` with operation `:http2-client` and the received frame as
+detail.
 `send-http2-priority-update` emits an RFC 9218 priority update.
 `send-http2-goaway` and its convenience alias
 `graceful-shutdown-http2-connection` make the connection drain without
