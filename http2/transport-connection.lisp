@@ -1389,7 +1389,8 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                          (%h2-with-scheduler-lock (connection)
                            (or (%h2-batch-entry-local-retired-p entry)
                                (%h2-batch-entry-error entry)
-                               (%h2-batch-entry-response entry)))))))))))
+                               (%h2-batch-entry-response entry)
+                               (fifth event)))))))))))
 
   (defun %h2-scheduler-entry-for-stream (connection stream-id)
     (%h2-batch-entry-for-stream
@@ -1725,8 +1726,9 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                      (setf callback-queued-p
                            (%h2-scheduler-queue-callback
                             connection entry
-                            (list :body callback payload
-                                  flow-controlled-length)))))))
+                            (list :body callback payload flow-controlled-length
+                                  (/= 0 (logand (%h2-frame-flags frame)
+                                                +http2-end-stream-flag+)))))))))
           (multiple-value-bind (end-stream-p body-length payload-length)
               (%h2-append-data-frame*
                frame
@@ -1752,7 +1754,7 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                   (unless (%http2-connection-closed-p connection)
                     (%h2-scheduler-return-flow-credit
                      connection stream-id payload-length clock-function
-                     retired-p)))))
+                     (or retired-p end-stream-p))))))
             (when end-stream-p
               (%h2-scheduler-mark-response
                connection entry
@@ -2634,8 +2636,9 @@ sent in successive multiplexed waves under the same deadline."
                                        collect-body-p stream-id)
                                     (setf (%h2-batch-entry-body-length entry)
                                           new-body-length)
-                                    (%h2-send-window-update writer stream-id
-                                                            payload-length)
+                                    (unless end-stream-p
+                                      (%h2-send-window-update writer stream-id
+                                                              payload-length))
                                     (%h2-send-window-update writer 0
                                                             payload-length)
                                     (when end-stream-p
