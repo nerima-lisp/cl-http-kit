@@ -366,6 +366,7 @@
               pkgs.caddy
               (quicPeer pkgs)
             ]
+            ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.iproute2 ]
             ++ sbclDependencies;
             text = ''
               coverage_cache="$(mktemp -d "''${TMPDIR:-/tmp}/cl-http-kit-coverage.XXXXXXXX")"
