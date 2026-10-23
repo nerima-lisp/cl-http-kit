@@ -275,7 +275,11 @@
                (http-protocol-error (condition) condition))))
       (ensure-true (typep condition 'http-protocol-error))
       (ensure-equal :request-parse (http-error-operation condition))
-      (ensure-equal value (http-protocol-error-detail condition))))
+      (ensure-equal
+       (if (eq option :on-body-chunk)
+           (list value nil nil)
+           value)
+       (http-protocol-error-detail condition))))
   (ensure-equal nil (parse-http-request (octets) :allow-eof-p t)))
 
 (deftest core-coverage-http1-request-authority-errors
