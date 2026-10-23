@@ -605,7 +605,7 @@
 
   (deftest network-tls-contract-tls-stream-and-server-inputs
     (%network-tls-contract-protocol
-     (lambda () (http-tls-selected-alpn-protocol :not-stream)) :tls :not-stream)
+     (lambda () (http-tls-selected-alpn-protocol :not-stream)) :tls :invalid-stream)
     (%network-tls-contract-protocol
      (lambda ()
        (funcall (make-http-tls-upgrader :verify :optional
@@ -838,7 +838,8 @@
                         (ensure-equal :not-found (http-protocol-error-detail condition))
                         (ensure-equal 0 (length (binary-test-output stream))))
                       (progn
-                        (ensure-equal :eof (http-protocol-error-detail condition))
+                        (ensure-equal :handshake-failed
+                                      (http-protocol-error-detail condition))
                         (ensure-true (plusp (length (binary-test-output stream)))))))
                 (ensure-false (open-stream-p stream))
                 (ensure-equal (if (eq verify :required) 1 2)
