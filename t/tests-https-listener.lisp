@@ -392,31 +392,33 @@
                     :error-output :string
                     :ignore-error-status t)
                  (unless (zerop status)
-                   (unless (eq :stopped
-                               (http-kit::http-server-state server))
-                     (stop-http-server
-                      server :graceful-timeout 2))
-                   (let ((wait-error
-                           (handler-case
-                               (progn
-                                 (%https-listener-wait
-                                  (lambda ()
-                                    (zerop
-                                     (%https-listener-connection-count
-                                      server))))
-                                 nil)
-                             (error (condition) condition)))
-                         (events nil)
-                         (listener-errors nil)
-                         (state (http-kit::http-server-state server)))
+                   (let ((state-before-cleanup
+                           (http-kit::http-server-state server))
+                         (events-before-cleanup nil)
+                         (listener-errors-before-cleanup nil))
                      (sb-thread:with-mutex (observation-lock)
-                       (setf events (reverse (copy-list server-events))
-                             listener-errors
+                       (setf events-before-cleanup
+                             (reverse (copy-list server-events))
+                             listener-errors-before-cleanup
                              (reverse (copy-list server-errors))))
-                     (error
-                      "curl ~A request failed (~D): ~A~%listener events: ~S~%listener errors: ~S~%listener state: ~S~%listener wait error: ~S"
-                      protocol status errors events listener-errors state
-                      wait-error)))
+                     (unless (eq :stopped state-before-cleanup)
+                       (stop-http-server
+                        server :graceful-timeout 2))
+                     (let ((wait-error
+                             (handler-case
+                                 (progn
+                                   (%https-listener-wait
+                                    (lambda ()
+                                      (zerop
+                                       (%https-listener-connection-count
+                                        server))))
+                                   nil)
+                               (error (condition) condition))))
+                       (error
+                        "curl ~A request failed (~D): ~A~%listener state before cleanup: ~S~%listener events before cleanup: ~S~%listener errors before cleanup: ~S~%listener state after cleanup: ~S~%listener wait error: ~S"
+                        protocol status errors state-before-cleanup
+                        events-before-cleanup listener-errors-before-cleanup
+                        (http-kit::http-server-state server) wait-error))))
                  (ensure-equal 0 status)
                  (ensure-true (search "listener-ok" output))
                  (let ((version-start
