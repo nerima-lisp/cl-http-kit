@@ -325,6 +325,9 @@
             ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.iproute2 ]
             ++ sbclDependencies;
             text = ''
+              ${pkgs.lib.optionalString pkgs.stdenv.isLinux ''
+                export PATH="${pkgs.iproute2}/sbin:$PATH"
+              ''}
               test_cache="$(mktemp -d "''${TMPDIR:-/tmp}/cl-http-kit-test.XXXXXXXX")"
               export HTTP_QUIC_PEER="${quicPeer pkgs}/bin/quic-peer"
               export XDG_CACHE_HOME="$test_cache"
@@ -369,6 +372,9 @@
             ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.iproute2 ]
             ++ sbclDependencies;
             text = ''
+              ${pkgs.lib.optionalString pkgs.stdenv.isLinux ''
+                export PATH="${pkgs.iproute2}/sbin:$PATH"
+              ''}
               coverage_cache="$(mktemp -d "''${TMPDIR:-/tmp}/cl-http-kit-coverage.XXXXXXXX")"
               export HTTP_QUIC_PEER="${quicPeer pkgs}/bin/quic-peer"
               export XDG_CACHE_HOME="$coverage_cache"
@@ -641,9 +647,13 @@
                   pkgs.caddy
                   (quicPeer pkgs)
                 ]
+                ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.iproute2 ]
                 ++ sbclDependencies;
               }
               ''
+                ${pkgs.lib.optionalString pkgs.stdenv.isLinux ''
+                  export PATH="${pkgs.iproute2}/sbin:$PATH"
+                ''}
                 export HTTP_QUIC_PEER="${quicPeer pkgs}/bin/quic-peer"
                 export XDG_CACHE_HOME="$TMPDIR/cache"
                 mkdir -p "$XDG_CACHE_HOME"
