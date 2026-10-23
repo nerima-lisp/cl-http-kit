@@ -1120,6 +1120,12 @@ concurrent streams should use SEND-HTTP2-REQUESTS-OVER-CONNECTION."
   (body-length 0)
   response)
 
+(defstruct (%h2-scheduler-ping-waiter
+             (:constructor %make-h2-scheduler-ping-waiter (payload)))
+  payload
+  acknowledged-p
+  failure)
+
 (defun %h2-batch-entry-for-stream (entries stream-id)
   (find stream-id entries
         :key #'%h2-batch-entry-stream-id
@@ -1389,6 +1395,11 @@ CONTINUATION frames must still be consumed contiguously from that queue."
     (%h2-batch-entry-for-stream
      (%http2-connection-scheduler-entries connection) stream-id))
 
+  (defun %h2-scheduler-has-non-error-entry-p (connection)
+    (some (lambda (entry)
+            (not (%h2-batch-entry-error entry)))
+          (%http2-connection-scheduler-entries connection)))
+
   (defun %h2-scheduler-remove-entry (connection entry)
     (setf (%http2-connection-scheduler-entries connection)
           (delete entry (%http2-connection-scheduler-entries connection)
@@ -1461,11 +1472,14 @@ CONTINUATION frames must still be consumed contiguously from that queue."
              (let ((waiter
                      (find-if
                       (lambda (candidate)
-                        (and (not (second candidate))
-                             (equalp payload (first candidate))))
+                        (and (not (%h2-scheduler-ping-waiter-acknowledged-p
+                                   candidate))
+                             (equalp payload
+                                     (%h2-scheduler-ping-waiter-payload
+                                      candidate))))
                       (%http2-connection-scheduler-ping-waiters connection))))
                (when waiter
-                 (setf (second waiter) t)))
+                 (setf (%h2-scheduler-ping-waiter-acknowledged-p waiter) t)))
              (%h2-send-control writer +http2-ping-type+ +http2-ack-flag+
                                0 payload)))
         ((= type +http2-window-update-type+)
@@ -1653,9 +1667,11 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                        (%h2-scheduler-mark-response
                         connection entry response))))))))
         ((= type +http2-data-type+)
-         (let ((entry
-                 (%h2-with-scheduler-lock (connection)
-                   (%h2-scheduler-entry-for-stream connection stream-id))))
+         (let ((entry nil)
+               (non-error-entry-p nil))
+           (%h2-with-scheduler-lock (connection)
+             (setf entry (%h2-scheduler-entry-for-stream connection stream-id)
+                   non-error-entry-p (%h2-scheduler-has-non-error-entry-p connection)))
            (unless entry
              (if (%h2-scheduler-previously-opened-client-stream-p
                   connection stream-id)
@@ -1664,7 +1680,9 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                  (error 'http-kit:http-protocol-error
                         :message "The HTTP/2 scheduler received DATA for an unknown stream."
                         :operation :http2-read
-                        :detail stream-id)))
+                        :detail (if non-error-entry-p
+                                    stream-id
+                                    (list type stream-id)))))
            (when entry
   (if (%h2-batch-entry-local-retired-p entry)
       (%h2-scheduler-dispatch-retired-data
@@ -1804,7 +1822,7 @@ CONTINUATION frames must still be consumed contiguously from that queue."
       (connection payload deadline clock-function)
     (let* ((reader (%h2-reader-for (%http2-connection-stream connection)))
            (writer (%h2-scheduler-writer connection deadline clock-function))
-           (waiter (list payload nil)))
+           (waiter (%make-h2-scheduler-ping-waiter payload)))
       (%h2-with-scheduler-lock (connection)
         (unless (http2-connection-open-p connection)
           (error 'http-kit:http-connection-error
@@ -1814,11 +1832,33 @@ CONTINUATION frames must still be consumed contiguously from that queue."
         (push waiter (%http2-connection-scheduler-ping-waiters connection)))
       (unwind-protect
            (progn
-             (%h2-send-control writer +http2-ping-type+ 0 0 payload)
-             (%h2-scheduler-wait-until
-              connection
-              (lambda () (second waiter))
-              reader writer deadline clock-function)
+             (handler-case
+                 (progn
+                   (handler-case
+                       (%h2-send-control writer +http2-ping-type+ 0 0 payload)
+                     (error (condition)
+                       (let ((failure
+                               (%h2-with-scheduler-lock (connection)
+                                 (%h2-scheduler-ping-waiter-failure waiter))))
+                         (error (or failure condition)))))
+                   (%h2-scheduler-wait-until
+                    connection
+                    (lambda ()
+                      (%h2-scheduler-ping-waiter-acknowledged-p waiter))
+                    reader writer deadline clock-function)
+                   (let ((failure
+                           (%h2-with-scheduler-lock (connection)
+                             (%h2-scheduler-ping-waiter-failure waiter))))
+                     (when failure
+                       (error failure))))
+               (http-kit:http-connection-error (condition)
+                 (if (and (eq :http2-read (http-kit:http-error-operation condition))
+                          (eq :eof (http-kit:http-connection-error-cause condition)))
+                     (error 'http-kit:http-protocol-error
+                            :message "The HTTP/2 peer closed while awaiting PING ACK."
+                            :operation :http2-client
+                            :detail :eof)
+                     (error condition))))
              (%h2-with-scheduler-lock (connection)
                (unless (http2-connection-open-p connection)
                  (error 'http-kit:http-connection-error
@@ -1889,6 +1929,10 @@ CONTINUATION frames must still be consumed contiguously from that queue."
         (dolist (entry (%http2-connection-scheduler-entries connection))
           (unless (%h2-batch-entry-error entry)
             (setf (%h2-batch-entry-error entry) condition)))
+        (dolist (waiter (%http2-connection-scheduler-ping-waiters connection))
+          (unless (or (%h2-scheduler-ping-waiter-acknowledged-p waiter)
+                      (%h2-scheduler-ping-waiter-failure waiter))
+            (setf (%h2-scheduler-ping-waiter-failure waiter) condition)))
         (setf (%http2-connection-scheduler-entries connection) nil)
         (%h2-scheduler-broadcast connection))
       (when close-p
