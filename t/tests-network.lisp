@@ -329,70 +329,87 @@
                            (ldb (byte 8 0) length)))
       wire))
 
-  (defun tls-record-bound-test-driver (raw state handshake-key-p application-key-p)
-    (let* ((provider (cl-tls-kit:make-cl-crypto-kit-provider))
-           (driver (cl-tls-kit:make-tls13-client-driver
-                    :provider provider
-                    :transport (http-kit/tls::%tls-transport raw)))
-           (read-state
-             (when (or handshake-key-p application-key-p)
-               (cl-tls-kit:make-tls13-traffic-state
-                provider :sha256 :aes-128-gcm
-                (make-array 32 :element-type '(unsigned-byte 8)
-                               :initial-element 1)
-                16 12))))
-      (setf (cl-tls-kit::tls13-client-driver-state driver) state
-            (cl-tls-kit::tls13-client-driver-handshake-read-state driver)
-            (and handshake-key-p read-state)
-            (cl-tls-kit::tls13-client-driver-application-read-state driver)
-            (and application-key-p read-state))
-      driver))
-
   (defun tls-record-read-bound-cases ()
-    ;; Fixed RFC 8446 limits, independent of the implementation's calculation.
-    '((:awaiting-server-hello nil nil 22 16384)
-      (:awaiting-server-hello nil nil 23 16384)
-      (:awaiting-finished t nil 23 16640)
-      (:connected t t 23 16640)
-      (:connected t nil 23 16384)
-      (:awaiting-server-hello nil t 23 16384)
-      (:connected t t 20 16384)
-      (:connected t t 21 16384)
-      (:connected t t 22 16384)))
+    (labels ((server-hello-wire ()
+               (let* ((key-exchange
+                        (make-array 32 :element-type '(unsigned-byte 8)
+                                    :initial-element 1))
+                      (handshake
+                        (cl-tls-kit:encode-handshake
+                         2
+                         (cl-tls-kit:make-tls13-server-hello
+                          #x0303
+                          (make-array 32 :element-type '(unsigned-byte 8)
+                                      :initial-element 2)
+                          (octets)
+                          #x1301
+                          (list
+                           (cl-tls-kit:make-tls-extension
+                            51
+                            (cl-tls-kit:encode-key-share-server-extension
+                             #x001d key-exchange))
+                           (cl-tls-kit:make-tls-extension 43 #(3 4))))))
+                      (length (length handshake))
+                      (wire
+                        (make-array (+ 5 length)
+                                    :element-type '(unsigned-byte 8))))
+                 (replace wire
+                          (octets 22 3 3
+                                  (ldb (byte 8 8) length)
+                                  (ldb (byte 8 0) length)))
+                 (replace wire handshake :start1 5)
+                 wire)))
+      ;; Fixed RFC 8446 limits, independent of the implementation's calculation.
+      (list
+       (list 22 16384 nil)
+       (list 23 16384 nil)
+       (list 23 16640 (server-hello-wire))
+       (list 20 16384 (server-hello-wire))
+       (list 21 16384 (server-hello-wire))
+       (list 22 16384 (server-hello-wire)))))
 
   (deftest native-tls-record-read-bound-maximum
     (dolist (case (tls-record-read-bound-cases))
-      (destructuring-bind (state handshake-key-p application-key-p type limit) case
+      (destructuring-bind (type limit prefix-wire) case
         (let* ((wire (tls-record-bound-test-wire type limit))
-               (raw (make-instance 'binary-test-stream :input wire))
-               (driver (tls-record-bound-test-driver
-                        raw state handshake-key-p application-key-p)))
+               (input
+                 (concatenate '(vector (unsigned-byte 8))
+                              (or prefix-wire #()) wire))
+               (raw (make-instance 'binary-test-stream :input input))
+               (transport (http-kit/tls::%tls-transport raw)))
+          (when prefix-wire
+            (ensure-octets-equal
+             prefix-wire (funcall (getf transport :read) nil)))
           (ensure-octets-equal
-           wire (funcall (getf (http-kit/tls::%tls-transport raw) :read) driver))
-          (ensure-equal (+ 5 limit)
+           wire (funcall (getf transport :read) nil))
+          (ensure-equal (+ (length prefix-wire) 5 limit)
                         (http-kit/test-core::binary-test-input-position raw))))))
 
   (deftest native-tls-record-read-bound-overflow
     (dolist (case (tls-record-read-bound-cases))
-      (destructuring-bind (state handshake-key-p application-key-p type limit) case
+      (destructuring-bind (type limit prefix-wire) case
         (dolist (length (list (1+ limit) 65535))
-          (let* ((raw (make-instance 'binary-test-stream
-                                    :input (tls-record-bound-test-wire type length)))
-                 (driver (tls-record-bound-test-driver
-                          raw state handshake-key-p application-key-p))
-                 (condition
-                   (handler-case
-                       (progn
-                         (funcall (getf (http-kit/tls::%tls-transport raw) :read)
-                                  driver)
-                         nil)
-                     (http-protocol-error (condition) condition))))
-            (ensure-true condition)
-            (when condition
-              (ensure-equal :record-overflow
-                            (http-kit:http-protocol-error-detail condition)))
-            (ensure-equal 5
-                          (http-kit/test-core::binary-test-input-position raw)))))))
+          (let* ((wire (tls-record-bound-test-wire type length))
+                 (input
+                   (concatenate '(vector (unsigned-byte 8))
+                                (or prefix-wire #()) wire))
+                 (raw (make-instance 'binary-test-stream :input input))
+                 (transport (http-kit/tls::%tls-transport raw)))
+            (when prefix-wire
+              (ensure-octets-equal
+               prefix-wire (funcall (getf transport :read) nil)))
+            (let ((condition
+                    (handler-case
+                        (progn
+                          (funcall (getf transport :read) nil)
+                          nil)
+                      (http-protocol-error (condition) condition))))
+              (ensure-true condition)
+              (when condition
+                (ensure-equal :record-overflow
+                              (http-kit:http-protocol-error-detail condition)))
+              (ensure-equal (+ (length prefix-wire) 5)
+                            (http-kit/test-core::binary-test-input-position raw))))))))
 
   (deftest native-tls-record-truncation
     (dolist (wire (list (octets 23)
