@@ -298,7 +298,7 @@
              (ensure-octets-equal parallel-second-body
                                   (http-response-body second-parallel-response))
              (sb-thread:with-mutex (upgrade-lock)
-               (ensure-equal 4 upgraded))
+               (ensure-equal 3 upgraded))
              (sb-thread:signal-semaphore release-first-callback)
              (sb-thread:join-thread first-thread)
              (setf first-thread nil)

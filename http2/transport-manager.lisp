@@ -3,7 +3,7 @@
 (defstruct (%http2-managed-connection
             (:constructor %make-http2-managed-connection
                           (&key key connection opened-at last-used last-used-at
-                                active-count transient-p retired-p close-started-p)))
+                                active-count transient-p exclusive-p retired-p close-started-p)))
   key
   connection
   opened-at
@@ -11,6 +11,7 @@
   last-used-at
   (active-count 0)
   transient-p
+  exclusive-p
   retired-p
   close-started-p)
 
@@ -58,11 +59,14 @@ OPEN-CONNECTION receives the request and must return an HTTP2-CONNECTION. The
 manager always passes TIMEOUT and DEADLINE; proxy-routed requests also pass
 PROXY-PLAN and PROXY. By default, the cache key includes the request scheme,
 host, port, proxy plan, and proxy. MAX-CONNECTIONS bounds retained cache
-entries, not transient connections. A request for a key whose retained
-connection is busy uses a request-scoped connection. At capacity, if every
-retained entry is busy, requests for other keys also use request-scoped
-connections. Otherwise a new key can use a newly retained entry or replace
-the least-recently-used idle entry.
+entries, not total open connections; request-scoped connections do not count
+toward it. Concurrent single-request calls for the same key share a retained
+connection. Its scheduler assigns streams and enforces peer concurrent-stream
+and flow-control limits. A batch call holds an exclusive lease because the
+batch operation is cooperative rather than thread-safe. If an incompatible
+operation is already using the same key, the manager uses a request-scoped
+connection. At capacity, requests for other keys use a request-scoped
+connection when every retained entry is active.
 
 IDLE-TIMEOUT retires entries after the configured time without a completed
 manager call. MAX-CONNECTION-AGE retires entries after the configured time from
@@ -81,10 +85,9 @@ from either callback propagate after required close and retirement actions have
 been attempted. OPEN-CONNECTION, CLOCK-FUNCTION, and both callbacks may run
 concurrently with other manager calls, so they must synchronize shared state
 they use. Errors from OPEN-CONNECTION and CLOCK-FUNCTION propagate to the call.
-On SBCL, manager operations protect entry state for concurrent callers, and a
-retained connection is leased to at most one manager call at a time. Use
-SEND-HTTP2-REQUESTS-OVER-CONNECTION-MANAGER when one manager call needs several
-concurrent streams on that connection. Use CLEAR-HTTP2-CONNECTION-MANAGER to
+On SBCL, manager operations protect entry state for concurrent callers. Use
+SEND-HTTP2-REQUESTS-OVER-CONNECTION-MANAGER when one manager call needs a batch
+of concurrent streams on one connection. Use CLEAR-HTTP2-CONNECTION-MANAGER to
 clear retained entries while keeping the manager usable;
 CLOSE-HTTP2-CONNECTION-MANAGER also prevents future calls."
   (unless (functionp open-connection)
@@ -286,11 +289,14 @@ CLOSE-HTTP2-CONNECTION-MANAGER also prevents future calls."
                            (setf actions (%h2-manager-prune-locked manager now)))
     (%h2-manager-run-retirements manager actions)))
 
-(defun %h2-manager-entry-for-key-locked (manager key)
+(defun %h2-manager-entry-for-key-locked
+    (manager key &optional share-active-p)
   (reduce (lambda (latest entry)
             (if (and (equal key (%http2-managed-connection-key entry))
-                     (zerop (%http2-managed-connection-active-count entry))
-                     (%h2-manager-entry-usable-p entry))
+                     (%h2-manager-entry-usable-p entry)
+                     (or (zerop (%http2-managed-connection-active-count entry))
+                         (and share-active-p
+                              (not (%http2-managed-connection-exclusive-p entry)))))
                 (if (or (null latest)
                         (> (%http2-managed-connection-last-used entry)
                            (%http2-managed-connection-last-used latest)))
@@ -318,32 +324,34 @@ CLOSE-HTTP2-CONNECTION-MANAGER also prevents future calls."
            (%http2-connection-manager-entries manager))
           :initial-value nil))
 
-(defun %h2-manager-select-entry (manager key now)
+(defun %h2-manager-select-entry (manager key now &optional (share-active-p nil))
   (%h2-manager-with-lock (manager)
-                         (when (%http2-connection-manager-closed-p manager)
-                           (error 'http-kit:http-connection-error
-                                  :message "The HTTP/2 connection manager is closed."
-                                  :operation :http2-manager
-                                  :cause :closed))
-                         (let ((entry (%h2-manager-entry-for-key-locked manager key))
-                               (same-key (%h2-manager-same-key-entry-locked manager key))
-                               (actions nil)
-                               (request-scoped-p nil))
-                           (cond
-                            (entry
-                             (incf (%http2-managed-connection-active-count entry))
-                             (%h2-manager-touch-locked manager entry now))
-                            (same-key
-                             (setf request-scoped-p t))
-                            ((>= (length (%http2-connection-manager-entries manager))
-                                 (%http2-connection-manager-max-connections manager))
-                             (let ((oldest (%h2-manager-oldest-idle-entry-locked manager)))
-                               (if oldest
-                                   (setf actions
-                                         (list (%h2-manager-retire-entry-locked manager oldest)))
-                                 (setf request-scoped-p t)))))
-                           (values entry request-scoped-p actions
-                                   (%http2-connection-manager-clear-generation manager)))))
+    (when (%http2-connection-manager-closed-p manager)
+      (error 'http-kit:http-connection-error
+             :message "The HTTP/2 connection manager is closed."
+             :operation :http2-manager
+             :cause :closed))
+    (let ((entry (%h2-manager-entry-for-key-locked manager key share-active-p))
+          (same-key (%h2-manager-same-key-entry-locked manager key))
+          (actions nil)
+          (request-scoped-p nil))
+      (cond
+        (entry
+         (incf (%http2-managed-connection-active-count entry))
+         (setf (%http2-managed-connection-exclusive-p entry)
+               (not share-active-p))
+         (%h2-manager-touch-locked manager entry now))
+        (same-key
+         (setf request-scoped-p t))
+        ((>= (length (%http2-connection-manager-entries manager))
+             (%http2-connection-manager-max-connections manager))
+         (let ((oldest (%h2-manager-oldest-idle-entry-locked manager)))
+           (if oldest
+               (setf actions
+                     (list (%h2-manager-retire-entry-locked manager oldest)))
+             (setf request-scoped-p t)))))
+      (values entry request-scoped-p actions
+              (%http2-connection-manager-clear-generation manager)))))
 
 (defun %h2-manager-open-connection
     (manager request timeout deadline proxy-plan proxy)
@@ -359,7 +367,7 @@ CLOSE-HTTP2-CONNECTION-MANAGER also prevents future calls."
              :timeout timeout
              :deadline deadline)))
 
-(defun %h2-manager-new-entry (key connection now transient-p)
+(defun %h2-manager-new-entry (key connection now transient-p exclusive-p)
   (%make-http2-managed-connection
    :key key
    :connection connection
@@ -367,11 +375,11 @@ CLOSE-HTTP2-CONNECTION-MANAGER also prevents future calls."
    :last-used 0
    :last-used-at now
    :active-count 1
-   :transient-p transient-p))
+   :transient-p transient-p
+   :exclusive-p exclusive-p))
 
 (defun %h2-manager-connection-for
-    (manager request connection-key connection-key-supplied-p timeout deadline
-             proxy-plan proxy)
+    (manager request connection-key connection-key-supplied-p timeout deadline proxy-plan proxy &optional (share-active-p nil))
   (unless (http2-connection-manager-p manager)
     (error 'http-kit:http-protocol-error
            :message "An HTTP/2 request requires an HTTP2-CONNECTION-MANAGER."
@@ -383,14 +391,15 @@ CLOSE-HTTP2-CONNECTION-MANAGER also prevents future calls."
                (%h2-manager-request-key request proxy-plan proxy))))
     (%h2-manager-prune manager)
     (multiple-value-bind (entry request-scoped-p actions clear-generation)
-        (%h2-manager-select-entry manager key (%h2-manager-now manager))
+        (%h2-manager-select-entry manager key (%h2-manager-now manager)
+                                  share-active-p)
       (%h2-manager-run-retirements manager actions)
       (when entry
         (return-from %h2-manager-connection-for
-                     (values (%http2-managed-connection-connection entry) entry)))
+          (values (%http2-managed-connection-connection entry) entry)))
       (let ((connection
-             (%h2-manager-open-connection
-              manager request timeout deadline proxy-plan proxy)))
+              (%h2-manager-open-connection
+               manager request timeout deadline proxy-plan proxy)))
         (unless (http2-connection-p connection)
           (error 'http-kit:http-protocol-error
                  :message "The HTTP/2 manager open callback returned a non-connection."
@@ -405,57 +414,49 @@ CLOSE-HTTP2-CONNECTION-MANAGER also prevents future calls."
               (let ((opened-at (%h2-manager-now manager)))
                 (%h2-manager-prune manager)
                 (%h2-manager-with-lock (manager)
-                                       (if (%http2-connection-manager-closed-p manager)
-                                           (setf closed-during-open-p t)
-                                         (let ((existing
-                                                (%h2-manager-entry-for-key-locked
-                                                 manager key))
-                                               (same-key
-                                                (%h2-manager-same-key-entry-locked
-                                                 manager key))
-                                               (transient-p
-                                                (or request-scoped-p
-                                                    (/= clear-generation
-                                                        (%http2-connection-manager-clear-generation
-                                                         manager)))))
-                                           (cond
-                                            (existing
-                                             (incf
-                                              (%http2-managed-connection-active-count
-                                               existing))
-                                             (%h2-manager-touch-locked
-                                              manager existing opened-at)
-                                             (setf result-entry existing
-                                                   result-connection
-                                                   (%http2-managed-connection-connection
-                                                    existing)))
-                                            (same-key
-                                             (setf transient-p t))
-                                            ((>=
-                                              (length
-                                               (%http2-connection-manager-entries manager))
-                                              (%http2-connection-manager-max-connections
-                                               manager))
-                                             (let ((oldest
-                                                    (%h2-manager-oldest-idle-entry-locked
-                                                     manager)))
-                                               (if oldest
-                                                   (setf retirement-actions
-                                                         (list
-                                                          (%h2-manager-retire-entry-locked
-                                                           manager oldest)))
-                                                 (setf transient-p t)))))
-                                           (unless result-entry
-                                             (setf result-entry
-                                                   (%h2-manager-new-entry
-                                                    key connection opened-at transient-p)
-                                                   result-connection connection)
-                                             (unless transient-p
-                                               (push result-entry
-                                                     (%http2-connection-manager-entries
-                                                      manager)))
-                                             (%h2-manager-touch-locked
-                                              manager result-entry opened-at)))))
+                  (if (%http2-connection-manager-closed-p manager)
+                      (setf closed-during-open-p t)
+                    (let ((existing
+                            (%h2-manager-entry-for-key-locked
+                             manager key share-active-p))
+                          (same-key
+                            (%h2-manager-same-key-entry-locked manager key))
+                          (transient-p
+                            (or request-scoped-p
+                                (/= clear-generation
+                                    (%http2-connection-manager-clear-generation
+                                     manager)))))
+                      (cond
+                        (existing
+                         (incf
+                          (%http2-managed-connection-active-count existing))
+                         (setf (%http2-managed-connection-exclusive-p existing)
+                               (not share-active-p))
+                         (%h2-manager-touch-locked manager existing opened-at)
+                         (setf result-entry existing
+                               result-connection
+                               (%http2-managed-connection-connection existing)))
+                        (same-key
+                         (setf transient-p t))
+                        ((>= (length (%http2-connection-manager-entries manager))
+                             (%http2-connection-manager-max-connections manager))
+                         (let ((oldest (%h2-manager-oldest-idle-entry-locked manager)))
+                           (if oldest
+                               (setf retirement-actions
+                                     (list
+                                      (%h2-manager-retire-entry-locked
+                                       manager oldest)))
+                             (setf transient-p t)))))
+                      (unless result-entry
+                        (setf result-entry
+                              (%h2-manager-new-entry
+                               key connection opened-at transient-p
+                               (not share-active-p))
+                              result-connection connection)
+                        (unless transient-p
+                          (push result-entry
+                                (%http2-connection-manager-entries manager)))
+                        (%h2-manager-touch-locked manager result-entry opened-at)))))
                 (when closed-during-open-p
                   (error 'http-kit:http-connection-error
                          :message "The HTTP/2 connection manager is closed."
@@ -463,11 +464,10 @@ CLOSE-HTTP2-CONNECTION-MANAGER also prevents future calls."
                          :cause :closed))
                 (setf close-new-p (not (eq result-connection connection)))
                 (handler-case
-                    (%h2-manager-run-retirements
-                     manager retirement-actions)
+                    (%h2-manager-run-retirements manager retirement-actions)
                   (error (condition)
-                         (%h2-manager-finish-entry manager result-entry)
-                         (error condition)))
+                    (%h2-manager-finish-entry manager result-entry)
+                    (error condition)))
                 (values result-connection result-entry))
             (when close-new-p
               (%h2-manager-close-connection connection))))))))
@@ -575,7 +575,7 @@ CLOSE-HTTP2-CONNECTION-MANAGER also prevents future calls."
        (multiple-value-bind (connection entry)
            (%h2-manager-connection-for
             manager request connection-key connection-key-supplied-p
-            timeout deadline proxy-plan proxy)
+            timeout deadline proxy-plan proxy t)
          (let ((retry-p nil)
                (response nil))
            (unwind-protect
@@ -601,7 +601,7 @@ CLOSE-HTTP2-CONNECTION-MANAGER also prevents future calls."
                               condition request-body-function))
                         (setf retried-p t
                               retry-p t)
-                        (error condition))))
+                      (error condition))))
              (%h2-manager-finish-entry manager entry))
            (unless retry-p
              (return response))))))
@@ -621,7 +621,7 @@ CLOSE-HTTP2-CONNECTION-MANAGER also prevents future calls."
   (multiple-value-bind (connection entry)
       (%h2-manager-connection-for
        manager (first requests) connection-key connection-key-supplied-p
-       timeout deadline nil nil)
+       timeout deadline nil nil nil)
     (unwind-protect
          (send-http2-requests-over-connection
           connection requests
