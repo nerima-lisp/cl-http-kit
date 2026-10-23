@@ -369,7 +369,10 @@
               pkgs.caddy
               (quicPeer pkgs)
             ]
-            ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.iproute2 ]
+            ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+              pkgs.iproute2
+              pkgs.strace
+            ]
             ++ sbclDependencies;
             text = ''
               ${pkgs.lib.optionalString pkgs.stdenv.isLinux ''
@@ -404,8 +407,8 @@
                 -name '*.html' \
                 -delete
               coverage_status=0
-              CL_HTTP_KIT_COVERAGE_TIMEOUT_SECONDS="$coverage_timeout_seconds" \
-                perl -e 'alarm $ENV{CL_HTTP_KIT_COVERAGE_TIMEOUT_SECONDS}; exec @ARGV' \
+              coverage_command=(
+                perl -e 'alarm $ENV{CL_HTTP_KIT_COVERAGE_TIMEOUT_SECONDS}; exec @ARGV'
                 sbcl --noinform --no-userinit --no-sysinit --non-interactive \
                 --load scripts/coverage.lisp \
                 -- run cl-http-kit/test \
@@ -442,7 +445,31 @@
                 --max-workers "$max_workers" \
                 --bail true \
                 --coverage-report-directory "$coverage_report_directory/" \
-                --fail-with-no-tests "$@" || coverage_status=$?
+                --fail-with-no-tests "$@"
+              )
+              ${pkgs.lib.optionalString pkgs.stdenv.isLinux ''
+                # Trace selected socket calls throughout the coverage command to capture context for HTTPS listener failures.
+                # -ttt timestamps calls, and -yy annotates descriptors with socket endpoints.
+                coverage_trace_output="$(mktemp "''${TMPDIR:-/tmp}/cl-http-kit-coverage-fd-trace.XXXXXXXX")"
+                trap 'rm -f -- "$coverage_trace_output"' EXIT
+                set +e
+                CL_HTTP_KIT_COVERAGE_TIMEOUT_SECONDS="$coverage_timeout_seconds" \
+                  strace -f -ttt -yy \
+                    -e trace=close,accept,accept4,shutdown \
+                    -o "$coverage_trace_output" \
+                    "''${coverage_command[@]}"
+                coverage_status=$?
+                set -e
+                if [ "$coverage_status" -ne 0 ]; then
+                  echo "Linux coverage/strace command returned nonzero. Filtered socket trace follows on stderr (last 4000 matching calls, if any):" >&2
+                  awk '/accept4?\(|shutdown\(|close\([^)]*<(TCP|socket):/ { print }' "$coverage_trace_output" \
+                    | tail -n 4000 >&2
+                fi
+              ''}
+              ${pkgs.lib.optionalString (!pkgs.stdenv.isLinux) ''
+                CL_HTTP_KIT_COVERAGE_TIMEOUT_SECONDS="$coverage_timeout_seconds" \
+                  "''${coverage_command[@]}" || coverage_status=$?
+              ''}
               if [ "$coverage_status" -ne 0 ]; then
                 if [ -s "''${coverage_report_directory}/cover-index.html" ]; then
                   perl scripts/check-coverage.pl "$coverage_report_directory" || true
