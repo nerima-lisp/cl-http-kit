@@ -239,10 +239,14 @@
          :invalid-trust-store)))))
 
 (defun %tls-driver-error (condition)
-  (declare (ignore condition))
-  (%tls-protocol-error
-   "The TLS 1.3 client handshake failed."
-   :handshake-failed))
+  (let ((reason (cl-tls-kit:tls13-client-driver-error-reason condition)))
+    (%tls-protocol-error
+     "The TLS 1.3 client handshake failed."
+     (if (and (consp reason)
+              (member (first reason)
+                      (quote (:certificate-verification-failed :peer-alert))))
+         reason
+         :handshake-failed))))
 
 #+sbcl
 (progn
