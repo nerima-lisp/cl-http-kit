@@ -1136,7 +1136,9 @@
                  (ensure-true (typep observed 'http-protocol-error))
                  (ensure-equal :http2-server
                                (http-kit:http-error-operation observed))
-                 (ensure-equal invalid
+                 (ensure-equal (if (eq option :on-body-chunk)
+                                   (list invalid nil nil)
+                                   invalid)
                                (http-kit:http-protocol-error-detail observed))
                  (ensure-equal 0 handler-calls)
                  (ensure-equal 0 body-calls)
