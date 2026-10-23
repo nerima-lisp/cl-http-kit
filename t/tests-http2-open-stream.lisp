@@ -764,9 +764,21 @@
                          (and (= 4 (http-kit/http2::%h2-frame-type frame))
                               (= 1 (http-kit/http2::%h2-frame-flags frame))))
                        frames))
-        (ensure-equal 8
-                      (count 8 frames
-                             :key #'http-kit/http2::%h2-frame-type)))
+        (let ((window-update-frames
+                (remove-if-not
+                 (lambda (frame)
+                   (= 8 (http-kit/http2::%h2-frame-type frame)))
+                 frames)))
+          (ensure-equal 7 (length window-update-frames))
+          (ensure-equal 4
+                        (count 0 window-update-frames
+                               :key #'http-kit/http2::%h2-frame-stream-id))
+          (ensure-equal 2
+                        (count 1 window-update-frames
+                               :key #'http-kit/http2::%h2-frame-stream-id))
+          (ensure-equal 1
+                        (count 3 window-update-frames
+                               :key #'http-kit/http2::%h2-frame-stream-id))))
       (ensure-true
        (http-kit/http2:http2-connection-session-started-p connection))
       (http-kit/http2:close-http2-connection connection)))))
