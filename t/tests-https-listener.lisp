@@ -434,7 +434,8 @@
              (dolist (protocol '("http/1.1" "h2"))
                (multiple-value-bind (output errors status)
                    (uiop:run-program
-                    (list "openssl" "s_client"
+                    (list "openssl" "s_client" "-ign_eof"
+                          "-ignore_unexpected_eof"
                           "-connect" (format nil "127.0.0.1:~D" port)
                           "-servername" "localhost"
                           "-alpn" protocol)
