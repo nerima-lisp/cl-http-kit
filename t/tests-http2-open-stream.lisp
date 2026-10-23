@@ -1809,7 +1809,7 @@
           (:unexpected-data
            (ensure-true (typep result 'http-protocol-error))
            (ensure-equal :http2-read (http-error-operation result))
-           (ensure-equal '(0 3) (http-protocol-error-detail result)))))
+           (ensure-equal 3 (http-protocol-error-detail result)))))
       (ensure-equal (if (eq mode :available) '(1 3) '(1))
                     (mapcar #'http-kit/http2::%h2-frame-stream-id
                             (remove-if-not
