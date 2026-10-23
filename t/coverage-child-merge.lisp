@@ -102,11 +102,13 @@
     (format t "REJECT ~S native-unchanged~%" kind)))
 
 (defun reject-coherent-tampering (ticket collector)
-  (let* ((original (getf ticket :result))
-         (sealed (copy-seq (getf ticket :accepted-bytes)))
+  (let* ((original (getf ticket :stage))
+         (sealed (getf ticket :digest))
+         (tampered (make-pathname :name "coherent-tampering"
+                                  :type "sexp"
+                                  :defaults *output*))
          (bad (copy-payload (http-coverage-child-merge::accepted-payload ticket)
-                      :copy-marks t))
-         (pathname (merge-pathnames "coherent-tampering.sexp" *output*))
+                            :copy-marks t))
          (before (sb-cover:save-coverage))
          (changed 0))
     ;; Only the untrusted payload copy changes, never the parent's native store.
@@ -118,11 +120,11 @@
             (loop for paths in map for index from 0
                   when (and paths (= http-coverage-child-merge::+unmarked-byte+
                                      (aref marks index)))
-                    do (setf (aref marks index)
-                             (logxor http-coverage-child-merge::+unmarked-byte+ 1)))
+                  do (setf (aref marks index)
+                           (logxor http-coverage-child-merge::+unmarked-byte+ 1)))
             (loop for paths in map for mark across marks
                   unless (= mark http-coverage-child-merge::+unmarked-byte+)
-                    do (dolist (path paths) (setf (gethash path observed) t)))))
+                  do (dolist (path paths) (setf (gethash path observed) t)))))
         (dotimes (index (length (second record)))
           (let ((bit (if (gethash (aref (second record) index) observed) 1 0)))
             (when (/= bit (sbit (cddr record) index)) (incf changed))
@@ -130,23 +132,25 @@
     (check (> changed 0) :coherent-payload-has-unexecuted-counter-forgeries)
     (check (http-coverage-child-merge::canonical-input bad (getf ticket :request) *roots*)
            :coherent-payload-passes-native-consistency-alone)
-    (http-coverage-child-merge::write-form pathname bad)
+    (http-coverage-child-merge::write-form tampered bad)
     (unwind-protect
-         (progn
-           (setf (getf ticket :result) pathname)
-           (check (handler-case
-                      (progn (http-coverage-child-merge:merge-pending) nil)
-                    (error (condition)
-                      (not (null (search "accepted payload bytes changed"
-                                         (princ-to-string condition))))))
-                  :coherent-tampering-rejected-by-byte-seal)
-           (check (not (http-coverage-child-merge::collector-merged collector))
-                  :coherent-tampering-not-merged)
-           (check (raw-equal before (sb-cover:save-coverage)) :coherent-no-native-write)
-           (check (equalp sealed (getf ticket :accepted-bytes)) :accepted-seal-unchanged))
-      (setf (getf ticket :result) original
-            (http-coverage-child-merge::collector-failure collector) nil))
-    (check (equalp sealed (http-coverage-child-merge::payload-bytes original))
+        (progn
+          (setf (getf ticket :stage) tampered)
+          (check (handler-case
+                     (progn (http-coverage-child-merge:merge-pending) nil)
+                   (error (condition)
+                          (not (null (search "accepted payload digest changed"
+                                             (princ-to-string condition))))))
+                 :coherent-tampering-rejected-by-byte-seal)
+          (check (not (http-coverage-child-merge::collector-merged collector))
+                 :coherent-tampering-not-merged)
+          (check (raw-equal before (sb-cover:save-coverage)) :coherent-no-native-write)
+          (check (equal sealed (getf ticket :digest)) :accepted-seal-unchanged))
+      (setf (getf ticket :stage) original
+            (http-coverage-child-merge::collector-failure collector) nil)
+      (when (probe-file tampered) (delete-file tampered)))
+    (check (equal sealed
+                  (subseq (http-coverage-child-merge::hashes (list original)) 0 64))
            :original-accepted-file-unchanged)
     (format t "REJECT :COHERENT-TAMPERING forged-counters=~D native-unchanged seal=EQ~%"
             changed)))
@@ -238,9 +242,7 @@
             selected assertions))
   (let* ((collector http-coverage-child-merge:*collector*)
          (tickets (reverse (http-coverage-child-merge::collector-tickets collector)))
-         (payload-seal
-           (http-coverage-child-merge::hashes
-            (mapcar (lambda (ticket) (getf ticket :result)) tickets)))
+         (payload-seal (mapcar (lambda (ticket) (getf ticket :digest)) tickets))
          (before (sb-cover:save-coverage))
          (expected (mapcar (lambda (record)
                              (list* (first record) (second record) (copy-seq (cddr record))))
@@ -264,7 +266,39 @@
                    (search "Child coverage: payload identity"
                            (princ-to-string condition)))) :actual-feature-drift-rejected))
       (check (raw-equal unchanged (sb-cover:save-coverage)) :feature-drift-no-native-write))
-    (reject-coherent-tampering (first tickets) collector)
+    (progn
+      (reject-coherent-tampering (first tickets) collector)
+      (let* ((ticket (second tickets))
+             (original-stage (getf ticket :stage))
+             (invalid-stage (make-pathname :name "invalid-resealed" :type "sexp" :defaults *output*))
+             (original-digest (getf ticket :digest)))
+        (let* ((payload (http-coverage-child-merge::accepted-payload ticket))
+               (entry (first (getf payload :entries))))
+          (setf (second (getf entry :state)) nil)
+          (http-coverage-child-merge::write-form invalid-stage payload))
+        (unwind-protect
+             (progn
+               (setf (getf ticket :stage) invalid-stage
+                     (getf ticket :digest)
+                       (subseq (http-coverage-child-merge::hashes (list invalid-stage)) 0 64))
+               (check (equal (getf ticket :digest)
+                             (subseq (http-coverage-child-merge::hashes
+                                      (list (getf ticket :stage))) 0 64))
+                      :structural-invalid-payload-resealed)
+               (check (handler-case
+                          (progn (http-coverage-child-merge:merge-pending) nil)
+                        (error (condition)
+                          (not (null (search "native source/path/location/CODE-MAP mismatch"
+                                             (princ-to-string condition))))))
+                      :resealed-structural-invalid-payload-rejected)
+               (check (not (http-coverage-child-merge::collector-merged collector))
+                      :resealed-structural-invalid-not-merged)
+               (check (raw-equal before (sb-cover:save-coverage))
+                      :resealed-structural-invalid-no-native-write))
+          (setf (getf ticket :stage) original-stage
+                (getf ticket :digest) original-digest
+                (http-coverage-child-merge::collector-failure collector) nil)
+          (when (probe-file invalid-stage) (delete-file invalid-stage)))))
     ;; Validate a missing completion before the official merge can change any bit.
     (let ((ticket (first tickets)))
       (setf (getf ticket :exit) :pending)
@@ -286,13 +320,12 @@
     (sb-cover:report (merge-pathnames "before-report/" *output*))
     (http-coverage-child-merge:merge-pending)
     (check (and (equal payload-seal
-                         (http-coverage-child-merge::hashes
-                          (mapcar (lambda (ticket) (getf ticket :result)) tickets)))
-                    (every (lambda (ticket)
-                             (handler-case
-                                 (progn (http-coverage-child-merge::accepted-payload ticket) t)
-                               (error () nil)))
-                           tickets))
+                       (mapcar (lambda (ticket) (getf ticket :digest)) tickets))
+                (every (lambda (ticket)
+                         (handler-case
+                             (progn (http-coverage-child-merge::accepted-payload ticket) t)
+                           (error () nil)))
+                       tickets))
            :original-child-payloads-unchanged)
     (let ((after (sb-cover:save-coverage)) (delta 0) (client-delta 0)
           (branches 0) (negative 0))
