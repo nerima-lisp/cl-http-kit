@@ -913,12 +913,16 @@ concurrent streams should use SEND-HTTP2-REQUESTS-OVER-CONNECTION."
            :detail collect-body-p))
   (let* ((clock (or clock-function
                     (%http2-connection-clock-function connection)))
-         (header-limit (or max-header-bytes
-                           (%http2-connection-max-header-bytes connection)))
+         (header-limit
+          (min (or max-header-bytes
+                   (%http2-connection-max-header-bytes connection))
+               (%http2-connection-max-header-bytes connection)))
          (field-limit (min (or max-fields most-positive-fixnum)
                            (%http2-connection-max-fields connection)))
-         (body-limit (or max-body-bytes
-                         (%http2-connection-max-body-bytes connection)))
+         (body-limit
+          (min (or max-body-bytes
+                   (%http2-connection-max-body-bytes connection))
+               (%http2-connection-max-body-bytes connection)))
          (stream-id nil))
     (http-kit:with-http-deadline (absolute-deadline timeout
                                    :inherited deadline
@@ -1409,17 +1413,12 @@ CONTINUATION frames must still be consumed contiguously from that queue."
   (defun %h2-scheduler-close-goaway-retired-if-idle (connection)
     (let ((close-p nil))
       (%h2-with-scheduler-lock (connection)
-        (let ((last-stream-id
-                (%http2-connection-goaway-last-stream-id connection))
-              (highest-opened-stream-id
-                (max 0 (- (%http2-connection-next-stream-id connection) 2))))
-          (when (and (not (%http2-connection-closed-p connection))
-                     last-stream-id
-                     (> highest-opened-stream-id last-stream-id)
-                     (null (%http2-connection-scheduler-entries connection)))
-            (setf (%http2-connection-closed-p connection) t
-                  close-p t)
-            (%h2-scheduler-broadcast connection))))
+        (when (and (not (%http2-connection-closed-p connection))
+                   (%http2-connection-goaway-last-stream-id connection)
+                   (null (%http2-connection-scheduler-entries connection)))
+          (setf (%http2-connection-closed-p connection) t
+                close-p t)
+          (%h2-scheduler-broadcast connection)))
       (when close-p
         (http-kit::%with-http-cleanup
           (funcall (%http2-connection-close-stream connection)
@@ -1570,8 +1569,7 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                              +http2-end-stream-flag+)))
       (%h2-with-scheduler-lock (connection)
         (%h2-scheduler-remove-entry connection entry)
-        (%h2-scheduler-broadcast connection))
-      (%h2-scheduler-close-goaway-retired-if-idle connection)))
+        (%h2-scheduler-broadcast connection))))
 
   (defun %h2-scheduler-previously-opened-client-stream-p
       (connection stream-id)
@@ -1620,9 +1618,7 @@ CONTINUATION frames must still be consumed contiguously from that queue."
       (cond
         ((%h2-control-frame-p type)
          (%h2-with-scheduler-lock (connection)
-           (%h2-scheduler-control-frame connection frame control-writer))
-         (when (= type +http2-goaway-type+)
-           (%h2-scheduler-close-goaway-retired-if-idle connection)))
+           (%h2-scheduler-control-frame connection frame control-writer)))
         ((= type +http2-headers-type+)
          (let ((entry
                  (%h2-with-scheduler-lock (connection)
@@ -1933,9 +1929,13 @@ CONTINUATION frames must still be consumed contiguously from that queue."
       (connection reader writer deadline clock-function)
     (%h2-scheduler-wait-until
      connection
-     (lambda () (%h2-scheduler-capacity-available-p connection))
+     (lambda ()
+       (or (%http2-connection-goaway-last-stream-id connection)
+           (%h2-scheduler-capacity-available-p connection)))
      reader writer deadline clock-function)
     (%h2-with-scheduler-lock (connection)
+      (when (%http2-connection-goaway-last-stream-id connection)
+        (%h2-connection-next-stream-id connection))
       (unless (%h2-scheduler-capacity-available-p connection)
         (error 'http-kit:http-connection-error
                :message "The HTTP/2 connection closed while streams were paused."
@@ -2094,12 +2094,16 @@ CONTINUATION frames must still be consumed contiguously from that queue."
              :detail collect-body-p))
     (let* ((clock (or clock-function
                       (%http2-connection-clock-function connection)))
-           (header-limit (or max-header-bytes
-                             (%http2-connection-max-header-bytes connection)))
+           (header-limit
+            (min (or max-header-bytes
+                     (%http2-connection-max-header-bytes connection))
+                 (%http2-connection-max-header-bytes connection)))
            (field-limit (min (or max-fields most-positive-fixnum)
                              (%http2-connection-max-fields connection)))
-           (body-limit (or max-body-bytes
-                           (%http2-connection-max-body-bytes connection)))
+           (body-limit
+            (min (or max-body-bytes
+                     (%http2-connection-max-body-bytes connection))
+                 (%http2-connection-max-body-bytes connection)))
            (reader (%h2-reader-for (%http2-connection-stream connection)))
            (entry nil))
       (unless (functionp clock)
@@ -2167,7 +2171,6 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                                        (null (%h2-batch-entry-callback-events entry)))
                               (%h2-batch-entry-response entry)))))
                     (when response
-                      (%h2-scheduler-close-goaway-retired-if-idle connection)
                       (return response)))))
             (error (condition)
               (let ((timeout-p (typep condition 'http-kit:http-timeout))
@@ -2312,12 +2315,16 @@ sent in successive multiplexed waves under the same deadline."
              :detail collect-body-p))
     (let* ((clock (or clock-function
                       (%http2-connection-clock-function connection)))
-           (header-limit (or max-header-bytes
-                             (%http2-connection-max-header-bytes connection)))
+           (header-limit
+            (min (or max-header-bytes
+                     (%http2-connection-max-header-bytes connection))
+                 (%http2-connection-max-header-bytes connection)))
            (field-limit (min (or max-fields most-positive-fixnum)
                              (%http2-connection-max-fields connection)))
-           (body-limit (or max-body-bytes
-                           (%http2-connection-max-body-bytes connection))))
+           (body-limit
+            (min (or max-body-bytes
+                     (%http2-connection-max-body-bytes connection))
+                 (%http2-connection-max-body-bytes connection))))
       (http-kit:with-http-deadline (absolute-deadline timeout
                                      :inherited deadline
                                      :clock-function clock)
@@ -2423,7 +2430,11 @@ sent in successive multiplexed waves under the same deadline."
                     header-writes (nreverse header-writes))
               (dolist (write header-writes)
                 (%h2-write-wire (%http2-connection-stream connection)
-                                (first write) absolute-deadline clock))
+                                (first write) absolute-deadline clock)
+                (%h2-with-scheduler-lock (connection)
+                  (setf (%http2-connection-scheduler-last-opened-stream-id connection)
+                        (max (%http2-connection-scheduler-last-opened-stream-id connection)
+                             (third write)))))
               (let ((pending-head nil)
                     (pending-tail nil)
                     (first-settings-p (not session-started-p))
@@ -2465,7 +2476,9 @@ sent in successive multiplexed waves under the same deadline."
                                     :detail (list (%h2-frame-type frame)
                                                   (%h2-frame-stream-id frame)
                                                   (%h2-frame-flags frame))))
-                           (setf first-settings-p nil))
+                           (setf first-settings-p nil
+                                 (%http2-connection-session-started-p connection) t
+                                 (%http2-connection-scheduler-first-peer-frame-p connection) nil))
                          frame))
                      (next-frame ()
                        (or (dequeue) (read-network-frame)))

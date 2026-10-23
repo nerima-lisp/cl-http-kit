@@ -624,6 +624,139 @@
               (ensure-equal 3 (http-size-limit-exceeded-observed result))
               (ensure-equal (if streaming-p (octets) (octets 7)) body)
               (ensure-false chunks)))))))
+(deftest http2-connection-request-limits-cannot-weaken-connection-caps
+  (dolist (batch-p (list nil t))
+    (dolist (kind (list :headers :body))
+      (let* ((header-limit 256)
+             (body-limit 2)
+             (header-block
+               (h2-header-block
+                (cons ":status" "200")
+                (cons "x-padding" (make-string 512 :initial-element #\a))))
+             (response-headers
+               (if (eq kind :headers)
+                   header-block
+                 (h2-header-block (cons ":status" "200"))))
+             (input
+               (concatenate-octets
+                (h2-frame 4 0 0 (octets))
+                (h2-frame 1 4 1 response-headers)
+                (if (eq kind :body)
+                    (h2-frame 0 1 1 (octets 1 2 3))
+                  (octets))))
+             (stream (make-instance 'binary-session-stream :input input))
+             (closed 0)
+             (connection
+               (http-kit/http2:make-http2-connection
+                :stream stream
+                :max-header-bytes header-limit
+                :max-body-bytes body-limit
+                :close-stream (lambda (actual)
+                                (ensure-true (eq stream actual))
+                                (incf closed)
+                                (close actual))))
+             (request
+               (make-http-request :method "GET" :uri "https://limits.test/"))
+             (result
+               (handler-case
+                   (if batch-p
+                       (first
+                        (http-kit/http2:send-http2-requests-over-connection
+                         connection (list request)
+                         :max-header-bytes 4096
+                         :max-body-bytes 4096))
+                     (http-kit/http2:send-http2-request-over-connection
+                      connection request
+                      :max-header-bytes 4096
+                      :max-body-bytes 4096))
+                 (http-size-limit-exceeded (condition) condition))))
+        (ensure-true (typep result 'http-size-limit-exceeded))
+        (ensure-equal :response-parse (http-error-operation result))
+        (ensure-equal (if (eq kind :headers) :headers :body)
+                      (http-size-limit-exceeded-kind result))
+        (ensure-equal (if (eq kind :headers) header-limit body-limit)
+                      (http-size-limit-exceeded-limit result))
+        (ensure-equal 1 closed)
+        (ensure-false
+         (http-kit/http2:http2-connection-open-p connection))
+        (http-kit/http2:close-http2-connection connection)
+        (ensure-equal 1 closed)))))
+#+sbcl
+(deftest http2-scheduler-frame-dispatch-error-fails-all-active-requests
+  (let* ((input
+           (concatenate-octets
+            (h2-frame 4 0 0 (octets))
+            (h2-frame 1 4 1 (h2-header-block (cons ":status" "200")))
+            (h2-frame 1 4 3 (h2-header-block (cons ":status" "200")))
+            (h2-frame 0 1 1 (octets 1 2))))
+         (stream (make-instance 'binary-session-stream :input input))
+         (closed 0)
+         (connection
+           (http-kit/http2:make-http2-connection
+            :stream stream
+            :max-body-bytes 1
+            :close-stream (lambda (actual)
+                            (ensure-true (eq stream actual))
+                            (incf closed)
+                            (close actual))))
+         (first-opened (sb-thread:make-semaphore :count 0))
+         (second-opened (sb-thread:make-semaphore :count 0))
+         (release-first (sb-thread:make-semaphore :count 0))
+         (first-error nil)
+         (second-error nil)
+         (first-thread nil)
+         (second-thread nil))
+    (labels ((send-first ()
+               (handler-case
+                   (http-kit/http2:send-http2-request-over-connection
+                    connection
+                    (make-http-request :method "GET" :uri "https://errors.test/first")
+                    :on-stream-open
+                    (lambda (stream-id cancel)
+                      (declare (ignore cancel))
+                      (ensure-equal 1 stream-id)
+                      (sb-thread:signal-semaphore first-opened)
+                      (sb-thread:wait-on-semaphore release-first :timeout 5)))
+                 (error (condition)
+                   (setf first-error condition))))
+             (send-second ()
+               (handler-case
+                   (http-kit/http2:send-http2-request-over-connection
+                    connection
+                    (make-http-request :method "GET" :uri "https://errors.test/second")
+                    :on-stream-open
+                    (lambda (stream-id cancel)
+                      (declare (ignore cancel))
+                      (ensure-equal 3 stream-id)
+                      (sb-thread:signal-semaphore second-opened)))
+                 (error (condition)
+                   (setf second-error condition)))))
+      (unwind-protect
+           (progn
+             (setf first-thread (sb-thread:make-thread #'send-first))
+             (ensure-true
+              (sb-thread:wait-on-semaphore first-opened :timeout 5))
+             (setf second-thread (sb-thread:make-thread #'send-second))
+             (ensure-true
+              (sb-thread:wait-on-semaphore second-opened :timeout 5))
+             (sb-thread:signal-semaphore release-first)
+             (sb-thread:join-thread first-thread)
+             (setf first-thread nil)
+             (sb-thread:join-thread second-thread)
+             (setf second-thread nil)
+             (ensure-true (typep first-error 'http-size-limit-exceeded))
+             (ensure-true (typep second-error 'http-size-limit-exceeded))
+             (ensure-false
+              (http-kit/http2:http2-connection-open-p connection))
+             (ensure-equal 1 closed))
+        (sb-thread:signal-semaphore second-opened)
+        (sb-thread:signal-semaphore release-first)
+        (when first-thread
+          (ignore-errors (sb-thread:join-thread first-thread)))
+        (when second-thread
+          (ignore-errors (sb-thread:join-thread second-thread)))
+        (http-kit/http2:close-http2-connection connection)
+        (ensure-equal 1 closed)))))
 
 #+sbcl
 (deftest http2-public-padded-streaming-trailers-cleanup

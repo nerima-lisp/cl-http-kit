@@ -1944,3 +1944,106 @@
       (when entry
         (http-kit/http2::%h2-manager-finish-entry manager entry))
       (http-kit/http2:close-http2-connection-manager manager))))
+#+sbcl
+(deftest http2-connection-manager-multiplexes-concurrent-high-level-client-requests
+  (let* ((body-entered (sb-thread:make-semaphore :count 0))
+         (release-first (sb-thread:make-semaphore :count 0))
+         (first-done (sb-thread:make-semaphore :count 0))
+         (input-wire
+           (concatenate-octets
+            (h2-frame 4 0 0 (octets))
+            (h2-frame 1 4 1 (h2-header-block (cons ":status" "200")))
+            (h2-frame 0 1 1 (octets 1))
+            (h2-frame 1 4 3 (h2-header-block (cons ":status" "201")))
+            (h2-frame 0 1 3 (octets 2))))
+         (opened 0)
+         (closed 0)
+         (streams nil)
+         (manager
+           (http-kit/http2:make-http2-connection-manager
+            :open-connection
+            (lambda (request &key timeout deadline proxy-plan proxy)
+              (declare (ignore timeout deadline proxy-plan proxy))
+              (let* ((stream
+                       (make-instance
+                        'binary-session-stream
+                        :input (if (zerop opened)
+                                   input-wire
+                                   (h2-response-wire (octets 9)))))
+                     (connection
+                       (http-kit/http2:make-http2-connection
+                        :stream stream
+                        :close-stream
+                        (lambda (closed-stream)
+                          (ensure-true (eq stream closed-stream))
+                          (incf closed)))))
+                (ensure-equal "GET" (http-request-method request))
+                (incf opened)
+                (push stream streams)
+                connection))))
+         (manager-transport
+           (http-kit/http2:make-http2-connection-manager-transport manager))
+         (client
+           (http-kit/client:make-http-client
+            :transport-function
+            (lambda (request &rest arguments)
+              (apply manager-transport request
+                     :connection-key "multiplex.test" arguments))
+            :cache nil
+            :default-timeout 5))
+         (first-response nil)
+         (second-response nil)
+         (first-error nil)
+         (first-thread nil))
+    (unwind-protect
+         (progn
+           (setf first-thread
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (unwind-protect
+                         (handler-case
+                             (setf first-response
+                                   (sb-ext:with-timeout 15
+                                     (http-kit/client:http-client-send
+                                      client "GET"
+                                      "http://multiplex.test/first"
+                                      :on-body-chunk
+                                      (lambda (chunk)
+                                        (ensure-equal (octets 1) chunk)
+                                        (sb-thread:signal-semaphore body-entered)
+                                        (unless (sb-thread:wait-on-semaphore
+                                                 release-first :timeout 10)
+                                          (error "Timed out waiting to release the first response callback"))))))
+                           (error (condition)
+                             (setf first-error condition)))
+                      (sb-thread:signal-semaphore first-done)))))
+           (ensure-true
+            (sb-thread:wait-on-semaphore body-entered :timeout 5))
+           (setf second-response
+                 (sb-ext:with-timeout 10
+                   (http-kit/client:http-client-send
+                    client "GET" "http://multiplex.test/second")))
+           (ensure-equal 201 (http-response-status second-response))
+           (ensure-equal (octets 2) (http-response-body second-response))
+           (sb-thread:signal-semaphore release-first)
+           (ensure-true
+            (sb-thread:wait-on-semaphore first-done :timeout 5))
+           (sb-thread:join-thread first-thread)
+           (setf first-thread nil)
+           (ensure-true (null first-error))
+           (ensure-equal 200 (http-response-status first-response))
+           (ensure-equal (octets 1) (http-response-body first-response))
+           (ensure-equal 1 opened)
+           (ensure-equal
+            1
+            (http-kit/http2:http2-connection-manager-connection-count manager))
+           (ensure-equal
+            '(1 3)
+            (loop for frame in (h2-output-frames (first streams))
+                  when (= 1 (http-kit/http2::%h2-frame-type frame))
+                    collect (http-kit/http2::%h2-frame-stream-id frame))))
+      (sb-thread:signal-semaphore release-first)
+      (when first-thread
+        (sb-thread:join-thread first-thread))
+      (http-kit/http2:close-http2-connection-manager manager))
+    (ensure-equal 1 closed)))

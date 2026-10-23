@@ -292,7 +292,6 @@
                     (http-response-body response))
       (ensure-equal
        (list (h2-frame 4 1 0 (octets)) (h2-frame 6 1 0 payload)
-             (h2-frame 8 0 1 (octets 0 0 0 4))
              (h2-frame 8 0 0 (octets 0 0 0 4)))
        (reverse writes)))))
 
