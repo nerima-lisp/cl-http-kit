@@ -55,7 +55,7 @@
              (sb-thread:make-thread
               (lambda ()
                 (handler-case
-                    (loop repeat 11
+                    (loop repeat 10
                           for request = (%https-e2e-read-headers output)
                           for request-text = (octets-as-string request)
                           for path = (second (uiop:split-string
