@@ -361,6 +361,7 @@
               pkgs.perl
               pkgs.nghttp2
               pkgs.openssl
+              pkgs.curl
               pkgs.caddy
               (quicPeer pkgs)
             ]
