@@ -381,6 +381,7 @@
                (multiple-value-bind (output errors status)
                    (uiop:run-program
                     (list "curl" "--insecure" "--show-error" "--verbose"
+                          "--trace" "/dev/stderr"
                           "--fail" "--max-time" "10" "--noproxy" "*"
                           "--resolve"
                           (format nil "localhost:~D:127.0.0.1" port)
@@ -394,6 +395,7 @@
                  (unless (zerop status)
                    (let ((state-before-cleanup
                            (http-kit::http-server-state server))
+                         (failure-time (get-universal-time))
                          (events-before-cleanup nil)
                          (listener-errors-before-cleanup nil))
                      (sb-thread:with-mutex (observation-lock)
@@ -414,11 +416,25 @@
                                         server))))
                                    nil)
                                (error (condition) condition))))
-                       (error
-                        "curl ~A request failed (~D): ~A~%listener state before cleanup: ~S~%listener events before cleanup: ~S~%listener errors before cleanup: ~S~%listener state after cleanup: ~S~%listener wait error: ~S"
-                        protocol status errors state-before-cleanup
-                        events-before-cleanup listener-errors-before-cleanup
-                        (http-kit::http-server-state server) wait-error))))
+                       (multiple-value-bind (curl-version-output
+                                             curl-version-errors
+                                             curl-version-status)
+                           (uiop:run-program
+                            (list "curl" "--version")
+                            :output :string
+                            :error-output :string
+                            :ignore-error-status t)
+                         (error
+                          "curl ~A request failed (~D): ~A~%curl version (~D): stdout=~S stderr=~S~%failure time (UTC universal seconds): ~D~%listener config: handshake-timeout=~D max-connections=~D max-handshakes=~D~%listener state before cleanup: ~S~%listener events before cleanup: ~S~%listener errors before cleanup: ~S~%listener state after cleanup: ~S~%listener wait error: ~S"
+                          protocol status errors curl-version-status
+                          curl-version-output curl-version-errors
+                          failure-time
+                          (http-kit::http-server-handshake-timeout server)
+                          (http-kit::http-server-max-connections server)
+                          (http-kit::http-server-max-handshakes server)
+                          state-before-cleanup events-before-cleanup
+                          listener-errors-before-cleanup
+                          (http-kit::http-server-state server) wait-error)))))
                  (ensure-equal 0 status)
                  (ensure-true (search "listener-ok" output))
                  (let ((version-start
@@ -434,7 +450,10 @@
              (dolist (protocol '("http/1.1" "h2"))
                (multiple-value-bind (output errors status)
                    (uiop:run-program
-                    (list "openssl" "s_client" "-ign_eof"
+                    (list "openssl" "s_client" "-trace"
+                          "-groups"
+                          "X25519MLKEM768:X25519:secp256r1:X448:secp384r1:secp521r1:ffdhe2048:ffdhe3072"
+                          "-ign_eof"
                           "-ignore_unexpected_eof"
                           "-connect" (format nil "127.0.0.1:~D" port)
                           "-servername" "localhost"
@@ -446,6 +465,7 @@
                  (unless (zerop status)
                    (let ((state-before-cleanup
                            (http-kit::http-server-state server))
+                         (failure-time (get-universal-time))
                          (connection-count-before-cleanup
                            (%https-listener-connection-count server))
                          (events-before-cleanup nil)
@@ -455,19 +475,58 @@
                              (reverse (copy-list server-events))
                              listener-errors-before-cleanup
                              (reverse (copy-list server-errors))))
-                     (error
-                      "openssl s_client for ALPN ~A failed (~D): stdout=~S stderr=~S~%listener state before cleanup: ~S~%listener connection count before cleanup: ~D~%listener events before cleanup: ~S~%listener errors before cleanup: ~S"
-                      protocol status output errors state-before-cleanup
-                      connection-count-before-cleanup events-before-cleanup
-                      listener-errors-before-cleanup)))
+                     (multiple-value-bind (version-output version-errors
+                                           version-status)
+                         (uiop:run-program
+                          (list "openssl" "version")
+                          :output :string
+                          :error-output :string
+                          :ignore-error-status t)
+                       (error
+                        "openssl s_client for ALPN ~A failed (~D); OpenSSL version (~D): stdout=~S stderr=~S~%s_client stdout=~S stderr=~S~%failure time (UTC universal seconds): ~D~%listener config: handshake-timeout=~D max-connections=~D max-handshakes=~D~%listener state before cleanup: ~S~%listener connection count before cleanup: ~D~%listener events before cleanup: ~S~%listener errors before cleanup: ~S"
+                        protocol status version-status version-output
+                        version-errors output errors failure-time
+                        (http-kit::http-server-handshake-timeout server)
+                        (http-kit::http-server-max-connections server)
+                        (http-kit::http-server-max-handshakes server)
+                        state-before-cleanup
+                        connection-count-before-cleanup events-before-cleanup
+                        listener-errors-before-cleanup))))
                  (ensure-equal 0 status)
                  (unless
                      (or (search (format nil "ALPN protocol: ~A" protocol)
                                  output)
                          (search (format nil "ALPN protocol: ~A" protocol)
                                  errors))
-                   (error "openssl s_client did not report ALPN ~A: stdout=~S stderr=~S"
-                          protocol output errors))))
+                   (let ((state-before-cleanup
+                           (http-kit::http-server-state server))
+                         (failure-time (get-universal-time))
+                         (connection-count-before-cleanup
+                           (%https-listener-connection-count server))
+                         (events-before-cleanup nil)
+                         (listener-errors-before-cleanup nil))
+                     (sb-thread:with-mutex (observation-lock)
+                       (setf events-before-cleanup
+                             (reverse (copy-list server-events))
+                             listener-errors-before-cleanup
+                             (reverse (copy-list server-errors))))
+                     (multiple-value-bind (version-output version-errors
+                                           version-status)
+                         (uiop:run-program
+                          (list "openssl" "version")
+                          :output :string
+                          :error-output :string
+                          :ignore-error-status t)
+                       (error
+                        "openssl s_client did not report ALPN ~A; OpenSSL version (~D): stdout=~S stderr=~S~%s_client stdout=~S stderr=~S~%failure time (UTC universal seconds): ~D~%listener config: handshake-timeout=~D max-connections=~D max-handshakes=~D~%listener state before cleanup: ~S~%listener connection count before cleanup: ~D~%listener events before cleanup: ~S~%listener errors before cleanup: ~S"
+                        protocol version-status version-output version-errors
+                        output errors failure-time
+                        (http-kit::http-server-handshake-timeout server)
+                        (http-kit::http-server-max-connections server)
+                        (http-kit::http-server-max-handshakes server)
+                        state-before-cleanup
+                        connection-count-before-cleanup events-before-cleanup
+                        listener-errors-before-cleanup))))))
              (ensure-equal :stopped
                            (http-kit::http-server-state
                             (stop-http-server server :graceful-timeout 2))))
