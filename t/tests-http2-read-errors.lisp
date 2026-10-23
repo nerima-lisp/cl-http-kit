@@ -374,7 +374,7 @@
                                 (:body (list (octets 0)))
                                 (t (list (octets 0) (octets 255))))
                            (nreverse chunks))
-             ;; END_STREAM needs only connection credit; a body callback error resets its stream.
+             ;; Earlier DATA gets stream and connection credit; END_STREAM gets connection credit only.
              (let ((frames (h2-output-frames stream)))
                (ensure-equal
                 (case phase
@@ -399,7 +399,7 @@
                 (mapcar #'http-kit/http2::%h2-frame-type frames))
                (ensure-equal '(0 4) (mapcar #'http-kit/http2::%h2-frame-flags (subseq frames 0 2)))
                (when (null phase)
-                 (ensure-equal '(0 0 0)
+                 (ensure-equal '(1 0 0)
                                (mapcar #'http-kit/http2::%h2-frame-stream-id
                                        (nthcdr 4 frames))))
                (when (eq phase :body)
