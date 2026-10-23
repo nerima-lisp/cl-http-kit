@@ -322,6 +322,7 @@
               pkgs.openssl
               (quicPeer pkgs)
             ]
+            ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.iproute2 ]
             ++ sbclDependencies;
             text = ''
               test_cache="$(mktemp -d "''${TMPDIR:-/tmp}/cl-http-kit-test.XXXXXXXX")"
