@@ -10,13 +10,13 @@
     };
 
     cl-hpack-codec-kit = {
-      url = "github:nerima-lisp/cl-hpack-codec-kit/v1.1.1";
+      url = "github:nerima-lisp/cl-hpack-codec-kit/08bc4c9ff1bcedb0624ad65d567a5e2d213b7ab9";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.cl-weave.follows = "cl-weave";
     };
 
     cl-http-message-kit = {
-      url = "github:nerima-lisp/cl-http-message-kit/7a4358170b1e472a0b7862de7921d7ebcb829425";
+      url = "github:nerima-lisp/cl-http-message-kit/874662c25187403604497c26723c309a9005d6d6";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.cl-weave.follows = "cl-weave";
       inputs.cl-hpack-codec-kit.follows = "cl-hpack-codec-kit";

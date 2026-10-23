@@ -137,12 +137,11 @@
   :author "nerima-lisp"
   :license "MIT"
   :version "0.4.1"
-  :depends-on ("cl-http-kit" "cl-http-kit/http2" "cl-quic-kit")
+  :depends-on ("cl-http-kit" "cl-quic-kit")
   :pathname "http3"
   :serial t
   :components ((:file "package")
                (:file "varint")
-               (:file "qpack")
                (:file "frames")
                (:file "transport")
                (:file "quic-adapter")))

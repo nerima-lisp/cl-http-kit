@@ -1,7 +1,9 @@
 (in-package #:http-kit/test)
 
 (deftest http3-quic-adapter-contract-unbounded-handshake-poll-exhaustion
-  (let* ((symbols '(cl-quic-kit:client-start cl-quic-kit:client-poll cl-quic-kit:client-close))
+  (let* ((http-kit/http3::*http3-quic-adapter-handshake-sleep-function*
+           (lambda (seconds) (declare (ignore seconds))))
+         (symbols '(cl-quic-kit:client-start cl-quic-kit:client-poll cl-quic-kit:client-close))
          (originals (mapcar #'symbol-function symbols))
          (now (lambda () 0))
          (local-id (octets 1 2 3 4))
@@ -14,8 +16,8 @@
             :now-fn now
             :io-write (lambda (actual bytes)
                         (push (cons actual (copy-seq bytes)) writes)))))
-    ;; With no peer and no deadline, the real TLS client exhausts the adapter's
-    ;; finite poll budget rather than manufacturing an established connection.
+    ;; With no peer or deadline, the no-op poll keeps the client handshaking until
+    ;; the adapter exhausts its budget; client-start emits the Initial packet below.
     (call-with-http3-quic-lifecycle-spies
      (lambda (calls)
        (handler-case
@@ -43,7 +45,11 @@
          (ensure-true
           (every (lambda (arguments) (eq client (car arguments)))
                  (gethash 'cl-quic-kit:client-poll calls)))
-         (ensure-true (eq client (caar (gethash 'cl-quic-kit:client-close calls)))))))
+         (ensure-true
+          (eq client (caar (gethash 'cl-quic-kit:client-close calls))))))
+     :client-poll
+     (lambda (client &optional at)
+       (declare (ignore client at))))
     (ensure-equal :closing (cl-quic-kit:connection-state connection))
     (ensure-true (consp writes))
     (ensure-true

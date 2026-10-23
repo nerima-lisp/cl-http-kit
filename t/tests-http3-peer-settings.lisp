@@ -22,7 +22,11 @@
          (key (namestring (merge-pathnames "peer.key" directory)))
          (openssl (or (uiop:getenv "OPENSSL") "openssl"))
          (process nil) (adapter nil) (socket nil) (log nil)
-         (port nil) (local-port nil) (condition nil) (elapsed nil))
+         (port nil) (local-port nil) (condition nil) (elapsed nil)
+         (original-poll (symbol-function 'cl-quic-kit:client-poll))
+         (handshake-polls 0) (control-polls 0)
+         (control-poll-delegations 0)
+         (control-sleep-seconds 0))
     (unwind-protect
          (progn
            (ensure-equal
@@ -40,9 +44,19 @@
                          (cl-tls-kit:pem-decode (uiop:read-file-string certificate))
                          :key #'cl-tls-kit:pem-block-label :test #'string=)))
              (ensure-true block)
-             (let ((anchor
+             (let* ((anchor
                      (cl-tls-kit.x509:parse-certificate-der
-                      (cl-tls-kit:pem-block-der block))))
+                      (cl-tls-kit:pem-block-der block)))
+                    (adapter-maker
+                      (lambda ()
+                        (http-kit/http3:make-http3-quic-adapter
+                         :udp-socket socket :server-host "127.0.0.1" :server-port port
+                         :hostname "localhost" :tls-trust-anchors (list anchor)
+                         :tls-verify-signature #'crypto-kit:verify-signature
+                         :tls-signature-algorithms #(1027)
+                         :now-fn (lambda ()
+                                   (/ (get-internal-real-time)
+                                      internal-time-units-per-second))))))
                (setf log (open (merge-pathnames "peer.stderr.log" directory)
                                :direction :output :if-exists :error)
                      process
@@ -63,17 +77,57 @@
                      local-port (cl-quic-kit:udp-socket-local-port socket))
                (ensure-true (< 0 local-port 65536))
                (let ((start (get-internal-real-time)))
+                 (when (member mode
+                               (list "control-none" "control-prefix-no-settings")
+                               :test
+                               (function string=))
+                   (ensure-true
+                    (eq (function sleep)
+                        http-kit/http3::*http3-quic-adapter-peer-control-sleep-function*)))
                  (handler-case
                      ;; Omitted timeout and deadline exercise the public NIL defaults.
                      (setf adapter
-                           (http-kit/http3:make-http3-quic-adapter
-                            :udp-socket socket :server-host "127.0.0.1" :server-port port
-                            :hostname "localhost" :tls-trust-anchors (list anchor)
-                            :tls-verify-signature #'crypto-kit:verify-signature
-                            :tls-signature-algorithms #(1027)
-                            :now-fn (lambda ()
-                                      (/ (get-internal-real-time)
-                                         internal-time-units-per-second))))
+                           (if (member mode
+                                       (list "control-none" "control-prefix-no-settings")
+                                       :test
+                                       (function string=))
+                               (let* ((sleep-function
+                                       (lambda (duration)
+                                         (incf control-sleep-seconds (rationalize duration))))
+                                      (http-kit/http3::*http3-quic-adapter-peer-control-sleep-function*
+                                       sleep-function))
+                                 (call-with-http3-quic-lifecycle-spies
+                                  (lambda (calls)
+                                    (declare (ignore calls))
+                                    (funcall adapter-maker))
+                                  :client-poll
+                                  (lambda (client &rest arguments)
+                                    (cond
+                                      ((not
+                                        (eq :established
+                                            (cl-quic-kit:connection-state
+                                             (cl-quic-kit:quic-client-connection client))))
+                                        (incf handshake-polls)
+                                        (apply original-poll client arguments))
+                                      ((string= mode "control-none")
+                                       (incf control-polls)
+                                       (multiple-value-prog1
+                                           (apply original-poll client arguments)
+                                         (incf control-poll-delegations)))
+                                      ((and (string= mode "control-prefix-no-settings")
+                                            (let ((control-stream
+                                                   (gethash 3 (cl-quic-kit::quic-client-streams client))))
+                                              (and control-stream
+                                                   (or (plusp (cl-quic-kit:stream-readable-bytes control-stream))
+                                                       (>= (cl-quic-kit:stream-read-offset control-stream) 1)))))
+                                       (incf control-polls)
+                                       (multiple-value-prog1
+                                           (apply original-poll client arguments)
+                                         (incf control-poll-delegations)))
+                                      (t
+                                        (incf handshake-polls)
+                                        (apply original-poll client arguments))))))
+                               (funcall adapter-maker)))
                    (http-protocol-error (error) (setf condition error)))
                  (setf elapsed (/ (- (get-internal-real-time) start)
                                   internal-time-units-per-second)))
@@ -86,7 +140,21 @@
                      (ensure-equal message (http-error-message condition))
                      (ensure-equal :http3-quic-adapter (http-error-operation condition))
                      (ensure-equal :established (http-protocol-error-detail condition))
-                     (ensure-true (>= elapsed 15)))
+                     (when (string= mode "control-none")
+                       (ensure-true (plusp handshake-polls)))
+                     (when (member mode
+                                   (list "control-none" "control-prefix-no-settings")
+                                   :test
+                                   (function string=))
+                       (ensure-true (plusp control-polls))
+                       (ensure-equal control-polls control-poll-delegations))
+                     (ensure-true
+                      (if (member mode
+                                  (list "control-none" "control-prefix-no-settings")
+                                  :test
+                                  (function string=))
+                          (>= control-sleep-seconds 15)
+                          (>= elapsed 15))))
                    (progn
                      (ensure-false condition)
                      (ensure-true (http-kit/http3:http3-quic-adapter-p adapter))
@@ -187,12 +255,12 @@
 
 #+sbcl
 (deftest http3-peer-settings-control-none-default-deadline
-  (cl-weave:expect-assertions 24)
+  (cl-weave:expect-assertions 28)
   (call-with-http3-settings-peer
    "control-none" "The peer HTTP/3 control stream did not become readable."))
 
 #+sbcl
 (deftest http3-peer-settings-control-prefix-only-default-deadline
-  (cl-weave:expect-assertions 24)
+  (cl-weave:expect-assertions 27)
   (call-with-http3-settings-peer
    "control-prefix-no-settings" "The peer HTTP/3 SETTINGS did not arrive."))

@@ -5,6 +5,9 @@
                 #:http-protocol-error
                 #:http-size-limit-exceeded
                 #:http-unsupported-feature)
+  (:import-from #:http-message-kit
+                #:qpack-encode-stream-cancellation
+                #:qpack-encode-insert-count-increment)
   (:export
    #:+http3-default-qpack-max-instruction-bytes+
    #:+http3-default-qpack-max-buffer-bytes+
@@ -59,57 +62,8 @@
    #:http3-control-stream-prefix
    #:http3-qpack-encoder-stream-prefix
    #:http3-qpack-decoder-stream-prefix
-   #:qpack-dynamic-entry
-   #:qpack-dynamic-entry-p
-   #:qpack-dynamic-entry-absolute-index
-   #:qpack-dynamic-entry-name
-   #:qpack-dynamic-entry-value
-   #:qpack-dynamic-entry-size
-   #:qpack-dynamic-table
-   #:qpack-dynamic-table-p
-   #:make-qpack-dynamic-table
-   #:qpack-dynamic-table-max-capacity
-   #:qpack-dynamic-table-capacity
-   #:qpack-dynamic-table-entries
-   #:qpack-dynamic-table-size
-   #:qpack-dynamic-table-insert-count
-   #:qpack-dynamic-table-set-capacity
-   #:qpack-dynamic-table-insert
-   #:qpack-blocked-field-section
-   #:qpack-blocked-field-section-required-insert-count
-   #:qpack-blocked-field-section-current-insert-count
-   #:http3-qpack-decoder-context
-   #:http3-qpack-decoder-context-p
-   #:make-http3-qpack-decoder-context
-   #:http3-qpack-decoder-context-dynamic-table
-   #:http3-qpack-decoder-context-blocked-stream-limit
-   #:http3-qpack-blocked-stream
-   #:http3-qpack-blocked-stream-p
-   #:http3-qpack-blocked-stream-stream-id
-   #:http3-qpack-blocked-stream-required-insert-count
-   #:decode-http3-qpack-field-section
-   #:resume-http3-qpack-blocked-stream
-   #:qpack-decoder-stream-state
-   #:qpack-decoder-stream-state-p
-   #:make-qpack-decoder-stream-state
-   #:qpack-decoder-stream-state-dynamic-table
-   #:qpack-decoder-stream-state-sent-insert-count
-   #:qpack-decoder-stream-state-known-received-count
-   #:qpack-decoder-stream-state-blocked-stream-limit
-   #:qpack-decoder-stream-state-outstanding-sections
-   #:qpack-decoder-stream-state-note-insertions-sent
-   #:qpack-decoder-stream-state-register-section
-   #:qpack-encode-set-dynamic-table-capacity
-   #:qpack-encode-insert-with-name-reference
-   #:qpack-encode-insert-with-literal-name
-   #:qpack-encode-duplicate
-   #:qpack-encode-section-acknowledgment
    #:qpack-encode-stream-cancellation
    #:qpack-encode-insert-count-increment
-   #:qpack-encode-field-section
-   #:qpack-decode-field-section
-   #:qpack-process-encoder-stream
-   #:qpack-process-decoder-stream
    #:http3-client
    #:http3-client-p
    #:make-http3-client
@@ -145,10 +99,6 @@
    #:http3-client-peer-control-fin-p
    #:http3-client-peer-qpack-encoder-stream
    #:http3-client-peer-qpack-decoder-stream
-   #:http3-client-qpack-encoder-table
-   #:http3-client-qpack-decoder-table
-   #:http3-client-qpack-decoder-context
-   #:http3-client-qpack-decoder-state
    #:http3-client-max-frame-size
    #:http3-client-max-header-bytes
    #:http3-client-max-fields
