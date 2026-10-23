@@ -138,7 +138,7 @@
           (setf (getf ticket :stage) tampered)
           (check (handler-case
                      (progn (http-coverage-child-merge:merge-pending) nil)
-                   (error (condition)
+                   (simple-error (condition)
                           (not (null (search "accepted payload digest changed"
                                              (princ-to-string condition))))))
                  :coherent-tampering-rejected-by-byte-seal)
@@ -287,7 +287,7 @@
                       :structural-invalid-payload-resealed)
                (check (handler-case
                           (progn (http-coverage-child-merge:merge-pending) nil)
-                        (error (condition)
+                        (simple-error (condition)
                           (not (null (search "native source/path/location/CODE-MAP mismatch"
                                              (princ-to-string condition))))))
                       :resealed-structural-invalid-payload-rejected)
@@ -322,9 +322,7 @@
     (check (and (equal payload-seal
                        (mapcar (lambda (ticket) (getf ticket :digest)) tickets))
                 (every (lambda (ticket)
-                         (handler-case
-                             (progn (http-coverage-child-merge::accepted-payload ticket) t)
-                           (error () nil)))
+                         (http-coverage-child-merge::accepted-payload ticket))
                        tickets))
            :original-child-payloads-unchanged)
     (let ((after (sb-cover:save-coverage)) (delta 0) (client-delta 0)
