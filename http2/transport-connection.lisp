@@ -1464,10 +1464,19 @@ CONTINUATION frames must still be consumed contiguously from that queue."
          (%h2-connection-note-settings connection frame writer))
         ((= type +http2-ping-type+)
          (unless (and (zerop stream-id) (= (length payload) 8))
-           (error 'http-kit:http-protocol-error
-                  :message "An HTTP/2 PING must be an eight-byte stream-zero frame."
-                  :operation :http2-control
-                  :detail (list stream-id (length payload))))
+           (if (some (lambda (waiter)
+                       (and (not (%h2-scheduler-ping-waiter-acknowledged-p
+                                  waiter))
+                            (not (%h2-scheduler-ping-waiter-failure waiter))))
+                     (%http2-connection-scheduler-ping-waiters connection))
+               (error 'http-kit:http-protocol-error
+                      :message "An HTTP/2 PING frame is invalid."
+                      :operation :http2-client
+                      :detail frame)
+               (error 'http-kit:http-protocol-error
+                      :message "An HTTP/2 PING must be an eight-byte stream-zero frame."
+                      :operation :http2-control
+                      :detail (list stream-id (length payload)))))
          (if (/= 0 (logand (%h2-frame-flags frame) +http2-ack-flag+))
              (let ((waiter
                      (find-if
