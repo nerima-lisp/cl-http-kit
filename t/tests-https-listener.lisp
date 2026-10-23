@@ -341,7 +341,9 @@
 
   (deftest https-listener-interoperates-with-curl-and-openssl
     (let* ((material (%tls-server-test-material))
-           (error-lock (sb-thread:make-mutex :name "HTTPS listener errors"))
+           (observation-lock
+             (sb-thread:make-mutex :name "HTTPS listener observations"))
+           (server-events nil)
            (server-errors nil)
            (server
              (make-http-server
@@ -357,9 +359,13 @@
               :request-timeout 5
               :idle-timeout 5
               :graceful-timeout 2
+              :on-event
+              (lambda (event)
+                (sb-thread:with-mutex (observation-lock)
+                  (push (copy-list event) server-events)))
               :on-error
               (lambda (condition context)
-                (sb-thread:with-mutex (error-lock)
+                (sb-thread:with-mutex (observation-lock)
                   (push (list (http-server-error-reason-code condition)
                               (http-server-error-phase condition)
                               context)
@@ -386,10 +392,31 @@
                     :error-output :string
                     :ignore-error-status t)
                  (unless (zerop status)
-                   (error "curl ~A request failed (~D): ~A~%listener errors: ~S"
-                          protocol status errors
-                          (sb-thread:with-mutex (error-lock)
-                            (reverse server-errors))))
+                   (unless (eq :stopped
+                               (http-kit::http-server-state server))
+                     (stop-http-server
+                      server :graceful-timeout 2))
+                   (let ((wait-error
+                           (handler-case
+                               (progn
+                                 (%https-listener-wait
+                                  (lambda ()
+                                    (zerop
+                                     (%https-listener-connection-count
+                                      server))))
+                                 nil)
+                             (error (condition) condition)))
+                         (events nil)
+                         (listener-errors nil)
+                         (state (http-kit::http-server-state server)))
+                     (sb-thread:with-mutex (observation-lock)
+                       (setf events (reverse (copy-list server-events))
+                             listener-errors
+                             (reverse (copy-list server-errors))))
+                     (error
+                      "curl ~A request failed (~D): ~A~%listener events: ~S~%listener errors: ~S~%listener state: ~S~%listener wait error: ~S"
+                      protocol status errors events listener-errors state
+                      wait-error)))
                  (ensure-equal 0 status)
                  (ensure-true (search "listener-ok" output))
                  (let ((version-start
