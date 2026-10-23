@@ -442,6 +442,10 @@
                     :output :string
                     :error-output :string
                     :ignore-error-status t)
+                 (unless (zerop status)
+                   (error
+                    "openssl s_client for ALPN ~A failed (~D): stdout=~S stderr=~S"
+                    protocol status output errors))
                  (ensure-equal 0 status)
                  (unless
                      (or (search (format nil "ALPN protocol: ~A" protocol)
