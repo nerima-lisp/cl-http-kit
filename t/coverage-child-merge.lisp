@@ -56,8 +56,14 @@
 
 (let ((identity (http-coverage-child-merge::runtime-identity)))
   (let ((*features* (cons :coverage-child-feature-drift *features*)))
+    (check (equal identity (http-coverage-child-merge::runtime-identity))
+           :dynamic-library-feature-ignored))
+  (let ((*features* (remove :sbcl *features*)))
     (check (not (equal identity (http-coverage-child-merge::runtime-identity)))
            :actual-runtime-feature-drift-observed))
+  (let ((*features* (cons (make-symbol "PACKAGE-LOCAL-FEATURE") *features*)))
+    (check (equal identity (http-coverage-child-merge::runtime-identity))
+           :non-keyword-feature-ignored))
   (check (equal identity (http-coverage-child-merge::runtime-identity))
          :actual-runtime-features-restored))
 
@@ -255,17 +261,29 @@
     (dolist (kind '(:source :fasl :archive :load-count :path :marker :location :compiler
                     :runtime :core :features :policy :missing-file :missing-marks))
       (reject-control (first tickets) kind))
-    (let ((*features* (cons :coverage-child-feature-drift *features*))
-          (unchanged (sb-cover:save-coverage)))
-      (let ((ticket (first tickets)))
-        (check (handler-case
-                   (progn (http-coverage-child-merge::canonical-input
-                           (http-coverage-child-merge::accepted-payload ticket)
-                           (getf ticket :request) *roots*) nil)
-                 (simple-error (condition)
-                   (search "Child coverage: payload identity"
-                           (princ-to-string condition)))) :actual-feature-drift-rejected))
-      (check (raw-equal unchanged (sb-cover:save-coverage)) :feature-drift-no-native-write))
+    (progn
+      (let ((*features* (cons :coverage-child-feature-drift *features*))
+            (unchanged (sb-cover:save-coverage)))
+        (let* ((ticket (first tickets))
+               (accepted (http-coverage-child-merge::canonical-input
+                          (http-coverage-child-merge::accepted-payload ticket)
+                          (getf ticket :request) *roots*)))
+          (check accepted :volatile-feature-drift-ignored))
+        (check (raw-equal unchanged (sb-cover:save-coverage))
+               :dynamic-feature-no-native-write))
+      (let ((*features* (remove :sbcl *features*))
+            (unchanged (sb-cover:save-coverage)))
+        (let ((ticket (first tickets)))
+          (check (handler-case
+                     (progn (http-coverage-child-merge::canonical-input
+                             (http-coverage-child-merge::accepted-payload ticket)
+                             (getf ticket :request) *roots*) nil)
+                   (simple-error (condition)
+                     (search "Child coverage: payload identity"
+                             (princ-to-string condition))))
+                 :actual-feature-drift-rejected))
+        (check (raw-equal unchanged (sb-cover:save-coverage))
+               :actual-feature-no-native-write)))
     (progn
       (reject-coherent-tampering (first tickets) collector)
       (let* ((ticket (second tickets))
