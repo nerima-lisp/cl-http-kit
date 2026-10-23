@@ -443,9 +443,22 @@
                     :error-output :string
                     :ignore-error-status t)
                  (unless (zerop status)
-                   (error
-                    "openssl s_client for ALPN ~A failed (~D): stdout=~S stderr=~S"
-                    protocol status output errors))
+                   (let ((state-before-cleanup
+                           (http-kit::http-server-state server))
+                         (connection-count-before-cleanup
+                           (%https-listener-connection-count server))
+                         (events-before-cleanup nil)
+                         (listener-errors-before-cleanup nil))
+                     (sb-thread:with-mutex (observation-lock)
+                       (setf events-before-cleanup
+                             (reverse (copy-list server-events))
+                             listener-errors-before-cleanup
+                             (reverse (copy-list server-errors))))
+                     (error
+                      "openssl s_client for ALPN ~A failed (~D): stdout=~S stderr=~S~%listener state before cleanup: ~S~%listener connection count before cleanup: ~D~%listener events before cleanup: ~S~%listener errors before cleanup: ~S"
+                      protocol status output errors state-before-cleanup
+                      connection-count-before-cleanup events-before-cleanup
+                      listener-errors-before-cleanup)))
                  (ensure-equal 0 status)
                  (unless
                      (or (search (format nil "ALPN protocol: ~A" protocol)
