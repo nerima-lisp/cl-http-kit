@@ -2599,5 +2599,81 @@
               (http-kit/http2::%h2-u32
                (http-kit/http2::%h2-frame-payload reset-frame) 0))))
       (http-kit/http2:close-http2-connection connection))))
+#+sbcl
+(deftest http2-coverage-request-body-inactive-scheduler-entry
+  (let* ((stream
+           (make-instance 'binary-session-stream :input (octets)))
+         (connection
+           (http-kit/http2:make-http2-connection :stream stream))
+         (entry
+           (http-kit/http2::%make-h2-batch-entry
+            :request
+            (make-http-request :method "POST"
+                               :uri "https://example.com/inactive")
+            :stream-id 1))
+         (writes nil)
+         (condition nil))
+    (ensure-false
+     (member entry
+             (http-kit/http2::%http2-connection-scheduler-entries connection)
+             :test #'eq))
+    (unwind-protect
+         (progn
+           (handler-case
+               (http-kit/http2::%h2-connection-send-request-body
+                connection nil
+                (lambda (wire) (push (copy-seq wire) writes))
+                1 (octets 97) nil nil nil 16384 nil nil
+                (lambda () 0) nil nil
+                :scheduler-p t :scheduler-entry entry)
+             (http-connection-error (observed)
+               (setf condition observed)))
+           (ensure-true (typep condition 'http-connection-error))
+           (ensure-equal :http2-write (http-error-operation condition))
+           (ensure-equal '(:stream-inactive 1)
+                         (http-connection-error-cause condition))
+           (ensure-false writes)
+           (ensure-false
+            (member entry
+                    (http-kit/http2::%http2-connection-scheduler-entries
+                     connection)
+                    :test #'eq)))
+      (http-kit/http2:close-http2-connection connection))))
+#+sbcl
+(deftest http2-coverage-request-body-unscheduled-trailer-headers
+  (let* ((stream
+           (make-instance 'binary-session-stream :input (octets)))
+         (connection
+           (http-kit/http2:make-http2-connection :stream stream))
+         (trailers '(("x-upload-result" . "complete")))
+         (writes nil))
+    (unwind-protect
+         (progn
+           (multiple-value-bind (pending-frames read-initial-settings-p)
+               (http-kit/http2::%h2-connection-send-request-body
+                connection nil
+                (lambda (wire) (push (copy-seq wire) writes))
+                1 (octets) nil nil nil 16384 trailers nil
+                (lambda () 0) nil nil
+                :scheduler-p nil)
+             (ensure-false pending-frames)
+             (ensure-false read-initial-settings-p))
+           (ensure-equal 1 (length writes))
+           (let* ((reader (h2-reader-from-frames (first writes)))
+                  (frame
+                    (http-kit/http2::%h2-read-frame reader 16384 nil nil)))
+             (ensure-false (eq frame :eof))
+             (ensure-equal http-kit/http2::+http2-headers-type+
+                           (http-kit/http2::%h2-frame-type frame))
+             (ensure-equal 5 (http-kit/http2::%h2-frame-flags frame))
+             (ensure-equal 1 (http-kit/http2::%h2-frame-stream-id frame))
+             (ensure-equal trailers
+                           (h2-decode-header-block
+                            (http-kit/http2::%h2-frame-payload frame)
+                            (h2-hpack-context)))
+             (ensure-equal :eof
+                           (http-kit/http2::%h2-read-frame
+                            reader 16384 nil nil))))
+      (http-kit/http2:close-http2-connection connection))))
 
 
