@@ -4,6 +4,15 @@ Unreleased entries describe pending changes. Versioned sections record
 historical release behavior, not the current API contract; see the
 [API reference](../reference/api.md) for that contract.
 
+## Unreleased
+
+### Breaking changes
+
+- Remove the `http-kit/websocket` package and SSE exports from
+  `http-kit/client`. Move WebSocket consumers to `websocket-kit` from
+  `cl-websocket-kit` and SSE consumers to `sse-kit` from `cl-sse-kit`.
+  See the [WebSocket and SSE migration guide](migration.md#websocket-and-sse-api-migration).
+
 ## 0.4.1
 
 - require certificate-chain, hostname, and trust verification by default on
@@ -87,8 +96,3 @@ The 0.4.0 runtime verification was limited to Ubuntu x86_64. Its HTTP/3
 connection path was verified through the cl-quic-kit adapter; native QUIC
 sockets and server acceptance were outside that release boundary.
 
-## Earlier 0.3.x source
-
-The 0.3.x source provided callback and stream APIs for HTTP/1.1, injected
-HTTP/2, injected HTTP/3 framing, client policy helpers, native TCP/DNS, and
-the cl-tls-kit TLS 1.3 client wrapper.

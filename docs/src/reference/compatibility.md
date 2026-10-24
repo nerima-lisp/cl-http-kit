@@ -2,7 +2,7 @@
 
 cl-http-kit focuses on reusable HTTP/1.x client and server framing with
 optional HTTP/2 connection/session support, HTTP/3 request-stream framing,
-WebSocket sessions, and native TCP/DNS integration. This page describes the
+and native TCP/DNS integration. This page describes the
 behavior implemented by the registered systems; it is not a claim of complete
 RFC coverage.
 
@@ -216,36 +216,6 @@ Client transport functions must accept the keywords used by the request.
 The [client API](api.md#make-http-client) distinguishes always-passed keywords
 from optional body-producer and response-callback keywords. Use the provided
 stream or connection-pool constructors to compose those boundaries.
-
-## WebSocket
-
-The `http-kit/websocket` package is loaded by `cl-http-kit/client`. It provides
-RFC 6455 frame serialization and parsing, masking and payload-size validation,
-fragmented-message assembly, close-code and UTF-8 reason handling, the
-`Sec-WebSocket-Accept` handshake calculation, and validated HTTP/1.1 upgrade
-request/response helpers. `make-websocket-upgrade-request` and
-`websocket-client-handshake` also cover the client-side HTTP 101 exchange on
-an already-open stream and leave that stream available for frame I/O. The
-frame API exposes masking explicitly: callers
-must supply masking keys or a per-frame key function when producing masked
-frames. It does not open sockets, perform TLS or ALPN, or negotiate
-extensions. Extension fields use strict RFC 6455 token and quoted-string
-parsing, and RFC 7692 `permessage-deflate` offer/response parameters are
-validated. The client handshake returns normalized negotiated extensions as
-its third value. Message reads and writes accept application-provided raw
-DEFLATE codec functions; only this explicit opt-in permits RSV1, and expanded
-messages remain subject to the configured size limit. The codec owns context
-takeover, window settings, and the RFC 7692 DEFLATE tail transformation.
-`make-websocket-client-key` validates and Base64-encodes 16 octets
-from an application-supplied cryptographically secure random source;
-`make-websocket-upgrade-request` can invoke that source directly. The entropy
-source itself and connection lifecycle remain application-owned.
-
-serve-websocket-session serves an already-upgraded stream: it requires masked
-client frames by default, automatically answers Ping frames, echoes a valid
-peer Close frame, dispatches complete messages to a handler, and closes with
-an appropriate protocol or size code on errors. It does not open sockets,
-perform TLS or ALPN, or choose extension and codec policy.
 
 ## Native network boundary
 

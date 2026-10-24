@@ -1,15 +1,14 @@
 # Migration guide
 
-This guide describes the 0.4.0 integration and the planned 0.5.0 QPACK API
-break from the current 0.4.1 API. It does not announce a 0.5.0 release. See the
-[changelog](changelog.md) for the 0.4.x security and protocol fixes.
+This guide describes the 0.4.0 integration and planned 0.5.0 breaking changes
+to the QPACK, WebSocket, and SSE APIs. It does not announce a 0.5.0 release.
+See the [changelog](changelog.md) for the 0.4.x security and protocol fixes.
 
 ## 0.3.x client boundary carried into 0.4.0
 
 The current high-level client permits `make-http-client` without a supplied
 transport boundary and lazily creates a native TCP/TLS connection pool. Build a
-request with `http-client-request` and execute it with `http-client-send`.
-These compatibility entry points remain supported by 0.4.0, and
+request with `http-client-request` and execute it with `http-client-send`;
 `http-client-send` also accepts a method and URL convenience form.
 
 The current client already provides explicit policy helpers for proxy routing,
@@ -390,6 +389,60 @@ The downstream cl-websocket-kit migration follows its update to cl-http-kit
    inspect or construct the removed table and state objects.
 3. Run the cl-websocket-kit test suite and require its GitHub PR checks to pass
    against the 0.5.0 pin before landing the dependency update.
+
+### WebSocket and SSE API migration
+
+The planned 0.5.0 release removes the `http-kit/websocket` package and the SSE
+exports from `http-kit/client`. Migrate WebSocket code to `websocket-kit` from
+cl-websocket-kit and SSE code to `sse-kit` from cl-sse-kit. The replacement
+names below were verified against those packages' exports.
+
+| Removed symbol | Replacement | Notes |
+| --- | --- | --- |
+| `http-kit/websocket:websocket-frame` | `websocket-kit:websocket-frame` | None |
+| `http-kit/websocket:websocket-frame-p` | `websocket-kit:websocket-frame-p` | None |
+| `http-kit/websocket:websocket-frame-fin-p` | `websocket-kit:websocket-frame-fin-p` | None |
+| `http-kit/websocket:websocket-frame-rsv1-p` | `websocket-kit:websocket-frame-reserved-bits` | Inspect mask `#x40` to test RSV1. |
+| `http-kit/websocket:websocket-frame-opcode` | `websocket-kit:websocket-frame-opcode` | None |
+| `http-kit/websocket:websocket-frame-mask-p` | `websocket-kit:websocket-frame-mask-p` | None |
+| `http-kit/websocket:websocket-frame-masking-key` | `websocket-kit:websocket-frame-masking-key` | None |
+| `http-kit/websocket:websocket-frame-payload` | `websocket-kit:websocket-frame-payload` | None |
+| `http-kit/websocket:make-websocket-frame` | `websocket-kit:make-websocket-frame` | Use `:reserved-bits` in place of `:rsv1-p`; set bit `#x40` for RSV1. |
+| `http-kit/websocket:serialize-websocket-frame` | `websocket-kit:serialize-websocket-frame` | None |
+| `http-kit/websocket:parse-websocket-frame` | `websocket-kit:parse-websocket-frame` | None |
+| `http-kit/websocket:read-websocket-frame` | `websocket-kit:read-websocket-frame` | None |
+| `http-kit/websocket:write-websocket-frame` | `websocket-kit:write-websocket-frame` | None |
+| `http-kit/websocket:read-websocket-message` | `websocket-kit:read-websocket-message` | None |
+| `http-kit/websocket:write-websocket-message` | `websocket-kit:write-websocket-message` | None |
+| `http-kit/websocket:websocket-ping` | `websocket-kit:websocket-ping` | None |
+| `http-kit/websocket:websocket-pong` | `websocket-kit:websocket-pong` | None |
+| `http-kit/websocket:websocket-close` | `websocket-kit:websocket-close` | None |
+| `http-kit/websocket:serve-websocket-session` | `websocket-kit:serve-websocket-session` | None |
+| `http-kit/websocket:make-websocket-client-key` | `websocket-kit:generate-websocket-key` | None |
+| `http-kit/websocket:websocket-accept-key` | `websocket-kit:websocket-accept-key` | None |
+| `http-kit/websocket:websocket-extension` | No direct replacement | The upstream API exports only the permessage-deflate-specific `websocket-permessage-deflate-extension`, not a generic extension structure. |
+| `http-kit/websocket:websocket-extension-p` | No direct replacement | The upstream API exports only the permessage-deflate-specific `websocket-permessage-deflate-extension`, not a generic extension predicate. |
+| `http-kit/websocket:websocket-extension-name` | No direct replacement | The upstream API exports no generic extension accessors; it exposes only the permessage-deflate-specific `websocket-permessage-deflate-extension`. |
+| `http-kit/websocket:websocket-extension-parameters` | No direct replacement | The upstream API exports no generic extension accessors; it exposes only the permessage-deflate-specific `websocket-permessage-deflate-extension`. |
+| `http-kit/websocket:parse-websocket-extensions` | No direct replacement | The upstream API exports no generic extension parser; it exposes only the permessage-deflate-specific `websocket-permessage-deflate-extension`. |
+| `http-kit/websocket:websocket-upgrade-request-p` | `websocket-kit:websocket-upgrade-request-p` | None |
+| `http-kit/websocket:websocket-upgrade-response` | `websocket-kit:websocket-upgrade-response` | None |
+| `http-kit/websocket:make-websocket-upgrade-request` | `websocket-kit:make-websocket-upgrade-request` | None |
+| `http-kit/websocket:websocket-client-handshake` | `websocket-kit:websocket-client-handshake` | None |
+| `http-kit/websocket:websocket-valid-close-code-p` | `websocket-kit:websocket-valid-close-code-p` | None |
+| `http-kit/websocket:make-websocket-close-payload` | `websocket-kit:make-websocket-close-payload` | None |
+| `http-kit/websocket:parse-websocket-close-payload` | `websocket-kit:parse-websocket-close-payload` | None |
+| `http-kit/client:http-sse-event` | `sse-kit:http-sse-event` | None |
+| `http-kit/client:http-sse-event-p` | `sse-kit:http-sse-event-p` | None |
+| `http-kit/client:make-http-sse-event` | `sse-kit:make-http-sse-event` | None |
+| `http-kit/client:http-sse-event-event` | `sse-kit:http-sse-event-event` | None |
+| `http-kit/client:http-sse-event-data` | `sse-kit:http-sse-event-data` | None |
+| `http-kit/client:http-sse-event-id` | `sse-kit:http-sse-event-id` | None |
+| `http-kit/client:http-sse-event-retry` | `sse-kit:http-sse-event-retry` | None |
+| `http-kit/client:http-sse-event-comments` | `sse-kit:http-sse-event-comments` | None |
+| `http-kit/client:parse-http-sse-events` | `sse-kit:parse-http-sse-events` | None |
+| `http-kit/client:read-http-sse-events` | `sse-kit:read-http-sse-events` | None |
+| `http-kit/client:serialize-http-sse-event` | `sse-kit:serialize-http-sse-event` | None |
 
 ## Migration checklist
 

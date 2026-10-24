@@ -16,8 +16,9 @@ The checked-in ASDF systems are version 0.4.1. `make-http-client` creates a
 native TCP/TLS connection pool when no transport boundary is supplied, while
 `http-client-request` and `http-client-send` remain supported request paths.
 `http-client-send` also accepts a method and URL convenience form. See the
-[changelog](docs/src/project/changelog.md) and [migration guide](docs/src/project/migration.md)
-for the 0.4.0 compatibility boundary.
+[changelog](docs/src/project/changelog.md) and
+[migration guide](docs/src/project/migration.md) for the 0.4.0 integration and
+planned API migrations.
 
 The client uses cl-deflate-kit for compression and cl-tls-kit 0.1.2 or later
 for TLS 1.3.
@@ -54,7 +55,7 @@ shell.
 | System | Purpose |
 | --- | --- |
 | cl-http-kit | HTTP message model, HTTP/1.1 wire format, HTTP/1.x server sessions, transport callbacks, deadlines, limits, conditions, and recording sessions |
-| cl-http-kit/client | URI, authentication, cookies, RFC 6797 HSTS, RFC 7838 Alt-Svc discovery, RFC 9111 cache with RFC 5861 `stale-if-error`, proxy, redirect, retry, gzip/deflate response decoding, HTTP/1.1 connection-pool, multipart body, Server-Sent Events, and WebSocket client/server-session policies |
+| cl-http-kit/client | URI, authentication, cookies, RFC 6797 HSTS, RFC 7838 Alt-Svc discovery, RFC 9111 cache with RFC 5861 `stale-if-error`, proxy, redirect, retry, gzip/deflate response decoding, HTTP/1.1 connection-pool, multipart body |
 | cl-http-kit/http2 | HTTP/2 client and injected-stream server-session boundaries |
 | cl-http-kit/http3 | HTTP/3 frames, SETTINGS, QPACK static/literal/Huffman codecs with caller-owned dynamic tables, and injected-QUIC client/request-stream server-session boundaries |
 | cl-http-kit/network | Optional SBCL TCP/DNS stream opener, IPv4/IPv6 listener, and HTTP/1 listener service |
@@ -97,42 +98,7 @@ environment.
 The documentation build is described in
 [Project Development](https://nerima-lisp.github.io/cl-http-kit/project/development/).
 
-## Scope
-
-The library owns HTTP message validation, HTTP/1.1 framing, HTTP/1.x request
-and response sessions, bounded body handling, high-level request policies, and
-small composition boundaries. The optional client system adds cookie-jar
-partitioning and SameSite request context, content-coding adapter selection,
-cache request-directive handling with 304 metadata refresh, and ALPN protocol
-name helpers. The current client integration can supply native dialing, TLS,
-proxy selection, content coding, and a locked pool when its default boundary is
-used. The optional
-`cl-http-kit/http2` system supplies both a client and a
-server session over caller-provided binary I/O. The optional
-`cl-http-kit/http3` system supplies client and per-request server stream
-framing with static/literal/Huffman QPACK and caller-owned dynamic-table
-references over caller-provided QUIC streams. Its optional cl-quic-kit adapter
-can drive the client QUIC connection and stream lifecycle when explicitly
-supplied. QUIC packets, loss recovery, congestion control, TLS 1.3, ALPN,
-sockets, certificate policy, and native HTTP/3 server acceptance remain
-outside the framing boundary. The optional
-`cl-http-kit/network` system supplies native TCP, DNS, and an HTTP/1 listener
-service on SBCL; `cl-http-kit/tls` supplies the client TLS upgrade wrapper.
-Server-side TLS wrapping is unsupported because the current
-cl-tls-kit integration has no server driver. To expose HTTPS for a server,
-terminate TLS in a reverse proxy or load balancer and forward plain HTTP to
-`cl-http-kit/network`; preserve the original host and scheme using the proxy's
-trusted forwarding policy. ALPN selection remains explicit in the current
-client path, and the
-optional client system also supplies
-a thread-safe HTTP/1.1 connection pool and RFC 6455 frame, message,
-close-payload, HTTP upgrade, client-side 101 handshake, and upgraded server
-session helpers. WebSocket extension grammar and RFC 7692 negotiation
-parameters are validated, with application-injected compression codecs for
-negotiated message processing. WebSocket key generation, dialing, TLS/ALPN,
-extension selection, codec state, and masking-key generation remain
-application-owned; the server session handles Ping/Pong and the close
-handshake it owns.
+## HTTP/3 fallback
 
 When a client supplies `:http3-transport-function`, an advertised
 Alt-Svc `h3` alternative is attempted before TCP. TCP fallback requires an
