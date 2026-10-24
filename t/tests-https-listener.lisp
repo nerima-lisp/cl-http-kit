@@ -115,6 +115,69 @@
       (funcall
        (symbol-function '%https-listener-test-restore-stubs)
        originals))))
+#+sbcl
+(deftest https-listener-restarts-without-stale-acceptors
+  (let* ((context (funcall (symbol-function '%make-https-listener-test-context)))
+         (originals
+           (mapcar #'fdefinition
+                   (funcall
+                    (symbol-function '%https-listener-test-symbols))))
+         (server nil))
+    (unwind-protect
+         (progn
+           (funcall
+            (symbol-function '%https-listener-test-install-stubs)
+            context)
+           (setf server
+                 (funcall
+                  (symbol-function '%https-listener-make-server)
+                  :on-event
+                  (lambda (event)
+                    (funcall
+                     (symbol-function '%https-listener-record-event)
+                     context event))))
+           (labels ((event-count (type)
+                      (count type
+                             (funcall
+                              (symbol-function '%https-listener-events)
+                              context)
+                             :key (lambda (event) (getf event :type))
+                             :test #'eq)))
+             (loop for iteration from 1 to 32
+                   do (setf (http-kit::http-server-port server) 0)
+                      (start-http-server server)
+                      (let* ((supervisor
+                               (http-kit::http-server-supervisor server))
+                             (client
+                               (funcall
+                                (symbol-function '%https-listener-connect)
+                                server)))
+                        (close-http-tcp-stream client)
+                        (funcall
+                         (symbol-function '%https-listener-wait)
+                         (lambda ()
+                           (>= (event-count :connection-accepted)
+                               iteration)))
+                        (funcall
+                         (symbol-function '%https-listener-wait)
+                         (lambda ()
+                           (>= (event-count :connection-closed)
+                               iteration)))
+                        (stop-http-server server :graceful-timeout 1)
+                        (ensure-false
+                         (sb-thread:thread-alive-p supervisor))
+                        (ensure-equal
+                         iteration
+                         (event-count :connection-accepted))
+                        (ensure-equal :stopped
+                                      (http-kit::http-server-state server))))))
+      (when (and server
+                 (not (eq :stopped
+                          (http-kit::http-server-state server))))
+        (stop-http-server server :graceful-timeout 1))
+      (funcall
+       (symbol-function '%https-listener-test-restore-stubs)
+       originals))))
 
 #+sbcl
 (progn
