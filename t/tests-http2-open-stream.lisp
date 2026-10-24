@@ -1399,6 +1399,8 @@
                     (h2-frame 1 5 1 (octets #x88))
                     (h2-frame 1 5 3 (octets #x88)))))
          (connection (http-kit/http2:make-http2-connection :stream stream))
+         (scheduler-lock
+           (http-kit/http2::%http2-connection-scheduler-lock connection))
          (goaway-started (sb-thread:make-semaphore :count 0))
          (goaway-completed (sb-thread:make-semaphore :count 0))
          (request-started (sb-thread:make-semaphore :count 0))
@@ -1409,14 +1411,14 @@
          (request-response nil)
          (goaway-started-p nil)
          (request-started-p nil)
-         (goaway-completed-while-locked-p nil))
+         (goaway-waiting-for-lock-p nil)
+         (goaway-completed-after-unlock-p nil))
     (unwind-protect
          (progn
            (http-kit/http2:send-http2-request-over-connection
             connection
             (make-http-request :method "GET" :uri "https://127.0.0.1/first"))
-           (sb-thread:with-mutex
-               ((http-kit/http2::%http2-connection-scheduler-lock connection))
+           (sb-thread:with-mutex (scheduler-lock)
              (setf goaway-thread
                    (sb-thread:make-thread
                     (lambda ()
@@ -1428,8 +1430,17 @@
                       (sb-thread:signal-semaphore goaway-completed))))
              (setf goaway-started-p
                    (sb-thread:wait-on-semaphore goaway-started :timeout 5)
-                   goaway-completed-while-locked-p
-                   (sb-thread:wait-on-semaphore goaway-completed :timeout 0.05)
+                   goaway-waiting-for-lock-p
+                   (loop with deadline =
+                           (+ (get-internal-real-time)
+                              (* 5 internal-time-units-per-second))
+                         for waiting-for =
+                           (sb-thread::thread-waiting-for goaway-thread)
+                         when (eq waiting-for scheduler-lock)
+                           return t
+                         while (< (get-internal-real-time) deadline)
+                         do (sb-thread:thread-yield)
+                         finally (return nil))
                    request-thread
                    (sb-thread:make-thread
                     (lambda ()
@@ -1445,13 +1456,16 @@
                           (setf request-error condition)))))
                    request-started-p
                    (sb-thread:wait-on-semaphore request-started :timeout 5)))
+           (setf goaway-completed-after-unlock-p
+                 (sb-thread:wait-on-semaphore goaway-completed :timeout 5))
            (sb-thread:join-thread goaway-thread)
            (setf goaway-thread nil)
            (sb-thread:join-thread request-thread)
            (setf request-thread nil)
            (ensure-true goaway-started-p)
            (ensure-true request-started-p)
-           (ensure-true (not goaway-completed-while-locked-p))
+           (ensure-true goaway-waiting-for-lock-p)
+           (ensure-true goaway-completed-after-unlock-p)
            (ensure-true (null goaway-error))
            (ensure-true (http-kit/http2:http2-connection-draining-p connection))
            (let* ((frames (h2-output-frames stream))
