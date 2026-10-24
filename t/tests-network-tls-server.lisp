@@ -242,6 +242,16 @@
                      :wire hrr-wire)))
         (ensure-true
          (http-kit/tls::http-tls-server-state-hello-retry-request-sent-p state))
+        (let ((malformed-state
+                (http-kit/tls::%make-http-tls-server-state
+                 :driver nil :provider nil :transport-stream nil)))
+          (signals cl-tls-kit:tls13-decode-error
+            (http-kit/tls::%tls-server-handle-events
+             malformed-state
+             (list (list :type :send
+                         :level :initial
+                         :content-type :handshake
+                         :wire (octets 2 0 0 1))))))
         (setf (fill-pointer (binary-test-output raw)) 0)
         (let ((condition
                 (%tls-server-test-condition
