@@ -50,11 +50,55 @@
     (ensure-true
      (equal (reverse events)
             (list (list :reserve 4) (list :release 4))))))
+(deftest http1-session-rejects-body-over-release
+  (let* ((parse-symbol (find-symbol "PARSE-HTTP-REQUEST" "HTTP-KIT"))
+         (original-parse (symbol-function parse-symbol))
+         (reserve-calls 0)
+         (release-calls 0)
+         (stream (make-string-input-stream "")))
+    (unwind-protect
+         (progn
+           (setf (symbol-function parse-symbol)
+                 (lambda (input &rest arguments &key release-body-bytes
+                          &allow-other-keys)
+                   (declare (ignore input arguments))
+                   (funcall release-body-bytes 1)
+                   nil))
+           (let ((condition
+                   (handler-case
+                       (progn
+                         (serve-http1-session
+                          stream
+                          (lambda (request)
+                            (declare (ignore request))
+                            (make-http-response :status 204))
+                          :reserve-body-bytes
+                          (lambda (amount)
+                            (incf reserve-calls amount))
+                          :release-body-bytes
+                          (lambda (amount)
+                            (incf release-calls amount))
+                          :close-stream nil)
+                         nil)
+                     (http-protocol-error (condition) condition))))
+             (ensure-true
+              (typep condition
+                     (find-symbol "HTTP-PROTOCOL-ERROR" "HTTP-KIT")))
+             (ensure-equal :session (http-error-operation condition))
+             (ensure-equal 1 (http-protocol-error-detail condition))
+             (ensure-equal 0 reserve-calls)
+             (ensure-equal 0 release-calls)))
+      (setf (symbol-function parse-symbol) original-parse)
+      (close stream))))
 
 (deftest core-coverage-http1-session-argument-errors
   (dolist (case '((:stream 7) (:handler 7) (:max-requests -1)
                   (:max-requests "1") (:on-error 7) (:on-upgrade 7)
-                  (:on-expect-continue 7) (:close-stream 7)))
+                  (:on-expect-continue 7) (:close-stream 7)
+                  (:request-timeout -1) (:request-timeout "soon")
+                  (:idle-timeout -1) (:idle-timeout "soon")
+                  (:shutdown-p 7) (:reserve-body-bytes 7)
+                  (:release-body-bytes 7)))
     (destructuring-bind (option value) case
       (let* ((output (make-string-output-stream))
              (stream (make-two-way-stream (make-string-input-stream "") output))
@@ -74,12 +118,41 @@
                        (http-protocol-error (condition) condition))))
                (ensure-true (typep condition 'http-protocol-error))
                (ensure-equal :session (http-error-operation condition))
-               (ensure-equal (if (eq option :max-requests) value (type-of value))
-                             (http-protocol-error-detail condition))
+               (ensure-equal
+                (cond
+                  ((eq option :max-requests) value)
+                  ((member option '(:request-timeout :idle-timeout))
+                   (cons option value))
+                  ((eq option :shutdown-p) (list value nil nil))
+                  ((eq option :reserve-body-bytes) (list nil value nil))
+                  ((eq option :release-body-bytes) (list nil nil value))
+                  (t (type-of value)))
+                (http-protocol-error-detail condition))
                (ensure-equal 0 handler-calls)
                (ensure-true (open-stream-p stream))
                (ensure-equal "" (get-output-stream-string output)))
-          (close stream))))))
+          (close stream)))))
+  (let* ((output (make-string-output-stream))
+         (stream (make-two-way-stream (make-string-input-stream "") output))
+         (condition
+           (handler-case
+               (serve-http1-session
+                stream
+                (lambda (request)
+                  (declare (ignore request))
+                  (make-http-response :status 204))
+                :reserve-body-bytes #'identity
+                :release-body-bytes 7)
+             (http-protocol-error (condition) condition))))
+    (unwind-protect
+         (progn
+           (ensure-true (typep condition 'http-protocol-error))
+           (ensure-equal :session (http-error-operation condition))
+           (ensure-equal (list nil #'identity 7)
+                         (http-protocol-error-detail condition))
+           (ensure-true (open-stream-p stream))
+           (ensure-equal "" (get-output-stream-string output)))
+      (close stream))))
 
 (deftest core-coverage-http1-session-connect-outcomes
   (dolist (stream-response-p '(nil t))
