@@ -3926,7 +3926,7 @@
                    (1 (setf (gethash stream read-stages) 2)
                       (values nil t :fin))
                    (otherwise
-                    (error "The native scheduler read past response FIN."))))))
+                    (error "The native scheduler read past response FIN.")))))))
          (request
           (make-http-request
            :method "POST"
@@ -3979,7 +3979,7 @@
              (length
               (http-kit/http3:http3-frame-payload (third frames))))))
       (when (http-kit/http3:http3-client-open-p client)
-        (http-kit/http3:close-http3-client client))))))
+        (http-kit/http3:close-http3-client client)))))
 (deftest http3-client-native-scheduler-expired-waiter-cancels-after-owner-release
   (let* ((poll-started (sb-thread:make-semaphore :count 0))
          (release-owner (sb-thread:make-semaphore :count 0))
@@ -4037,7 +4037,7 @@
                  (make-http-request
                   :method "GET"
                   :uri "https://example.test/expired")
-                 :deadline 0))))
+                 :deadline (1- (http-kit::%monotonic-time))))))
            (ensure-true
             (sb-thread:wait-on-semaphore waiter-finished :timeout 3))
            (ensure-false
@@ -4054,11 +4054,11 @@
                                 (http-kit:http-request-target
                                  (http-kit/http3::%http3-request-stream-request
                                   entry))))
-                     (http-kit/http3::http3-client-pending-request-streams client))))
+                     (http-kit/http3::http3-client-pending-request-streams client)))))
              (ensure-true waiter-entry)
              (ensure-true
               (http-kit/http3::%http3-request-stream-cancel-requested-p
-               waiter-entry)))
+               waiter-entry))
            (sb-thread:signal-semaphore release-owner)
            (ensure-true
             (sb-thread:wait-on-semaphore owner-finished :timeout 3))
