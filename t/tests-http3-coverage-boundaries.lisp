@@ -3463,18 +3463,22 @@
            (http-kit/http3:make-http3-client
             :open-stream
             (lambda (request &key stream-type timeout deadline)
-              (declare (ignore stream-type timeout deadline))
-              (let* ((path (http-kit:http-request-target request))
+              (declare (ignore timeout deadline))
+              (let* ((path (if request
+                               (http-kit:http-request-target request)
+                               stream-type))
                      (stream (make-http3-test-stream :kind path)))
-                (push stream opened-streams)
-                (if (string= path "/first")
-                    (setf first-stream stream)
-                    (setf second-stream stream))
-                (values stream 0)))
+                (when request
+                  (push stream opened-streams)
+                  (if (string= path "/first")
+                      (setf first-stream stream)
+                      (setf second-stream stream)))
+                (values stream (and request 0))))
             :write-stream
             (lambda (stream bytes &key fin-p timeout deadline)
               (declare (ignore bytes fin-p timeout deadline))
-              (push stream request-writes))
+              (when (stringp (http3-test-stream-kind stream))
+                (push stream request-writes)))
             :read-stream
             (lambda (stream &key timeout deadline)
               (declare (ignore stream timeout deadline))
