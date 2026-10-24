@@ -45,8 +45,7 @@ See [Getting Started](docs/src/getting-started.md#load-the-core-system) for
 ASDF loading, the recording example, and optional system setup. The native
 TCP/DNS implementation requires SBCL. Loading `cl-http-kit/http3` also requires
 SBCL because its cl-quic-kit dependency loads the UDP implementation, even when
-QUIC callbacks are injected. The repository also includes a Nix development
-shell.
+QUIC callbacks are injected.
 
 ## Systems
 
@@ -122,9 +121,12 @@ contract `(request) -> (values response informational-responses)`. It bounds
 concurrent connections and handshakes, HTTP/2 streams, request sizes, aggregate
 buffered request bodies, and the time spent in handshakes, requests, idle waits,
 and shutdown.
-Applications can pass the same ticket-key store to multiple server instances
-to share TLS resumption keys. The listener supports HTTPS only; HTTP/3 server
-acceptance remains outside this boundary. The default origin client offers
+Applications can pass a store created with
+`cl-tls-kit:make-tls13-server-ticket-key-store` to multiple server instances to
+share TLS resumption keys. See the
+[HTTPS server API](docs/src/reference/api.md#https-server). The listener
+supports HTTPS only; HTTP/3 server acceptance remains outside this boundary.
+The default origin client offers
 `h2` and `http/1.1` through ALPN. TLS to an HTTPS proxy offers only
 `http/1.1`; custom transports supply their own ALPN policy. The optional
 client system also supplies a thread-safe HTTP/1.1 connection pool.

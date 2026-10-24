@@ -26,7 +26,9 @@ must be HTTP or HTTPS, authority is required, and path must begin with a slash.
 
 ### `parse-http-uri`
 
-Parse a string into an HTTP-URI.
+Parse an absolute HTTP or HTTPS URI into an HTTP-URI. An authority is required;
+an omitted path defaults to `/`, and fragments are rejected. The parsed URI
+uses a slash-prefixed path.
 
 ### `http-uri-scheme`
 
@@ -396,9 +398,9 @@ max-header-bytes max-body-bytes clock-function).
 
 ### `send-recorded-http-request/cps`
 
-The CPS form of send-recorded-http-request. It takes session, request,
-on-success, and optional on-error, timeout, deadline, byte-limit, and clock
-arguments.
+The CPS form of send-recorded-http-request. Its signature is
+`send-recorded-http-request/cps (session request on-success &key on-error
+timeout deadline max-header-bytes max-body-bytes clock-function)`.
 
 ### `http-deadline`
 
@@ -550,24 +552,40 @@ cannot weaken the client or reusable connection limits.
 
 ### `send-http2-request/cps`
 
-The CPS form of send-http2-request. It takes client, request, on-success, and
-optional on-error, timeout, deadline, byte-limit, and clock arguments.
+The CPS form of send-http2-request. Its signature is
+`send-http2-request/cps (client request on-success &key on-error timeout
+deadline max-header-bytes max-fields max-body-bytes clock-function
+request-body-function request-body-length on-body-chunk collect-body-p
+huffman-p)`.
 
 ### Reusable HTTP/2 connections
 
-`make-http2-connection` creates a connection over an already negotiated binary
-stream. Callers must serialize operations on this low-level connection; on
-SBCL, use a connection manager or the high-level client for requests shared
-across threads. `send-http2-request-over-connection` sends one request, while
-`send-http2-requests-over-connection` multiplexes a non-empty batch.
-`send-http2-request-over-connection/cps` and
-`send-http2-requests-over-connection/cps` accept success and error
-continuations, and
-`make-http2-connection-transport` adapts a connection to the high-level client
-transport protocol. `http2-client-connection` returns the reusable connection
-owned by a stream-backed client, when present. These constructors, send
-functions, CPS forms, and transport adapters accept `max-fields`; the default
-per decoded header or trailer section is 256.
+`make-http2-connection (&key stream close-stream max-frame-size
+max-header-bytes max-fields max-body-bytes max-control-frames
+max-control-window clock-function)` creates a connection over an already
+negotiated binary stream.
+`send-http2-request-over-connection (connection request &key timeout deadline
+max-header-bytes max-fields max-body-bytes clock-function
+request-body-function request-body-length on-body-chunk on-information
+on-stream-open collect-body-p huffman-p)` sends one request.
+`send-http2-requests-over-connection (connection requests &key timeout deadline
+max-header-bytes max-fields max-body-bytes clock-function
+request-body-functions request-body-lengths on-body-chunk collect-body-p
+huffman-p)` multiplexes a non-empty batch. The CPS signatures are
+`send-http2-request-over-connection/cps (connection request on-success &key
+on-error timeout deadline max-header-bytes max-fields max-body-bytes
+clock-function request-body-function request-body-length on-body-chunk
+on-stream-open collect-body-p huffman-p)` and
+`send-http2-requests-over-connection/cps (connection requests on-success &key
+on-error timeout deadline max-header-bytes max-fields max-body-bytes
+clock-function request-body-functions request-body-lengths on-body-chunk
+collect-body-p huffman-p)`. Callers must serialize operations on this low-level
+connection. On SBCL, use a connection manager or the high-level client for
+requests shared across threads. `make-http2-connection-transport (connection)` adapts a
+connection to the high-level client transport protocol.
+`http2-client-connection (client)` returns the reusable connection owned by a
+stream-backed client, when present. These functions accept `max-fields`; the
+default per decoded header or trailer section is 256.
 
 `cancel-http2-stream` emits `RST_STREAM` for an opened client stream.
 `ping-http2-connection` sends a PING and waits for the matching acknowledgement.
@@ -801,8 +819,18 @@ producer receives the client's maximum DATA payload
 size and returns non-empty octet arrays until NIL; a declared length is
 enforced and emitted as Content-Length. It opens a request stream, writes
 request headers, DATA, and trailers, then parses the response. The QPACK tables
-are caller-owned and are not synchronized automatically. HTTP3-CLIENT accessors
-expose the callback slots, limits, settings, and open state.
+are caller-owned and are not synchronized automatically. Public accessors
+include `http3-client-open-p`; callback slots `http3-client-open-stream`,
+`http3-client-write-stream`, `http3-client-read-stream`,
+`http3-client-close-stream`, and `http3-client-cancel-stream`; limits
+`http3-client-max-frame-size`, `http3-client-max-header-bytes`,
+`http3-client-max-fields`, `http3-client-max-request-streams`,
+`http3-client-max-peer-unidirectional-streams`,
+`http3-client-max-state-bytes`, `http3-client-qpack-max-instruction-bytes`, and
+`http3-client-qpack-max-buffer-bytes`; and state accessors
+`http3-client-qpack-settings`, `http3-client-max-push-id`,
+`http3-client-promised-push-ids`, `http3-client-cancelled-push-ids`, and
+`http3-client-consumed-push-ids`.
 
 MAKE-HTTP3-CLIENT also accepts MAX-REQUEST-STREAMS,
 MAX-PEER-UNIDIRECTIONAL-STREAMS, MAX-STATE-BYTES,
@@ -812,14 +840,20 @@ client, server-stream, push, and connection-manager body-limit entry points
 default MAX-BODY-BYTES to the core 16 MiB default; an explicitly supplied NIL
 disables that limit for the call.
 
-MAKE-HTTP3-CONNECTION-MANAGER pools clients by request origin. Its
+`make-http3-connection-manager (&key open-client max-connections idle-timeout
+max-connection-age clock-function)` pools clients by request origin. Its
 MAX-CONNECTIONS policy evicts the least recently used origin, while
 IDLE-TIMEOUT and MAX-CONNECTION-AGE expire retained clients using a monotonic
-CLOCK-FUNCTION. SEND-HTTP3-REQUEST-OVER-CONNECTION-MANAGER preserves the
-SEND-HTTP3-REQUEST options, including streaming request bodies, and
-MAKE-HTTP3-CONNECTION-MANAGER-TRANSPORT adapts the manager to a high-level
-transport callback. Informational-response callbacks receive each validated
-1xx response in wire order; proxy routing is rejected rather than silently
+CLOCK-FUNCTION. `send-http3-request-over-connection-manager (manager request
+&key connection-key on-body-chunk on-information collect-body-p
+max-header-bytes max-fields max-body-bytes request-body-function
+request-body-length proxy proxy-plan qpack-encoder-context
+qpack-decoder-context qpack-http3-decoder-context await-qpack huffman-p
+on-stream-open on-push-promise timeout deadline)` preserves the
+`send-http3-request` options, including streaming request bodies, and
+`make-http3-connection-manager-transport (manager)` adapts the manager to a
+high-level transport callback. Informational-response callbacks receive each
+validated 1xx response in wire order; proxy routing is rejected rather than silently
 ignored. Per-request MAX-HEADER-BYTES and MAX-FIELDS values can tighten but
 never weaken the retained client's configured limits.
 CLOSE-HTTP3-CONNECTION-MANAGER closes all retained clients and rejects
