@@ -4598,7 +4598,8 @@
              (list
               (list 0 2 '() :h3-stream-creation-error)
               (list http-kit/http3:+http3-push-stream-type+ 3 '() :h3-id-error)
-              (list http-kit/http3:+http3-push-stream-type+ 2 '(2) :h3-id-error)))
+              (list http-kit/http3:+http3-push-stream-type+ 2 '(2) :h3-id-error)
+              (list http-kit/http3:+http3-push-stream-type+ 1 nil :h3-id-error)))
       (let* ((wire
                (http3-test-concat-octets
                 (http-kit/http3:http3-varint-encode (first case))
