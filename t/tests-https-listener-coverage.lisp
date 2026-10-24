@@ -233,9 +233,9 @@
               (http-kit::http-server-listener-wake-in-progress-p server) t)
         (%https-listener-test-call-with-function-stubs
          (list
-          (cons 'sb-thread:condition-wait
-                (lambda (&rest arguments)
-                  (declare (ignore arguments))
+          (cons 'http-kit::%http-server-wait-for-listener-wakeup
+                (lambda (target)
+                  (declare (ignore target))
                   (setf waited t
                         (http-kit::http-server-listener-wake-in-progress-p server)
                         nil))))
@@ -244,6 +244,21 @@
         (ensure-true waited)
         (ensure-equal :stopped (http-kit::http-server-state server))
         (ensure-false (http-kit::http-server-shutdown-coordinator server)))
+      (let* ((server (%https-listener-make-server))
+             (waiter-ready (sb-thread:make-semaphore :count 0))
+             (woke nil)
+             (waiter
+               (sb-thread:make-thread
+                (lambda ()
+                  (http-kit::%with-http-server-lock (server)
+                    (sb-thread:signal-semaphore waiter-ready)
+                    (http-kit::%http-server-wait-for-listener-wakeup server))
+                  (setf woke t)))))
+        (sb-thread:wait-on-semaphore waiter-ready)
+        (http-kit::%with-http-server-lock (server)
+          (http-kit::%http-server-broadcast server))
+        (sb-thread:join-thread waiter)
+        (ensure-true woke))
       (let* ((server (%https-listener-make-server))
              (supervisor (sb-thread:make-thread (lambda () nil)))
              (listener (gensym "LISTENER-"))

@@ -219,6 +219,14 @@
   #-sbcl
   (declare (ignore server)))
 
+(defun %http-server-wait-for-listener-wakeup (server)
+  #+sbcl
+  (sb-thread:condition-wait
+   (http-server-waitqueue server)
+   (http-server-lock server))
+  #-sbcl
+  (declare (ignore server)))
+
 (defun %http-server-close-listener-object (listener)
   (when listener
     (%with-http-cleanup
@@ -739,9 +747,7 @@
                (sb-thread:join-thread supervisor))
              (%with-http-server-lock (server)
                (loop while (http-server-listener-wake-in-progress-p server)
-                     do (sb-thread:condition-wait
-                         (http-server-waitqueue server)
-                         (http-server-lock server)))
+                     do (%http-server-wait-for-listener-wakeup server))
                (setf listener (http-server-listener server)))
              (%http-server-close-listener-object listener)
              (%with-http-server-lock (server)
