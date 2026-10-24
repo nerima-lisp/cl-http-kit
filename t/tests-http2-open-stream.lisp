@@ -252,6 +252,83 @@
         (ensure-equal 200 (http-response-status response))
         (ensure-equal (octets) (http-response-body response)))
       (http-kit/http2:close-http2-connection connection)))
+  (deftest http2-public-connection-does-not-send-data-after-peer-reset-during-upload
+    (let* ((producer-started (sb-thread:make-semaphore :count 0))
+           (release-producer (sb-thread:make-semaphore :count 0))
+           (upload-done (sb-thread:make-semaphore :count 0))
+           (stream
+             (make-instance
+              'binary-session-stream
+              :input
+              (concatenate-octets
+               (h2-frame 4 0 0 (octets))
+               (h2-frame 3 0 1 (octets 0 0 0 8))
+               (h2-frame 1 5 3 (octets #x88)))))
+           (connection
+             (http-kit/http2:make-http2-connection :stream stream))
+           (upload-thread nil)
+           (upload-error nil)
+           (peer-response nil)
+           (producer-started-p nil)
+           (upload-done-p nil))
+      (unwind-protect
+           (progn
+             (setf upload-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (unwind-protect
+                           (handler-case
+                               (http-kit/http2:send-http2-request-over-connection
+                                connection
+                                (make-http-request
+                                 :method "POST"
+                                 :uri "https://127.0.0.1/upload")
+                                :timeout 5
+                                :request-body-function
+                                (lambda (maximum-size)
+                                  (declare (ignore maximum-size))
+                                  (sb-thread:signal-semaphore producer-started)
+                                  (unless
+                                      (sb-thread:wait-on-semaphore
+                                       release-producer :timeout 5)
+                                    (error "Timed out waiting to release the upload producer."))
+                                  (octets 65))
+                                :request-body-length 1)
+                             (error (condition)
+                               (setf upload-error condition)))
+                        (sb-thread:signal-semaphore upload-done)))))
+             (setf producer-started-p
+                   (sb-thread:wait-on-semaphore producer-started :timeout 5))
+             (ensure-true producer-started-p)
+             (setf peer-response
+                   (http-kit/http2:send-http2-request-over-connection
+                    connection
+                    (make-http-request :method "GET"
+                                       :uri "https://127.0.0.1/next")
+                    :timeout 5))
+             (ensure-equal 200 (http-response-status peer-response))
+             (ensure-equal (octets) (http-response-body peer-response))
+             (sb-thread:signal-semaphore release-producer)
+             (setf upload-done-p
+                   (sb-thread:wait-on-semaphore upload-done :timeout 5))
+             (ensure-true upload-done-p)
+             (sb-thread:join-thread upload-thread)
+             (setf upload-thread nil)
+             (ensure-true (typep upload-error 'http-connection-error))
+             (ensure-equal '(:rst-stream 1 8)
+                           (http-connection-error-cause upload-error))
+             (ensure-true (http-kit/http2:http2-connection-open-p connection))
+             (ensure-equal
+              0
+              (count-if
+               (lambda (frame)
+                 (and (= 0 (http-kit/http2::%h2-frame-type frame))
+                      (= 1 (http-kit/http2::%h2-frame-stream-id frame))))
+               (h2-output-frames stream))))
+        (sb-thread:signal-semaphore release-producer)
+        (when upload-thread
+          (sb-thread:join-thread upload-thread))
+        (http-kit/http2:close-http2-connection connection))))
 
   (deftest http2-public-priority-update
     (let* ((stream
