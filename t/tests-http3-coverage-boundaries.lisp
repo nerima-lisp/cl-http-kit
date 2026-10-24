@@ -5228,7 +5228,7 @@
            (unwind-protect
                (progn
                  (setf (http-kit/http3::http3-client-pending-request-streams client)
-                       (list current-entry queued-entry done-entry)
+                       (list done-entry current-entry queued-entry)
                        (symbol-function start-entry-symbol)
                        (lambda (ignored-client ignored-entry)
                          (declare (ignore ignored-client ignored-entry))
@@ -5359,6 +5359,63 @@
                                 (http-kit/http3::%http3-request-stream-response entry))))
              (setf (symbol-function process-symbol) original-process
                    (http-kit/http3::http3-client-scheduler-close-state client) nil)
+             (when (http-kit/http3:http3-client-open-p client)
+               (http-kit/http3:close-http3-client client)))))
+(deftest http3-native-scheduler-response-completion-rechecks-state-after-poll
+         (let* ((mutation nil)
+                (peer-control-stream
+                 (make-http3-test-stream :kind :peer-control))
+                (client
+                 (http3-test-make-native-client
+                  :try-read-stream
+                  (lambda (stream &key timeout deadline)
+                    (declare (ignore timeout deadline))
+                    (when (eq stream peer-control-stream)
+                      (when mutation (funcall mutation)))
+                    (values nil nil :would-block))))
+                (entry
+                 (http-kit/http3::%make-http3-request-stream
+                  :stream (make-http3-test-stream :kind :request)
+                  :request-method "GET"
+                  :response-status 200
+                  :final-response-p t)))
+           (unwind-protect
+               (progn
+                 (setf (http-kit/http3::http3-client-peer-control-stream client)
+                       peer-control-stream)
+                 (flet ((check-state-change (mutator)
+                                            (setf (http-kit/http3::%http3-request-stream-response-fin-p
+                                                   entry)
+                                                  t
+                                                  (http-kit/http3::%http3-request-stream-qpack-token entry)
+                                                  nil
+                                                  (http-kit/http3::%http3-request-stream-response-frames
+                                                   entry)
+                                                  nil
+                                                  mutation mutator)
+                                            (ensure-equal
+                                             nil
+                                             (http-kit/http3::%h3-scheduler-complete-response-if-finished
+                                              client entry))
+                                            (ensure-equal
+                                             nil
+                                             (http-kit/http3::%http3-request-stream-done-p entry))))
+                   (check-state-change
+                    (lambda ()
+                      (setf (http-kit/http3::%http3-request-stream-response-fin-p entry)
+                            nil)))
+                   (check-state-change
+                    (lambda ()
+                      (setf (http-kit/http3::%http3-request-stream-qpack-token entry)
+                            :blocked)))
+                   (check-state-change
+                    (lambda ()
+                      (setf (http-kit/http3::%http3-request-stream-response-frames entry)
+                            (list :pending)))))
+                 (setf mutation nil
+                       (http-kit/http3::http3-client-peer-control-stream client) nil))
+             (setf mutation nil
+                   (http-kit/http3::http3-client-peer-control-stream client) nil)
              (when (http-kit/http3:http3-client-open-p client)
                (http-kit/http3:close-http3-client client)))))
 (deftest http3-native-scheduler-wait-entry-observes-racing-terminal-state
