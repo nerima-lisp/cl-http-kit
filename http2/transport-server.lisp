@@ -347,6 +347,24 @@ pseudo-fields are kept separate because they are not ordinary HTTP headers.
            (setf deadline stream-deadline)))
        stream-deadlines)
       deadline))
+  (defun %h2-server-request-deadline
+        (request-timeout frame-start-deadline absolute-deadline clock-function)
+      (or frame-start-deadline
+          (http-kit:http-deadline request-timeout
+                                  :deadline absolute-deadline
+                                  :clock-function clock-function)))
+    (defun %h2-server-new-client-stream-p
+        (stream-id last-client-stream-id streams)
+      (and (> stream-id last-client-stream-id)
+           (not (gethash stream-id streams))))
+    (defun %h2-server-check-body-release
+        (amount session-body-bytes state)
+      (unless (<= amount session-body-bytes)
+        (%h2-server-error
+         "HTTP/2 request body accounting became inconsistent" state)))
+    (defun %h2-server-validate-limit (name value &key allow-zero)
+      (%h2-validate-limit name value :allow-zero allow-zero
+                                       :operation :http2-server))
   (defun %h2-server-write-wire
       (stream wire session-deadline idle-deadline stream-deadlines
        clock-function)
@@ -470,29 +488,29 @@ values.
            :operation :http2-server
            :detail shutdown-p))
   (%h2-validate-frame-size max-frame-size))
-  (%h2-validate-limit :max-header-bytes max-header-bytes)
-  (%h2-validate-limit :max-fields max-fields)
+  (%h2-server-validate-limit :max-header-bytes max-header-bytes)
+  (%h2-server-validate-limit :max-fields max-fields)
   (progn
-    (%h2-validate-limit :max-body-bytes max-body-bytes :allow-zero t)
-    (%h2-validate-limit :max-aggregate-body-bytes
+    (%h2-server-validate-limit :max-body-bytes max-body-bytes :allow-zero t)
+    (%h2-server-validate-limit :max-aggregate-body-bytes
                         max-aggregate-body-bytes :allow-zero t))
-  (%h2-validate-limit :max-concurrent-streams max-concurrent-streams
+  (%h2-server-validate-limit :max-concurrent-streams max-concurrent-streams
                       :allow-zero t)
-  (%h2-validate-limit :max-reset-streams max-reset-streams :allow-zero t)
+  (%h2-server-validate-limit :max-reset-streams max-reset-streams :allow-zero t)
   (unless (and (realp max-reset-window)
                (not (minusp max-reset-window)))
     (error 'http-kit:http-protocol-error
            :message "HTTP/2 max-reset-window must be a non-negative real"
            :operation :http2-server
            :detail max-reset-window))
-  (%h2-validate-limit :max-control-frames max-control-frames :allow-zero t)
+  (%h2-server-validate-limit :max-control-frames max-control-frames :allow-zero t)
   (unless (and (realp max-control-window)
                (not (minusp max-control-window)))
     (error 'http-kit:http-protocol-error
            :message "HTTP/2 max-control-window must be a non-negative real"
            :operation :http2-server
            :detail max-control-window))
-  (%h2-validate-limit :max-hpack-table-size max-hpack-table-size
+  (%h2-server-validate-limit :max-hpack-table-size max-hpack-table-size
                       :allow-zero t)
   (let* ((request-count 0)
          (termination :running)
@@ -521,9 +539,7 @@ values.
                       (:body (%h2-server-stream-body-buffered-bytes state))
                       (:request (%h2-server-stream-request-body-bytes state)))))
               (when (plusp amount)
-                (unless (<= amount (car session-body-bytes))
-                  (%h2-server-error
-                   "HTTP/2 request body accounting became inconsistent" state))
+                (%h2-server-check-body-release amount (car session-body-bytes) state)
                 (decf (car session-body-bytes) amount)
                 (ecase charge-kind
                   (:body (setf (%h2-server-stream-body-buffered-bytes state) 0))
@@ -697,16 +713,18 @@ values.
                                      (when (and shutdown-p (funcall shutdown-p))
                                        (send-goaway))
                                      (when (and (= type +http2-headers-type+)
-                                                (> stream-id last-client-stream-id)
-                                                (not (gethash stream-id streams)))
+                                                (%h2-server-new-client-stream-p
+                                                 stream-id
+                                                 last-client-stream-id
+                                                 streams))
                                        (unless goaway-sent-p
                                          (when request-timeout
                                            (setf (gethash stream-id stream-deadlines)
-                                                 (or frame-start-deadline
-                                                     (http-kit:http-deadline
-                                                      request-timeout
-                                                      :deadline absolute-deadline
-                                                      :clock-function clock-function)))))))))))
+                                                 (%h2-server-request-deadline
+                                                  request-timeout
+                                                  frame-start-deadline
+                                                  absolute-deadline
+                                                  clock-function))))))))))
                           ;; Validate the wire sequence before controls can bypass
                           ;; the queued header block while a response is blocked.
                           (unless (eq frame :eof)
