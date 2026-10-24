@@ -1,8 +1,8 @@
 # API Reference
 
-This page documents the primary exported symbols of the registered ASDF
-systems. Package definition files remain authoritative for lower-level and
-auxiliary exports not described here.
+This page documents selected exports from the registered ASDF systems. Package
+definition files remain authoritative for lower-level and auxiliary exports
+not described here.
 
 The registered systems in this checkout are version 0.4.1.
 
@@ -753,6 +753,19 @@ available control or QPACK input and returns its stream kind, effects, and end
 status. A connection event loop can call the matching READ-HTTP3-CONTROL-STREAM
 or QPACK reader on later readiness notifications. Push and unknown extension
 streams remain caller-owned.
+
+For native scheduler operation, supply POLL-FUNCTION, TRY-READ-STREAM, and
+STREAM-WRITE-PENDING-P together. POLL-FUNCTION takes no arguments;
+TRY-READ-STREAM returns data, FIN, or would-block without waiting, and
+STREAM-WRITE-PENDING-P reports whether submitted bytes remain queued. The
+optional ACCEPT-PEER-UNIDIRECTIONAL-STREAM callback must also return without
+blocking. The scheduler calls it after each poll, buffers incomplete stream
+type and push-ID prefixes, and reads peer control and QPACK streams as they
+become readable. Push streams with complete stream-type and push-ID prefixes
+are queued for DEQUEUE-HTTP3-PENDING-PUSH, which returns the stream and push ID without
+polling, or two NIL values when the queue is empty. Pass a dequeued stream to
+RECEIVE-HTTP3-PUSH. Unknown extension streams are cancelled when
+CANCEL-STREAM is available, or drained through FIN.
 
 SEND-HTTP3-REQUEST takes an HTTP request and optional ON-BODY-CHUNK,
 ON-INFORMATION, COLLECT-BODY-P, MAX-HEADER-BYTES, MAX-FIELDS, MAX-BODY-BYTES,
