@@ -4347,7 +4347,8 @@
            :max-table-capacity 64 :table-capacity 64 :huffman nil))
          (entry
           (http-kit/http3::%make-http3-request-stream
-           :encoder-context encoder-context)))
+           :encoder-context encoder-context
+           :stream-id -1)))
     (unwind-protect
          (progn
            (http-message-kit:qpack-encode-insert-with-literal-name

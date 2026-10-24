@@ -2610,10 +2610,10 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
           (when (%http3-request-stream-on-stream-open entry)
             (funcall (%http3-request-stream-on-stream-open entry)
                      stream stream-id
-                     (lambda (&key (error-code nil error-code-supplied-p))
+                     (lambda (&key (error-code #x10c))
                        (cancel-http3-stream
                         client stream
-                        :error-code (if error-code-supplied-p error-code #x10c)
+                        :error-code error-code
                         :timeout (%http3-request-stream-timeout entry)
                         :deadline (%http3-request-stream-deadline entry)))))
           entry)
