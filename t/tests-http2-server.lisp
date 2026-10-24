@@ -1275,6 +1275,30 @@
         (when (open-stream-p stream)
           (close stream)))
       (ensure-false (open-stream-p stream))))
+  (deftest http2-server-preflight-rejects-nonfunction-body-buffer-callback
+    (let ((stream (make-instance 'binary-session-stream :input (octets)))
+          (observed nil))
+      (unwind-protect
+           (progn
+             (handler-case
+                 (http-kit/http2:serve-http2-session
+                  stream #'identity :close-stream nil
+                  :reserve-body-bytes 42
+                  :release-body-bytes #'identity)
+               (http-protocol-error (condition)
+                 (setf observed condition)))
+             (ensure-true (typep observed 'http-protocol-error))
+             (ensure-equal :http2-server
+                           (http-kit:http-error-operation observed))
+             (let ((detail (http-kit:http-protocol-error-detail observed)))
+               (ensure-equal nil (first detail))
+               (ensure-equal 42 (second detail))
+               (ensure-true (functionp (third detail))))
+             (ensure-equal 0 (binary-session-input-position stream))
+             (ensure-true (open-stream-p stream)))
+        (when (open-stream-p stream)
+          (close stream)))
+      (ensure-false (open-stream-p stream))))
   (deftest http2-server-internal-deadline-and-stream-guards
     (let ((deadlines (make-hash-table :test #'eq))
           (streams (make-hash-table)))
