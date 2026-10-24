@@ -4041,7 +4041,7 @@
            (ensure-true
             (sb-thread:wait-on-semaphore waiter-finished :timeout 3))
            (ensure-false
-            (sb-thread:wait-on-semaphore owner-finished :timeout 0.0))
+            (sb-thread:wait-on-semaphore owner-finished :timeout 0.001))
            (ensure-equal :error (first waiter-result))
            (ensure-true (typep (second waiter-result) 'http-timeout))
            (ensure-equal nil cancellations)
