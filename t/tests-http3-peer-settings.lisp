@@ -424,7 +424,7 @@
         (http-kit/http3:close-http3-client client)))))
 #+sbcl
 (deftest http3-peer-native-accept-reports-truncated-prefix-fin
-  (cl-weave:expect-assertions 14)
+  (cl-weave:expect-assertions 16)
   (dolist
       (case
        (list
