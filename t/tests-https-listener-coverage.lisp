@@ -204,6 +204,18 @@
         (ensure-equal :connection-error
                       (http-server-error-reason-code
                        (http-server-failure server))))
+      (let ((server (%https-listener-make-server)))
+        (setf (http-kit::http-server-state server) :running)
+        (%https-listener-test-call-with-function-stubs
+         (list
+          (cons 'http-kit/network:accept-http-tcp-stream
+                (lambda (listener)
+                  (declare (ignore listener))
+                  (setf (http-kit::http-server-state server) :stopping)
+                  (error "accept failure after shutdown began"))))
+         (lambda ()
+           (http-kit::%http-server-supervisor server :listener)))
+        (ensure-equal :stopping (http-kit::http-server-state server)))
       (let ((server
               (%https-listener-make-server
                :on-error
@@ -259,6 +271,13 @@
           (http-kit::%http-server-broadcast server))
         (sb-thread:join-thread waiter)
         (ensure-true woke))
+      (let ((server (%https-listener-make-server)))
+        (setf (http-kit::http-server-state server) :stopping
+              (http-kit::http-server-supervisor server)
+              sb-thread:*current-thread*)
+        (http-kit::%http-server-shutdown-coordinator server)
+        (ensure-equal :stopped (http-kit::http-server-state server))
+        (ensure-false (http-kit::http-server-supervisor server)))
       (let* ((server (%https-listener-make-server))
              (supervisor (sb-thread:make-thread (lambda () nil)))
              (listener (gensym "LISTENER-"))
@@ -308,7 +327,7 @@
                   nil)
               (error () t)))))
         (ensure-false
-         (http-kit::http-server-shutdown-coordinator server))))
+         (http-kit::http-server-shutdown-coordinator server)))))
 
   (deftest https-listener-covers-start-and-stop-state-paths
     (%with-https-listener-test-stubs (context)
@@ -373,6 +392,23 @@
         (ensure-equal :failed (http-kit::http-server-state server))
         (ensure-equal 19.0d0
                       (http-kit::http-server-stop-deadline server)))
+      (let ((server (%https-listener-make-server))
+            (observed nil))
+        (%https-listener-test-call-with-function-stubs
+         (list
+          (cons 'http-kit/network:open-http-tcp-listener
+                (lambda (&key host port)
+                  (declare (ignore host port))
+                  (error "listener open failure before stop deadline"))))
+         (lambda ()
+           (setf observed
+                 (handler-case
+                     (progn (start-http-server server) nil)
+                   (http-server-error (condition) condition)))))
+        (ensure-true observed)
+        (ensure-equal :failed (http-kit::http-server-state server))
+        (ensure-true (http-kit::http-server-shutdown-p server))
+        (ensure-true (http-kit::http-server-stop-deadline server)))
       (let ((server (%https-listener-make-server))
             (listener (gensym "STALE-LISTENER-"))
             (closed nil))
@@ -494,5 +530,5 @@
         (ensure-true observed)
         (ensure-equal
          :event-callback-failed
-         (http-server-error-reason-code (http-server-failure server)))))))
+         (http-server-error-reason-code (http-server-failure server))))))
 )

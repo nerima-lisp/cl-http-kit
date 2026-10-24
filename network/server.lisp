@@ -89,13 +89,16 @@
   (error 'http-server-error :reason-code reason-code :phase :configuration))
 
 (defun %http-server-positive-real-p (value)
+  #+sbcl
+  (and (realp value)
+       (or (not (floatp value))
+           (and (not (sb-ext:float-nan-p value))
+                (not (sb-ext:float-infinity-p value))))
+       (plusp value))
+  #-sbcl
   (handler-case
       (and (realp value)
            (or (not (floatp value))
-               #+sbcl
-               (and (not (sb-ext:float-nan-p value))
-                    (not (sb-ext:float-infinity-p value)))
-               #-sbcl
                (= value value))
            (plusp value))
     (arithmetic-error () nil)))
