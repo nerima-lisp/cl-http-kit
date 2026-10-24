@@ -44,6 +44,7 @@
   listener
   supervisor
   shutdown-coordinator
+  (workers (make-hash-table :test (function eq)))
   listener-wakeup-p
   listener-wake-in-progress-p
   (connection-count 0)
@@ -627,21 +628,43 @@
 
 #+sbcl
 (defun %http-server-start-connection-worker (server connection)
-  (handler-case
-      (sb-thread:make-thread
-       (lambda () (%http-server-run-connection server connection))
-       :name "http server connection")
-    (error ()
-      (%http-server-close-connection-stream server connection)
-      (%http-server-release-connection server connection)
-      (let ((condition
-              (make-condition 'http-server-error
-                              :reason-code :worker-start-failed
-                              :phase :supervisor)))
-        (handler-case
-            (%http-server-report-error server condition :supervisor :fatal-p t)
-          (http-server-callback-error (callback-condition)
-            (%http-server-mark-failed server callback-condition)))))))
+  (let ((worker nil))
+    (let ((finished-workers
+            (%with-http-server-lock
+                (server)
+              (loop for thread being the hash-keys of
+                    (http-server-workers server)
+                    unless (sb-thread:thread-alive-p thread)
+                      collect thread))))
+      (dolist (thread finished-workers)
+        (sb-thread:join-thread thread)
+        (%with-http-server-lock (server)
+          (remhash thread (http-server-workers server)))))
+    (handler-case
+        (progn
+          (%with-http-server-lock (server)
+            (setf worker
+                  (sb-thread:make-thread
+                   (lambda ()
+                     (%with-http-server-lock (server)
+                       nil)
+                     (%http-server-run-connection server connection))
+                   :name "http server connection"))
+            (setf (gethash worker (http-server-workers server)) t)
+            (%http-server-broadcast server))
+          worker)
+      (error ()
+        (%http-server-close-connection-stream server connection)
+        (%http-server-release-connection server connection)
+        (let ((condition
+                (make-condition 'http-server-error
+                                :reason-code :worker-start-failed
+                                :phase :supervisor)))
+          (handler-case
+              (%http-server-report-error
+               server condition :supervisor :fatal-p t)
+            (http-server-callback-error (callback-condition)
+              (%http-server-mark-failed server callback-condition))))))))
 
 (defun %http-server-reject-connection
     (server raw-stream reason peer-address peer-port)
@@ -763,13 +786,17 @@
     (%with-http-server-lock (server)
       (when (zerop (http-server-connection-count server))
         (return-from %http-server-wait-for-connections t))
-      (let ((remaining (- deadline (%http-server-now))))
-        (unless (plusp remaining)
-          (return-from %http-server-wait-for-connections nil))
-        (sb-thread:condition-wait
-         (http-server-waitqueue server)
-         (http-server-lock server)
-         :timeout remaining))))
+      (if deadline
+          (let ((remaining (- deadline (%http-server-now))))
+            (unless (plusp remaining)
+              (return-from %http-server-wait-for-connections nil))
+            (sb-thread:condition-wait
+             (http-server-waitqueue server)
+             (http-server-lock server)
+             :timeout remaining))
+          (sb-thread:condition-wait
+           (http-server-waitqueue server)
+           (http-server-lock server)))))
   #-sbcl
   (declare (ignore server deadline))
   #-sbcl
@@ -810,7 +837,18 @@
                                (+ (%http-server-now)
                                   (http-server-graceful-timeout server)))))
              (unless (%http-server-wait-for-connections server deadline)
-               (%http-server-force-close-connections server)))
+               (%http-server-force-close-connections server)
+               (%http-server-wait-for-connections server nil)))
+           (let ((workers
+                   (%with-http-server-lock
+                       (server)
+                     (loop for worker being the hash-keys of
+                           (http-server-workers server)
+                           collect worker))))
+             (dolist (worker workers)
+               (sb-thread:join-thread worker)
+               (%with-http-server-lock (server)
+                 (remhash worker (http-server-workers server)))))
            (%http-server-release-owned-ticket-key-store server)
            (%http-server-emit-event-once
             server :stopped (list :type :listener-stopped :phase :shutdown))
@@ -997,7 +1035,17 @@
     (unless (or (null coordinator)
                 (eq caller supervisor)
                 (eq caller coordinator))
-      (sb-thread:join-thread coordinator))
+      (let ((deadline (%http-server-stop-deadline server)))
+        (when deadline
+          (let ((remaining (- deadline (%http-server-now))))
+            (when (plusp remaining)
+              (multiple-value-bind (result status)
+                  (sb-thread:join-thread coordinator
+                                         :timeout remaining
+                                         :default nil)
+                (declare (ignore result))
+                (when (eq status :abort)
+                  (sb-thread:join-thread coordinator))))))))
     (when event-error
       (error event-error))
     server))

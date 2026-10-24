@@ -953,8 +953,11 @@ including when PORT was zero. `stop-http-server` stops accepting new
 connections and asks active HTTP/2 sessions to send GOAWAY at their next
 frame-processing point. Active responses can drain until the configured
 graceful timeout; sessions still waiting for a frame are closed when it
-expires. It is safe to call more than once. `http-server-p` identifies a server
-handle; `http-server-port` returns its bound port and `http-server-failure`
+expires. If a synchronous handler is still running, `stop-http-server` may
+return while shutdown remains in progress. The server does not cancel handler
+code and emits `:listener-stopped` only after every connection worker exits. It
+is safe to call more than once. `http-server-p` identifies a server handle;
+`http-server-port` returns its bound port and `http-server-failure`
 returns a fatal server failure, if one occurred. `http-server-error-reason-code`
 and `http-server-error-phase` expose safe error metadata, while
 `http-server-callback-error-callback` identifies whether `:on-event` or

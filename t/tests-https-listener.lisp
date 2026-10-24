@@ -1632,3 +1632,59 @@
             (handler-case
                 (stop-http-server server :graceful-timeout 1)
               (error () nil))))))))
+#+sbcl
+(deftest https-listener-does-not-report-stopped-while-handler-worker-runs
+  (%with-https-listener-test-stubs (context)
+    (let* ((handler-entered (sb-thread:make-semaphore :count 0))
+           (release-handler (sb-thread:make-semaphore :count 0))
+           (server nil))
+      (unwind-protect
+           (progn
+             (setf (%https-listener-test-context-session-action context)
+                   (lambda (protocol stream handler options)
+                     (declare (ignore protocol stream options))
+                     (funcall handler nil))
+                   server
+                   (%https-listener-make-server
+                    :graceful-timeout 0.1
+                    :handler
+                    (lambda (request)
+                      (declare (ignore request))
+                      (sb-thread:signal-semaphore handler-entered)
+                      (sb-thread:wait-on-semaphore release-handler)
+                      (make-http-response :status 204))
+                    :on-event
+                    (lambda (event)
+                      (%https-listener-record-event context event))))
+             (start-http-server server)
+             (let ((client (%https-listener-connect server)))
+               (close-http-tcp-stream client))
+             (ensure-true
+              (sb-thread:wait-on-semaphore handler-entered :timeout 5))
+             (stop-http-server server :graceful-timeout 0.1)
+             (ensure-equal :stopping (http-kit::http-server-state server))
+             (ensure-equal
+              1
+              (hash-table-count (http-kit::http-server-workers server)))
+             (ensure-equal 1 (%https-listener-connection-count server))
+             (ensure-false
+              (%https-listener-event-present-p
+               context :listener-stopped nil))
+             (sb-thread:signal-semaphore release-handler)
+             (%https-listener-wait
+              (lambda ()
+                (%https-listener-event-present-p
+                 context :listener-stopped nil)))
+             (ensure-equal :stopped (http-kit::http-server-state server))
+             (ensure-equal
+              0
+              (hash-table-count (http-kit::http-server-workers server)))
+             (ensure-equal 0 (%https-listener-connection-count server)))
+        (when server
+          (sb-thread:signal-semaphore release-handler)
+          (stop-http-server server :graceful-timeout 1)
+          (%https-listener-wait
+           (lambda ()
+             (or (%https-listener-event-present-p
+                  context :listener-stopped nil)
+                 (eq :failed (http-kit::http-server-state server))))))))))
