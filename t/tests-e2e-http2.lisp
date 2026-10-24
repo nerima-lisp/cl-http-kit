@@ -799,7 +799,21 @@
                                                            (http-kit/http2::%h2-frame-stream-id frame)))
                                                      (unless (member stream-id initial-stream-ids)
                                                        (setf nested-stream-id stream-id
-                                                             nested-request-seen-p t))))
+                                                             nested-request-seen-p t)
+                                                       (write-sequence
+                                                        (http-kit/http2::%h2-frame-wire
+                                                         http-kit/http2::+http2-headers-type+
+                                                         http-kit/http2::+http2-end-headers-flag+
+                                                         stream-id headers)
+                                                        server-stream)
+                                                       (write-sequence
+                                                        (http-kit/http2::%h2-frame-wire
+                                                         http-kit/http2::+http2-data-type+
+                                                         http-kit/http2::+http2-end-stream-flag+
+                                                         stream-id
+                                                         (ascii "nested-response"))
+                                                        server-stream)
+                                                       (finish-output server-stream))))
                                                   ((and (= (http-kit/http2::%h2-frame-type frame)
                                                            http-kit/http2::+http2-rst-stream-type+)
                                                         (= (http-kit/http2::%h2-frame-stream-id frame)
@@ -894,8 +908,7 @@
                                                   (setf late-data-flow-credit-seen-p
                                                         t)))
                                        (dolist (stream-id
-                                                (list nested-stream-id
-                                                      (aref stream-ids 1)
+                                                (list (aref stream-ids 1)
                                                       (aref stream-ids 0)))
                                          (write-sequence
                                           (http-kit/http2::%h2-frame-wire
@@ -909,13 +922,6 @@
                                          0
                                          (aref stream-ids 1)
                                          (ascii "response-"))
-                                        server-stream)
-                                       (write-sequence
-                                        (http-kit/http2::%h2-frame-wire
-                                         http-kit/http2::+http2-data-type+
-                                         http-kit/http2::+http2-end-stream-flag+
-                                         nested-stream-id
-                                         (ascii "nested-response"))
                                         server-stream)
                                        (write-sequence
                                         (http-kit/http2::%h2-frame-wire
