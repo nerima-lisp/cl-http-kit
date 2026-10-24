@@ -2043,7 +2043,7 @@
     (let* ((raw (make-instance 'network-tls-contract-stream :input (octets)))
            (state (http-kit/tls::%make-http-tls-server-state
                    :driver nil :provider nil :transport-stream raw))
-           (legacy-handshake (octets 22 3 1 0 0)))
+           (legacy-handshake (octets 22 3 1 0 1 1)))
       (ensure-equal nil (http-kit/tls::%tls-server-process-record state legacy-handshake))
       (ensure-false (http-kit/tls::http-tls-server-state-client-hello-received-p state))
       (setf (http-kit/tls::http-tls-server-state-client-hello-received-p state) t)
