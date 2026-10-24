@@ -3643,62 +3643,62 @@
                       (http-kit/http3:encode-http3-frame
                        (http-kit/http3:make-http3-frame
                         :type http-kit/http3:+http3-goaway-type+
-                        :payload (http-kit/http3:http3-varint-encode goaway-id))))))
-               (peer-stream (make-http3-test-stream :kind :peer-control))
-               (peer-read-count 0)
-               (response-wire (http3-test-native-response-wire))
-               (request-stream nil)
-               (request-writes nil)
-               (request-read-count 0)
-               (request-response-stage 0)
-               (cancellations nil)
-               (close-condition :unset)
-               (client
-                (http3-test-make-native-client
-                 :read-stream
-                 (lambda (stream &key timeout deadline)
-                   (declare (ignore timeout deadline))
-                   (if (eq stream peer-stream)
-                       (if (= (incf peer-read-count) 1)
-                           (values peer-wire nil)
-                         (values nil nil))
-                     (values nil t)))
-                 :write-stream
-                 (lambda (stream bytes &key fin-p timeout deadline)
-                   (declare (ignore timeout deadline))
-                   (when (stringp (http3-test-stream-kind stream))
-                     (setf request-stream stream)
-                     (push (list (copy-seq bytes) fin-p) request-writes)))
-                 :try-read-stream
-                 (lambda (stream &key timeout deadline)
-                   (declare (ignore timeout deadline))
-                   (if (not (stringp (http3-test-stream-kind stream)))
-                       (values nil nil :would-block)
-                     (if (null request-writes)
-                         (values nil nil :would-block)
-                       (progn
-                         (setf request-stream stream)
-                         (case (incf request-response-stage)
-                           (1 (incf request-read-count)
-                              (values response-wire nil :data))
-                           (2 (incf request-read-count)
-                              (values nil t :fin))
-                           (otherwise
-                            (error "The native scheduler read past response FIN.")))))))
-                 :close-stream
-                 (lambda (stream &key condition)
-                   (when (stringp (http3-test-stream-kind stream))
-                     (setf request-stream stream
-                           close-condition condition
-                           (http3-test-stream-closed-p stream) t)))
-                 :cancel-stream
-                 (lambda (stream &key error-code timeout deadline)
-                   (declare (ignore timeout deadline))
-                   (setf request-stream stream)
-                   (push (list stream error-code) cancellations)
-                   t))
-                (failure nil)
-                (response nil))
+                        :payload (http-kit/http3:http3-varint-encode goaway-id)))))
+                    (peer-stream (make-http3-test-stream :kind :peer-control))
+                    (peer-read-count 0)
+                    (response-wire (http3-test-native-response-wire))
+                    (request-stream nil)
+                    (request-writes nil)
+                    (request-read-count 0)
+                    (request-response-stage 0)
+                    (cancellations nil)
+                    (close-condition :unset)
+                    (client
+                     (http3-test-make-native-client
+                      :read-stream
+                      (lambda (stream &key timeout deadline)
+                        (declare (ignore timeout deadline))
+                        (if (eq stream peer-stream)
+                            (if (= (incf peer-read-count) 1)
+                                (values peer-wire nil)
+                              (values nil nil))
+                          (values nil t)))
+                      :write-stream
+                      (lambda (stream bytes &key fin-p timeout deadline)
+                        (declare (ignore timeout deadline))
+                        (when (stringp (http3-test-stream-kind stream))
+                          (setf request-stream stream)
+                          (push (list (copy-seq bytes) fin-p) request-writes)))
+                      :try-read-stream
+                      (lambda (stream &key timeout deadline)
+                        (declare (ignore timeout deadline))
+                        (if (not (stringp (http3-test-stream-kind stream)))
+                            (values nil nil :would-block)
+                          (if (null request-writes)
+                              (values nil nil :would-block)
+                            (progn
+                              (setf request-stream stream)
+                              (case (incf request-response-stage)
+                                (1 (incf request-read-count)
+                                   (values response-wire nil :data))
+                                (2 (incf request-read-count)
+                                   (values nil t :fin))
+                                (otherwise
+                                 (error "The native scheduler read past response FIN.")))))))
+                      :close-stream
+                      (lambda (stream &key condition)
+                        (when (stringp (http3-test-stream-kind stream))
+                          (setf request-stream stream
+                                close-condition condition
+                                (http3-test-stream-closed-p stream) t)))
+                      :cancel-stream
+                      (lambda (stream &key error-code timeout deadline)
+                        (declare (ignore timeout deadline))
+                        (setf request-stream stream)
+                        (push (list stream error-code) cancellations)
+                        t)))
+                    (failure nil)
+                    (response nil))
                (unwind-protect
                    (progn
                      (http-kit/http3:attach-http3-peer-control-stream client peer-stream)
