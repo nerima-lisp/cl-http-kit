@@ -79,12 +79,12 @@
     try-read-stream
     stream-write-pending-p
     accept-peer-unidirectional-stream
-    (prefetched-stream-inputs (quote ()))
-    (pending-peer-unidirectional-streams (quote ()))
-    (peer-unidirectional-prefix-buffers (quote ()))
-    (pending-push-streams (quote ()))
-    (seen-peer-push-ids (quote ()))
-    (discard-peer-unidirectional-streams (quote ()))
+    prefetched-stream-inputs
+    pending-peer-unidirectional-streams
+    peer-unidirectional-prefix-buffers
+    pending-push-streams
+    seen-peer-push-ids
+    discard-peer-unidirectional-streams
     close-stream
     cancel-stream
     control-stream
@@ -105,8 +105,8 @@
     (peer-qpack-decoder-fin-p nil :type boolean)
     (request-stream-count 0 :type integer)
     (request-streams (make-hash-table :test (function eql)) :type hash-table)
-    (pending-request-streams (quote ()))
-    (runnable-stream-ids (quote ()))
+    pending-request-streams
+    runnable-stream-ids
     scheduler-owner-thread
     scheduler-close-state
     scheduler-close-owner-active-p
@@ -131,13 +131,13 @@
     (max-header-bytes 65536 :type integer)
     (max-fields 256 :type integer)
     max-push-id
-    (promised-push-ids (quote ()))
-    (push-promises (quote ()))
-    (cancelled-push-ids (quote ()))
-    (consumed-push-ids (quote ()))
+    promised-push-ids
+    push-promises
+    cancelled-push-ids
+    consumed-push-ids
     (qpack-settings nil)
     (peer-qpack-settings-applied-p nil :type boolean)
-    (close-pending-streams (quote ()))
+    close-pending-streams
     (open-p t))
   (defstruct (%http3-request-stream
                (:constructor %make-http3-request-stream))
@@ -164,7 +164,7 @@
     deadline
     request-write-state
     (response-buffer #() :type vector)
-    (response-frames '())
+    response-frames
     response-status
     response-headers
     response-trailers
@@ -3608,8 +3608,6 @@ validated informational response in wire order."
     (when owner-p
       (%h3-scheduler-owner-loop client entry))
     (%h3-scheduler-wait-entry client entry)
-    (when (%http3-request-stream-failure entry)
-      (error (%http3-request-stream-failure entry)))
     (%http3-request-stream-response entry)))
 
 )
