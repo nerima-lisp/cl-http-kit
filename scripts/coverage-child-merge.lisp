@@ -24,7 +24,7 @@
 (defvar *child-loads* nil)
 
 (defstruct collector
-  roots loads tickets manifest merged failure directory (sequence 0)
+  roots loads tickets manifest merged failure directory stage-directory (sequence 0)
   (table (car sb-c::*code-coverage-info*)))
 
 (defun require-proof (value message)
@@ -135,16 +135,13 @@
           (require-proof (eq :end (read stream nil :end)) "trailing payload"))))))
 
 (defun accepted-payload (ticket)
-  (let ((bytes (payload-bytes (getf ticket :result))))
-    (require-proof (and (getf ticket :accepted-bytes)
-                        (equalp bytes (getf ticket :accepted-bytes)))
-                   "accepted payload bytes changed")
-    ;; Parse this verified snapshot, never reopen the pathname after verification.
-    (with-input-from-string (stream (sb-ext:octets-to-string bytes :external-format :utf-8))
-      (with-standard-io-syntax
-        (let ((*read-eval* nil))
-          (prog1 (read stream)
-            (require-proof (eq :end (read stream nil :end)) "trailing payload")))))))
+  (let ((stage (getf ticket :stage)))
+    (require-proof (probe-file stage) "missing staged payload")
+    (require-proof (and (getf ticket :digest)
+                        (equal (getf ticket :digest)
+                               (subseq (hashes (list stage)) 0 64)))
+                   "accepted payload digest changed")
+    (read-form stage)))
 
 (defun code-name (code)
   (sb-c::debug-source-namestring
@@ -202,16 +199,28 @@
                                                            (merge-pathnames "http-coverage-child.XXXXXXXX"
                                                                             (uiop:temporary-directory))))
                                                     :output :string))))
+         (stage-directory
+           (or (collector-stage-directory *collector*)
+               (setf (collector-stage-directory *collector*)
+                     (uiop:ensure-directory-pathname
+                      (string-trim '(#\Newline #\Return)
+                                   (uiop:run-program (list "mktemp" "-d"
+                                                           (namestring
+                                                            (merge-pathnames "http-coverage-stage.XXXXXXXX"
+                                                                             (uiop:temporary-directory))))
+                                                     :output :string))))))
          (request-file (merge-pathnames "request.sexp" directory))
          (result-file (merge-pathnames "result.sexp" directory))
+         (stage-file (merge-pathnames
+                      (format nil "~D.sexp" (1+ (length (collector-tickets *collector*))))
+                      stage-directory))
          (paths (append (input-paths)
                         (loop for record in (collector-loads *collector*)
                               append (third record))))
          (manifest (hashes paths))
          (request (list :identity (runtime-identity) :paths paths :manifest manifest
                         :loads (collector-loads *collector*) :result result-file))
-         (ticket (list :request request :result result-file :exit :pending
-                       :accepted-bytes nil)))
+         (ticket (list :request request :stage stage-file :exit :pending :digest nil)))
     (if (collector-manifest *collector*)
         (require-proof (equal manifest (collector-manifest *collector*)) "input drift")
         (setf (collector-manifest *collector*) manifest))
@@ -229,8 +238,15 @@
   (require-proof (eq :pending (getf ticket :exit)) "duplicate child completion")
   (setf (getf ticket :exit) exit)
   (require-proof (eql 0 exit) "child failed")
-  (require-proof (probe-file (getf ticket :result)) "missing child payload")
-  (setf (getf ticket :accepted-bytes) (payload-bytes (getf ticket :result))))
+  (let ((result (getf (getf ticket :request) :result))
+        (stage (getf ticket :stage)))
+    (require-proof (probe-file result) "missing child payload")
+    (require-proof (not (probe-file stage)) "staging path already exists")
+    (progn
+      (rename-file result stage)
+      (uiop:run-program (list "chmod" "400" (namestring stage))
+                        :output :string))
+    (setf (getf ticket :digest) (subseq (hashes (list stage)) 0 64))))
 
 (defun start-child (pathname)
   (setf *child-request* (read-form pathname))
@@ -399,21 +415,28 @@
   (when (and *collector* (not (collector-merged *collector*)))
     (when (collector-failure *collector*) (error (collector-failure *collector*)))
     (handler-case
-        (let* ((tickets (reverse (collector-tickets *collector*)))
-               (inputs
-                 (loop for ticket in tickets
-                       for request = (getf ticket :request)
-                       do (require-proof (eql 0 (getf ticket :exit)) "missing successful child exit")
-                          (require-proof (equal (hashes (getf request :paths))
-                                                (getf request :manifest)) "pre-merge input drift")
-                       collect (canonical-input (accepted-payload ticket) request
-                                                (collector-roots *collector*)))))
-          (require-proof (eq (collector-table *collector*) (car sb-c::*code-coverage-info*))
-                         "pre-merge native table changed")
+        (let ((tickets (reverse (collector-tickets *collector*))))
+          (dolist (ticket tickets)
+            (let ((request (getf ticket :request)))
+              (require-proof (eql 0 (getf ticket :exit)) "missing successful child exit")
+              (require-proof (equal (hashes (getf request :paths)) (getf request :manifest)) "pre-merge input drift")
+              (canonical-input (accepted-payload ticket) request
+                               (collector-roots *collector*))))
+          (progn
+            (require-proof (eq (collector-table *collector*) (car sb-c::*code-coverage-info*))
+                           "pre-merge native table changed")
+            (when tickets
+              (uiop:run-program (list "chmod" "500"
+                                      (namestring (collector-stage-directory *collector*)))
+                                :output :string)))
           ;; Validate every child before any official native merge is attempted.
-          (dolist (input inputs) (sb-cover:merge-coverage input))
+          (dolist (ticket tickets)
+            (let ((request (getf ticket :request)))
+              (sb-cover:merge-coverage
+               (canonical-input (accepted-payload ticket) request
+                                (collector-roots *collector*)))))
           (setf (collector-merged *collector*) t)
-          (format *error-output* "Child coverage merge: ~D verified children.~%" (length inputs)))
+          (format *error-output* "Child coverage merge: ~D verified children.~%" (length tickets)))
       (error (condition)
-        (setf (collector-failure *collector*) condition)
-        (error condition)))))
+             (setf (collector-failure *collector*) condition)
+             (error condition)))))
