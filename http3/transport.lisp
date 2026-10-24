@@ -2610,12 +2610,18 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
           (when (%http3-request-stream-on-stream-open entry)
             (funcall (%http3-request-stream-on-stream-open entry)
                      stream stream-id
-                     (lambda (&key (error-code #x10c))
-                       (cancel-http3-stream
-                        client stream
-                        :error-code error-code
-                        :timeout (%http3-request-stream-timeout entry)
-                        :deadline (%http3-request-stream-deadline entry)))))
+                     (lambda (&rest arguments)
+                       (let ((error-code-supplied-p
+                              (loop for tail on arguments by #'cddr
+                                    thereis (eq (first tail) :error-code))))
+                         (apply
+                          #'(lambda (&key error-code)
+                            (cancel-http3-stream
+                             client stream
+                             :error-code (if error-code-supplied-p error-code #x10c)
+                             :timeout (%http3-request-stream-timeout entry)
+                             :deadline (%http3-request-stream-deadline entry)))
+                          arguments)))))
           entry)
       (error (condition)
              (if stream

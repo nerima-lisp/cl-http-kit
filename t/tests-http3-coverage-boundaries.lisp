@@ -4668,8 +4668,20 @@
                              request-id stream-id
                              request-entry
                              (http-kit/http3::%h3-scheduler-entry-for-stream
-                              client stream)
-                             cancel-return-value (funcall cancel))))))))
+                              client stream))
+                       (let ((explicit-nil-failure
+                               (http3-boundary-error
+                                (lambda ()
+                                  (funcall cancel :error-code nil)))))
+                         (ensure-true
+                          (typep explicit-nil-failure
+                                 (quote http-kit:http-protocol-error)))
+                         (when (typep explicit-nil-failure
+                                      (quote http-kit:http-protocol-error))
+                           (ensure-equal
+                            "HTTP/3 cancellation error-code must be a QUIC varint."
+                            (http-error-message explicit-nil-failure))))
+                       (setf cancel-return-value (funcall cancel))))))))
            (ensure-true request-stream)
            (ensure-equal 0 request-id)
            (ensure-equal t cancel-return-value)
