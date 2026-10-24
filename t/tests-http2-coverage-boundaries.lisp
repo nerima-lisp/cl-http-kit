@@ -2353,4 +2353,47 @@
         (http-kit/http2:close-http2-connection-manager manager)
         (http-kit/http2:close-http2-connection existing-connection)
         (http-kit/http2:close-http2-connection new-connection)))))
+(deftest http2-coverage-manager-exclusive-entry-is-not-shared
+  (let* ((stream (make-instance 'binary-session-stream :input (octets)))
+         (connection
+           (http-kit/http2:make-http2-connection
+            :stream stream
+            :close-stream
+            (lambda (owned-stream)
+              (ensure-true (eq stream owned-stream))
+              (close owned-stream))))
+         (key :same-key)
+         (entry
+           (http-kit/http2::%make-http2-managed-connection
+            :key key
+            :connection connection
+            :opened-at 0
+            :last-used 0
+            :last-used-at 0
+            :active-count 1
+            :exclusive-p t))
+         (manager
+           (http-kit/http2:make-http2-connection-manager
+            :open-connection
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              nil))))
+    (setf (http-kit/http2::%http2-connection-manager-entries manager)
+          (list entry))
+    (unwind-protect
+         (multiple-value-bind (selected-entry request-scoped-p actions
+                               clear-generation)
+             (http-kit/http2::%h2-manager-select-entry manager key 0 t)
+           (ensure-true (null selected-entry))
+           (ensure-true request-scoped-p)
+           (ensure-true (null actions))
+           (ensure-equal 0 clear-generation)
+           (ensure-equal 1
+                         (http-kit/http2::%http2-managed-connection-active-count
+                          entry))
+           (ensure-true
+            (http-kit/http2::%http2-managed-connection-exclusive-p entry)))
+      (http-kit/http2::%h2-manager-finish-entry manager entry)
+      (http-kit/http2:close-http2-connection-manager manager)
+      (http-kit/http2:close-http2-connection connection))))
 
