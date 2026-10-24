@@ -451,7 +451,7 @@
                (lambda (condition details)
                  (declare (ignore condition details))
                  (error "startup error callback failure"))))
-            (listener (gensym "STARTUP-LISTENER-"))
+            (listener (http-kit/network::%make-http-network-listener :port 443))
             (closed nil))
         (%https-listener-test-call-with-function-stubs
          (list
