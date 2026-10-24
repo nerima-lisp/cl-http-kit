@@ -3702,3 +3702,149 @@
          :handled 1 :error-p t :detail 103 :statuses nil
          :response (make-http-response :status 200)
          :information (list information))))))
+
+(deftest http2-server-effective-deadline-prefers-earliest-deadline
+  (let ((deadlines (make-hash-table :test #'eql)))
+    (ensure-equal
+     7
+     (http-kit/http2::%h2-server-effective-deadline 11 7 deadlines))
+    (ensure-equal
+     11
+     (http-kit/http2::%h2-server-effective-deadline 11 nil deadlines))
+    (ensure-equal
+     7
+     (http-kit/http2::%h2-server-effective-deadline nil 7 deadlines))
+    (ensure-equal
+     nil
+     (http-kit/http2::%h2-server-effective-deadline nil nil deadlines))
+    (setf (gethash :frame-start deadlines) 9)
+    (ensure-equal
+     9
+     (http-kit/http2::%h2-server-effective-deadline nil nil deadlines))
+    (ensure-equal
+     8
+     (http-kit/http2::%h2-server-effective-deadline 11 8 deadlines))
+    (setf (gethash :frame-start deadlines) 6)
+    (ensure-equal
+     6
+     (http-kit/http2::%h2-server-effective-deadline 11 8 deadlines))))
+
+(deftest http2-server-rejects-invalid-timeout-and-body-callback-options
+  (let ((input
+          (concatenate-octets
+           (h2-preface)
+           (h2-frame 4 0 0 (octets))
+           (h2-frame 1 5 1
+                     (h2-header-block
+                      (cons ":method" "GET")
+                      (cons ":scheme" "https")
+                      (cons ":authority" "example.com")
+                      (cons ":path" "/"))))))
+    (dolist (case '((:reserve-body-bytes :invalid)
+                    (:release-body-bytes :invalid)
+                    (:request-timeout :invalid)
+                    (:idle-timeout -1)
+                    (:shutdown-p :invalid)))
+      (destructuring-bind (option invalid) case
+        (let* ((stream (make-instance 'binary-session-stream :input input))
+               (handler-calls 0)
+               (body-calls 0)
+               (error-calls 0)
+               (close-calls 0)
+               (observed nil)
+               (handler
+                 (lambda (request)
+                   (declare (ignore request))
+                   (incf handler-calls)
+                   (make-http-response :status 200)))
+               (options
+                 (list :close-stream
+                       (lambda (closed-stream)
+                         (incf close-calls)
+                         (close closed-stream))
+                       :on-error
+                       (lambda (condition request)
+                         (declare (ignore condition request))
+                         (incf error-calls))
+                       :on-body-chunk
+                       (lambda (state chunk)
+                         (declare (ignore state chunk))
+                         (incf body-calls))
+                       :reserve-body-bytes (function identity)
+                       :release-body-bytes (function identity)
+                       :request-timeout nil
+                       :idle-timeout nil
+                       :shutdown-p nil)))
+          (setf (getf options option) invalid)
+          (let ((expected-detail
+                  (case option
+                    ((:reserve-body-bytes :release-body-bytes)
+                     (list (getf options :on-body-chunk)
+                           (getf options :reserve-body-bytes)
+                           (getf options :release-body-bytes)))
+                    ((:request-timeout :idle-timeout)
+                     (cons option invalid))
+                    (:shutdown-p invalid))))
+            (unwind-protect
+                 (progn
+                   (handler-case
+                       (apply #'http-kit/http2:serve-http2-session
+                              stream handler options)
+                     (http-protocol-error (condition)
+                       (setf observed condition)))
+                   (ensure-true
+                    (typep observed 'http-protocol-error))
+                   (ensure-equal
+                    :http2-server
+                    (http-kit:http-error-operation observed))
+                   (ensure-equal
+                    expected-detail
+                    (http-kit:http-protocol-error-detail observed))
+                   (ensure-equal 0 handler-calls)
+                   (ensure-equal 0 body-calls)
+                   (ensure-equal 0 error-calls)
+                   (ensure-equal 0 close-calls)
+                   (ensure-equal 0
+                                 (binary-session-input-position stream))
+                   (ensure-equal 0
+                                 (length (binary-session-output stream)))
+                   (ensure-true (open-stream-p stream)))
+              (when (open-stream-p stream)
+                (close stream)))
+            (ensure-false (open-stream-p stream))))))))
+
+(deftest http2-server-rejects-invalid-body-limit-before-session-ownership
+  (let* ((input
+           (concatenate-octets
+            (h2-preface)
+            (h2-frame 4 0 0 (octets))
+            (h2-frame 1 5 1
+                      (h2-header-block
+                       (cons ":method" "GET")
+                       (cons ":scheme" "https")
+                       (cons ":authority" "example.com")
+                       (cons ":path" "/")))))
+         (stream (make-instance 'binary-session-stream :input input))
+         (observed nil))
+    (unwind-protect
+         (progn
+           (handler-case
+               (http-kit/http2:serve-http2-session
+                stream
+                (lambda (request)
+                  (declare (ignore request))
+                  (make-http-response :status 204))
+                :max-body-bytes "invalid"
+                :close-stream nil)
+             (http-protocol-error (condition)
+               (setf observed condition)))
+           (ensure-true (typep observed 'http-protocol-error))
+           (ensure-equal
+            "invalid"
+            (http-kit:http-protocol-error-detail observed))
+           (ensure-equal 0 (binary-session-input-position stream))
+           (ensure-equal 0 (length (binary-session-output stream)))
+           (ensure-true (open-stream-p stream)))
+      (when (open-stream-p stream)
+        (close stream)))
+    (ensure-false (open-stream-p stream))))
