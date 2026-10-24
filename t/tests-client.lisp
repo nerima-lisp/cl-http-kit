@@ -650,21 +650,28 @@
               :content-type "application/octet-stream"))
        :boundary "boundary")
     (ensure-equal "multipart/form-data; boundary=\"boundary\"" content-type)
-    (let ((parts (parse-http-multipart-body
-                  body
-                  :content-type "multipart/form-data; boundary=\"boundary\"")))
-      (ensure-equal 2 (length parts))
-      (let ((field (first parts))
-            (upload (second parts)))
-        (ensure-equal "field" (http-multipart-part-name field))
-        (ensure-equal (octets-as-string (octets 118 97 108 117 101))
-                      (octets-as-string (http-multipart-part-value field)))
-        (ensure-equal "upload" (http-multipart-part-name upload))
-        (ensure-equal "data.bin" (http-multipart-part-filename upload))
-        (ensure-equal "application/octet-stream"
-                      (http-multipart-part-content-type upload))
-        (ensure-equal (octets 0 1 2 255)
-                      (http-multipart-part-value upload))))))
+    (let ((original-body (copy-seq body)))
+      (let ((parts (parse-http-multipart-body
+                    body
+                    :content-type "multipart/form-data; boundary=\"boundary\"")))
+        (ensure-octets-equal original-body body)
+        (ensure-equal 2 (length parts))
+        (let ((field (first parts))
+              (upload (second parts)))
+          (ensure-equal "field" (http-multipart-part-name field))
+          (ensure-equal (octets-as-string (octets 118 97 108 117 101))
+                        (octets-as-string (http-multipart-part-value field)))
+          (ensure-equal "upload" (http-multipart-part-name upload))
+          (ensure-equal "data.bin" (http-multipart-part-filename upload))
+          (ensure-equal "application/octet-stream"
+                        (http-multipart-part-content-type upload))
+          (ensure-equal (octets 0 1 2 255)
+                        (http-multipart-part-value upload))
+          (let ((payload-offset (position 0 body)))
+            (ensure-true payload-offset)
+            (setf (aref body payload-offset) 42)
+            (ensure-equal (octets 0 1 2 255)
+                          (http-multipart-part-value upload))))))))
 
 (deftest client-multipart-generator-rejects-header-control-characters
   (dolist (part (list (make-http-multipart-part

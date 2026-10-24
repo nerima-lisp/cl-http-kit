@@ -262,7 +262,20 @@
                         (http-protocol-error-detail condition))
           (ensure-octets-equal #(21 3 3 0 2 2 10)
                                (binary-test-output raw)))
-        (close raw :abort t))))
+        (close raw :abort t)))
+    (let* ((stream (make-instance '%tls-server-test-stream :input (octets)))
+           (state (http-kit/tls::%make-http-tls-server-state
+                   :driver nil :provider nil :transport-stream stream)))
+      (setf (http-kit/tls::http-tls-server-state-early-data-offered-p state) t
+            (http-kit/tls::http-tls-server-state-handshake-complete-p state) t)
+      (let ((condition
+              (%tls-server-test-condition
+               (lambda ()
+                 (http-kit/tls::%tls-server-process-record
+                  state (octets 23 3 3 0 1 0))))))
+        (ensure-equal :unexpected-record
+                      (http-protocol-error-detail condition)))
+      (close stream :abort t)))
 
   (progn
 (deftest tls-server-wrapper-sanitizes-peer-and-setup-failures
@@ -304,13 +317,15 @@
               :ticket-key-store store
               :alpn-protocols '("h2"))))
       (unwind-protect
-           (let ((condition
-                   (%tls-server-test-condition
-                    (lambda () (funcall wrapper stream :timeout 2)))))
-             (ensure-equal :handshake-failed
-                           (http-protocol-error-detail condition))
-             (ensure-true (%tls-server-test-safe-condition-p condition marker))
-             (ensure-false (open-stream-p stream)))
+           (progn
+             (close stream :abort t)
+             (let ((condition
+                     (%tls-server-test-condition
+                      (lambda () (funcall wrapper stream :timeout 2)))))
+               (ensure-equal :handshake-failed
+                             (http-protocol-error-detail condition))
+               (ensure-true (%tls-server-test-safe-condition-p condition marker))
+               (ensure-false (open-stream-p stream))))
         (when (open-stream-p stream)
           (close stream :abort t)))))
 (deftest tls-server-wrapper-constructor-validation-boundaries
@@ -511,6 +526,17 @@
       (multiple-value-bind (ciphertext-p pending)
           (http-kit/tls::%tls-client-track-server-hello (octets) wire)
         (ensure-true ciphertext-p)
+        (ensure-equal 0 (length pending))))
+    (let ((hrr-wire
+            (cl-tls-kit:encode-handshake
+             2
+             (cl-tls-kit:make-tls13-hello-retry-request
+              #x0303 #x0017
+              (list (cl-tls-kit:make-tls-extension 43 (octets 3 4)))
+              #x1301))))
+      (multiple-value-bind (ciphertext-p pending)
+          (http-kit/tls::%tls-client-track-server-hello (octets) hrr-wire)
+        (ensure-false ciphertext-p)
         (ensure-equal 0 (length pending))))
     (multiple-value-bind (ciphertext-p pending)
         (http-kit/tls::%tls-client-track-server-hello
