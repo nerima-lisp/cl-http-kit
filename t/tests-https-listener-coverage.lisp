@@ -476,7 +476,7 @@
         (ensure-true closed)
         (ensure-equal :failed (http-kit::http-server-state server))
         (ensure-equal
-         :error-callback-failed
+         :supervisor-start-failed
          (http-server-error-reason-code (http-server-failure server))))
       (let ((server (%https-listener-make-server)))
         (setf (http-kit::http-server-state server) :stopped)
