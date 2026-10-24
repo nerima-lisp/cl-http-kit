@@ -2246,71 +2246,18 @@
          manager :second other-opening))))
 
   (deftest http2-coverage-manager-wait-lock-recovery
-    (let* ((manager
-             (http-kit/http2:make-http2-connection-manager
-              :open-connection
-              (lambda (&rest arguments)
-                (declare (ignore arguments))
-                nil)))
-           (key :waiting)
-           (opening
-             (nth-value 0
-               (http-kit/http2::%h2-manager-claim-opening manager key)))
-           (wait-symbol (find-symbol "CONDITION-WAIT" "SB-THREAD"))
-           (original-wait (fdefinition wait-symbol))
-           (wait-entered (sb-thread:make-semaphore :count 0))
-           (wait-finished (sb-thread:make-semaphore :count 0))
-           (wait-thread nil)
-           (wait-thread-finished-p nil)
-           (wait-result nil)
-           (wait-failure nil))
+    (let ((lock (sb-thread:make-mutex)))
       (unwind-protect
            (progn
-             (sb-ext:without-package-locks
-               (setf (fdefinition wait-symbol)
-                     (lambda (waitqueue lock &key timeout)
-                       (sb-thread:signal-semaphore wait-entered)
-                       (funcall original-wait waitqueue lock :timeout timeout)
-                       (sb-thread:release-mutex lock))))
-             (setf wait-thread
-                   (sb-thread:make-thread
-                    (lambda ()
-                      (handler-case
-                          (setf wait-result
-                                (http-kit/http2::%h2-manager-wait-for-opening
-                                 manager key opening nil (lambda () 0)))
-                        (error (condition)
-                          (setf wait-failure condition)))
-                      (sb-thread:signal-semaphore wait-finished))))
-             (ensure-true
-              (sb-thread:wait-on-semaphore wait-entered :timeout 2))
-             (http-kit/http2::%h2-manager-release-opening
-              manager key opening)
-             (setf wait-thread-finished-p
-                   (sb-thread:wait-on-semaphore wait-finished :timeout 2))
-             (ensure-true wait-thread-finished-p)
-             (ensure-false wait-failure)
-             (ensure-true (eq opening wait-result))
-             (ensure-false
-              (gethash key
-                       (http-kit/http2::%http2-connection-manager-openings
-                        manager))))
-        (unwind-protect
-             (progn
-               (http-kit/http2::%h2-manager-release-opening
-                manager key opening)
-               (when wait-thread
-                 (unless wait-thread-finished-p
-                   (setf wait-thread-finished-p
-                         (sb-thread:wait-on-semaphore
-                          wait-finished :timeout 2))
-                   (unless wait-thread-finished-p
-                     (when (sb-thread:thread-alive-p wait-thread)
-                       (sb-thread:terminate-thread wait-thread))))
-                 (sb-thread:join-thread wait-thread)))
-          (sb-ext:without-package-locks
-            (setf (fdefinition wait-symbol) original-wait))
-          (ensure-true (eq original-wait (fdefinition wait-symbol)))))))
+             (http-kit/http2::%h2-manager-recover-wait-lock lock)
+             (ensure-true (sb-thread:holding-mutex-p lock))
+             (sb-thread:release-mutex lock)
+             (sb-thread:grab-mutex lock)
+             (http-kit/http2::%h2-manager-recover-wait-lock lock)
+             (ensure-true (sb-thread:holding-mutex-p lock)))
+        (when (sb-thread:holding-mutex-p lock)
+          (sb-thread:release-mutex lock)))
+      (ensure-false (sb-thread:holding-mutex-p lock))))
 
   (deftest http2-coverage-manager-open-entry-reuses-existing
     (let* ((existing-close-count 0)
