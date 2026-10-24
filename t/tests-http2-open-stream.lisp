@@ -1379,6 +1379,7 @@
            (h2-frame 4 0 0 (octets 0 5 0 0 64 0)))
          (settings-applied-p nil)
          (producer-calls 0)
+         (producer-thread nil)
          (response nil))
     (unwind-protect
          (progn
@@ -1396,6 +1397,7 @@
                    ;; Apply a peer SETTINGS frame after the body loop has read
                    ;; its old frame limit but before the DATA writer takes the lock.
                    (when (and (eq window-connection connection)
+                              (eq sb-thread:*current-thread* producer-thread)
                               (= stream-id 3)
                               (plusp producer-calls)
                               (not settings-applied-p))
@@ -1415,6 +1417,7 @@
                   :request-body-function
                   (lambda (maximum-size)
                     (incf producer-calls)
+                    (setf producer-thread sb-thread:*current-thread*)
                     (when (= producer-calls 1)
                       (ensure-equal initial-frame-size maximum-size)
                       body))
