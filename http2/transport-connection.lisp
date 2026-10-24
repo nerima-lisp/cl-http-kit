@@ -532,51 +532,68 @@ are rejected after this function marks the connection draining."
                           connection frame writer stream-id)
                          (push frame pending-frames)))))
              (write-data (payload end-stream-p)
-               (let ((size (length payload)))
-                 (let ((wire (%h2-frame-wire
-                              +http2-data-type+
-                              (if end-stream-p +http2-end-stream-flag+ 0)
-                              stream-id payload)))
-                   (if scheduler-p
-                       (%h2-with-scheduler-lock (connection)
-                         (check-scheduler-entry-under-lock)
-                         (let* ((stream-window
-                                  (%h2-connection-stream-window
-                                   connection stream-id))
-                                (connection-window
-                                  (%http2-connection-peer-connection-window-size
-                                   connection)))
-                           (when (or (zerop size)
-                                     (>= (min stream-window connection-window)
-                                         size))
-                             (funcall writer wire)
-                             (when (plusp size)
-                               (decf
+               (let ((payload-size (length payload)))
+                 (if scheduler-p
+                     (%h2-with-scheduler-lock (connection)
+                       (check-scheduler-entry-under-lock)
+                       (let* ((size
+                                (min payload-size
+                                     (effective-max-frame-size)))
+                              (frame-payload
+                                (if (= size payload-size)
+                                    payload
+                                    (subseq payload 0 size)))
+                              (wire
+                                (%h2-frame-wire
+                                 +http2-data-type+
+                                 (if (and end-stream-p
+                                          (= size payload-size))
+                                     +http2-end-stream-flag+
+                                     0)
+                                 stream-id frame-payload))
+                              (stream-window
+                                (%h2-connection-stream-window
+                                 connection stream-id))
+                              (connection-window
                                 (%http2-connection-peer-connection-window-size
-                                 connection)
-                                size)
-                               (decf (cdr (assoc
-                                           stream-id
-                                           (%http2-connection-peer-stream-windows
-                                            connection)))
-                                     size)
-                               (incf position size))
-                             t)))
-                       (progn
-                         (funcall writer wire)
-                         (when (plusp size)
-                           (decf
-                            (%http2-connection-peer-connection-window-size
-                             connection)
-                            size)
-                           (let ((entry
-                                   (assoc
+                                 connection)))
+                         (when (or (zerop size)
+                                   (>= (min stream-window connection-window)
+                                       size))
+                           (funcall writer wire)
+                           (when (plusp size)
+                             (decf
+                              (%http2-connection-peer-connection-window-size
+                               connection)
+                              size)
+                             (decf
+                              (cdr (assoc
                                     stream-id
                                     (%http2-connection-peer-stream-windows
-                                     connection))))
-                             (decf (cdr entry) size))
-                           (incf position size))
-                         t)))))
+                                     connection)))
+                              size)
+                             (incf position size))
+                           size)))
+                     (let* ((size payload-size)
+                            (wire
+                              (%h2-frame-wire
+                               +http2-data-type+
+                               (if end-stream-p +http2-end-stream-flag+ 0)
+                               stream-id payload)))
+                       (funcall writer wire)
+                       (when (plusp size)
+                         (decf
+                          (%http2-connection-peer-connection-window-size
+                           connection)
+                          size)
+                         (let ((entry
+                                 (assoc
+                                  stream-id
+                                  (%http2-connection-peer-stream-windows
+                                   connection))))
+                           (decf (cdr entry) size))
+                         (incf position size))
+                       size))))
              (effective-max-frame-size ()
                (min local-max-frame-size
                     (%http2-connection-peer-max-frame-size connection)))
@@ -663,17 +680,20 @@ are rejected after this function marks the connection draining."
                                         expected-body-length))))
                          (http-kit::%check-limit
                           :body (+ position size) max-body-bytes)
-                         (when
-                             (write-data
-                              (subseq pending-chunk
-                                      pending-offset (+ pending-offset size))
-                              end-stream-p)
-                           (incf pending-offset size)
-                           (when (= pending-offset (length pending-chunk))
-                             (setf pending-chunk nil
-                                   pending-offset 0))
-                           (when end-stream-p
-                             (return))))
+                         (let ((written-size
+                                 (write-data
+                                  (subseq pending-chunk
+                                          pending-offset
+                                          (+ pending-offset size))
+                                  end-stream-p)))
+                           (when written-size
+                             (incf pending-offset written-size)
+                             (when (= pending-offset (length pending-chunk))
+                               (setf pending-chunk nil
+                                     pending-offset 0))
+                             (when (and end-stream-p
+                                        (= written-size size))
+                               (return)))))
                        (read-while-blocked)))))))
           (loop while (< position body-length)
                 do (let* ((max-frame-size (effective-max-frame-size))

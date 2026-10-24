@@ -1352,6 +1352,112 @@
         (ensure-equal (length body) (funcall body-position))
         (ensure-true (plusp (funcall body-calls)))
         (http-kit/http2:close-http2-connection connection))))
+#+sbcl
+(deftest http2-public-produced-body-respects-peer-frame-size-shrink
+  (let* ((initial-frame-size 32768)
+         (reduced-frame-size 16384)
+         (body (make-array initial-frame-size
+                           :element-type '(unsigned-byte 8)
+                           :initial-element #x5a))
+         (stream
+           (make-instance 'binary-session-stream
+                          :input
+                          (concatenate-octets
+                           (h2-frame 4 0 0
+                                     (octets 0 5 0 0 128 0))
+                           (h2-frame 1 5 1
+                                     (h2-header-block (cons ":status" "200")))
+                           (h2-frame 1 5 3
+                                     (h2-header-block (cons ":status" "200"))))))
+         (connection
+           (http-kit/http2:make-http2-connection
+            :stream stream :max-frame-size initial-frame-size))
+         (window-symbol
+           (find-symbol "%H2-CONNECTION-STREAM-WINDOW" "HTTP-KIT/HTTP2"))
+         (original-window (symbol-function window-symbol))
+         (shrink-frame
+           (h2-frame 4 0 0 (octets 0 5 0 0 64 0)))
+         (settings-applied-p nil)
+         (producer-calls 0)
+         (response nil))
+    (unwind-protect
+         (progn
+           (let ((warmup-response
+                   (http-kit/http2:send-http2-request-over-connection
+                    connection
+                    (make-http-request :method "GET"
+                                       :uri "https://127.0.0.1/frame-size-warmup"))))
+             (ensure-equal 200 (http-response-status warmup-response))
+             (ensure-equal
+              initial-frame-size
+              (http-kit/http2:http2-connection-peer-max-frame-size connection)))
+           (setf (symbol-function window-symbol)
+                 (lambda (window-connection stream-id)
+                   ;; Apply a peer SETTINGS frame after the body loop has read
+                   ;; its old frame limit but before the DATA writer takes the lock.
+                   (when (and (eq window-connection connection)
+                              (not settings-applied-p))
+                     (setf settings-applied-p t)
+                     (http-kit/http2::%h2-scheduler-control-frame
+                      connection shrink-frame
+                      (http-kit/http2::%h2-scheduler-control-writer
+                       connection
+                       (http-kit/http2::%http2-connection-clock-function
+                        connection))))
+                   (funcall original-window window-connection stream-id)))
+           (setf response
+                 (http-kit/http2:send-http2-request-over-connection
+                  connection
+                  (make-http-request :method "POST"
+                                     :uri "https://127.0.0.1/frame-size-upload")
+                  :request-body-function
+                  (lambda (maximum-size)
+                    (incf producer-calls)
+                    (when (= producer-calls 1)
+                      (ensure-equal initial-frame-size maximum-size)
+                      body))
+                  :request-body-length (length body)))
+           (ensure-equal 200 (http-response-status response))
+           (ensure-true settings-applied-p)
+           (ensure-equal
+            reduced-frame-size
+            (http-kit/http2:http2-connection-peer-max-frame-size connection))
+           (let* ((reader
+                    (http-kit/http2::%h2-reader-for
+                     (subseq (binary-session-output stream)
+                             (length (h2-preface)))))
+                  (frames
+                    (loop for frame = (http-kit/http2::%h2-read-frame
+                                       reader initial-frame-size nil nil)
+                          until (eq frame :eof)
+                          collect frame))
+                  (data-frames
+                    (remove-if-not
+                     (lambda (frame)
+                       (and (= 0 (http-kit/http2::%h2-frame-type frame))
+                            (= 3 (http-kit/http2::%h2-frame-stream-id frame))))
+                     frames))
+                  (payloads
+                    (mapcar #'http-kit/http2::%h2-frame-payload data-frames)))
+             (ensure-equal 2 (length data-frames))
+             (ensure-true
+              (every (lambda (frame)
+                       (<= (length (http-kit/http2::%h2-frame-payload frame))
+                           reduced-frame-size))
+                     data-frames))
+             (ensure-equal (list reduced-frame-size reduced-frame-size)
+                           (mapcar #'length payloads))
+             (ensure-equal body (apply #'concatenate-octets payloads))
+             (ensure-equal 0
+                           (logand 1
+                                   (http-kit/http2::%h2-frame-flags
+                                    (first data-frames))))
+             (ensure-equal 1
+                           (logand 1
+                                   (http-kit/http2::%h2-frame-flags
+                                    (second data-frames))))))
+      (setf (symbol-function window-symbol) original-window)
+      (http-kit/http2:close-http2-connection connection))))
 
   (deftest http2-client-control-budget-counts-all-but-rst-stream
     (let* ((stream (make-instance 'binary-session-stream
