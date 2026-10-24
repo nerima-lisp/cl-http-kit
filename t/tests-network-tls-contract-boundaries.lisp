@@ -938,6 +938,40 @@
              (ensure-true (network-tls-contract-abort-p stream))
              (ensure-true (plusp (length (binary-test-output stream)))))
         (when (open-stream-p stream) (close stream :abort t))))))
+#+sbcl
+(progn
+  (deftest network-tls-contract-wake-listener
+    (%network-tls-contract-protocol
+     (lambda () (wake-http-tcp-listener :not-listener)) :wake :not-listener)
+    (let ((listener (open-http-tcp-listener)))
+      (unwind-protect
+           (progn
+             (ensure-equal nil (close-http-tcp-listener listener))
+             (ensure-equal nil (wake-http-tcp-listener listener)))
+        (close-http-tcp-listener listener)))
+    (dolist (ipv6-p '(nil t))
+      (let ((listener (open-http-tcp-listener :ipv6-p ipv6-p))
+            (accepted nil))
+        (unwind-protect
+             (progn
+               (ensure-equal (if ipv6-p :ipv6 :ipv4)
+                             (http-network-listener-address-family listener))
+               (ensure-equal
+                (if ipv6-p
+                    "0000:0000:0000:0000:0000:0000:0000:0000"
+                    "0.0.0.0")
+                (http-network-listener-address listener))
+               (ensure-equal nil (wake-http-tcp-listener listener))
+               (multiple-value-bind (stream address port)
+                   (accept-http-tcp-stream listener :timeout 2)
+                 (setf accepted stream)
+                 (ensure-true (streamp stream))
+                 (ensure-true
+                  (if ipv6-p (find #\: address)
+                      (string= "127.0.0.1" address)))
+                 (ensure-true (plusp port))))
+          (when accepted (close accepted :abort t))
+          (close-http-tcp-listener listener))))))
 
 #+sbcl
 (progn
