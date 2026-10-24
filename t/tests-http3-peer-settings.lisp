@@ -288,3 +288,137 @@
   (cl-weave:expect-assertions 27)
   (call-with-http3-settings-peer
    "control-prefix-no-settings" "The peer HTTP/3 SETTINGS did not arrive."))
+#+sbcl
+(deftest http3-peer-native-finished-unknown-stream-is-retained
+  (let* ((unknown-stream
+           (make-http3-test-stream :kind :peer-extension))
+         (extension-prefix (http-kit/http3:http3-varint-encode 64))
+         (pending-peer-streams nil)
+         (accepted-count 0)
+         (first-poll-p nil)
+         (unknown-read-count 0)
+         (response-wire (http3-test-native-response-wire))
+         (response-sent-p nil)
+         (client
+           (http3-test-make-native-client
+            :poll-function
+            (lambda ()
+              (unless first-poll-p
+                (setf first-poll-p t
+                      pending-peer-streams (list unknown-stream))))
+            :accept-peer-unidirectional-stream
+            (lambda ()
+              (let ((stream (pop pending-peer-streams)))
+                (when stream (incf accepted-count))
+                stream))
+            :try-read-stream
+            (lambda (stream &key timeout deadline)
+              (declare (ignore timeout deadline))
+              (cond
+                ((eq stream unknown-stream)
+                 (incf unknown-read-count)
+                 (if (= unknown-read-count 1)
+                     (values extension-prefix t :data)
+                     (values nil nil :would-block)))
+                ((stringp (http3-test-stream-kind stream))
+                 (if (and (plusp unknown-read-count) (not response-sent-p))
+                     (progn
+                       (setf response-sent-p t)
+                       (values response-wire t :data))
+                     (values nil nil :would-block)))
+                (t (values nil nil :would-block)))))))
+    (unwind-protect
+         (let ((response
+                 (http-kit/http3:send-http3-request
+                  client
+                  (make-http-request
+                   :method "GET"
+                   :uri "https://example.test/finished-unknown-stream"))))
+           (ensure-equal 200 (http-response-status response))
+           (ensure-true first-poll-p)
+           (ensure-equal 1 accepted-count)
+           (ensure-equal 1 unknown-read-count)
+           (ensure-equal
+            :finished
+            (cdr
+             (assoc
+              unknown-stream
+              (http-kit/http3::http3-client-discard-peer-unidirectional-streams
+               client)
+              :test (function eq))))
+           (ensure-true (http-kit/http3:http3-client-open-p client)))
+      (when (http-kit/http3:http3-client-open-p client)
+        (http-kit/http3:close-http3-client client)))))
+#+sbcl
+(deftest http3-peer-native-cancels-unknown-stream-after-classification
+  (let* ((unknown-stream
+           (make-http3-test-stream :kind :peer-extension))
+         (extension-prefix (http-kit/http3:http3-varint-encode 64))
+         (pending-peer-streams nil)
+         (accepted-count 0)
+         (first-poll-p nil)
+         (unknown-read-count 0)
+         (cancel-count 0)
+         (cancelled-stream nil)
+         (cancel-error-code nil)
+         (response-wire (http3-test-native-response-wire))
+         (response-sent-p nil)
+         (client
+           (http3-test-make-native-client
+            :poll-function
+            (lambda ()
+              (unless first-poll-p
+                (setf first-poll-p t
+                      pending-peer-streams (list unknown-stream))))
+            :accept-peer-unidirectional-stream
+            (lambda ()
+              (let ((stream (pop pending-peer-streams)))
+                (when stream (incf accepted-count))
+                stream))
+            :cancel-stream
+            (lambda (stream &key error-code timeout deadline)
+              (declare (ignore timeout deadline))
+              (incf cancel-count)
+              (setf cancelled-stream stream
+                    cancel-error-code error-code))
+            :try-read-stream
+            (lambda (stream &key timeout deadline)
+              (declare (ignore timeout deadline))
+              (cond
+                ((eq stream unknown-stream)
+                 (incf unknown-read-count)
+                 (if (= unknown-read-count 1)
+                     (values extension-prefix nil :data)
+                     (values nil nil :would-block)))
+                ((stringp (http3-test-stream-kind stream))
+                 (if (and (= cancel-count 1) (not response-sent-p))
+                     (progn
+                       (setf response-sent-p t)
+                       (values response-wire t :data))
+                     (values nil nil :would-block)))
+                (t (values nil nil :would-block)))))))
+    (unwind-protect
+         (let ((response
+                 (http-kit/http3:send-http3-request
+                  client
+                  (make-http-request
+                   :method "GET"
+                   :uri "https://example.test/cancel-unknown-stream"))))
+           (ensure-equal 200 (http-response-status response))
+           (ensure-true first-poll-p)
+           (ensure-equal 1 accepted-count)
+           (ensure-equal 1 unknown-read-count)
+           (ensure-equal 1 cancel-count)
+           (ensure-true (eq unknown-stream cancelled-stream))
+           (ensure-equal #x103 cancel-error-code)
+           (ensure-equal
+            :cancelled
+            (cdr
+             (assoc
+              unknown-stream
+              (http-kit/http3::http3-client-discard-peer-unidirectional-streams
+               client)
+              :test (function eq))))
+           (ensure-true (http-kit/http3:http3-client-open-p client)))
+      (when (http-kit/http3:http3-client-open-p client)
+        (http-kit/http3:close-http3-client client)))))

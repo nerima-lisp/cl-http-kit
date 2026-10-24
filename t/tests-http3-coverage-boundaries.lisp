@@ -2923,4 +2923,159 @@
                (ensure-equal nil stream)
                (ensure-equal nil push-id))))
       (http-kit/http3:close-http3-client client))))
+(deftest http3-scheduler-data-frame-boundaries
+  (let* ((payload (octets 1 2))
+         (entry (http-kit/http3::%make-http3-request-stream))
+         (failure
+           (http3-boundary-error
+            (lambda ()
+              (http-kit/http3::%h3-scheduler-process-data-frame
+               entry payload)))))
+    (http3-public-error-check
+     failure "An HTTP/3 DATA frame arrived before final response HEADERS." nil)
+    (ensure-equal 0
+                  (http-kit/http3::%http3-request-stream-response-body-length
+                   entry)))
+  (let* ((payload (octets 3))
+         (entry
+           (http-kit/http3::%make-http3-request-stream
+            :request-method "GET" :response-status 200
+            :final-response-p t :trailers-seen-p t))
+         (failure
+           (http3-boundary-error
+            (lambda ()
+              (http-kit/http3::%h3-scheduler-process-data-frame
+               entry payload)))))
+    (http3-public-error-check
+     failure "An HTTP/3 DATA frame arrived after response trailers." nil)
+    (ensure-equal 0
+                  (http-kit/http3::%http3-request-stream-response-body-length
+                   entry)))
+  (dolist (case (list (list nil 200 nil)
+                      (list "GET" 200 nil)
+                      (list "HEAD" 200 t)
+                      (list "GET" 204 t)))
+    (destructuring-bind (method status error-p) case
+      (let* ((entry
+               (http-kit/http3::%make-http3-request-stream
+                :request-method method :response-status status
+                :final-response-p t))
+             (result nil)
+             (failure
+               (http3-boundary-error
+                (lambda ()
+                  (setf result
+                        (http-kit/http3::%h3-scheduler-process-data-frame
+                         entry (octets 4)))))))
+        (if error-p
+            (http3-public-error-check
+             failure "This HTTP/3 response cannot carry DATA."
+             (list method status))
+            (progn
+              (ensure-equal nil failure)
+              (ensure-equal t result)))
+        (ensure-equal (if error-p 0 1)
+                      (http-kit/http3::%http3-request-stream-response-body-length entry)))))
+  (let* ((entry
+           (http-kit/http3::%make-http3-request-stream
+            :request-method "GET" :response-status 200
+            :final-response-p t :max-body-bytes 3
+            :response-body (octets 8 9) :response-body-length 2
+            :collect-body-p t))
+         (failure
+           (http3-boundary-error
+            (lambda ()
+              (http-kit/http3::%h3-scheduler-process-data-frame
+               entry (octets 10 11)))))
+         (body (http-kit/http3::%http3-request-stream-response-body entry)))
+    (ensure-true (typep failure 'http-size-limit-exceeded))
+    (ensure-equal :body (http-size-limit-exceeded-kind failure))
+    (ensure-equal 3 (http-size-limit-exceeded-limit failure))
+    (ensure-equal 4 (http-size-limit-exceeded-observed failure))
+    (ensure-equal 2
+                  (http-kit/http3::%http3-request-stream-response-body-length
+                   entry))
+    (ensure-octets-equal (octets 8 9) body))
+  (let* ((entry
+           (http-kit/http3::%make-http3-request-stream
+            :request-method "GET" :response-status 200
+            :final-response-p t :max-body-bytes 3
+            :response-body (octets 9) :response-body-length 1
+            :collect-body-p t))
+         (result
+           (http-kit/http3::%h3-scheduler-process-data-frame
+            entry (octets 10 11))))
+    (ensure-equal t result)
+    (ensure-equal 3
+                  (http-kit/http3::%http3-request-stream-response-body-length
+                   entry))
+    (ensure-octets-equal
+     (octets 9 10 11)
+     (http-kit/http3::%http3-request-stream-response-body entry)))
+  (let* ((entry
+           (http-kit/http3::%make-http3-request-stream
+            :request-method "GET" :response-status 200
+            :final-response-p t :collect-body-p nil))
+         (result
+           (http-kit/http3::%h3-scheduler-process-data-frame
+            entry (octets 12))))
+    (ensure-equal t result)
+    (ensure-equal 1
+                  (http-kit/http3::%http3-request-stream-response-body-length
+                   entry))
+    (ensure-octets-equal
+     (octets)
+     (http-kit/http3::%http3-request-stream-response-body entry)))
+  (let* ((input (octets 20 21))
+         (original (copy-seq input))
+         (callback-chunk nil)
+         (callback-original nil)
+         (callback-count 0)
+         (entry
+           (http-kit/http3::%make-http3-request-stream
+            :request-method "GET" :response-status 200
+            :final-response-p t :collect-body-p t
+            :on-body-chunk
+            (lambda (chunk)
+              (incf callback-count)
+              (setf callback-chunk chunk
+                    callback-original (copy-seq chunk))
+              (setf (aref chunk 0) 99))))
+         (result
+           (http-kit/http3::%h3-scheduler-process-data-frame entry input)))
+    (ensure-equal t result)
+    (ensure-equal 1 callback-count)
+    (ensure-true (not (eq input callback-chunk)))
+    (ensure-octets-equal original callback-original)
+    (ensure-octets-equal original input)
+    (ensure-equal 2
+                  (http-kit/http3::%http3-request-stream-response-body-length
+                   entry))
+    (ensure-octets-equal
+     original
+     (http-kit/http3::%http3-request-stream-response-body entry))))
+(deftest http3-scheduler-frame-dispatch-ignores-extension-and-rejects-control
+  (let* ((entry (http-kit/http3::%make-http3-request-stream))
+         (extension-frame
+           (http-kit/http3:make-http3-frame
+            :type #x2a :payload (octets 1 2)))
+         (settings-frame (http-kit/http3:make-http3-settings-frame))
+         (failure
+           (http3-boundary-error
+            (lambda ()
+              (http-kit/http3::%h3-scheduler-process-frame
+               nil entry settings-frame)))))
+    (ensure-equal #x2a
+                  (http-kit/http3:http3-frame-type extension-frame))
+    (ensure-octets-equal
+     (octets 1 2)
+     (http-kit/http3:http3-frame-payload extension-frame))
+    (ensure-equal
+     t
+     (http-kit/http3::%h3-scheduler-process-frame
+      nil entry extension-frame))
+    (http3-public-error-check
+     failure
+     "HTTP/3 control frames are not valid on a request stream."
+     http-kit/http3:+http3-settings-type+)))
 
