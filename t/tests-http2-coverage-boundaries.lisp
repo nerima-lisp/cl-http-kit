@@ -1403,7 +1403,7 @@
     (ensure-false (open-stream-p stream))
     (http-kit/http2:close-http2-connection connection)))
 #+sbcl
-(deftest http2-coverage-scheduler-upload-cancel-and-response-body
+(deftest http2-coverage-scheduler-upload-and-response-body
   (let* ((input
            (concatenate-octets
             (h2-frame 4 0 0 (octets))
@@ -1413,10 +1413,10 @@
             (h2-frame 0 1 1 (octets 111 107))))
          (stream (make-instance 'binary-session-stream :input input))
          (connection (http-kit/http2:make-http2-connection :stream stream))
-         (request (make-http-request :method "POST" :uri "https://example.com/scheduled-upload"))
+         (request (make-http-request :method "POST"
+                                     :uri "https://example.com/scheduled-upload"))
          (body-chunks (list (octets 117 112)))
-         (received-chunks nil)
-         (opened-stream nil))
+         (received-chunks nil))
     (unwind-protect
          (let ((response
                  (http-kit/http2:send-http2-request-over-connection
@@ -1426,14 +1426,9 @@
                     (ensure-true (>= maximum-size 2))
                     (pop body-chunks))
                   :request-body-length 2
-                  :on-stream-open
-                  (lambda (stream-id cancel)
-                    (setf opened-stream stream-id)
-                    (funcall cancel))
                   :on-body-chunk
                   (lambda (payload)
                     (push (copy-seq payload) received-chunks)))))
-           (ensure-equal 1 opened-stream)
            (ensure-false body-chunks)
            (ensure-equal 200 (http-response-status response))
            (ensure-equal (octets 111 107) (http-response-body response))
@@ -1441,18 +1436,147 @@
            (let* ((frames (h2-output-frames stream))
                   (reset (find 3 frames :key #'http-kit/http2::%h2-frame-type))
                   (data (find 0 frames :key #'http-kit/http2::%h2-frame-type)))
-             (ensure-true reset)
-             (ensure-equal 1 (http-kit/http2::%h2-frame-stream-id reset))
-             (ensure-equal (octets 0 0 0 8)
-                           (http-kit/http2::%h2-frame-payload reset))
+             (ensure-false reset)
              (ensure-true data)
              (ensure-equal 1 (http-kit/http2::%h2-frame-stream-id data))
              (ensure-equal (octets 117 112)
                            (http-kit/http2::%h2-frame-payload data))
              (ensure-equal 1
                            (logand 1 (http-kit/http2::%h2-frame-flags data)))
-             (ensure-equal 1 (count 0 frames :key #'http-kit/http2::%h2-frame-type))))
+             (ensure-equal 1
+                           (count 0 frames
+                                  :key #'http-kit/http2::%h2-frame-type))))
       (http-kit/http2:close-http2-connection connection))))
+#+sbcl
+(deftest http2-coverage-scheduler-cancel-retires-slot-and-wakes-capacity-waiter
+  (let* ((input
+           (concatenate-octets
+            (h2-frame 4 0 0 (octets 0 3 0 0 0 1))
+            (h2-frame 1 5 1
+                      (h2-header-block (cons ":status" "200")
+                                       (cons "content-length" "0")))))
+         (stream (make-instance 'binary-session-stream :input input))
+         (connection (http-kit/http2:make-http2-connection :stream stream))
+         (wait-symbol 'http-kit/http2::%h2-scheduler-condition-wait)
+         (original-wait (symbol-function wait-symbol))
+         (wait-entered (sb-thread:make-semaphore :count 0))
+         (waiter-finished (sb-thread:make-semaphore :count 0))
+         (waiter-thread nil)
+         (first-stream-id nil)
+         (second-stream-id nil)
+         (second-entry-stream-ids nil)
+         (first-error nil)
+         (second-error nil)
+         (producer-calls 0))
+    (unwind-protect
+         (progn
+           (let ((response
+                   (http-kit/http2:send-http2-request-over-connection
+                    connection
+                    (make-http-request :method "GET"
+                                       :uri "https://example.com/cancel-warmup"))))
+             (ensure-equal 200 (http-response-status response)))
+           ;; Keep peer capacity and sleep the waiter without consuming fixture EOF.
+           (http-kit/http2::%h2-with-scheduler-lock (connection)
+             (setf (http-kit/http2::%http2-connection-scheduler-reader-active-p
+                    connection)
+                   t))
+           (setf (symbol-function wait-symbol)
+                 (lambda (wait-connection deadline clock-function)
+                   (sb-thread:signal-semaphore wait-entered)
+                   (funcall original-wait wait-connection deadline clock-function)))
+           (handler-case
+               (http-kit/http2:send-http2-request-over-connection
+                connection
+                (make-http-request :method "POST"
+                                   :uri "https://example.com/cancel-owner")
+                :request-body-function
+                (lambda (maximum-size)
+                  (declare (ignore maximum-size))
+                  (incf producer-calls)
+                  (octets 97))
+                :request-body-length 1
+                :on-stream-open
+                (lambda (stream-id cancel)
+                  (setf first-stream-id stream-id)
+                  (setf waiter-thread
+                        (sb-thread:make-thread
+                         (lambda ()
+                           (unwind-protect
+                                (handler-case
+                                    (http-kit/http2:send-http2-request-over-connection
+                                     connection
+                                     (make-http-request
+                                      :method "POST"
+                                      :uri "https://example.com/cancel-waiter")
+                                     :request-body-function
+                                     (lambda (maximum-size)
+                                       (declare (ignore maximum-size))
+                                       (incf producer-calls)
+                                       (octets 98))
+                                     :request-body-length 1
+                                     :on-stream-open
+                                     (lambda (opened-stream-id cancel-waiter)
+                                       (setf second-stream-id opened-stream-id
+                                             second-entry-stream-ids
+                                             (http-kit/http2::%h2-with-scheduler-lock
+                                                 (connection)
+                                               (mapcar
+                                                #'http-kit/http2::%h2-batch-entry-stream-id
+                                                (http-kit/http2::%http2-connection-scheduler-entries
+                                                 connection))))
+                                       (funcall cancel-waiter)))
+                                  (error (condition)
+                                    (setf second-error condition)))
+                             (sb-thread:signal-semaphore waiter-finished)))))
+                  (ensure-true
+                   (sb-thread:wait-on-semaphore wait-entered :timeout 5))
+                  (funcall cancel)
+                  (ensure-true
+                   (sb-thread:wait-on-semaphore waiter-finished :timeout 5)))
+             (error (condition)
+               (setf first-error condition)))
+           (when waiter-thread
+             (sb-thread:join-thread waiter-thread)
+             (setf waiter-thread nil))
+           (ensure-equal 3 first-stream-id)
+           (ensure-equal 5 second-stream-id)
+           (ensure-equal '(5) second-entry-stream-ids)
+           (ensure-true (typep first-error 'http-connection-error))
+           (ensure-equal '(:local-cancel 3 8)
+                         (http-connection-error-cause first-error))
+           (ensure-true (typep second-error 'http-connection-error))
+           (ensure-equal '(:local-cancel 5 8)
+                         (http-connection-error-cause second-error))
+           (ensure-equal 0 producer-calls)
+           (ensure-false
+            (http-kit/http2::%http2-connection-scheduler-entries connection))
+           (ensure-true
+            (http-kit/http2::%h2-scheduler-capacity-available-p connection))
+           (let* ((frames (h2-output-frames stream))
+                  (resets
+                    (sort
+                     (loop for frame in frames
+                           when (= 3 (http-kit/http2::%h2-frame-type frame))
+                             collect
+                             (list
+                              (http-kit/http2::%h2-frame-stream-id frame)
+                              (http-kit/http2::%h2-u32
+                               (http-kit/http2::%h2-frame-payload frame) 0)))
+                     #'< :key #'first)))
+             (ensure-equal '((3 8) (5 8)) resets)
+             (ensure-equal 0
+                           (count 0 frames
+                                  :key #'http-kit/http2::%h2-frame-type))))
+      (setf (symbol-function wait-symbol) original-wait)
+      (http-kit/http2::%h2-with-scheduler-lock (connection)
+        (setf (http-kit/http2::%http2-connection-scheduler-reader-active-p
+               connection)
+              nil)
+        (http-kit/http2::%h2-scheduler-broadcast connection))
+      (http-kit/http2:close-http2-connection connection)
+      (when waiter-thread
+        (ignore-errors (sb-thread:join-thread waiter-thread)))))))
 #+sbcl
 (deftest http2-coverage-scheduler-explicit-cancel-code
   (let* ((input
@@ -1463,19 +1587,25 @@
                                        (cons "content-length" "0")))))
          (stream (make-instance 'binary-session-stream :input input))
          (connection (http-kit/http2:make-http2-connection :stream stream))
-         (opened-stream nil))
+         (opened-stream nil)
+         (failure nil))
     (unwind-protect
-         (let ((response
-                 (http-kit/http2:send-http2-request-over-connection
-                  connection
-                  (make-http-request :method "GET"
-                                     :uri "https://example.com/cancel-code")
-                  :on-stream-open
-                  (lambda (stream-id cancel)
-                    (setf opened-stream stream-id)
-                    (funcall cancel :error-code 2)))))
+         (progn
+           (handler-case
+               (http-kit/http2:send-http2-request-over-connection
+                connection
+                (make-http-request :method "GET"
+                                   :uri "https://example.com/cancel-code")
+                :on-stream-open
+                (lambda (stream-id cancel)
+                  (setf opened-stream stream-id)
+                  (funcall cancel :error-code 2)))
+             (error (condition)
+               (setf failure condition)))
            (ensure-equal 1 opened-stream)
-           (ensure-equal 200 (http-response-status response))
+           (ensure-true (typep failure 'http-connection-error))
+           (ensure-equal '(:local-cancel 1 2)
+                         (http-connection-error-cause failure))
            (ensure-false
             (http-kit/http2::%http2-connection-scheduler-entries connection))
            (let* ((frames (h2-output-frames stream))
@@ -1495,19 +1625,25 @@
                                        (cons "content-length" "0")))))
          (stream (make-instance 'binary-session-stream :input input))
          (connection (http-kit/http2:make-http2-connection :stream stream))
-         (opened-stream nil))
+         (opened-stream nil)
+         (failure nil))
     (unwind-protect
-         (let ((response
-                 (http-kit/http2:send-http2-request-over-connection
-                  connection
-                  (make-http-request :method "GET"
-                                     :uri "https://example.com/default-cancel")
-                  :on-stream-open
-                  (lambda (stream-id cancel)
-                    (setf opened-stream stream-id)
-                    (funcall cancel)))))
+         (progn
+           (handler-case
+               (http-kit/http2:send-http2-request-over-connection
+                connection
+                (make-http-request :method "GET"
+                                   :uri "https://example.com/default-cancel")
+                :on-stream-open
+                (lambda (stream-id cancel)
+                  (setf opened-stream stream-id)
+                  (funcall cancel)))
+             (error (condition)
+               (setf failure condition)))
            (ensure-equal 1 opened-stream)
-           (ensure-equal 200 (http-response-status response))
+           (ensure-true (typep failure 'http-connection-error))
+           (ensure-equal '(:local-cancel 1 8)
+                         (http-connection-error-cause failure))
            (ensure-false
             (http-kit/http2::%http2-connection-scheduler-entries connection))
            (let* ((frames (h2-output-frames stream))

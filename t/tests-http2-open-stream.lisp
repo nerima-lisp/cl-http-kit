@@ -296,65 +296,82 @@
            (connection
              (http-kit/http2:make-http2-connection :stream stream))
            (opened-stream-id nil)
-           (response
-             (http-kit/http2:send-http2-request-over-connection
-              connection
-              (make-http-request :method "GET"
-                                 :uri "https://127.0.0.1/cancel")
-              :on-stream-open
-              (lambda (stream-id cancel-function)
-                (setf opened-stream-id stream-id)
-                (funcall cancel-function))))
-           (reader
-             (http-kit/http2::%h2-reader-for
-              (subseq (binary-session-output stream)
-                      (length (h2-preface)))))
-           (reset-frame nil))
-      (loop for frame = (http-kit/http2::%h2-read-frame
-                         reader 16384 nil nil)
-            until (eq frame :eof)
-            when (= 3 (http-kit/http2::%h2-frame-type frame))
-              do (setf reset-frame frame))
-      (ensure-equal 200 (http-response-status response))
-      (ensure-equal 1 opened-stream-id)
-      (ensure-true reset-frame)
-      (ensure-equal 1 (http-kit/http2::%h2-frame-stream-id reset-frame))
-      (ensure-equal (octets 0 0 0 8)
-                    (http-kit/http2::%h2-frame-payload reset-frame))
-      (http-kit/http2:close-http2-connection connection)))
+           (failure nil))
+      (unwind-protect
+           (progn
+             (handler-case
+                 (http-kit/http2:send-http2-request-over-connection
+                  connection
+                  (make-http-request :method "GET"
+                                     :uri "https://127.0.0.1/cancel")
+                  :on-stream-open
+                  (lambda (stream-id cancel-function)
+                    (setf opened-stream-id stream-id)
+                    (funcall cancel-function)))
+               (error (condition)
+                 (setf failure condition)))
+             (ensure-true (typep failure 'http-connection-error))
+             (ensure-equal '(:local-cancel 1 8)
+                           (http-connection-error-cause failure))
+             (ensure-equal 1 opened-stream-id)
+             (ensure-true (http-kit/http2:http2-connection-open-p connection))
+             (let ((reader
+                     (http-kit/http2::%h2-reader-for
+                      (subseq (binary-session-output stream)
+                              (length (h2-preface)))))
+                   (reset-frame nil))
+               (loop for frame = (http-kit/http2::%h2-read-frame
+                                  reader 16384 nil nil)
+                     until (eq frame :eof)
+                     when (= 3 (http-kit/http2::%h2-frame-type frame))
+                       do (setf reset-frame frame))
+               (ensure-true reset-frame)
+               (ensure-equal 1 (http-kit/http2::%h2-frame-stream-id reset-frame))
+               (ensure-equal (octets 0 0 0 8)
+                             (http-kit/http2::%h2-frame-payload reset-frame))))
+        (http-kit/http2:close-http2-connection connection))))
 
   (deftest http2-public-connection-cancel-custom-and-direct-api
     (let* ((stream (make-instance 'binary-session-stream
                                   :input (h2-response-wire (octets))))
            (connection
-             (http-kit/http2:make-http2-connection :stream stream)))
-      (http-kit/http2:send-http2-request-over-connection
-       connection
-       (make-http-request :method "GET"
-                          :uri "https://127.0.0.1/cancel-custom")
-       :on-stream-open
-       (lambda (stream-id cancel-function)
-         (ensure-equal 1 stream-id)
-         (funcall cancel-function :error-code 7)))
-      (ensure-true
-       (http-kit/http2:cancel-http2-stream connection 1 :error-code 9))
-      (let ((reader
-              (http-kit/http2::%h2-reader-for
-               (subseq (binary-session-output stream)
-                       (length (h2-preface)))))
-            (reset-payloads nil))
-        (loop for frame = (http-kit/http2::%h2-read-frame
-                           reader 16384 nil nil)
-              until (eq frame :eof)
-              when (= 3 (http-kit/http2::%h2-frame-type frame))
-                do (progn
-                     (ensure-equal
-                      1 (http-kit/http2::%h2-frame-stream-id frame))
-                     (push (http-kit/http2::%h2-frame-payload frame)
-                           reset-payloads)))
-        (ensure-equal (list (octets 0 0 0 7) (octets 0 0 0 9))
-                      (nreverse reset-payloads)))
-      (http-kit/http2:close-http2-connection connection)))
+             (http-kit/http2:make-http2-connection :stream stream))
+           (failure nil))
+      (unwind-protect
+           (progn
+             (handler-case
+                 (http-kit/http2:send-http2-request-over-connection
+                  connection
+                  (make-http-request :method "GET"
+                                     :uri "https://127.0.0.1/cancel-custom")
+                  :on-stream-open
+                  (lambda (stream-id cancel-function)
+                    (ensure-equal 1 stream-id)
+                    (funcall cancel-function :error-code 7)))
+               (error (condition)
+                 (setf failure condition)))
+             (ensure-true (typep failure 'http-connection-error))
+             (ensure-equal '(:local-cancel 1 7)
+                           (http-connection-error-cause failure))
+             (ensure-true
+              (http-kit/http2:cancel-http2-stream connection 1 :error-code 9))
+             (let ((reader
+                     (http-kit/http2::%h2-reader-for
+                      (subseq (binary-session-output stream)
+                              (length (h2-preface)))))
+                   (reset-payloads nil))
+               (loop for frame = (http-kit/http2::%h2-read-frame
+                                  reader 16384 nil nil)
+                     until (eq frame :eof)
+                     when (= 3 (http-kit/http2::%h2-frame-type frame))
+                       do (progn
+                            (ensure-equal
+                             1 (http-kit/http2::%h2-frame-stream-id frame))
+                            (push (http-kit/http2::%h2-frame-payload frame)
+                                  reset-payloads)))
+               (ensure-equal (list (octets 0 0 0 7) (octets 0 0 0 9))
+                             (nreverse reset-payloads))))
+        (http-kit/http2:close-http2-connection connection))))
 
   (deftest http2-public-connection-cancel-rejects-invalid-callback
     (let* ((stream (make-instance 'binary-session-stream

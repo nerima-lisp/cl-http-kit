@@ -476,12 +476,27 @@ are rejected after this function marks the connection draining."
     (connection reader writer stream-id body request-body-function
                 expected-body-length max-body-bytes local-max-frame-size
                 trailer-fields deadline clock-function read-initial-settings-p
-                huffman-p &key scheduler-p flow-wait-function)
+                huffman-p &key scheduler-p flow-wait-function scheduler-entry)
   (let ((position 0)
         (pending-frames '())
         (first-settings-p read-initial-settings-p)
         (body-length (length body)))
-    (labels ((read-while-blocked ()
+    (labels ((check-scheduler-entry-under-lock ()
+               (when scheduler-entry
+                 (when (%h2-batch-entry-error scheduler-entry)
+                   (error (%h2-batch-entry-error scheduler-entry)))
+                 (unless (member scheduler-entry
+                                 (%http2-connection-scheduler-entries connection)
+                                 :test #'eq)
+                   (error 'http-kit:http-connection-error
+                          :message "The HTTP/2 request stream is no longer active."
+                          :operation :http2-write
+                          :cause (list :stream-inactive stream-id)))))
+             (check-scheduler-entry ()
+               (when scheduler-entry
+                 (%h2-with-scheduler-lock (connection)
+                   (check-scheduler-entry-under-lock))))
+             (read-while-blocked ()
                (if flow-wait-function
                    (funcall flow-wait-function connection stream-id
                             deadline clock-function)
@@ -519,6 +534,7 @@ are rejected after this function marks the connection draining."
                               stream-id payload)))
                    (if scheduler-p
                        (%h2-with-scheduler-lock (connection)
+                         (check-scheduler-entry-under-lock)
                          (let* ((stream-window
                                   (%h2-connection-stream-window
                                    connection stream-id))
@@ -561,13 +577,23 @@ are rejected after this function marks the connection draining."
                     (%http2-connection-peer-max-frame-size connection)))
              (write-trailers ()
                (when trailer-fields
-                 (funcall
-                  writer
-                  (%h2-concat
-                   (%h2-header-frames
-                    (%h2-encode-header-block trailer-fields
-                                             :huffman-p huffman-p)
-                    t (effective-max-frame-size) stream-id)))))
+                 (if scheduler-p
+                     (%h2-with-scheduler-lock (connection)
+                       (check-scheduler-entry-under-lock)
+                       (funcall
+                        writer
+                        (%h2-concat
+                         (%h2-header-frames
+                          (%h2-encode-header-block trailer-fields
+                                                   :huffman-p huffman-p)
+                          t (effective-max-frame-size) stream-id))))
+                     (funcall
+                      writer
+                      (%h2-concat
+                       (%h2-header-frames
+                        (%h2-encode-header-block trailer-fields
+                                                 :huffman-p huffman-p)
+                        t (effective-max-frame-size) stream-id))))))
              (window-available-size (frame-size)
                (if scheduler-p
                    (%h2-with-scheduler-lock (connection)
@@ -587,6 +613,7 @@ are rejected after this function marks the connection draining."
             (loop
               (when (and (null pending-chunk)
                          (not producer-done-p))
+                (check-scheduler-entry)
                 (let* ((producer-max-frame-size
                          (effective-max-frame-size))
                        (chunk (funcall request-body-function
@@ -655,8 +682,7 @@ are rejected after this function marks the connection draining."
                           (and (= (+ position size) body-length)
                                (null trailer-fields)))
                          (read-while-blocked)))))
-      (when trailer-fields
-        (write-trailers))
+      (when trailer-fields (write-trailers))
       (values (nreverse pending-frames) first-settings-p))))
 
 (defun %h2-connection-note-window-update (connection frame expected-stream-id)
@@ -838,7 +864,8 @@ are rejected after this function marks the connection draining."
            :detail (type-of connection)))
   (let ((clock (or clock-function
                    (%http2-connection-clock-function connection)))
-        (error-code (%h2-control-error-code error-code)))
+        (error-code (%h2-control-error-code error-code))
+        (entry nil))
     (unless (functionp clock)
       (error 'http-kit:http-protocol-error
              :message "An HTTP/2 cancellation clock must be callable."
@@ -861,12 +888,24 @@ are rejected after this function marks the connection draining."
                  :message "STREAM-ID must identify an opened client HTTP/2 stream."
                  :operation :http2-write
                  :detail stream-id))
-        (%h2-send-rst-stream
-         (%h2-writer (%http2-connection-stream connection)
-                     absolute-deadline clock
-                     #+sbcl (%http2-connection-writer-lock connection)
-                     #-sbcl nil)
-         stream-id error-code)))
+        #+sbcl
+        (setf entry (%h2-scheduler-entry-for-stream connection stream-id))
+        (unless entry
+          (%h2-send-rst-stream
+           (%h2-writer (%http2-connection-stream connection)
+                       absolute-deadline clock
+                       #+sbcl (%http2-connection-writer-lock connection)
+                       #-sbcl nil)
+           stream-id error-code)))
+      #+sbcl
+      (when entry
+        (%h2-scheduler-retire-entry
+         connection entry
+         (make-condition 'http-kit:http-connection-error
+                          :message "The HTTP/2 stream was cancelled locally."
+                          :operation :http2-write
+                          :cause (list :local-cancel stream-id error-code))
+         clock 0 error-code)))
   t))
 
 (defun %h2-send-http2-request-over-connection-serial
@@ -1342,7 +1381,8 @@ CONTINUATION frames must still be consumed contiguously from that queue."
           (car events)))))
 
   (defun %h2-scheduler-retire-entry
-      (connection entry condition clock-function &optional (flow-credit 0))
+      (connection entry condition clock-function &optional (flow-credit 0)
+       (reset-error-code 8))
     (let ((reset-p nil)
           (connection-credit flow-credit))
       (%h2-with-scheduler-lock (connection)
@@ -1375,7 +1415,7 @@ CONTINUATION frames must still be consumed contiguously from that queue."
             (when reset-p
               (%h2-send-rst-stream
                (%h2-scheduler-control-writer connection clock-function)
-               (%h2-batch-entry-stream-id entry) 8)))
+               (%h2-batch-entry-stream-id entry) reset-error-code)))
         (error (reset-condition)
           (%h2-scheduler-fail-connection connection reset-condition)
           (error reset-condition)))))
@@ -2162,6 +2202,11 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                               :error-code (getf cancel-arguments :error-code 8)
                               :deadline absolute-deadline
                               :clock-function clock))))
+                (let ((entry-error
+                        (%h2-with-scheduler-lock (connection)
+                          (%h2-batch-entry-error entry))))
+                  (when entry-error
+                    (error entry-error)))
                 (%h2-connection-send-request-body
                  connection reader writer
                  (%h2-batch-entry-stream-id entry)
@@ -2173,7 +2218,8 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                  (%h2-batch-entry-trailer-fields entry)
                  absolute-deadline clock nil huffman-p
                  :scheduler-p t
-                 :flow-wait-function #'%h2-scheduler-wait-for-window)
+                 :flow-wait-function #'%h2-scheduler-wait-for-window
+                 :scheduler-entry entry)
                 (%h2-scheduler-mark-body-sent connection entry)
                 (loop
                   (%h2-scheduler-wait-until
