@@ -313,9 +313,9 @@
                 (progn
                   (http-kit::%http-server-shutdown-coordinator server)
                   nil)
-              (error () t))))
+              (error () t)))))
         (ensure-false
-         (http-kit::http-server-shutdown-coordinator server)))))
+         (http-kit::http-server-shutdown-coordinator server))))
 
   (deftest https-listener-covers-start-and-stop-state-paths
     (%with-https-listener-test-stubs (context)
