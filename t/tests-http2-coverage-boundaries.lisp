@@ -294,6 +294,23 @@
        (list (h2-frame 4 1 0 (octets)) (h2-frame 6 1 0 payload)
              (h2-frame 8 0 0 (octets 0 0 0 4)))
        (reverse writes)))))
+#+sbcl (deftest http2-coverage-response-uses-initial-frames
+  (let* ((reads 0)
+         (response
+           (http-kit/http2::%h2-read-response
+            (lambda () (incf reads) :eof)
+            (lambda (wire) (declare (ignore wire)))
+            16384 nil (lambda () 0) 4096 16 "GET"
+            :read-initial-settings-p nil
+            :initial-frames
+            (list
+             (h2-frame-object 1 5 1
+                              (h2-header-block
+                               (cons ":status" "200")
+                               (cons "content-length" "0")))))))
+    (ensure-equal 200 (http-response-status response))
+    (ensure-equal (octets) (http-response-body response))
+    (ensure-equal 0 reads)))
 
 #+sbcl
 (deftest http2-coverage-response-option-errors-before-io
