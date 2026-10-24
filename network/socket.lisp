@@ -440,7 +440,43 @@ perform TLS or proxy negotiation."
         (http-kit::%with-http-cleanup
           (sb-bsd-sockets:socket-close socket)))))
   nil)
-
+#+sbcl
+(defun wake-http-tcp-listener (listener)
+  "Wake a thread blocked in ACCEPT-HTTP-TCP-STREAM without closing LISTENER."
+  (unless (http-network-listener-p listener)
+    (%network-listener-error :wake listener))
+  (unless (http-network-listener-closed-p listener)
+    (let ((listener-socket (http-network-listener-socket listener)))
+      (when listener-socket
+        (multiple-value-bind (bound-address port)
+            (sb-bsd-sockets:socket-name listener-socket)
+          (let* ((family (http-network-listener-address-family listener))
+                 (address
+                   (if (every #'zerop bound-address)
+                       (case family
+                         (:ipv4 #(127 0 0 1))
+                         (:ipv6
+                          (let ((loopback
+                                  (make-array
+                                   16
+                                   :element-type '(unsigned-byte 8)
+                                   :initial-element 0)))
+                            (setf (aref loopback 15) 1)
+                            loopback)))
+                       bound-address))
+                 (wake-socket
+                   (make-instance
+                    (%network-socket-class
+                     (ecase family
+                       (:ipv4 +network-ipv4-address-type+)
+                       (:ipv6 +network-ipv6-address-type+)))
+                    :type :stream
+                    :protocol :tcp)))
+            (unwind-protect
+                 (sb-bsd-sockets:socket-connect wake-socket address port)
+              (http-kit::%with-http-cleanup
+                (sb-bsd-sockets:socket-close wake-socket))))))))
+  nil)
 (defun close-http-tcp-stream (stream)
   "Close a stream returned by OPEN-HTTP-TCP-STREAM."
   (when stream
