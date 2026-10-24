@@ -1688,3 +1688,170 @@
              (or (%https-listener-event-present-p
                   context :listener-stopped nil)
                  (eq :failed (http-kit::http-server-state server))))))))))
+#+sbcl
+(deftest https-listener-times-out-slow-real-tls-handshake
+  (let* ((material (%tls-server-test-material))
+         (context (%make-https-listener-test-context))
+         (server nil)
+         (transport nil)
+         (client-thread nil)
+         (client-tls-stream nil)
+         (client-condition nil))
+    (unwind-protect
+         (progn
+           (setf server
+                 (make-http-server
+                  :host "127.0.0.1"
+                  :port 0
+                  :handler
+                  (lambda (request)
+                    (declare (ignore request))
+                    (make-http-response :status 204))
+                  :certificate-chain (getf material :certificate-chain)
+                  :private-key (getf material :private-key)
+                  :handshake-timeout 0.25
+                  :request-timeout 5
+                  :idle-timeout 5
+                  :graceful-timeout 2
+                  :on-event
+                  (lambda (event)
+                    (%https-listener-record-event context event))
+                  :on-error
+                  (lambda (condition details)
+                    (%https-listener-record-error
+                     context condition details))))
+           (start-http-server server)
+           (setf transport
+                 (nth-value
+                  0
+                  (%https-listener-open-real-tls-transport
+                   (http-server-port server)
+                   :mode :stall)))
+           (setf client-thread
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (handler-case
+                        (setf client-tls-stream
+                              (funcall
+                               (%https-listener-real-tls-upgrader material)
+                               transport
+                               (parse-http-uri
+                                (format nil "https://localhost:~D/"
+                                        (http-server-port server)))
+                               :timeout 5))
+                      (error (condition)
+                        (setf client-condition condition))))))
+           (ensure-true (%https-listener-wait-for-client-prefix transport))
+           (%https-listener-wait
+            (lambda () (%https-listener-errors context)))
+           (let* ((entry (first (%https-listener-errors context)))
+                  (condition (first entry))
+                  (details (second entry)))
+             (ensure-equal 1 (length (%https-listener-errors context)))
+             (ensure-equal :timeout
+                           (http-server-error-reason-code condition))
+             (ensure-equal :handshake
+                           (http-server-error-phase condition))
+             (ensure-equal :handshake (getf details :phase)))
+           (ensure-equal 0 (%https-listener-session-count context))
+           (ensure-false
+            (%https-listener-event-present-p context :alpn-selected nil))
+           (%https-listener-release-client-prefix transport)
+           (sb-thread:join-thread client-thread :default nil :timeout 5)
+           (ensure-false (sb-thread:thread-alive-p client-thread))
+           (ensure-false client-tls-stream)
+           (ensure-true client-condition)
+           (%https-listener-wait
+            (lambda ()
+              (and (zerop (%https-listener-connection-count server))
+                   (zerop (%https-listener-handshake-count server))))))
+      (when transport
+        (%https-listener-release-client-prefix transport)
+        (when (open-stream-p transport)
+          (close-http-tcp-stream transport)))
+      (when (and client-thread
+                 (sb-thread:thread-alive-p client-thread))
+        (sb-thread:join-thread client-thread :default nil :timeout 5))
+      (when (and client-tls-stream (open-stream-p client-tls-stream))
+        (close client-tls-stream :abort t))
+      (when (and server
+                 (not (eq :stopped (http-kit::http-server-state server))))
+        (stop-http-server server :graceful-timeout 2))
+      (%tls-server-test-remove-material material))))
+#+sbcl
+(deftest https-listener-rejects-unoffered-alpn-over-real-tls
+  (let* ((material (%tls-server-test-material))
+         (context (%make-https-listener-test-context))
+         (server nil)
+         (transport nil)
+         (client-tls-stream nil)
+         (client-condition nil))
+    (unwind-protect
+         (progn
+           (setf server
+                 (make-http-server
+                  :host "127.0.0.1"
+                  :port 0
+                  :handler
+                  (lambda (request)
+                    (declare (ignore request))
+                    (make-http-response :status 204))
+                  :certificate-chain (getf material :certificate-chain)
+                  :private-key (getf material :private-key)
+                  :handshake-timeout 5
+                  :request-timeout 5
+                  :idle-timeout 5
+                  :graceful-timeout 2
+                  :on-event
+                  (lambda (event)
+                    (%https-listener-record-event context event))
+                  :on-error
+                  (lambda (condition details)
+                    (%https-listener-record-error
+                     context condition details))))
+           (start-http-server server)
+           (setf transport
+                 (open-http-tcp-stream
+                  (make-http-request
+                   :method "GET"
+                   :uri (format nil "http://127.0.0.1:~D/"
+                                (http-server-port server)))
+                  :timeout 5))
+           (handler-case
+               (setf client-tls-stream
+                     (funcall
+                      (%https-listener-real-tls-upgrader material '("h3"))
+                      transport
+                      (parse-http-uri
+                       (format nil "https://localhost:~D/"
+                               (http-server-port server)))
+                      :timeout 5))
+             (error (condition)
+               (setf client-condition condition)))
+           (%https-listener-wait
+            (lambda () (%https-listener-errors context)))
+           (let* ((entry (first (%https-listener-errors context)))
+                  (condition (first entry))
+                  (details (second entry)))
+             (ensure-equal 1 (length (%https-listener-errors context)))
+             (ensure-equal :protocol-error
+                           (http-server-error-reason-code condition))
+             (ensure-equal :handshake
+                           (http-server-error-phase condition))
+             (ensure-equal :handshake (getf details :phase)))
+           (ensure-true client-condition)
+           (ensure-false client-tls-stream)
+           (ensure-equal 0 (%https-listener-session-count context))
+           (ensure-false
+            (%https-listener-event-present-p context :alpn-selected nil))
+           (%https-listener-wait
+            (lambda () (zerop (%https-listener-connection-count server)))))
+      (when (and client-tls-stream (open-stream-p client-tls-stream))
+        (close client-tls-stream :abort t))
+      (when (and transport (open-stream-p transport))
+        (close-http-tcp-stream transport))
+      (when (and server
+                 (not (eq :stopped (http-kit::http-server-state server))))
+        (stop-http-server server :graceful-timeout 2))
+      (%tls-server-test-remove-material material))))
+
