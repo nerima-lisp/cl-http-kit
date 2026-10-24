@@ -232,11 +232,6 @@ Server-side wrapping is an explicit unsupported boundary.
 serve-http1-listener combines accept and serve-http1-session dispatch for a
 caller-owned listener, with connection limits and accept/error callbacks.
 
-The native client path uses cl-tls-kit. Client-side HTTP/3 connection setup is
-available through the cl-quic-kit adapter, while the HTTP/3 framing system
-remains an injected QUIC stream boundary and applications retain socket and
-certificate policy.
-
 ## Application-owned behavior
 
 The portable core does not choose a socket library, DNS resolver, or TLS

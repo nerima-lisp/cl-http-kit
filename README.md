@@ -15,7 +15,8 @@ integrations.
 The checked-in ASDF systems are version 0.4.1. `make-http-client` creates a
 native TCP/TLS connection pool when no transport boundary is supplied, while
 `http-client-request` and `http-client-send` remain supported request paths.
-`http-client-send` also accepts a method and URL convenience form. See the
+`http-client-send` also accepts a method and URI positionally, or a URI alone
+that defaults to GET. See the
 [changelog](docs/src/project/changelog.md) and
 [migration guide](docs/src/project/migration.md) for the 0.4.0 integration and
 planned API migrations.
@@ -26,8 +27,8 @@ TLS certificate-chain, hostname, and trust verification is required by
 default. `:verify :optional` has the same verification policy as `:required`;
 `:verify nil` skips those certificate-policy checks but still requires the
 peer's CertificateVerify signature. Use `nil` only for deliberately
-unauthenticated test connections. Server TLS remains outside the current kit
-boundary.
+unauthenticated test connections. `cl-http-kit` does not support server-side
+TLS because cl-tls-kit has no server driver.
 
 ## Quick Start
 
@@ -100,12 +101,8 @@ The documentation build is described in
 
 ## HTTP/3 fallback
 
-When a client supplies `:http3-transport-function`, an advertised
-Alt-Svc `h3` alternative is attempted before TCP. TCP fallback requires an
-`http-connection-error` whose `http-connection-error-request-sent-p` reader is
-false, and no request-body producer or response callback may have run.
-Other failures are propagated. An explicit HTTP/3 request is a hard
-requirement and does not fall back.
+See the [HTTP/3 compatibility notes](docs/src/reference/compatibility.md#http3)
+for Alt-Svc selection, fallback conditions, and explicit HTTP/3 requests.
 
 ## Support
 
