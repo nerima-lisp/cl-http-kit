@@ -72,3 +72,43 @@
     (ensure-equal expected-count count)
     (ensure-equal expected-reason reason)
     wire))
+(deftest core-coverage-http1-session-deadline-eof-and-shutdown
+  (let* ((request-bytes
+           (ascii "GET /deadline HTTP/1.1|CRLF|Host: example.test|CRLF||CRLF|"))
+         (response-wire (ascii "HTTP/1.1 204 No Content|CRLF||CRLF|"))
+         (handler-calls 0)
+         (handler (lambda (request)
+                    (declare (ignore request))
+                    (incf handler-calls)
+                    (make-http-response :status 204))))
+    (multiple-value-bind (count reason wire)
+        (%run-http1-session-from-file
+         request-bytes handler
+         :timeout 10 :request-timeout 1
+         :clock-function (lambda () 0)
+         :close-stream nil)
+      (ensure-equal 1 count)
+      (ensure-equal :eof reason)
+      (ensure-equal 1 handler-calls)
+      (ensure-octets-equal response-wire wire))
+    (setf handler-calls 0)
+    (multiple-value-bind (count reason wire)
+        (%run-http1-session-from-file
+         request-bytes handler
+         :timeout 10 :idle-timeout 1
+         :clock-function (lambda () 0)
+         :close-stream nil)
+      (ensure-equal 1 count)
+      (ensure-equal :eof reason)
+      (ensure-equal 1 handler-calls)
+      (ensure-octets-equal response-wire wire))
+    (setf handler-calls 0)
+    (multiple-value-bind (count reason wire)
+        (%run-http1-session-from-file
+         request-bytes handler
+         :shutdown-p (constantly t)
+         :close-stream nil)
+      (ensure-equal 0 count)
+      (ensure-equal :close reason)
+      (ensure-equal 0 handler-calls)
+      (ensure-octets-equal (octets) wire))))
