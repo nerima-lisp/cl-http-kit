@@ -180,8 +180,6 @@
   (let* ((store (or ticket-key-store (%http-server-new-ticket-key-store)))
          (wrapper (%http-server-make-tls-wrapper
                    certificate-chain private-key store)))
-    (unless (cl-tls-kit:tls13-server-ticket-key-store-p store)
-      (%http-server-configuration-error :invalid-ticket-key-store))
     (%make-http-server
      :host host
      :port port
