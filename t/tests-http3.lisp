@@ -13820,6 +13820,10 @@
          (let* ((closed-streams nil)
                 (client
                  (http3-test-make-native-client
+                  :try-read-stream
+                  (lambda (stream &key timeout deadline)
+                    (declare (ignore stream timeout deadline))
+                    (values nil nil :would-block))
                   :close-stream
                   (lambda (stream &key condition)
                     (declare (ignore condition))
