@@ -282,7 +282,8 @@
    #:http-client-on-request
    #:http-client-on-response
    #:http-client-request
-   #:http-client-send))
+   #:http-client-send
+   #:http-client-clear-connections))
 
 (defpackage #:http-kit/websocket
   (:use #:cl)

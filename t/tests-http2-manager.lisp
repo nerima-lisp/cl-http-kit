@@ -1169,17 +1169,21 @@
                    manager))
     (ensure-false (http-kit/http2:http2-connection-manager-open-p manager))))
 #+sbcl
-(deftest http2-connection-manager-same-key-concurrent-open-reuses-retained-connection
+(deftest http2-connection-manager-cold-open-coalesces-same-key-single-callers
   (let* ((open-entered (sb-thread:make-semaphore :count 0))
          (release-first (sb-thread:make-semaphore :count 0))
+         (waiter-arrived (sb-thread:make-semaphore :count 0))
          (first-done (sb-thread:make-semaphore :count 0))
          (second-done (sb-thread:make-semaphore :count 0))
-         (open-lock (sb-thread:make-mutex :name "same-key open counter"))
+         (open-lock (sb-thread:make-mutex :name "cold open counter"))
          (opened 0)
          (closed 0)
          (connections (make-array 2 :initial-element nil))
+         (wait-symbol 'http-kit/http2::%h2-manager-wait-for-opening)
+         (original-wait (symbol-function
+                         'http-kit/http2::%h2-manager-wait-for-opening))
          (request
-           (make-http-request :method "GET" :uri "https://same-open.test/"))
+           (make-http-request :method "GET" :uri "https://cold-open.test/"))
          (manager
            (http-kit/http2:make-http2-connection-manager
             :open-connection
@@ -1192,8 +1196,8 @@
                 (when (zerop index)
                   (sb-thread:signal-semaphore open-entered)
                   (unless (sb-thread:wait-on-semaphore
-                           release-first :timeout 5)
-                    (error "Timed out waiting to release the first same-key open")))
+                           release-first :timeout 10)
+                    (error "Timed out waiting to release the first cold open")))
                 (let ((stream (make-instance 'binary-session-stream :input (octets))))
                   (setf (aref connections index)
                         (http-kit/http2:make-http2-connection
@@ -1210,8 +1214,12 @@
          (first-connection nil)
          (first-entry nil)
          (second-connection nil)
-         (second-entry nil)
-         (second-entry-identity nil))
+         (second-entry nil))
+    (setf (symbol-function wait-symbol)
+          (lambda (wait-manager key opening deadline clock-function)
+            (sb-thread:signal-semaphore waiter-arrived)
+            (funcall original-wait wait-manager key opening deadline
+                     clock-function)))
     (unwind-protect
          (progn
            (setf first-thread
@@ -1219,10 +1227,10 @@
                   (lambda ()
                     (unwind-protect
                          (handler-case
-                             (sb-ext:with-timeout 10
+                             (sb-ext:with-timeout 15
                                (multiple-value-setq (first-connection first-entry)
                                  (http-kit/http2::%h2-manager-connection-for
-                                  manager request "same-key" t nil nil nil nil)))
+                                  manager request "same-key" t nil nil nil nil t)))
                            (error (condition)
                              (setf first-error condition)))
                       (sb-thread:signal-semaphore first-done)))))
@@ -1233,53 +1241,56 @@
                   (lambda ()
                     (unwind-protect
                          (handler-case
-                             (sb-ext:with-timeout 10
-                               (multiple-value-setq
-                                   (second-connection second-entry)
+                             (sb-ext:with-timeout 15
+                               (multiple-value-setq (second-connection second-entry)
                                  (http-kit/http2::%h2-manager-connection-for
-                                  manager request "same-key" t nil nil nil nil)))
+                                  manager request "same-key" t nil nil nil nil t)))
                            (error (condition)
                              (setf second-error condition)))
                       (sb-thread:signal-semaphore second-done)))))
            (ensure-true
-            (sb-thread:wait-on-semaphore second-done :timeout 12))
-           (sb-thread:join-thread second-thread)
-           (setf second-thread nil)
-           (ensure-true (null second-error))
-           (ensure-true second-entry)
-           (setf second-entry-identity second-entry)
-           (http-kit/http2::%h2-manager-finish-entry manager second-entry)
-           (setf second-entry nil)
+            (sb-thread:wait-on-semaphore waiter-arrived :timeout 5))
+           (ensure-equal
+            1
+            (sb-thread:with-mutex (open-lock) opened))
            (sb-thread:signal-semaphore release-first)
            (ensure-true
             (sb-thread:wait-on-semaphore first-done :timeout 12))
+           (ensure-true
+            (sb-thread:wait-on-semaphore second-done :timeout 12))
            (sb-thread:join-thread first-thread)
            (setf first-thread nil)
+           (sb-thread:join-thread second-thread)
+           (setf second-thread nil)
            (ensure-true (null first-error))
-           (ensure-true (eq second-connection first-connection))
-           (ensure-true (eq first-connection (aref connections 1)))
-           (ensure-true (eq second-entry-identity first-entry))
-           (ensure-equal 2 opened)
-           (ensure-equal 1 closed)
-           (ensure-false
-            (http-kit/http2:http2-connection-open-p (aref connections 0)))
-           (ensure-equal
-            1
-            (http-kit/http2:http2-connection-manager-connection-count manager))
+           (ensure-true (null second-error))
+           (ensure-equal 1 opened)
+           (ensure-true first-entry)
+           (ensure-true (eq first-connection second-connection))
+           (ensure-true (eq first-entry second-entry))
+           (ensure-true (eq first-connection (aref connections 0)))
+           (ensure-equal 1
+                         (http-kit/http2:http2-connection-manager-connection-count
+                          manager))
+           (ensure-equal 0 closed)
            (http-kit/http2::%h2-manager-finish-entry manager first-entry)
            (setf first-entry nil)
-           (http-kit/http2:close-http2-connection-manager manager))
+           (http-kit/http2::%h2-manager-finish-entry manager second-entry)
+           (setf second-entry nil)
+           (http-kit/http2:close-http2-connection-manager manager)
+           (ensure-equal 1 closed))
       (sb-thread:signal-semaphore release-first)
       (when first-thread
-        (sb-thread:join-thread first-thread))
+        (ignore-errors (sb-thread:join-thread first-thread)))
       (when second-thread
-        (sb-thread:join-thread second-thread))
+        (ignore-errors (sb-thread:join-thread second-thread)))
+      (setf (symbol-function wait-symbol) original-wait)
       (when first-entry
         (http-kit/http2::%h2-manager-finish-entry manager first-entry))
       (when second-entry
         (http-kit/http2::%h2-manager-finish-entry manager second-entry))
       (http-kit/http2:close-http2-connection-manager manager))
-    (ensure-equal 2 closed)))
+    (ensure-equal 1 closed)))
 #+sbcl
 (deftest http2-connection-manager-opening-at-capacity-retires-idle-entry
   (let* ((open-entered (sb-thread:make-semaphore :count 0))
@@ -1944,3 +1955,636 @@
       (when entry
         (http-kit/http2::%h2-manager-finish-entry manager entry))
       (http-kit/http2:close-http2-connection-manager manager))))
+#+sbcl
+(progn
+  (defun %make-cold-open-regression-connection (on-close)
+    (let ((stream (make-instance 'binary-session-stream :input (octets))))
+      (http-kit/http2:make-http2-connection
+       :stream stream
+       :close-stream
+       (lambda (closed-stream)
+         (unless (eq stream closed-stream)
+           (error "HTTP/2 regression connection closed the wrong stream."))
+         (funcall on-close)))))
+
+  (deftest http2-connection-manager-cold-open-failure-wakes-waiter-and-retries
+    (let* ((open-entered (sb-thread:make-semaphore :count 0))
+           (release-first (sb-thread:make-semaphore :count 0))
+           (waiter-arrived (sb-thread:make-semaphore :count 0))
+           (owner-done (sb-thread:make-semaphore :count 0))
+           (waiter-done (sb-thread:make-semaphore :count 0))
+           (counter-lock (sb-thread:make-mutex :name "cold-open failure"))
+           (opened 0)
+           (closed 0)
+           (request (make-http-request :method "GET"
+                                       :uri "https://cold-failure.test/"))
+           (manager
+             (http-kit/http2:make-http2-connection-manager
+              :open-connection
+              (lambda (request &key timeout deadline)
+                (declare (ignore request timeout deadline))
+                (let ((index (sb-thread:with-mutex (counter-lock)
+                               (prog1 opened (incf opened)))))
+                  (if (zerop index)
+                      (progn
+                        (sb-thread:signal-semaphore open-entered)
+                        (unless (sb-thread:wait-on-semaphore
+                                 release-first :timeout 10)
+                          (error "Timed out waiting to fail the first open."))
+                        (error "Expected first cold open failure."))
+                      (%make-cold-open-regression-connection
+                       (lambda () (incf closed))))))))
+           (wait-symbol 'http-kit/http2::%h2-manager-wait-for-opening)
+           (original-wait (symbol-function wait-symbol))
+           (owner-thread nil)
+           (waiter-thread nil)
+           (owner-error nil)
+           (waiter-error nil)
+           (waiter-connection nil)
+           (waiter-entry nil))
+      (setf (symbol-function wait-symbol)
+            (lambda (manager key opening deadline clock-function)
+              (sb-thread:signal-semaphore waiter-arrived)
+              (funcall original-wait manager key opening deadline
+                       clock-function)))
+      (unwind-protect
+           (progn
+             (setf owner-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (unwind-protect
+                           (handler-case
+                               (http-kit/http2::%h2-manager-connection-for
+                                manager request "failure" t nil nil nil nil t)
+                             (error (condition) (setf owner-error condition)))
+                        (sb-thread:signal-semaphore owner-done)))))
+             (ensure-true (sb-thread:wait-on-semaphore open-entered :timeout 5))
+             (setf waiter-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (unwind-protect
+                           (handler-case
+                               (multiple-value-setq
+                                   (waiter-connection waiter-entry)
+                                 (http-kit/http2::%h2-manager-connection-for
+                                  manager request "failure" t nil nil nil nil t))
+                             (error (condition) (setf waiter-error condition)))
+                        (sb-thread:signal-semaphore waiter-done)))))
+             (ensure-true
+              (sb-thread:wait-on-semaphore waiter-arrived :timeout 5))
+             (sb-thread:signal-semaphore release-first)
+             (ensure-true (sb-thread:wait-on-semaphore owner-done :timeout 10))
+             (ensure-true (sb-thread:wait-on-semaphore waiter-done :timeout 10))
+             (sb-thread:join-thread owner-thread)
+             (setf owner-thread nil)
+             (sb-thread:join-thread waiter-thread)
+             (setf waiter-thread nil)
+             (ensure-true owner-error)
+             (ensure-true (null waiter-error))
+             (ensure-equal 2 opened)
+             (ensure-true waiter-entry)
+             (ensure-true waiter-connection)
+             (ensure-equal 1
+                           (http-kit/http2:http2-connection-manager-connection-count
+                            manager))
+             (http-kit/http2::%h2-manager-finish-entry manager waiter-entry)
+             (setf waiter-entry nil)
+             (http-kit/http2:close-http2-connection-manager manager)
+             (ensure-equal 1 closed))
+        (sb-thread:signal-semaphore release-first)
+        (when owner-thread (ignore-errors (sb-thread:join-thread owner-thread)))
+        (when waiter-thread (ignore-errors (sb-thread:join-thread waiter-thread)))
+        (setf (symbol-function wait-symbol) original-wait)
+        (when waiter-entry
+          (http-kit/http2::%h2-manager-finish-entry manager waiter-entry))
+        (http-kit/http2:close-http2-connection-manager manager))))
+
+  (deftest http2-connection-manager-cold-open-wait-observes-request-deadline
+    (let* ((open-entered (sb-thread:make-semaphore :count 0))
+           (release-open (sb-thread:make-semaphore :count 0))
+           (waiter-arrived (sb-thread:make-semaphore :count 0))
+           (owner-done (sb-thread:make-semaphore :count 0))
+           (waiter-done (sb-thread:make-semaphore :count 0))
+           (opened 0)
+           (closed 0)
+           (request (make-http-request :method "GET"
+                                       :uri "https://cold-deadline.test/"))
+           (manager
+             (http-kit/http2:make-http2-connection-manager
+              :open-connection
+              (lambda (request &key timeout deadline)
+                (declare (ignore request timeout deadline))
+                (incf opened)
+                (sb-thread:signal-semaphore open-entered)
+                (unless (sb-thread:wait-on-semaphore release-open :timeout 10)
+                  (error "Timed out waiting to release the deadline test open."))
+                (%make-cold-open-regression-connection
+                 (lambda () (incf closed))))))
+           (wait-symbol 'http-kit/http2::%h2-manager-wait-for-opening)
+           (original-wait (symbol-function wait-symbol))
+           (owner-thread nil)
+           (waiter-thread nil)
+           (owner-error nil)
+           (waiter-error nil)
+           (owner-entry nil))
+      (setf (symbol-function wait-symbol)
+            (lambda (manager key opening deadline clock-function)
+              (sb-thread:signal-semaphore waiter-arrived)
+              (funcall original-wait manager key opening deadline
+                       clock-function)))
+      (unwind-protect
+           (progn
+             (setf owner-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (unwind-protect
+                           (handler-case
+                               (multiple-value-bind (connection entry)
+                                   (http-kit/http2::%h2-manager-connection-for
+                                    manager request "deadline" t nil nil nil nil t)
+                                 (declare (ignore connection))
+                                 (setf owner-entry entry))
+                             (error (condition) (setf owner-error condition)))
+                        (sb-thread:signal-semaphore owner-done)))))
+             (ensure-true (sb-thread:wait-on-semaphore open-entered :timeout 5))
+             (setf waiter-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (unwind-protect
+                           (handler-case
+                               (http-kit/http2::%h2-manager-connection-for
+                                manager request "deadline" t 0 nil nil nil t)
+                             (error (condition) (setf waiter-error condition)))
+                        (sb-thread:signal-semaphore waiter-done)))))
+             (ensure-true
+              (sb-thread:wait-on-semaphore waiter-arrived :timeout 5))
+             (ensure-true (sb-thread:wait-on-semaphore waiter-done :timeout 5))
+             (sb-thread:join-thread waiter-thread)
+             (setf waiter-thread nil)
+             (ensure-true (typep waiter-error 'http-timeout))
+             (ensure-equal :read (http-timeout-kind waiter-error))
+             (sb-thread:signal-semaphore release-open)
+             (ensure-true (sb-thread:wait-on-semaphore owner-done :timeout 10))
+             (sb-thread:join-thread owner-thread)
+             (setf owner-thread nil)
+             (ensure-true (null owner-error))
+             (ensure-equal 1 opened)
+             (ensure-true owner-entry)
+             (http-kit/http2::%h2-manager-finish-entry manager owner-entry)
+             (setf owner-entry nil)
+             (http-kit/http2:close-http2-connection-manager manager)
+             (ensure-equal 1 closed))
+        (sb-thread:signal-semaphore release-open)
+        (when owner-thread (ignore-errors (sb-thread:join-thread owner-thread)))
+        (when waiter-thread (ignore-errors (sb-thread:join-thread waiter-thread)))
+        (setf (symbol-function wait-symbol) original-wait)
+        (when owner-entry
+          (http-kit/http2::%h2-manager-finish-entry manager owner-entry))
+        (http-kit/http2:close-http2-connection-manager manager))))
+
+  (deftest http2-connection-manager-cold-open-close-wakes-waiter-and-rejects-owner-result
+    (let* ((open-entered (sb-thread:make-semaphore :count 0))
+           (release-open (sb-thread:make-semaphore :count 0))
+           (waiter-arrived (sb-thread:make-semaphore :count 0))
+           (owner-done (sb-thread:make-semaphore :count 0))
+           (waiter-done (sb-thread:make-semaphore :count 0))
+           (opened 0)
+           (closed 0)
+           (request (make-http-request :method "GET"
+                                       :uri "https://cold-close.test/"))
+           (manager
+             (http-kit/http2:make-http2-connection-manager
+              :open-connection
+              (lambda (request &key timeout deadline)
+                (declare (ignore request timeout deadline))
+                (incf opened)
+                (sb-thread:signal-semaphore open-entered)
+                (unless (sb-thread:wait-on-semaphore release-open :timeout 10)
+                  (error "Timed out waiting to release the close test open."))
+                (%make-cold-open-regression-connection
+                 (lambda () (incf closed))))))
+           (wait-symbol 'http-kit/http2::%h2-manager-wait-for-opening)
+           (original-wait (symbol-function wait-symbol))
+           (owner-thread nil)
+           (waiter-thread nil)
+           (owner-error nil)
+           (waiter-error nil))
+      (setf (symbol-function wait-symbol)
+            (lambda (manager key opening deadline clock-function)
+              (sb-thread:signal-semaphore waiter-arrived)
+              (funcall original-wait manager key opening deadline
+                       clock-function)))
+      (unwind-protect
+           (progn
+             (setf owner-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (unwind-protect
+                           (handler-case
+                               (http-kit/http2::%h2-manager-connection-for
+                                manager request "close" t nil nil nil nil t)
+                             (error (condition) (setf owner-error condition)))
+                        (sb-thread:signal-semaphore owner-done)))))
+             (ensure-true (sb-thread:wait-on-semaphore open-entered :timeout 5))
+             (setf waiter-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (unwind-protect
+                           (handler-case
+                               (http-kit/http2::%h2-manager-connection-for
+                                manager request "close" t nil nil nil nil t)
+                             (error (condition) (setf waiter-error condition)))
+                        (sb-thread:signal-semaphore waiter-done)))))
+             (ensure-true
+              (sb-thread:wait-on-semaphore waiter-arrived :timeout 5))
+             (http-kit/http2:close-http2-connection-manager manager)
+             (ensure-true (sb-thread:wait-on-semaphore waiter-done :timeout 5))
+             (sb-thread:join-thread waiter-thread)
+             (setf waiter-thread nil)
+             (ensure-true (typep waiter-error 'http-connection-error))
+             (sb-thread:signal-semaphore release-open)
+             (ensure-true (sb-thread:wait-on-semaphore owner-done :timeout 10))
+             (sb-thread:join-thread owner-thread)
+             (setf owner-thread nil)
+             (ensure-true (typep owner-error 'http-connection-error))
+             (ensure-equal 1 opened)
+             (ensure-equal 1 closed)
+             (ensure-equal
+              0
+              (http-kit/http2:http2-connection-manager-connection-count manager)))
+        (sb-thread:signal-semaphore release-open)
+        (when owner-thread (ignore-errors (sb-thread:join-thread owner-thread)))
+        (when waiter-thread (ignore-errors (sb-thread:join-thread waiter-thread)))
+        (setf (symbol-function wait-symbol) original-wait)
+        (http-kit/http2:close-http2-connection-manager manager))))
+
+  (deftest http2-connection-manager-cold-open-clear-wakes-waiter-to-retry
+    (let* ((open-entered (sb-thread:make-semaphore :count 0))
+           (release-open (sb-thread:make-semaphore :count 0))
+           (waiter-arrived (sb-thread:make-semaphore :count 0))
+           (owner-done (sb-thread:make-semaphore :count 0))
+           (waiter-done (sb-thread:make-semaphore :count 0))
+           (counter-lock (sb-thread:make-mutex :name "cold-open clear"))
+           (opened 0)
+           (closed 0)
+           (request (make-http-request :method "GET"
+                                       :uri "https://cold-clear.test/"))
+           (manager
+             (http-kit/http2:make-http2-connection-manager
+              :open-connection
+              (lambda (request &key timeout deadline)
+                (declare (ignore request timeout deadline))
+                (let ((index (sb-thread:with-mutex (counter-lock)
+                               (prog1 opened (incf opened)))))
+                  (when (zerop index)
+                    (sb-thread:signal-semaphore open-entered)
+                    (unless (sb-thread:wait-on-semaphore
+                             release-open :timeout 10)
+                      (error "Timed out waiting to release the clear test open.")))
+                  (%make-cold-open-regression-connection
+                   (lambda () (incf closed)))))))
+           (wait-symbol 'http-kit/http2::%h2-manager-wait-for-opening)
+           (original-wait (symbol-function wait-symbol))
+           (owner-thread nil)
+           (waiter-thread nil)
+           (owner-error nil)
+           (waiter-error nil)
+           (owner-connection nil)
+           (owner-entry nil)
+           (waiter-connection nil)
+           (waiter-entry nil))
+      (setf (symbol-function wait-symbol)
+            (lambda (manager key opening deadline clock-function)
+              (sb-thread:signal-semaphore waiter-arrived)
+              (funcall original-wait manager key opening deadline
+                       clock-function)))
+      (unwind-protect
+           (progn
+             (setf owner-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (unwind-protect
+                           (handler-case
+                               (multiple-value-setq (owner-connection owner-entry)
+                                 (http-kit/http2::%h2-manager-connection-for
+                                  manager request "clear" t nil nil nil nil t))
+                             (error (condition) (setf owner-error condition)))
+                        (sb-thread:signal-semaphore owner-done)))))
+             (ensure-true (sb-thread:wait-on-semaphore open-entered :timeout 5))
+             (setf waiter-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (unwind-protect
+                           (handler-case
+                               (multiple-value-setq (waiter-connection waiter-entry)
+                                 (http-kit/http2::%h2-manager-connection-for
+                                  manager request "clear" t nil nil nil nil t))
+                             (error (condition) (setf waiter-error condition)))
+                        (sb-thread:signal-semaphore waiter-done)))))
+             (ensure-true
+              (sb-thread:wait-on-semaphore waiter-arrived :timeout 5))
+             (http-kit/http2:clear-http2-connection-manager manager)
+             (ensure-equal
+              0
+              (http-kit/http2:http2-connection-manager-connection-count manager))
+             (sb-thread:signal-semaphore release-open)
+             (ensure-true (sb-thread:wait-on-semaphore owner-done :timeout 10))
+             (ensure-true (sb-thread:wait-on-semaphore waiter-done :timeout 10))
+             (sb-thread:join-thread owner-thread)
+             (setf owner-thread nil)
+             (sb-thread:join-thread waiter-thread)
+             (setf waiter-thread nil)
+             (ensure-true (null owner-error))
+             (ensure-true (null waiter-error))
+             (ensure-equal 2 opened)
+             (ensure-true (http-kit/http2::%http2-managed-connection-transient-p
+                           owner-entry))
+             (ensure-false (http-kit/http2::%http2-managed-connection-transient-p
+                            waiter-entry))
+             (ensure-true (not (eq owner-connection waiter-connection)))
+             (ensure-equal
+              1
+              (http-kit/http2:http2-connection-manager-connection-count manager))
+             (http-kit/http2::%h2-manager-finish-entry manager owner-entry)
+             (setf owner-entry nil)
+             (ensure-equal 1 closed)
+             (http-kit/http2::%h2-manager-finish-entry manager waiter-entry)
+             (setf waiter-entry nil)
+             (http-kit/http2:close-http2-connection-manager manager)
+             (ensure-equal 2 closed))
+        (sb-thread:signal-semaphore release-open)
+        (when owner-thread (ignore-errors (sb-thread:join-thread owner-thread)))
+        (when waiter-thread (ignore-errors (sb-thread:join-thread waiter-thread)))
+        (setf (symbol-function wait-symbol) original-wait)
+        (when owner-entry
+          (http-kit/http2::%h2-manager-finish-entry manager owner-entry))
+        (when waiter-entry
+          (http-kit/http2::%h2-manager-finish-entry manager waiter-entry))
+        (http-kit/http2:close-http2-connection-manager manager))))
+
+  (deftest http2-connection-manager-cold-open-reentrant-owner-uses-transient-fallback
+    (let* ((request (make-http-request :method "GET"
+                                       :uri "https://cold-reentrant.test/"))
+           (opened 0)
+           (closed 0)
+           (manager nil)
+           (nested-connection nil)
+           (nested-entry nil)
+           (outer-connection nil)
+           (outer-entry nil))
+      (setf manager
+            (http-kit/http2:make-http2-connection-manager
+             :open-connection
+             (lambda (request &key timeout deadline)
+               (declare (ignore timeout deadline))
+               (incf opened)
+               (let ((connection
+                       (%make-cold-open-regression-connection
+                        (lambda () (incf closed)))))
+                 (when (= opened 1)
+                   (multiple-value-setq (nested-connection nested-entry)
+                     (http-kit/http2::%h2-manager-connection-for
+                      manager
+                      request
+                      "reentrant"
+                      t nil nil nil nil t)))
+                 connection))))
+      (multiple-value-setq (outer-connection outer-entry)
+        (http-kit/http2::%h2-manager-connection-for
+         manager request "reentrant" t nil nil nil nil t))
+      (ensure-equal 2 opened)
+      (ensure-true nested-entry)
+      (ensure-true outer-entry)
+      (ensure-true (http-kit/http2::%http2-managed-connection-transient-p
+                    nested-entry))
+      (ensure-false (http-kit/http2::%http2-managed-connection-transient-p
+                     outer-entry))
+      (ensure-true (not (eq nested-connection outer-connection)))
+      (ensure-equal
+       1
+       (http-kit/http2:http2-connection-manager-connection-count manager))
+      (http-kit/http2::%h2-manager-finish-entry manager nested-entry)
+      (ensure-equal 1 closed)
+      (http-kit/http2::%h2-manager-finish-entry manager outer-entry)
+      (http-kit/http2:close-http2-connection-manager manager)
+      (ensure-equal 2 closed))))
+#+sbcl
+(deftest http2-connection-manager-multiplexes-concurrent-high-level-client-requests
+  (let* ((body-entered (sb-thread:make-semaphore :count 0))
+         (release-first (sb-thread:make-semaphore :count 0))
+         (first-done (sb-thread:make-semaphore :count 0))
+         (input-wire
+           (concatenate-octets
+            (h2-frame 4 0 0 (octets))
+            (h2-frame 1 4 1 (h2-header-block (cons ":status" "200")))
+            (h2-frame 0 1 1 (octets 1))
+            (h2-frame 1 4 3 (h2-header-block (cons ":status" "201")))
+            (h2-frame 0 1 3 (octets 2))))
+         (opened 0)
+         (closed 0)
+         (streams nil)
+         (manager
+           (http-kit/http2:make-http2-connection-manager
+            :open-connection
+            (lambda (request &key timeout deadline proxy-plan proxy)
+              (declare (ignore timeout deadline proxy-plan proxy))
+              (let* ((stream
+                       (make-instance
+                        'binary-session-stream
+                        :input (if (zerop opened)
+                                   input-wire
+                                   (h2-response-wire (octets 9)))))
+                     (connection
+                       (http-kit/http2:make-http2-connection
+                        :stream stream
+                        :close-stream
+                        (lambda (closed-stream)
+                          (ensure-true (eq stream closed-stream))
+                          (incf closed)))))
+                (ensure-equal "GET" (http-request-method request))
+                (incf opened)
+                (push stream streams)
+                connection))))
+         (manager-transport
+           (http-kit/http2:make-http2-connection-manager-transport manager))
+         (client
+           (http-kit/client:make-http-client
+            :transport-function
+            (lambda (request &rest arguments)
+              (apply manager-transport request
+                     :connection-key "multiplex.test" arguments))
+            :cache nil
+            :default-timeout 5))
+         (first-response nil)
+         (second-response nil)
+         (first-error nil)
+         (first-thread nil))
+    (unwind-protect
+         (progn
+           (setf first-thread
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (unwind-protect
+                         (handler-case
+                             (setf first-response
+                                   (sb-ext:with-timeout 15
+                                     (http-kit/client:http-client-send
+                                      client "GET"
+                                      "http://multiplex.test/first"
+                                      :on-body-chunk
+                                      (lambda (chunk)
+                                        (ensure-equal (octets 1) chunk)
+                                        (sb-thread:signal-semaphore body-entered)
+                                        (unless (sb-thread:wait-on-semaphore
+                                                 release-first :timeout 10)
+                                          (error "Timed out waiting to release the first response callback"))))))
+                           (error (condition)
+                             (setf first-error condition)))
+                      (sb-thread:signal-semaphore first-done)))))
+           (ensure-true
+            (sb-thread:wait-on-semaphore body-entered :timeout 5))
+           (setf second-response
+                 (sb-ext:with-timeout 10
+                   (http-kit/client:http-client-send
+                    client "GET" "http://multiplex.test/second")))
+           (ensure-equal 201 (http-response-status second-response))
+           (ensure-equal (octets 2) (http-response-body second-response))
+           (sb-thread:signal-semaphore release-first)
+           (ensure-true
+            (sb-thread:wait-on-semaphore first-done :timeout 5))
+           (sb-thread:join-thread first-thread)
+           (setf first-thread nil)
+           (ensure-true (null first-error))
+           (ensure-equal 200 (http-response-status first-response))
+           (ensure-equal (octets 1) (http-response-body first-response))
+           (ensure-equal 1 opened)
+           (ensure-equal
+            1
+            (http-kit/http2:http2-connection-manager-connection-count manager))
+           (ensure-equal
+            '(1 3)
+            (loop for frame in (h2-output-frames (first streams))
+                  when (= 1 (http-kit/http2::%h2-frame-type frame))
+                    collect (http-kit/http2::%h2-frame-stream-id frame))))
+      (sb-thread:signal-semaphore release-first)
+      (when first-thread
+        (sb-thread:join-thread first-thread))
+      (http-kit/http2:close-http2-connection-manager manager))
+    (ensure-equal 1 closed)))
+#+sbcl
+(deftest http2-connection-manager-cold-open-owner-rechecks-entry-after-claim
+  (let* ((open-entered (sb-thread:make-semaphore :count 0))
+         (release-open (sb-thread:make-semaphore :count 0))
+         (owner-done (sb-thread:make-semaphore :count 0))
+         (claim-arrived (sb-thread:make-semaphore :count 0))
+         (resume-claim (sb-thread:make-semaphore :count 0))
+         (second-started (sb-thread:make-semaphore :count 0))
+         (start-second (sb-thread:make-semaphore :count 0))
+         (second-done (sb-thread:make-semaphore :count 0))
+         (counter-lock (sb-thread:make-mutex :name "cold-open claim race"))
+         (opened 0)
+         (closed 0)
+         (request (make-http-request :method "GET"
+                                     :uri "https://cold-claim-race.test/"))
+         (manager
+           (http-kit/http2:make-http2-connection-manager
+            :open-connection
+            (lambda (request &key timeout deadline)
+              (declare (ignore request timeout deadline))
+              (let ((index
+                      (sb-thread:with-mutex (counter-lock)
+                        (prog1 opened (incf opened)))))
+                (unless (zerop index)
+                  (error "Unexpected duplicate cold open."))
+                (sb-thread:signal-semaphore open-entered)
+                (unless (sb-thread:wait-on-semaphore release-open :timeout 10)
+                  (error "Timed out waiting to release the first cold open."))
+                (%make-cold-open-regression-connection
+                 (lambda () (incf closed)))))))
+         (claim-symbol 'http-kit/http2::%h2-manager-claim-opening)
+         (original-claim (symbol-function claim-symbol))
+         (owner-thread nil)
+         (second-thread nil)
+         (owner-error nil)
+         (second-error nil)
+         (owner-connection nil)
+         (owner-entry nil)
+         (second-connection nil)
+         (second-entry nil))
+    (unwind-protect
+         (progn
+           (setf owner-thread
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (unwind-protect
+                         (handler-case
+                             (multiple-value-setq (owner-connection owner-entry)
+                               (http-kit/http2::%h2-manager-connection-for
+                                manager request "claim-race" t nil nil nil nil t))
+                           (error (condition) (setf owner-error condition)))
+                      (sb-thread:signal-semaphore owner-done)))))
+           (ensure-true (sb-thread:wait-on-semaphore open-entered :timeout 5))
+           (setf (symbol-function claim-symbol)
+                 (lambda (claim-manager key)
+                   (when (eq sb-thread:*current-thread* second-thread)
+                     (sb-thread:signal-semaphore claim-arrived)
+                     (unless (sb-thread:wait-on-semaphore
+                              resume-claim :timeout 10)
+                       (error "Timed out waiting to resume the cold-open claim.")))
+                   (funcall original-claim claim-manager key)))
+           (setf second-thread
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (sb-thread:signal-semaphore second-started)
+                    (sb-thread:wait-on-semaphore start-second)
+                    (unwind-protect
+                         (handler-case
+                             (multiple-value-setq
+                                 (second-connection second-entry)
+                               (http-kit/http2::%h2-manager-connection-for
+                                manager request "claim-race" t nil nil nil nil t))
+                           (error (condition) (setf second-error condition)))
+                      (sb-thread:signal-semaphore second-done)))))
+           (ensure-true
+            (sb-thread:wait-on-semaphore second-started :timeout 5))
+           (sb-thread:signal-semaphore start-second)
+           (ensure-true
+            (sb-thread:wait-on-semaphore claim-arrived :timeout 5))
+           (sb-thread:signal-semaphore release-open)
+           (ensure-true (sb-thread:wait-on-semaphore owner-done :timeout 10))
+           (sb-thread:join-thread owner-thread)
+           (setf owner-thread nil)
+           (ensure-true (null owner-error))
+           (sb-thread:signal-semaphore resume-claim)
+           (ensure-true (sb-thread:wait-on-semaphore second-done :timeout 10))
+           (sb-thread:join-thread second-thread)
+           (setf second-thread nil)
+           (ensure-true (null second-error))
+           (ensure-equal 1 opened)
+           (ensure-true (eq owner-connection second-connection))
+           (ensure-true (eq owner-entry second-entry))
+           (ensure-equal
+            1
+            (http-kit/http2:http2-connection-manager-connection-count manager))
+           (ensure-equal 0 closed)
+           (http-kit/http2::%h2-manager-finish-entry manager owner-entry)
+           (setf owner-entry nil)
+           (ensure-equal 0 closed)
+           (http-kit/http2::%h2-manager-finish-entry manager second-entry)
+           (setf second-entry nil)
+           (http-kit/http2:close-http2-connection-manager manager)
+           (ensure-equal 1 closed))
+      (sb-thread:signal-semaphore release-open)
+      (sb-thread:signal-semaphore resume-claim)
+      (when owner-thread
+        (ignore-errors (sb-thread:join-thread owner-thread)))
+      (when second-thread
+        (ignore-errors (sb-thread:join-thread second-thread)))
+      (setf (symbol-function claim-symbol) original-claim)
+      (when owner-entry
+        (http-kit/http2::%h2-manager-finish-entry manager owner-entry))
+      (when second-entry
+        (http-kit/http2::%h2-manager-finish-entry manager second-entry))
+      (http-kit/http2:close-http2-connection-manager manager))))
+
+

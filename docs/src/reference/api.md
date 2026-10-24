@@ -442,6 +442,10 @@ The condition type for malformed or contradictory protocol data.
 ### `http-protocol-error-detail`
 
 Return structured protocol detail.
+For `:http2-read` errors caused by DATA on a client stream that has never been
+opened, the detail is the stream ID when another request on the connection is
+still in progress and has not failed; otherwise it is a two-element list with
+`0` (the DATA frame type) first and the stream ID second.
 
 ### `http-invalid-uri`
 
@@ -557,6 +561,9 @@ per decoded header or trailer section is 256.
 
 `cancel-http2-stream` emits `RST_STREAM` for an opened client stream.
 `ping-http2-connection` sends a PING and waits for the matching acknowledgement.
+If it receives a malformed PING while waiting, it signals
+`HTTP-PROTOCOL-ERROR` with operation `:http2-client` and the received frame as
+detail.
 `send-http2-priority-update` emits an RFC 9218 priority update.
 `send-http2-goaway` and its convenience alias
 `graceful-shutdown-http2-connection` make the connection drain without
@@ -612,9 +619,16 @@ also clamps peer HPACK table settings to 4096 bytes by default through
 `&key open-connection max-connections idle-timeout max-connection-age
 clock-function on-evict on-transient-close`. `max-connections` defaults to `8`
 and limits retained cache entries; request-scoped connections do not count
-toward that limit. On SBCL, the manager synchronizes its entry state for
-concurrent callers and leases each retained connection to at most one manager
-call at a time.
+toward that limit, so the total number of open connections can exceed it. On
+SBCL, the manager synchronizes its entry state for concurrent callers. Ordinary
+single-request calls with the same key can share one retained connection; its
+scheduler assigns distinct stream IDs and observes the peer's concurrent-stream
+and flow-control limits. A batch call holds an exclusive lease on its selected
+connection. A concurrent call that cannot share an active entry uses a
+request-scoped connection.
+There is no separate cap on total open connections. Enforcing one would require
+the manager to define how concurrent calls wait or fail when all sockets are in
+use, so `max-connections` remains a retained-cache limit.
 By default, the cache key includes the request scheme, host, port, proxy plan,
 and proxy.
 Supplying `connection-key` to a send function replaces that default; keys are
@@ -626,11 +640,10 @@ Each invocation passes `:timeout` and `:deadline`; proxy-routed requests also
 pass `:proxy-plan` and `:proxy`. Caller-supplied `open-connection`,
 `clock-function`, `on-evict`, and `on-transient-close` functions may run
 concurrently with manager calls, so they must synchronize any shared state
-they use. A request for a key whose retained connection is busy uses a
-request-scoped connection. For a different key, the manager can create a
-retained entry while below the cap, or evict the least-recently-used idle
-entry at capacity. If the cache is full and every retained entry is active,
-it uses a request-scoped connection.
+they use. For a different key, the manager can create a retained entry while
+below the cap, or evict the least-recently-used idle entry at capacity. If the
+cache is full and every retained entry is active, a request for another key
+uses a request-scoped connection.
 
 `idle-timeout`, `max-connection-age`, and `on-evict` default to `nil`. Idle
 expiry is based on the time since the last completed manager call; maximum age
@@ -667,7 +680,17 @@ session multiplexes the streams.
 `make-http2-connection-manager-transport` adapts a manager to the high-level
 client transport protocol. The two send functions and the function returned by
 `make-http2-connection-manager-transport` each accept and forward the per-section
-`max-fields` limit.
+`max-fields` limit. Per-request `max-header-bytes`, `max-fields`, and
+`max-body-bytes` values can tighten the selected connection's limits; they
+cannot raise them.
+
+While dispatching received response frames, malformed headers and body-limit
+violations fail the connection and every active request on it. RFC 9113
+§5.4.1 permits treating a stream error as a connection error. A per-request
+timeout, callback error, explicit stream cancellation, or peer `RST_STREAM`
+uses the stream-level handling path. If writing a required `RST_STREAM` fails,
+the connection also fails.
+
 `clear-http2-connection-manager` is idempotent. It retires
 all retained connections without closing the manager and returns it on success.
 A call whose connection was still opening when clear began may finish using

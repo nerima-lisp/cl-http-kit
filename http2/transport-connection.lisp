@@ -1,5 +1,12 @@
 (in-package #:http-kit/http2)
 
+(defmacro %h2-with-scheduler-lock ((connection) &body body)
+  #+sbcl
+  `(sb-thread:with-mutex ((%http2-connection-scheduler-lock ,connection))
+     ,@body)
+  #-sbcl
+  `(progn ,@body))
+
 (defun http2-client-connection (client)
   (and (http2-client-p client)
        (%http2-connection client)))
@@ -7,7 +14,8 @@
 (defun %h2-peer-stream-reset-condition-p (condition)
   (and (typep condition 'http-kit:http-connection-error)
        (let ((cause (http-kit:http-connection-error-cause condition)))
-         (and (consp cause) (eq (first cause) :rst-stream)))))
+         (and (consp cause)
+              (member (first cause) '(:rst-stream :goaway))))))
 
 (defun make-http2-connection
     (&key stream close-stream
@@ -113,12 +121,22 @@ SETTINGS, stream identifiers, HPACK decoder state, and control frames."
            :message "CLOSE-HTTP2-CONNECTION requires an HTTP2-CONNECTION."
            :operation :http2-client
            :detail (type-of connection)))
-  (unless (%http2-connection-closed-p connection)
-    (setf (%http2-connection-closed-p connection) t)
-    (http-kit::%with-http-cleanup
-      (funcall (%http2-connection-close-stream connection)
-               (%http2-connection-stream connection))))
-  connection)
+  (let ((close-p nil))
+    #+sbcl
+    (%h2-with-scheduler-lock (connection)
+      (unless (%http2-connection-closed-p connection)
+        (setf (%http2-connection-closed-p connection) t
+              close-p t))
+      (%h2-scheduler-broadcast connection))
+    #-sbcl
+    (unless (%http2-connection-closed-p connection)
+      (setf (%http2-connection-closed-p connection) t
+            close-p t))
+    (when close-p
+      (http-kit::%with-http-cleanup
+        (funcall (%http2-connection-close-stream connection)
+                 (%http2-connection-stream connection))))
+    connection))
 
 (defun %h2-control-octets (value name)
   (unless (and value
@@ -170,7 +188,8 @@ are rejected after this function marks the connection draining."
          (clock (or clock-function
                     (%http2-connection-clock-function connection)))
          (error-code (%h2-control-error-code error-code))
-         (last-stream-id (%h2-control-stream-id connection last-stream-id))
+         (last-stream-id (when last-stream-id
+                           (%h2-control-stream-id connection last-stream-id)))
          (debug-data (%h2-control-octets
                       (or debug-data
                           (make-array 0
@@ -186,15 +205,6 @@ are rejected after this function marks the connection draining."
              :message "The HTTP/2 connection is already closed."
              :operation :http2-client
              :detail :goaway-after-close))
-    (let ((previous-last-stream-id
-            (%http2-connection-local-goaway-last-stream-id connection)))
-      (when (and previous-last-stream-id
-                 (> last-stream-id previous-last-stream-id))
-        (error 'http-kit:http-protocol-error
-               :message "A subsequent HTTP/2 GOAWAY last-stream identifier must not increase."
-               :operation :http2-client
-               :detail (list :previous previous-last-stream-id
-                             :new last-stream-id))))
     (when (> (+ 8 (length debug-data))
              (%http2-connection-peer-max-frame-size connection))
       (error 'http-kit:http-protocol-error
@@ -206,20 +216,36 @@ are rejected after this function marks the connection draining."
     (let ((payload (make-array (+ 8 (length debug-data))
                                :element-type '(unsigned-byte 8)))
           (writer nil))
-      (%h2-put-u32 payload 0 last-stream-id)
-      (%h2-put-u32 payload 4 error-code)
       (replace payload debug-data :start1 8)
-      ;; Record the state before writing so a re-entrant caller cannot open a
-      ;; stream while the GOAWAY bytes are still in the writer.
-      (setf (%http2-connection-local-goaway-last-stream-id connection)
-            last-stream-id
-            (%http2-connection-draining-p connection) t
-            writer (%h2-writer stream nil nil))
+      (%h2-with-scheduler-lock (connection)
+        (unless last-stream-id
+          (setf last-stream-id (%h2-control-stream-id connection nil)))
+        (let ((previous-last-stream-id
+                (%http2-connection-local-goaway-last-stream-id connection)))
+          (when (and previous-last-stream-id
+                     (> last-stream-id previous-last-stream-id))
+            (error 'http-kit:http-protocol-error
+                   :message "A subsequent HTTP/2 GOAWAY last-stream identifier must not increase."
+                   :operation :http2-client
+                   :detail (list :previous previous-last-stream-id
+                                 :new last-stream-id))))
+        (%h2-put-u32 payload 0 last-stream-id)
+        (%h2-put-u32 payload 4 error-code)
+        ;; Record the state before writing so a re-entrant caller cannot open a
+        ;; stream while the GOAWAY bytes are still in the writer.
+        (setf (%http2-connection-local-goaway-last-stream-id connection)
+              last-stream-id
+              (%http2-connection-draining-p connection) t
+              writer (%h2-writer stream nil nil
+                                 #+sbcl (%http2-connection-writer-lock connection)
+                                 #-sbcl nil)))
       (handler-case
           (http-kit:with-http-deadline (absolute-deadline timeout
                                          :inherited deadline
                                          :clock-function clock)
-            (setf writer (%h2-writer stream absolute-deadline clock))
+            (setf writer (%h2-writer stream absolute-deadline clock
+                                     #+sbcl (%http2-connection-writer-lock connection)
+                                     #-sbcl nil))
             (%h2-send-control writer +http2-goaway-type+ 0 0 payload))
         (error (condition)
           (close-http2-connection connection)
@@ -289,8 +315,7 @@ are rejected after this function marks the connection draining."
         (http-kit:with-http-deadline (absolute-deadline timeout
                                        :inherited deadline
                                        :clock-function clock)
-          (%h2-send-control (%h2-writer (%http2-connection-stream connection)
-                                        absolute-deadline clock)
+          (%h2-send-control (%h2-writer (%http2-connection-stream connection) absolute-deadline clock #+sbcl (%http2-connection-writer-lock connection) #-sbcl nil)
                             +http2-priority-update-type+ 0 0 payload))
       (error (condition)
         (close-http2-connection connection)
@@ -311,18 +336,13 @@ are rejected after this function marks the connection draining."
 
 (defun ping-http2-connection
     (connection &key payload timeout deadline clock-function)
-  "Send an HTTP/2 PING and wait for its matching ACK.
-
-PAYLOAD must be exactly eight octets when supplied.  Control frames received
-while waiting are processed; a non-control frame is a protocol error because
-this operation has no response stream to associate with it."
+  "Send an HTTP/2 PING and return its payload after a matching ACK."
   (let* ((connection (if (http2-connection-p connection)
                          connection
                          (error 'http-kit:http-protocol-error
                                 :message "PING-HTTP2-CONNECTION requires an HTTP2-CONNECTION."
                                 :operation :http2-client
                                 :detail (type-of connection))))
-         (stream (%http2-connection-stream connection))
          (clock (or clock-function
                     (%http2-connection-clock-function connection)))
          (payload (%h2-control-octets
@@ -350,7 +370,12 @@ this operation has no response stream to associate with it."
         (http-kit:with-http-deadline (absolute-deadline timeout
                                          :inherited deadline
                                          :clock-function clock)
-          (let* ((reader (%h2-reader-for stream))
+          #+sbcl
+          (%h2-scheduler-ping
+           connection payload absolute-deadline clock)
+          #-sbcl
+          (let* ((stream (%http2-connection-stream connection))
+                 (reader (%h2-reader-for stream))
                  (writer (%h2-writer stream absolute-deadline clock)))
             (%h2-send-control writer +http2-ping-type+ 0 0 payload)
             (loop
@@ -451,69 +476,110 @@ this operation has no response stream to associate with it."
     (connection reader writer stream-id body request-body-function
                 expected-body-length max-body-bytes local-max-frame-size
                 trailer-fields deadline clock-function read-initial-settings-p
-                huffman-p)
+                huffman-p &key scheduler-p flow-wait-function)
   (let ((position 0)
         (pending-frames '())
         (first-settings-p read-initial-settings-p)
         (body-length (length body)))
     (labels ((read-while-blocked ()
-               (let ((frame (%h2-read-frame
-                             reader
-                             (%http2-connection-max-frame-size connection)
-                 deadline clock-function)))
-                 (when (eq frame :eof)
-                   (error 'http-kit:http-connection-error
-                          :message "The HTTP/2 peer closed while upload flow control was blocked."
-                          :operation :http2-read
-                          :cause :eof))
-                 (when first-settings-p
-                   (unless (and (= (%h2-frame-type frame)
-                                   +http2-settings-type+)
-                                (zerop (%h2-frame-stream-id frame))
-                                (zerop (logand (%h2-frame-flags frame)
-                                               +http2-ack-flag+)))
-                     (error 'http-kit:http-protocol-error
-                            :message "The first HTTP/2 peer frame must be a non-ACK SETTINGS frame."
-                            :operation :http2-read
-                            :detail (list (%h2-frame-type frame)
-                                          (%h2-frame-stream-id frame)
-                                          (%h2-frame-flags frame))))
-                   (setf first-settings-p nil))
-                 (if (%h2-control-frame-p (%h2-frame-type frame))
-                     (%h2-connection-control-handler
-                      connection frame writer stream-id)
-                     (push frame pending-frames))))
+               (if flow-wait-function
+                   (funcall flow-wait-function connection stream-id
+                            deadline clock-function)
+                   (let ((frame (%h2-read-frame
+                                 reader
+                                 (%http2-connection-max-frame-size connection)
+                                 deadline clock-function)))
+                     (when (eq frame :eof)
+                       (error 'http-kit:http-connection-error
+                              :message "The HTTP/2 peer closed while upload flow control was blocked."
+                              :operation :http2-read
+                              :cause :eof))
+                     (when first-settings-p
+                       (unless (and (= (%h2-frame-type frame)
+                                       +http2-settings-type+)
+                                    (zerop (%h2-frame-stream-id frame))
+                                    (zerop (logand (%h2-frame-flags frame)
+                                                   +http2-ack-flag+)))
+                         (error 'http-kit:http-protocol-error
+                                :message "The first HTTP/2 peer frame must be a non-ACK SETTINGS frame."
+                                :operation :http2-read
+                                :detail (list (%h2-frame-type frame)
+                                              (%h2-frame-stream-id frame)
+                                              (%h2-frame-flags frame))))
+                       (setf first-settings-p nil))
+                     (if (%h2-control-frame-p (%h2-frame-type frame))
+                         (%h2-connection-control-handler
+                          connection frame writer stream-id)
+                         (push frame pending-frames)))))
              (write-data (payload end-stream-p)
                (let ((size (length payload)))
-                 (%h2-write-wire
-                  (%http2-connection-stream connection)
-                  (%h2-frame-wire
-                   +http2-data-type+
-                   (if end-stream-p +http2-end-stream-flag+ 0)
-                   stream-id payload)
-                  deadline clock-function)
-                 (when (plusp size)
-                   (decf (%http2-connection-peer-connection-window-size
-                          connection)
-                         size)
-                   (let ((entry (assoc stream-id
-                                       (%http2-connection-peer-stream-windows
-                                        connection))))
-                     (decf (cdr entry) size))
-                   (incf position size))))
+                 (let ((wire (%h2-frame-wire
+                              +http2-data-type+
+                              (if end-stream-p +http2-end-stream-flag+ 0)
+                              stream-id payload)))
+                   (if scheduler-p
+                       (%h2-with-scheduler-lock (connection)
+                         (let* ((stream-window
+                                  (%h2-connection-stream-window
+                                   connection stream-id))
+                                (connection-window
+                                  (%http2-connection-peer-connection-window-size
+                                   connection)))
+                           (when (or (zerop size)
+                                     (>= (min stream-window connection-window)
+                                         size))
+                             (funcall writer wire)
+                             (when (plusp size)
+                               (decf
+                                (%http2-connection-peer-connection-window-size
+                                 connection)
+                                size)
+                               (decf (cdr (assoc
+                                           stream-id
+                                           (%http2-connection-peer-stream-windows
+                                            connection)))
+                                     size)
+                               (incf position size))
+                             t)))
+                       (progn
+                         (funcall writer wire)
+                         (when (plusp size)
+                           (decf
+                            (%http2-connection-peer-connection-window-size
+                             connection)
+                            size)
+                           (let ((entry
+                                   (assoc
+                                    stream-id
+                                    (%http2-connection-peer-stream-windows
+                                     connection))))
+                             (decf (cdr entry) size))
+                           (incf position size))
+                         t)))))
              (effective-max-frame-size ()
                (min local-max-frame-size
                     (%http2-connection-peer-max-frame-size connection)))
              (write-trailers ()
                (when trailer-fields
-                 (%h2-write-wire
-                  (%http2-connection-stream connection)
+                 (funcall
+                  writer
                   (%h2-concat
                    (%h2-header-frames
                     (%h2-encode-header-block trailer-fields
-                                          :huffman-p huffman-p)
-                    t (effective-max-frame-size) stream-id))
-                  deadline clock-function))))
+                                             :huffman-p huffman-p)
+                    t (effective-max-frame-size) stream-id)))))
+             (window-available-size (frame-size)
+               (if scheduler-p
+                   (%h2-with-scheduler-lock (connection)
+                     (min frame-size
+                          (%h2-connection-stream-window
+                           connection stream-id)
+                          (%http2-connection-peer-connection-window-size
+                           connection)))
+                   (min frame-size
+                        (%h2-connection-stream-window connection stream-id)
+                        (%http2-connection-peer-connection-window-size
+                         connection)))))
       (if request-body-function
           (let ((pending-chunk nil)
                 (pending-offset 0)
@@ -545,14 +611,8 @@ this operation has no response stream to associate with it."
                  (return))
                 (t
                  (let* ((max-frame-size (effective-max-frame-size))
-                        (stream-window
-                          (%h2-connection-stream-window
-                           connection stream-id))
-                        (connection-window
-                          (%http2-connection-peer-connection-window-size
-                           connection))
                         (available
-                          (min max-frame-size stream-window connection-window))
+                          (window-available-size max-frame-size))
                         (remaining
                           (- (length pending-chunk) pending-offset)))
                    (when (and expected-body-length
@@ -571,29 +631,24 @@ this operation has no response stream to associate with it."
                                         expected-body-length))))
                          (http-kit::%check-limit
                           :body (+ position size) max-body-bytes)
-                         (write-data
-                          (subseq pending-chunk
-                                  pending-offset (+ pending-offset size))
-                          end-stream-p)
-                         (incf pending-offset size)
-                         (when (= pending-offset (length pending-chunk))
-                           (setf pending-chunk nil
-                                 pending-offset 0))
-                         (when end-stream-p
-                           (return)))
+                         (when
+                             (write-data
+                              (subseq pending-chunk
+                                      pending-offset (+ pending-offset size))
+                              end-stream-p)
+                           (incf pending-offset size)
+                           (when (= pending-offset (length pending-chunk))
+                             (setf pending-chunk nil
+                                   pending-offset 0))
+                           (when end-stream-p
+                             (return))))
                        (read-while-blocked)))))))
           (loop while (< position body-length)
                 do (let* ((max-frame-size (effective-max-frame-size))
-                          (stream-window
-                            (%h2-connection-stream-window
-                             connection stream-id))
-                          (connection-window
-                            (%http2-connection-peer-connection-window-size
-                             connection))
                           (size (min max-frame-size
                                      (- body-length position)
-                                     stream-window
-                                     connection-window)))
+                                     (window-available-size
+                                      max-frame-size))))
                      (if (plusp size)
                          (write-data
                           (subseq body position (+ position size))
@@ -781,19 +836,6 @@ this operation has no response stream to associate with it."
            :message "CANCEL-HTTP2-STREAM requires an HTTP2-CONNECTION."
            :operation :http2-client
            :detail (type-of connection)))
-  (unless (http2-connection-open-p connection)
-    (error 'http-kit:http-connection-error
-           :message "The HTTP/2 connection is closed."
-           :operation :http2-client
-           :cause :closed))
-  (unless (and (integerp stream-id)
-               (plusp stream-id)
-               (oddp stream-id)
-               (< stream-id (%http2-connection-next-stream-id connection)))
-    (error 'http-kit:http-protocol-error
-           :message "STREAM-ID must identify an opened client HTTP/2 stream."
-           :operation :http2-write
-           :detail stream-id))
   (let ((clock (or clock-function
                    (%http2-connection-clock-function connection)))
         (error-code (%h2-control-error-code error-code)))
@@ -805,13 +847,29 @@ this operation has no response stream to associate with it."
     (http-kit:with-http-deadline (absolute-deadline timeout
                                    :inherited deadline
                                    :clock-function clock)
-      (%h2-send-rst-stream
-       (%h2-writer (%http2-connection-stream connection)
-                   absolute-deadline clock)
-       stream-id error-code)))
-  t)
+      (%h2-with-scheduler-lock (connection)
+        (unless (http2-connection-open-p connection)
+          (error 'http-kit:http-connection-error
+                 :message "The HTTP/2 connection is closed."
+                 :operation :http2-client
+                 :cause :closed))
+        (unless (and (integerp stream-id)
+                     (plusp stream-id)
+                     (oddp stream-id)
+                     (< stream-id (%http2-connection-next-stream-id connection)))
+          (error 'http-kit:http-protocol-error
+                 :message "STREAM-ID must identify an opened client HTTP/2 stream."
+                 :operation :http2-write
+                 :detail stream-id))
+        (%h2-send-rst-stream
+         (%h2-writer (%http2-connection-stream connection)
+                     absolute-deadline clock
+                     #+sbcl (%http2-connection-writer-lock connection)
+                     #-sbcl nil)
+         stream-id error-code)))
+  t))
 
-(defun send-http2-request-over-connection
+(defun %h2-send-http2-request-over-connection-serial
     (connection request
      &key timeout deadline max-header-bytes max-fields max-body-bytes clock-function
        request-body-function request-body-length
@@ -855,12 +913,16 @@ concurrent streams should use SEND-HTTP2-REQUESTS-OVER-CONNECTION."
            :detail collect-body-p))
   (let* ((clock (or clock-function
                     (%http2-connection-clock-function connection)))
-         (header-limit (or max-header-bytes
-                           (%http2-connection-max-header-bytes connection)))
+         (header-limit
+          (min (or max-header-bytes
+                   (%http2-connection-max-header-bytes connection))
+               (%http2-connection-max-header-bytes connection)))
          (field-limit (min (or max-fields most-positive-fixnum)
                            (%http2-connection-max-fields connection)))
-         (body-limit (or max-body-bytes
-                         (%http2-connection-max-body-bytes connection)))
+         (body-limit
+          (min (or max-body-bytes
+                   (%http2-connection-max-body-bytes connection))
+               (%http2-connection-max-body-bytes connection)))
          (stream-id nil))
     (http-kit:with-http-deadline (absolute-deadline timeout
                                    :inherited deadline
@@ -1028,7 +1090,10 @@ concurrent streams should use SEND-HTTP2-REQUESTS-OVER-CONNECTION."
 (defstruct (%h2-batch-entry
              (:constructor %make-h2-batch-entry
                  (&key request stream-id body request-body-function
-                       expected-body-length outgoing-frame-size trailer-fields)))
+                       expected-body-length outgoing-frame-size trailer-fields
+                       max-header-bytes max-fields max-body-bytes
+                       on-body-chunk on-information collect-body-p
+                       deadline clock-function)))
   request
   stream-id
   body
@@ -1036,6 +1101,19 @@ concurrent streams should use SEND-HTTP2-REQUESTS-OVER-CONNECTION."
   expected-body-length
   outgoing-frame-size
   trailer-fields
+  max-header-bytes
+  max-fields
+  max-body-bytes
+  on-body-chunk
+  on-information
+  (collect-body-p t)
+  deadline
+  clock-function
+  body-sent-p
+  error
+  local-retired-p
+  callback-events
+  callback-events-tail
   (body-position 0)
   status
   headers
@@ -1045,6 +1123,12 @@ concurrent streams should use SEND-HTTP2-REQUESTS-OVER-CONNECTION."
                            :fill-pointer 0))
   (body-length 0)
   response)
+
+(defstruct (%h2-scheduler-ping-waiter
+             (:constructor %make-h2-scheduler-ping-waiter (payload)))
+  payload
+  acknowledged-p
+  failure)
 
 (defun %h2-batch-entry-for-stream (entries stream-id)
   (find stream-id entries
@@ -1153,12 +1237,1005 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                            :message "An informational HTTP/2 response cannot end the stream."
                            :operation :http2-read
                            :detail candidate-status))
+                  (when (%h2-batch-entry-on-information entry)
+                    (funcall (%h2-batch-entry-on-information entry)
+                             (http-kit:make-http-response
+                              :status candidate-status
+                              :headers candidate-headers
+                              :protocol-version "HTTP/2")))
                   (values nil nil nil))
                 (values candidate-status candidate-headers
                         (when end-stream
                           (%h2-finish-request-response
                            candidate-status candidate-headers nil body
                            request-method :body-length body-length)))))))))
+
+#+sbcl
+(progn
+  (defun %h2-scheduler-writer (connection deadline clock-function)
+    (%h2-writer (%http2-connection-stream connection)
+                deadline clock-function
+                (%http2-connection-writer-lock connection)))
+
+  (defun %h2-scheduler-condition-wait (connection deadline clock-function)
+    (http-kit::%check-deadline deadline clock-function :read)
+    (let* ((lock (%http2-connection-scheduler-lock connection))
+           (timeout (and deadline
+                         (max 0 (- deadline (funcall clock-function))))))
+      (sb-thread:condition-wait
+       (%http2-connection-scheduler-condition connection)
+       lock
+       :timeout timeout)
+      (unless (sb-thread:holding-mutex-p lock)
+        (sb-sys:without-interrupts
+          (sb-sys:allow-with-interrupts
+            (sb-thread:grab-mutex lock))))
+      (http-kit::%check-deadline deadline clock-function :read)))
+
+  (defun %h2-scheduler-broadcast (connection)
+    (sb-thread:condition-broadcast
+     (%http2-connection-scheduler-condition connection)))
+
+  (defun %h2-scheduler-entry-ready-p (entry)
+    (or (%h2-batch-entry-error entry)
+        (%h2-batch-entry-callback-events entry)
+        (and (%h2-batch-entry-response entry)
+             (%h2-batch-entry-body-sent-p entry))))
+
+  (defun %h2-scheduler-control-writer (connection clock-function)
+    (%h2-writer (%http2-connection-stream connection)
+                nil clock-function
+                (%http2-connection-writer-lock connection)))
+
+  (defun %h2-scheduler-return-flow-credit
+      (connection stream-id increment clock-function &optional connection-only-p)
+    (let ((writer (%h2-scheduler-control-writer connection clock-function)))
+      (unless connection-only-p
+        (%h2-send-window-update writer stream-id increment))
+      (%h2-send-window-update writer 0 increment)))
+
+  (defun %h2-scheduler-queue-callback (connection entry event)
+    (let ((queued-p nil))
+      (%h2-with-scheduler-lock (connection)
+        (unless (or (%h2-batch-entry-local-retired-p entry)
+                    (%h2-batch-entry-error entry))
+          (let ((cell (list event))
+                (tail (%h2-batch-entry-callback-events-tail entry)))
+            (if tail
+                (setf (cdr tail) cell)
+                (setf (%h2-batch-entry-callback-events entry) cell))
+            (setf (%h2-batch-entry-callback-events-tail entry) cell
+                  queued-p t))
+          (%h2-scheduler-broadcast connection)))
+      queued-p))
+
+  (defun %h2-scheduler-pop-callback (connection entry)
+    (%h2-with-scheduler-lock (connection)
+      (let ((events (%h2-batch-entry-callback-events entry)))
+        (when events
+          (setf (%h2-batch-entry-callback-events entry) (cdr events))
+          (unless (%h2-batch-entry-callback-events entry)
+            (setf (%h2-batch-entry-callback-events-tail entry) nil))
+          (car events)))))
+
+  (defun %h2-scheduler-retire-entry
+      (connection entry condition clock-function &optional (flow-credit 0))
+    (let ((reset-p nil)
+          (connection-credit flow-credit))
+      (%h2-with-scheduler-lock (connection)
+        (unless (or (%h2-batch-entry-local-retired-p entry)
+                    (%h2-peer-stream-reset-condition-p
+                     (%h2-batch-entry-error entry)))
+          (setf (%h2-batch-entry-local-retired-p entry) t)
+          (unless (%h2-batch-entry-error entry)
+            (setf (%h2-batch-entry-error entry) condition))
+          (setf reset-p
+                (member entry (%http2-connection-scheduler-entries connection)
+                        :test #'eq))
+          (%h2-scheduler-remove-entry connection entry)
+          (loop for event in (%h2-batch-entry-callback-events entry)
+                when (eq (first event) :body)
+                  do (incf connection-credit (fourth event)))
+          (setf (%h2-batch-entry-callback-events entry) nil
+                (%h2-batch-entry-callback-events-tail entry) nil
+                (%h2-batch-entry-body-vector entry)
+                (make-array 0 :element-type '(unsigned-byte 8)
+                            :adjustable t :fill-pointer 0)
+                (%h2-batch-entry-body-length entry) 0
+                (%h2-batch-entry-response entry) nil)
+          (%h2-scheduler-broadcast connection)))
+      (handler-case
+          (progn
+            (when (plusp connection-credit)
+              (%h2-scheduler-return-flow-credit
+               connection 0 connection-credit clock-function t))
+            (when reset-p
+              (%h2-send-rst-stream
+               (%h2-scheduler-control-writer connection clock-function)
+               (%h2-batch-entry-stream-id entry) 8)))
+        (error (reset-condition)
+          (%h2-scheduler-fail-connection connection reset-condition)
+          (error reset-condition)))))
+
+  (defun %h2-scheduler-run-entry-callbacks
+      (connection entry clock-function)
+    (loop for event = (%h2-scheduler-pop-callback connection entry)
+          while event
+          do (let ((entry-error
+                     (%h2-with-scheduler-lock (connection)
+                       (%h2-batch-entry-error entry))))
+               (ecase (first event)
+                 (:information
+                  (unless entry-error
+                    (handler-case
+                        (funcall (second event) (third event))
+                      (error (condition)
+                        (%h2-scheduler-retire-entry
+                         connection entry condition clock-function)
+                        (error condition)))))
+                 (:body
+                  (if entry-error
+                      (%h2-scheduler-return-flow-credit
+                       connection 0 (fourth event) clock-function t)
+                      (progn
+                        (handler-case
+                            (funcall (second event) (third event))
+                          (error (condition)
+                            (%h2-scheduler-retire-entry
+                             connection entry condition clock-function
+                             (fourth event))
+                            (error condition)))
+                        (%h2-scheduler-return-flow-credit
+                         connection
+                         (%h2-batch-entry-stream-id entry)
+                         (fourth event)
+                         clock-function
+                         (%h2-with-scheduler-lock (connection)
+                           (or (%h2-batch-entry-local-retired-p entry)
+                               (%h2-batch-entry-error entry)
+                               (%h2-batch-entry-response entry)
+                               (fifth event)))))))))))
+
+  (defun %h2-scheduler-entry-for-stream (connection stream-id)
+    (%h2-batch-entry-for-stream
+     (%http2-connection-scheduler-entries connection) stream-id))
+
+  (defun %h2-scheduler-has-non-error-entry-p (connection)
+    (some (lambda (entry)
+            (not (%h2-batch-entry-error entry)))
+          (%http2-connection-scheduler-entries connection)))
+
+  (defun %h2-scheduler-remove-entry (connection entry)
+    (setf (%http2-connection-scheduler-entries connection)
+          (delete entry (%http2-connection-scheduler-entries connection)
+                  :test #'eq)))
+
+  (defun %h2-scheduler-close-goaway-retired-if-idle (connection)
+    (let ((close-p nil))
+      (%h2-with-scheduler-lock (connection)
+        (when (and (not (%http2-connection-closed-p connection))
+                   (%http2-connection-goaway-last-stream-id connection)
+                   (null (%http2-connection-scheduler-entries connection)))
+          (setf (%http2-connection-closed-p connection) t
+                close-p t)
+          (%h2-scheduler-broadcast connection)))
+      (when close-p
+        (http-kit::%with-http-cleanup
+          (funcall (%http2-connection-close-stream connection)
+                   (%http2-connection-stream connection))))))
+
+  (defun %h2-scheduler-mark-response (connection entry response)
+    (%h2-with-scheduler-lock (connection)
+      (if (%h2-batch-entry-local-retired-p entry)
+          (setf (%h2-batch-entry-response entry) nil)
+          (setf (%h2-batch-entry-response entry) response))
+      (when (or (%h2-batch-entry-body-sent-p entry)
+                (%h2-batch-entry-local-retired-p entry))
+        (%h2-scheduler-remove-entry connection entry))
+      (%h2-scheduler-broadcast connection)))
+
+  (defun %h2-scheduler-mark-body-sent (connection entry)
+    (%h2-with-scheduler-lock (connection)
+      (setf (%h2-batch-entry-body-sent-p entry) t)
+      (when (%h2-batch-entry-response entry)
+        (%h2-scheduler-remove-entry connection entry))
+      (%h2-scheduler-broadcast connection)))
+
+  (defun %h2-scheduler-window-available-p (connection stream-id)
+    (and (plusp (%http2-connection-peer-connection-window-size connection))
+         (plusp (%h2-connection-stream-window connection stream-id))))
+
+  (defun %h2-scheduler-capacity-available-p (connection)
+    (let ((limit (%http2-connection-peer-max-concurrent-streams connection)))
+      (and (not (eql limit 0))
+           (or (null limit)
+               (< (count-if-not #'%h2-batch-entry-error
+                                (%http2-connection-scheduler-entries
+                                 connection))
+                  limit)))))
+
+  (defun %h2-scheduler-control-frame (connection frame writer)
+    (let* ((type (%h2-frame-type frame))
+           (stream-id (%h2-frame-stream-id frame))
+           (payload (%h2-frame-payload frame)))
+      (%h2-client-control-budget-check connection frame writer)
+      (cond
+        ((= type +http2-settings-type+)
+         (%h2-connection-note-settings connection frame writer))
+        ((= type +http2-ping-type+)
+         (unless (and (zerop stream-id) (= (length payload) 8))
+           (if (some (lambda (waiter)
+                       (and (not (%h2-scheduler-ping-waiter-acknowledged-p
+                                  waiter))
+                            (not (%h2-scheduler-ping-waiter-failure waiter))))
+                     (%http2-connection-scheduler-ping-waiters connection))
+               (error 'http-kit:http-protocol-error
+                      :message "An HTTP/2 PING frame is invalid."
+                      :operation :http2-client
+                      :detail frame)
+               (error 'http-kit:http-protocol-error
+                      :message "An HTTP/2 PING must be an eight-byte stream-zero frame."
+                      :operation :http2-control
+                      :detail (list stream-id (length payload)))))
+         (if (/= 0 (logand (%h2-frame-flags frame) +http2-ack-flag+))
+             (let ((waiter
+                     (find-if
+                      (lambda (candidate)
+                        (and (not (%h2-scheduler-ping-waiter-acknowledged-p
+                                   candidate))
+                             (equalp payload
+                                     (%h2-scheduler-ping-waiter-payload
+                                      candidate))))
+                      (%http2-connection-scheduler-ping-waiters connection))))
+               (when waiter
+                 (setf (%h2-scheduler-ping-waiter-acknowledged-p waiter) t)))
+             (%h2-send-control writer +http2-ping-type+ +http2-ack-flag+
+                               0 payload)))
+        ((= type +http2-window-update-type+)
+         (when (and (plusp stream-id)
+                    (>= stream-id (%http2-connection-next-stream-id connection)))
+           (error 'http-kit:http-protocol-error
+                  :message "An HTTP/2 WINDOW_UPDATE targeted an idle stream."
+                  :operation :http2-control
+                  :detail stream-id))
+         (%h2-connection-note-window-update
+          connection frame (if (zerop stream-id) 1 stream-id))
+         (%h2-handle-control-frame
+          frame writer (if (zerop stream-id) 1 stream-id)))
+        ((= type +http2-goaway-type+)
+         (unless (and (zerop stream-id) (>= (length payload) 8))
+           (error 'http-kit:http-protocol-error
+                  :message "An HTTP/2 GOAWAY frame is invalid."
+                  :operation :http2-control
+                  :detail (list stream-id (length payload))))
+         (let ((last-stream-id (%h2-u32 payload 0)))
+           (when (/= 0 (logand last-stream-id #x80000000))
+             (error 'http-kit:http-protocol-error
+                    :message "An HTTP/2 GOAWAY last-stream identifier is invalid."
+                    :operation :http2-control
+                    :detail last-stream-id))
+           (setf (%http2-connection-goaway-last-stream-id connection)
+                 last-stream-id)
+           (dolist (entry
+                    (copy-list
+                     (%http2-connection-scheduler-entries connection)))
+             (when (> (%h2-batch-entry-stream-id entry) last-stream-id)
+               (unless (%h2-batch-entry-error entry)
+                 (setf (%h2-batch-entry-error entry)
+                       (make-condition
+                        'http-kit:http-connection-error
+                        :message "The HTTP/2 peer rejected the active stream with GOAWAY."
+                        :operation :http2-control
+                        :cause (list :goaway last-stream-id
+                                     (%h2-u32 payload 4)))))
+               (when (%h2-batch-entry-local-retired-p entry)
+                 (%h2-scheduler-remove-entry connection entry))))))
+        ((= type +http2-rst-stream-type+)
+         (unless (and (plusp stream-id) (= (length payload) 4))
+           (error 'http-kit:http-protocol-error
+                  :message "An HTTP/2 RST_STREAM frame is invalid."
+                  :operation :http2-control
+                  :detail (list stream-id (length payload))))
+         (when (>= stream-id (%http2-connection-next-stream-id connection))
+           (error 'http-kit:http-protocol-error
+                  :message "An HTTP/2 RST_STREAM targeted an idle stream."
+                  :operation :http2-control
+                  :detail stream-id))
+         (let ((entry (%h2-scheduler-entry-for-stream connection stream-id)))
+           (when entry
+             (unless (%h2-batch-entry-error entry)
+               (setf (%h2-batch-entry-error entry)
+                     (make-condition
+                      'http-kit:http-connection-error
+                      :message "The HTTP/2 peer reset the response stream."
+                      :operation :http2-control
+                      :cause (list :rst-stream stream-id
+                                   (%h2-u32 payload 0)))))
+             (when (%h2-batch-entry-local-retired-p entry)
+               (%h2-scheduler-remove-entry connection entry)))))
+        (t
+         (%h2-handle-control-frame frame writer
+                                  (max 1 (%http2-connection-next-stream-id
+                                          connection)))))
+      (%h2-scheduler-broadcast connection))))
+
+  (defun %h2-scheduler-dispatch-retired-data
+      (connection entry frame clock-function)
+    (%h2-data-payload frame)
+    (%h2-scheduler-return-flow-credit
+     connection 0 (length (%h2-frame-payload frame)) clock-function t)
+    (when (and entry
+               (/= 0 (logand (%h2-frame-flags frame)
+                             +http2-end-stream-flag+)))
+      (%h2-with-scheduler-lock (connection)
+        (%h2-scheduler-remove-entry connection entry)
+        (%h2-scheduler-broadcast connection))))
+
+  (defun %h2-scheduler-previously-opened-client-stream-p
+      (connection stream-id)
+    (%h2-with-scheduler-lock (connection)
+      (and (plusp stream-id)
+           (oddp stream-id)
+           (<= stream-id
+               (%http2-connection-scheduler-last-opened-stream-id connection)))))
+
+  (defun %h2-scheduler-discard-closed-headers
+      (connection frame reader deadline clock-function)
+    (multiple-value-bind (block end-stream-p)
+        (%h2-batch-read-header-block
+         frame
+         (lambda ()
+           (%h2-read-frame reader
+                           (%http2-connection-max-frame-size connection)
+                           deadline clock-function))
+         (%http2-connection-max-frame-size connection)
+         (%http2-connection-max-header-bytes connection))
+      (declare (ignore end-stream-p))
+      (%h2-decode-header-block
+       block
+       (%http2-connection-hpack-context connection)
+       :max-header-bytes (%http2-connection-max-header-bytes connection)
+       :max-fields (%http2-connection-max-fields connection))))
+
+  (defun %h2-scheduler-dispatch-frame
+      (connection frame reader writer deadline clock-function)
+    (declare (ignore writer))
+    (when (%http2-connection-scheduler-first-peer-frame-p connection)
+      (unless (and (= (%h2-frame-type frame) +http2-settings-type+)
+                   (zerop (%h2-frame-stream-id frame))
+                   (zerop (logand (%h2-frame-flags frame) +http2-ack-flag+)))
+        (error 'http-kit:http-protocol-error
+               :message "The first HTTP/2 peer frame must be a non-ACK SETTINGS frame."
+               :operation :http2-read
+               :detail (list (%h2-frame-type frame)
+                             (%h2-frame-stream-id frame)
+                             (%h2-frame-flags frame))))
+      (setf (%http2-connection-scheduler-first-peer-frame-p connection) nil))
+    (let ((type (%h2-frame-type frame))
+          (stream-id (%h2-frame-stream-id frame))
+          (control-writer (%h2-scheduler-control-writer connection
+                                                        clock-function)))
+      (cond
+        ((%h2-control-frame-p type)
+         (%h2-with-scheduler-lock (connection)
+           (%h2-scheduler-control-frame connection frame control-writer)))
+        ((= type +http2-headers-type+)
+         (let ((entry
+                 (%h2-with-scheduler-lock (connection)
+                   (%h2-scheduler-entry-for-stream connection stream-id))))
+           (unless entry
+             (if (%h2-scheduler-previously-opened-client-stream-p
+                  connection stream-id)
+                 (%h2-scheduler-discard-closed-headers
+                  connection frame reader deadline clock-function)
+                 (error 'http-kit:http-protocol-error
+                        :message "The HTTP/2 scheduler received HEADERS for an unknown stream."
+                        :operation :http2-read
+                        :detail stream-id)))
+           (when entry
+             (when (%h2-batch-entry-response entry)
+               (error 'http-kit:http-protocol-error
+                      :message "The HTTP/2 scheduler received HEADERS after stream completion."
+                      :operation :http2-read
+                      :detail stream-id))
+             (let* ((retired-p (%h2-batch-entry-local-retired-p entry))
+                    (processing-entry (copy-%h2-batch-entry entry))
+                    (on-information
+                      (and (not retired-p)
+                           (%h2-batch-entry-on-information entry))))
+               (setf (%h2-batch-entry-on-information processing-entry)
+                     (when on-information
+                       (lambda (response)
+                         (%h2-scheduler-queue-callback
+                          connection entry
+                          (list :information on-information response)))))
+               (multiple-value-bind (status headers response)
+                   (%h2-batch-process-headers-frame
+                    processing-entry frame
+                    (lambda ()
+                      (%h2-read-frame reader
+                                      (%http2-connection-max-frame-size connection)
+                                      deadline clock-function))
+                    (%http2-connection-max-frame-size connection)
+                    (%h2-batch-entry-max-header-bytes entry)
+                    (%h2-batch-entry-max-fields entry)
+                    (%http2-connection-hpack-context connection)
+                    (http-kit:http-request-method
+                     (%h2-batch-entry-request entry)))
+                 (when status
+                   (setf (%h2-batch-entry-status entry) status
+                         (%h2-batch-entry-headers entry) headers))
+                 (when response
+                   (if retired-p
+                       (%h2-with-scheduler-lock (connection)
+                         (%h2-scheduler-remove-entry connection entry)
+                         (%h2-scheduler-broadcast connection))
+                       (%h2-scheduler-mark-response
+                        connection entry response))))))))
+        ((= type +http2-data-type+)
+         (let ((entry nil)
+               (non-error-entry-p nil)
+               (pending-ping-p nil))
+           (%h2-with-scheduler-lock (connection)
+             (setf entry (%h2-scheduler-entry-for-stream connection stream-id)
+                   non-error-entry-p (%h2-scheduler-has-non-error-entry-p connection)
+                   pending-ping-p
+                   (some (lambda (waiter)
+                           (and (not (%h2-scheduler-ping-waiter-acknowledged-p waiter))
+                                (not (%h2-scheduler-ping-waiter-failure waiter))))
+                         (%http2-connection-scheduler-ping-waiters connection))))
+           (unless entry
+             (if (%h2-scheduler-previously-opened-client-stream-p
+                  connection stream-id)
+                 (if (and pending-ping-p (not non-error-entry-p))
+                     (error 'http-kit:http-protocol-error
+                            :message "The HTTP/2 PING received an unexpected frame."
+                            :operation :http2-client
+                            :detail frame)
+                     (%h2-scheduler-dispatch-retired-data
+                      connection nil frame clock-function))
+                 (error 'http-kit:http-protocol-error
+                        :message "The HTTP/2 scheduler received DATA for an unknown stream."
+                        :operation :http2-read
+                        :detail (if non-error-entry-p
+                                    stream-id
+                                    (list type stream-id)))))
+           (when entry
+  (if (%h2-batch-entry-local-retired-p entry)
+      (%h2-scheduler-dispatch-retired-data
+       connection entry frame clock-function)
+      (progn
+        (when (%h2-batch-entry-response entry)
+          (error 'http-kit:http-protocol-error
+                 :message "The HTTP/2 scheduler received DATA after stream completion."
+                 :operation :http2-read
+                 :detail stream-id))
+        (let* ((callback (%h2-batch-entry-on-body-chunk entry))
+               (callback-queued-p nil)
+               (flow-controlled-length
+                 (length (%h2-frame-payload frame)))
+               (body-vector (%h2-batch-entry-body-vector entry))
+               (collect-body-p (%h2-batch-entry-collect-body-p entry))
+               (queue-callback
+                 (when callback
+                   (lambda (payload)
+                     (setf callback-queued-p
+                           (%h2-scheduler-queue-callback
+                            connection entry
+                            (list :body callback payload flow-controlled-length
+                                  (/= 0 (logand (%h2-frame-flags frame)
+                                                +http2-end-stream-flag+)))))))))
+          (multiple-value-bind (end-stream-p body-length payload-length)
+              (%h2-append-data-frame*
+               frame
+               (%h2-batch-entry-status entry)
+               body-vector
+               (%h2-batch-entry-body-length entry)
+               (http-kit:http-request-method
+                (%h2-batch-entry-request entry))
+               (%h2-batch-entry-max-body-bytes entry)
+               queue-callback
+               collect-body-p
+               stream-id)
+            (let ((retired-p
+                    (%h2-with-scheduler-lock (connection)
+                      (or (%h2-batch-entry-local-retired-p entry)
+                          (%h2-batch-entry-error entry)))))
+              (if retired-p
+                  (when collect-body-p
+                    (setf (fill-pointer body-vector) 0))
+                  (setf (%h2-batch-entry-body-length entry) body-length))
+              (unless callback-queued-p
+                (%h2-with-scheduler-lock (connection)
+                  (unless (%http2-connection-closed-p connection)
+                    (%h2-scheduler-return-flow-credit
+                     connection stream-id payload-length clock-function
+                     (or retired-p end-stream-p))))))
+            (when end-stream-p
+              (%h2-scheduler-mark-response
+               connection entry
+               (%h2-finish-request-response
+                (%h2-batch-entry-status entry)
+                (%h2-batch-entry-headers entry)
+                nil
+                body-vector
+                (http-kit:http-request-method
+                 (%h2-batch-entry-request entry))
+                :body-length body-length))))))))))
+        ((= type +http2-continuation-type+)
+         (error 'http-kit:http-protocol-error
+                :message "An HTTP/2 CONTINUATION arrived without HEADERS."
+                :operation :http2-headers
+                :detail stream-id))
+        ((= type +http2-push-promise-type+)
+         (error 'http-kit:http-protocol-error
+                :message "The peer sent HTTP/2 PUSH_PROMISE after server push was disabled."
+                :operation :http2-read
+                :detail :protocol-error))
+        (t nil))))
+
+  (defun %h2-scheduler-pump-until
+      (connection predicate reader writer deadline clock-function)
+    (loop
+      (when (%h2-with-scheduler-lock (connection)
+              (or (%http2-connection-closed-p connection)
+                  (funcall predicate)))
+        (return))
+      (let ((frame (%h2-read-frame
+                    reader (%http2-connection-max-frame-size connection)
+                    deadline clock-function)))
+        (when (eq frame :eof)
+          (error 'http-kit:http-connection-error
+                 :message "The HTTP/2 peer closed during a scheduled request."
+                 :operation :http2-read
+                 :cause :eof))
+        (%h2-scheduler-dispatch-frame
+         connection frame reader writer deadline clock-function))))
+
+  (defun %h2-scheduler-wait-until
+      (connection predicate reader writer deadline clock-function
+       &optional entry)
+    (handler-case
+        (loop
+          (http-kit::%check-deadline deadline clock-function :read)
+          (let ((run-pump-p nil)
+                (finished-p nil))
+            (%h2-with-scheduler-lock (connection)
+              (setf finished-p
+                    (or (%http2-connection-closed-p connection)
+                        (funcall predicate)))
+              (unless finished-p
+                (if (%http2-connection-scheduler-reader-active-p connection)
+                    (%h2-scheduler-condition-wait
+                     connection deadline clock-function)
+                    (setf (%http2-connection-scheduler-reader-active-p connection)
+                          t
+                          run-pump-p t))))
+            (when finished-p
+              (return))
+            (when run-pump-p
+              (unwind-protect
+                   (handler-case
+                       (%h2-scheduler-pump-until
+                        connection predicate reader writer deadline clock-function)
+                     (http-kit:http-timeout (condition)
+                       (when entry
+                         (%h2-scheduler-retire-entry
+                          connection entry condition clock-function))
+                       (error condition))
+                     (error (condition)
+                       (%h2-scheduler-fail-connection connection condition)
+                       (error condition)))
+                (%h2-with-scheduler-lock (connection)
+                  (setf (%http2-connection-scheduler-reader-active-p connection)
+                        nil)
+                  (%h2-scheduler-broadcast connection))))))
+      (http-kit:http-timeout (condition)
+        (when entry
+          (%h2-scheduler-retire-entry
+           connection entry condition clock-function))
+        (error condition))))
+
+  (defun %h2-scheduler-ping
+      (connection payload deadline clock-function)
+    (let* ((reader (%h2-reader-for (%http2-connection-stream connection)))
+           (writer (%h2-scheduler-writer connection deadline clock-function))
+           (waiter (%make-h2-scheduler-ping-waiter payload)))
+      (%h2-with-scheduler-lock (connection)
+        (unless (http2-connection-open-p connection)
+          (error 'http-kit:http-connection-error
+                 :message "The HTTP/2 connection closed before PING."
+                 :operation :http2-control
+                 :cause :closed))
+        (push waiter (%http2-connection-scheduler-ping-waiters connection)))
+      (unwind-protect
+           (progn
+             (handler-case
+                 (progn
+                   (handler-case
+                       (%h2-send-control writer +http2-ping-type+ 0 0 payload)
+                     (error (condition)
+                       (let ((failure
+                               (%h2-with-scheduler-lock (connection)
+                                 (%h2-scheduler-ping-waiter-failure waiter))))
+                         (error (or failure condition)))))
+                   (%h2-scheduler-wait-until
+                    connection
+                    (lambda ()
+                      (%h2-scheduler-ping-waiter-acknowledged-p waiter))
+                    reader writer deadline clock-function)
+                   (let ((failure
+                           (%h2-with-scheduler-lock (connection)
+                             (%h2-scheduler-ping-waiter-failure waiter))))
+                     (when failure
+                       (error failure))))
+               (http-kit:http-connection-error (condition)
+                 (if (and (eq :http2-read (http-kit:http-error-operation condition))
+                          (eq :eof (http-kit:http-connection-error-cause condition)))
+                     (error 'http-kit:http-protocol-error
+                            :message "The HTTP/2 peer closed while awaiting PING ACK."
+                            :operation :http2-client
+                            :detail :eof)
+                     (error condition))))
+             (%h2-with-scheduler-lock (connection)
+               (unless (http2-connection-open-p connection)
+                 (error 'http-kit:http-connection-error
+                        :message "The HTTP/2 connection closed while awaiting PING ACK."
+                        :operation :http2-control
+                        :cause :closed))
+               payload))
+        (%h2-with-scheduler-lock (connection)
+          (setf (%http2-connection-scheduler-ping-waiters connection)
+                (delete waiter
+                        (%http2-connection-scheduler-ping-waiters connection)
+                        :test #'eq))
+          (%h2-scheduler-broadcast connection)))))
+
+  (defun %h2-scheduler-wait-for-window
+      (connection stream-id deadline clock-function)
+    (let ((reader (%h2-reader-for (%http2-connection-stream connection)))
+          (writer (%h2-scheduler-writer connection deadline clock-function)))
+      (loop
+        (let ((entry (%h2-with-scheduler-lock (connection)
+                       (%h2-scheduler-entry-for-stream connection stream-id))))
+          (%h2-scheduler-wait-until
+           connection
+           (lambda ()
+             (let ((active-entry
+                     (%h2-scheduler-entry-for-stream connection stream-id)))
+               (or (null active-entry)
+                   (%h2-batch-entry-error active-entry)
+                   (%h2-batch-entry-callback-events active-entry)
+                   (%h2-scheduler-window-available-p connection stream-id))))
+           reader writer deadline clock-function entry)
+          (when entry
+            (%h2-scheduler-run-entry-callbacks
+             connection entry clock-function))
+          (%h2-with-scheduler-lock (connection)
+            (let ((active-entry
+                    (%h2-scheduler-entry-for-stream connection stream-id)))
+              (when (and active-entry (%h2-batch-entry-error active-entry))
+                (error (%h2-batch-entry-error active-entry)))
+              (when (or (%http2-connection-closed-p connection)
+                        (null active-entry))
+                (error 'http-kit:http-connection-error
+                       :message "The HTTP/2 connection closed while request flow control was blocked."
+                       :operation :http2-write
+                       :cause :closed))
+              (when (%h2-scheduler-window-available-p connection stream-id)
+                (return))))))))
+
+  (defun %h2-scheduler-wait-for-capacity
+      (connection reader writer deadline clock-function)
+    (%h2-scheduler-wait-until
+     connection
+     (lambda ()
+       (or (%http2-connection-goaway-last-stream-id connection)
+           (%h2-scheduler-capacity-available-p connection)))
+     reader writer deadline clock-function)
+    (%h2-with-scheduler-lock (connection)
+      (when (%http2-connection-goaway-last-stream-id connection)
+        (%h2-connection-next-stream-id connection))
+      (unless (%h2-scheduler-capacity-available-p connection)
+        (error 'http-kit:http-connection-error
+               :message "The HTTP/2 connection closed while streams were paused."
+               :operation :http2-write
+               :cause :closed))))
+
+  (defun %h2-scheduler-fail-connection (connection condition)
+    (let ((close-p nil))
+      (%h2-with-scheduler-lock (connection)
+        (unless (%http2-connection-closed-p connection)
+          (setf (%http2-connection-closed-p connection) t
+                close-p t))
+        (dolist (entry (%http2-connection-scheduler-entries connection))
+          (unless (%h2-batch-entry-error entry)
+            (setf (%h2-batch-entry-error entry) condition)))
+        (dolist (waiter (%http2-connection-scheduler-ping-waiters connection))
+          (unless (or (%h2-scheduler-ping-waiter-acknowledged-p waiter)
+                      (%h2-scheduler-ping-waiter-failure waiter))
+            (setf (%h2-scheduler-ping-waiter-failure waiter) condition)))
+        (setf (%http2-connection-scheduler-entries connection) nil)
+        (%h2-scheduler-broadcast connection))
+      (when close-p
+        (http-kit::%with-http-cleanup
+          (funcall (%http2-connection-close-stream connection)
+                   (%http2-connection-stream connection))))))
+
+  (defun %h2-scheduler-open-entry
+      (connection request body-function body-length header-limit field-limit
+       body-limit deadline clock-function huffman-p on-body-chunk
+       on-information collect-body-p reader writer)
+    (loop
+      (unless (%h2-with-scheduler-lock (connection)
+                (%h2-scheduler-capacity-available-p connection))
+        (%h2-scheduler-wait-for-capacity
+         connection reader writer deadline clock-function))
+      (let ((entry nil))
+        (%h2-with-scheduler-lock (connection)
+          (unless (http2-connection-open-p connection)
+            (error 'http-kit:http-connection-error
+                   :message "The HTTP/2 connection is closed."
+                   :operation :http2-client
+                   :cause :closed))
+          (when (%h2-scheduler-capacity-available-p connection)
+            (let ((session-started-p
+                    (%http2-connection-session-started-p connection)))
+              (when (and (http-kit:http-request-protocol request)
+                         (not session-started-p))
+                (%h2-connection-start-for-extended-connect
+                 connection reader writer deadline clock-function)
+                (setf session-started-p t
+                      (%http2-connection-scheduler-first-peer-frame-p
+                       connection) nil))
+              (when (and (http-kit:http-request-protocol request)
+                         (not (%http2-connection-peer-enable-connect-protocol-p
+                               connection)))
+                (error 'http-kit:http-protocol-error
+                       :message "The HTTP/2 peer did not enable extended CONNECT."
+                       :operation :http2-write
+                       :detail :protocol-error))
+              (let* ((stream-id (%h2-connection-next-stream-id connection))
+                     (header-wire nil)
+                     (body nil)
+                     (outgoing-frame-size nil)
+                     (expected-body-length nil)
+                     (trailer-fields nil))
+                (multiple-value-setq
+                    (header-wire body outgoing-frame-size
+                     expected-body-length trailer-fields)
+                  (%h2-request-header-wire
+                   request
+                   (%http2-connection-max-frame-size connection)
+                   header-limit body-limit
+                   :stream-id stream-id
+                   :include-session-p (not session-started-p)
+                   :peer-max-frame-size
+                   (%http2-connection-peer-max-frame-size connection)
+                   :peer-max-header-list-size
+                   (%http2-connection-peer-max-header-list-size connection)
+                   :request-body-function body-function
+                   :request-body-length body-length
+                   :huffman-p huffman-p))
+                (setf entry
+                      (%make-h2-batch-entry
+                       :request request
+                       :stream-id stream-id
+                       :body body
+                       :request-body-function body-function
+                       :expected-body-length expected-body-length
+                       :outgoing-frame-size outgoing-frame-size
+                       :trailer-fields trailer-fields
+                       :max-header-bytes header-limit
+                       :max-fields field-limit
+                       :max-body-bytes body-limit
+                       :on-body-chunk on-body-chunk
+                       :on-information on-information
+                       :collect-body-p collect-body-p
+                       :deadline deadline
+                       :clock-function clock-function))
+                (push entry (%http2-connection-scheduler-entries connection))
+                (incf (%http2-connection-next-stream-id connection) 2)
+                (handler-case
+                    (funcall writer header-wire)
+                  (http-kit:http-timeout (condition)
+                    (%h2-scheduler-remove-entry connection entry)
+                    (%h2-scheduler-broadcast connection)
+                    (error condition))
+                  (error (condition)
+                    (%h2-scheduler-remove-entry connection entry)
+                    (%h2-scheduler-broadcast connection)
+                    (error condition)))
+                (setf (%http2-connection-scheduler-last-opened-stream-id
+                       connection)
+                      stream-id
+                      (%http2-connection-session-started-p connection) t)))))
+        (when entry
+          (return entry)))))
+
+  (defun %h2-send-http2-request-over-connection-scheduled
+      (connection request
+       &key timeout deadline max-header-bytes max-fields max-body-bytes
+         clock-function request-body-function request-body-length
+         on-body-chunk on-information on-stream-open
+         (collect-body-p t) (huffman-p nil))
+    (unless (http2-connection-p connection)
+      (error 'http-kit:http-protocol-error
+             :message "An HTTP/2 request requires an HTTP2-CONNECTION."
+             :operation :http2-client
+             :detail (type-of connection)))
+    (unless (http2-connection-open-p connection)
+      (error 'http-kit:http-connection-error
+             :message "The HTTP/2 connection is closed."
+             :operation :http2-client
+             :cause :closed))
+    (http-kit::%check-http-request request)
+    (%h2-validate-request-body-options
+     request request-body-function request-body-length)
+    (when (and on-body-chunk (not (functionp on-body-chunk)))
+      (error 'http-kit:http-protocol-error
+             :message "ON-BODY-CHUNK must be a function or NIL."
+             :operation :http2-client
+             :detail on-body-chunk))
+    (when (and on-information (not (functionp on-information)))
+      (error 'http-kit:http-protocol-error
+             :message "ON-INFORMATION must be a function or NIL."
+             :operation :http2-client
+             :detail on-information))
+    (when (and on-stream-open (not (functionp on-stream-open)))
+      (error 'http-kit:http-protocol-error
+             :message "ON-STREAM-OPEN must be a function or NIL."
+             :operation :http2-client
+             :detail on-stream-open))
+    (unless (member collect-body-p '(nil t))
+      (error 'http-kit:http-protocol-error
+             :message "COLLECT-BODY-P must be NIL or T."
+             :operation :http2-client
+             :detail collect-body-p))
+    (let* ((clock (or clock-function
+                      (%http2-connection-clock-function connection)))
+           (header-limit
+            (min (or max-header-bytes
+                     (%http2-connection-max-header-bytes connection))
+                 (%http2-connection-max-header-bytes connection)))
+           (field-limit (min (or max-fields most-positive-fixnum)
+                             (%http2-connection-max-fields connection)))
+           (body-limit
+            (min (or max-body-bytes
+                     (%http2-connection-max-body-bytes connection))
+                 (%http2-connection-max-body-bytes connection)))
+           (reader (%h2-reader-for (%http2-connection-stream connection)))
+           (entry nil))
+      (unless (functionp clock)
+        (error 'http-kit:http-protocol-error
+               :message "An HTTP/2 request clock must be callable."
+               :operation :http2-client
+               :detail clock))
+      (http-kit:with-http-deadline (absolute-deadline timeout
+                                     :inherited deadline
+                                     :clock-function clock)
+        (%h2-validate-limit :max-header-bytes header-limit)
+        (%h2-validate-limit :max-fields field-limit)
+        (%h2-validate-limit :max-body-bytes body-limit :allow-zero t)
+        (http-kit::%with-http-error-translation
+            ("The HTTP/2 connection request failed." :http2-connection)
+          (handler-case
+              (let ((writer (%h2-scheduler-writer
+                             connection absolute-deadline clock)))
+                (setf entry
+                      (%h2-scheduler-open-entry
+                       connection request request-body-function
+                       request-body-length header-limit field-limit body-limit
+                       absolute-deadline clock huffman-p on-body-chunk
+                       on-information collect-body-p reader writer))
+                (when on-stream-open
+                  (funcall on-stream-open
+                           (%h2-batch-entry-stream-id entry)
+                           (lambda (&rest cancel-arguments)
+                             (apply (lambda (&key error-code) error-code)
+                                    cancel-arguments)
+                             (cancel-http2-stream
+                              connection (%h2-batch-entry-stream-id entry)
+                              :error-code (getf cancel-arguments :error-code 8)
+                              :deadline absolute-deadline
+                              :clock-function clock))))
+                (%h2-connection-send-request-body
+                 connection reader writer
+                 (%h2-batch-entry-stream-id entry)
+                 (%h2-batch-entry-body entry)
+                 request-body-function
+                 (%h2-batch-entry-expected-body-length entry)
+                 body-limit
+                 (%h2-batch-entry-outgoing-frame-size entry)
+                 (%h2-batch-entry-trailer-fields entry)
+                 absolute-deadline clock nil huffman-p
+                 :scheduler-p t
+                 :flow-wait-function #'%h2-scheduler-wait-for-window)
+                (%h2-scheduler-mark-body-sent connection entry)
+                (loop
+                  (%h2-scheduler-wait-until
+                   connection
+                   (lambda () (%h2-scheduler-entry-ready-p entry))
+                   reader writer absolute-deadline clock entry)
+                  (%h2-scheduler-run-entry-callbacks
+                   connection entry clock)
+                  (let ((response
+                          (%h2-with-scheduler-lock (connection)
+                            (when (%h2-batch-entry-error entry)
+                              (error (%h2-batch-entry-error entry)))
+                            (when (%http2-connection-closed-p connection)
+                              (error 'http-kit:http-connection-error
+                                     :message "The HTTP/2 connection closed before the response completed."
+                                     :operation :http2-read
+                                     :cause :closed))
+                            (when (and (%h2-batch-entry-response entry)
+                                       (%h2-batch-entry-body-sent-p entry)
+                                       (null (%h2-batch-entry-callback-events entry)))
+                              (%h2-batch-entry-response entry)))))
+                    (when response
+                      (return response)))))
+            (error (condition)
+              (let ((timeout-p (typep condition 'http-kit:http-timeout))
+                    (peer-reset-p
+                      (%h2-peer-stream-reset-condition-p condition)))
+                (when entry
+                  (cond
+                    (timeout-p
+                     (%h2-scheduler-retire-entry
+                      connection entry condition clock))
+                    (peer-reset-p
+                     (%h2-with-scheduler-lock (connection)
+                       (%h2-scheduler-remove-entry connection entry)))
+                    ((%h2-batch-entry-local-retired-p entry)
+                     nil)
+                    (t
+                     (%h2-with-scheduler-lock (connection)
+                       (%h2-scheduler-remove-entry connection entry)))))
+                (%h2-scheduler-close-goaway-retired-if-idle connection)
+                (unless (or timeout-p peer-reset-p
+                            (and entry (%h2-batch-entry-local-retired-p entry)))
+                  (%h2-scheduler-fail-connection connection condition))
+                (error condition)))))))
+)
+
+(defun send-http2-request-over-connection
+    (connection request
+     &key timeout deadline max-header-bytes max-fields max-body-bytes
+       clock-function request-body-function request-body-length
+       on-body-chunk on-information on-stream-open
+       (collect-body-p t) (huffman-p nil))
+  #+sbcl
+  (%h2-send-http2-request-over-connection-scheduled
+   connection request
+   :timeout timeout
+   :deadline deadline
+   :max-header-bytes max-header-bytes
+   :max-fields max-fields
+   :max-body-bytes max-body-bytes
+   :clock-function clock-function
+   :request-body-function request-body-function
+   :request-body-length request-body-length
+   :on-body-chunk on-body-chunk
+   :on-information on-information
+   :on-stream-open on-stream-open
+   :collect-body-p collect-body-p
+   :huffman-p huffman-p)
+  #-sbcl
+  (%h2-send-http2-request-over-connection-serial
+   connection request
+   :timeout timeout
+   :deadline deadline
+   :max-header-bytes max-header-bytes
+   :max-fields max-fields
+   :max-body-bytes max-body-bytes
+   :clock-function clock-function
+   :request-body-function request-body-function
+   :request-body-length request-body-length
+   :on-body-chunk on-body-chunk
+   :on-information on-information
+   :on-stream-open on-stream-open
+   :collect-body-p collect-body-p
+   :huffman-p huffman-p))
 
 (defun %h2-batch-list-length (value)
   (handler-case (list-length value)
@@ -1240,12 +2317,16 @@ sent in successive multiplexed waves under the same deadline."
              :detail collect-body-p))
     (let* ((clock (or clock-function
                       (%http2-connection-clock-function connection)))
-           (header-limit (or max-header-bytes
-                             (%http2-connection-max-header-bytes connection)))
+           (header-limit
+            (min (or max-header-bytes
+                     (%http2-connection-max-header-bytes connection))
+                 (%http2-connection-max-header-bytes connection)))
            (field-limit (min (or max-fields most-positive-fixnum)
                              (%http2-connection-max-fields connection)))
-           (body-limit (or max-body-bytes
-                           (%http2-connection-max-body-bytes connection))))
+           (body-limit
+            (min (or max-body-bytes
+                     (%http2-connection-max-body-bytes connection))
+                 (%http2-connection-max-body-bytes connection))))
       (http-kit:with-http-deadline (absolute-deadline timeout
                                      :inherited deadline
                                      :clock-function clock)
@@ -1351,7 +2432,11 @@ sent in successive multiplexed waves under the same deadline."
                     header-writes (nreverse header-writes))
               (dolist (write header-writes)
                 (%h2-write-wire (%http2-connection-stream connection)
-                                (first write) absolute-deadline clock))
+                                (first write) absolute-deadline clock)
+                (%h2-with-scheduler-lock (connection)
+                  (setf (%http2-connection-scheduler-last-opened-stream-id connection)
+                        (max (%http2-connection-scheduler-last-opened-stream-id connection)
+                             (third write)))))
               (let ((pending-head nil)
                     (pending-tail nil)
                     (first-settings-p (not session-started-p))
@@ -1393,7 +2478,9 @@ sent in successive multiplexed waves under the same deadline."
                                     :detail (list (%h2-frame-type frame)
                                                   (%h2-frame-stream-id frame)
                                                   (%h2-frame-flags frame))))
-                           (setf first-settings-p nil))
+                           (setf first-settings-p nil
+                                 (%http2-connection-session-started-p connection) t
+                                 (%http2-connection-scheduler-first-peer-frame-p connection) nil))
                          frame))
                      (next-frame ()
                        (or (dequeue) (read-network-frame)))
@@ -1564,8 +2651,9 @@ sent in successive multiplexed waves under the same deadline."
                                        collect-body-p stream-id)
                                     (setf (%h2-batch-entry-body-length entry)
                                           new-body-length)
-                                    (%h2-send-window-update writer stream-id
-                                                            payload-length)
+                                    (unless end-stream-p
+                                      (%h2-send-window-update writer stream-id
+                                                              payload-length))
                                     (%h2-send-window-update writer 0
                                                             payload-length)
                                     (when end-stream-p
@@ -1595,8 +2683,14 @@ sent in successive multiplexed waves under the same deadline."
                   (setf (%http2-connection-session-started-p connection) t)
                   (mapcar #'%h2-batch-entry-response entries)))
             (error (condition)
-              (unless (%h2-peer-stream-reset-condition-p condition)
-                (close-http2-connection connection))
+              (let ((stream-reset-p
+                      (and (%h2-peer-stream-reset-condition-p condition)
+                           (eq (first
+                                (http-kit:http-connection-error-cause
+                                 condition))
+                               :rst-stream))))
+                (unless stream-reset-p
+                  (close-http2-connection connection)))
               (error condition))))))))
 
 (defun send-http2-requests-over-connection/cps
