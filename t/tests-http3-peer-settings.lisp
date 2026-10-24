@@ -24,6 +24,7 @@
          (process nil) (adapter nil) (socket nil) (log nil)
          (port nil) (local-port nil) (condition nil) (elapsed nil)
          (original-poll (symbol-function 'cl-quic-kit:client-poll))
+         (accepted-peer-streams nil)
          (handshake-polls 0) (control-polls 0)
          (control-poll-delegations 0)
          (control-sleep-seconds 0))
@@ -87,10 +88,11 @@
                  (handler-case
                      ;; Omitted timeout and deadline exercise the public NIL defaults.
                      (setf adapter
-                           (if (member mode
-                                       (list "control-none" "control-prefix-no-settings")
-                                       :test
-                                       (function string=))
+                               (cond
+                                 ((member mode
+                                          (list "control-none" "control-prefix-no-settings")
+                                          :test
+                                          (function string=))
                                (let* ((sleep-function
                                        (lambda (duration)
                                          (incf control-sleep-seconds (rationalize duration))))
@@ -116,7 +118,8 @@
                                          (incf control-poll-delegations)))
                                       ((and (string= mode "control-prefix-no-settings")
                                             (let ((control-stream
-                                                   (gethash 3 (cl-quic-kit::quic-client-streams client))))
+                                                   (find 3 accepted-peer-streams
+                                                         :key #'cl-quic-kit:stream-id)))
                                               (and control-stream
                                                    (or (plusp (cl-quic-kit:stream-readable-bytes control-stream))
                                                        (>= (cl-quic-kit:stream-read-offset control-stream) 1)))))
@@ -126,8 +129,23 @@
                                          (incf control-poll-delegations)))
                                       (t
                                         (incf handshake-polls)
-                                        (apply original-poll client arguments))))))
-                               (funcall adapter-maker)))
+                                        (apply original-poll client arguments))))
+                                  :client-accept
+                                  (lambda (client stream)
+                                    (declare (ignore client))
+                                    (when stream
+                                      (push stream accepted-peer-streams))))))
+                                 ((string= mode "normal-delayed-stream-batch")
+                                  (call-with-http3-quic-lifecycle-spies
+                                   (lambda (calls)
+                                     (declare (ignore calls))
+                                     (funcall adapter-maker))
+                                   :client-accept
+                                   (lambda (client stream)
+                                     (declare (ignore client))
+                                     (when stream
+                                       (push stream accepted-peer-streams)))))
+                                 (t (funcall adapter-maker))))
                    (http-protocol-error (error) (setf condition error)))
                  (setf elapsed (/ (- (get-internal-real-time) start)
                                   internal-time-units-per-second)))
@@ -171,16 +189,22 @@
                        (ensure-true
                         (eq adapter (http-kit/http3:http3-quic-adapter-start adapter)))
                        (when (string= mode "normal-delayed-stream-batch")
-                         (let ((streams (cl-quic-kit::quic-client-streams quic)))
+                         (let ((streams (copy-list accepted-peer-streams)))
                            (loop repeat 1000
-                                 until (and (gethash 7 streams) (gethash 11 streams))
+                                 until (and (find 7 streams :key #'cl-quic-kit:stream-id)
+                                            (find 11 streams :key #'cl-quic-kit:stream-id))
                                  do (http-kit/http3:http3-quic-adapter-poll adapter)
+                                    (loop for stream =
+                                            (cl-quic-kit:client-accept-peer-stream
+                                             quic :type :unidirectional)
+                                          while stream
+                                          do (push stream streams))
                                     (sleep 0.005))
                            (loop for id in '(7 11)
                                  for accessor in
                                    (list #'http-kit/http3:http3-client-peer-qpack-encoder-stream
                                          #'http-kit/http3:http3-client-peer-qpack-decoder-stream)
-                                 for stream = (gethash id streams)
+                                 for stream = (find id streams :key #'cl-quic-kit:stream-id)
                                  do (ensure-true stream)
                                     (ensure-equal id (cl-quic-kit:stream-id stream))
                                     (ensure-false (cl-quic-kit:stream-local-p stream))
