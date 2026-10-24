@@ -3078,4 +3078,289 @@
      failure
      "HTTP/3 control frames are not valid on a request stream."
      http-kit/http3:+http3-settings-type+)))
+(deftest http3-scheduler-headers-frame-callback-and-trailer-contract
+  (flet ((process-fields (entry fields)
+           (setf (http-kit/http3::%http3-request-stream-qpack-resume-fields entry)
+                 fields
+                 (http-kit/http3::%http3-request-stream-qpack-resume-fields-p entry)
+                 t)
+           (http-kit/http3::%h3-scheduler-process-headers-frame
+            nil entry (octets))))
+    (let* ((information nil)
+           (information-count 0)
+           (entry
+             (http-kit/http3::%make-http3-request-stream
+              :request-method "GET"
+              :on-information
+              (lambda (response)
+                (incf information-count)
+                (setf information response)))))
+      (ensure-equal
+       t
+       (process-fields
+        entry
+        (list (cons ":status" "103") (cons "link" "</early>"))))
+      (ensure-equal 1 information-count)
+      (ensure-equal "HTTP/3" (http-response-protocol-version information))
+      (ensure-equal 103 (http-response-status information))
+      (ensure-equal "</early>"
+                    (http-header-value (http-response-headers information) "link"))
+      (ensure-equal nil (http-response-trailers information))
+      (ensure-equal 0 (length (http-response-body information)))
+      (ensure-equal nil
+                    (http-kit/http3::%http3-request-stream-final-response-p entry))
+      (ensure-equal nil
+                    (http-kit/http3::%http3-request-stream-qpack-resume-fields-p entry))
+      (ensure-equal
+       t
+       (process-fields entry (list (cons ":status" "200")
+                                  (cons "content-type" "text/plain"))))
+      (ensure-equal 1 information-count)
+      (ensure-equal 200
+                    (http-kit/http3::%http3-request-stream-response-status entry))
+      (ensure-equal t
+                    (http-kit/http3::%http3-request-stream-final-response-p entry))
+      (ensure-equal "text/plain"
+                    (http-header-value
+                     (http-kit/http3::%http3-request-stream-response-headers entry)
+                     "content-type"))
+      (ensure-equal
+       t
+       (process-fields entry (list (cons "x-end" "done"))))
+      (ensure-equal t
+                    (http-kit/http3::%http3-request-stream-trailers-seen-p entry))
+      (ensure-equal "done"
+                    (http-header-value
+                     (http-kit/http3::%http3-request-stream-response-trailers entry)
+                     "x-end"))
+      (let ((failure
+              (http3-boundary-error
+               (lambda ()
+                 (process-fields entry (list (cons "x-end" "again")))))))
+        (http3-public-error-check
+         failure "An HTTP/3 response cannot contain multiple trailer blocks." nil)
+        (ensure-equal "done"
+                      (http-header-value
+                       (http-kit/http3::%http3-request-stream-response-trailers entry)
+                       "x-end")))
+      (let ((response (http-kit/http3::%h3-scheduler-finish-response entry)))
+        (ensure-equal "HTTP/3" (http-response-protocol-version response))
+        (ensure-equal 200 (http-response-status response))
+        (ensure-equal "done"
+                      (http-header-value (http-response-trailers response) "x-end"))))
+    (let ((entry (http-kit/http3::%make-http3-request-stream
+                  :request-method "GET")))
+      (ensure-equal
+       t
+       (process-fields entry (list (cons ":status" "100"))))
+      (ensure-equal nil
+                    (http-kit/http3::%http3-request-stream-final-response-p entry))
+      (ensure-equal nil
+                    (http-kit/http3::%http3-request-stream-response-status entry)))
+    (let* ((entry (http-kit/http3::%make-http3-request-stream
+                   :request-method "GET"))
+           (failure
+             (http3-boundary-error
+              (lambda ()
+                (process-fields entry (list (cons ":status" "101")))))))
+      (http3-public-error-check
+       failure
+       "HTTP/3 does not permit a 101 Switching Protocols response."
+       nil)
+      (ensure-equal nil
+                    (http-kit/http3::%http3-request-stream-final-response-p entry)))
+    (let* ((entry (http-kit/http3::%make-http3-request-stream
+                   :request-method "GET"))
+           (failure
+             (http3-boundary-error
+              (lambda ()
+                (process-fields
+                 entry
+                 (list (cons ":status" "103") (cons "content-length" "0")))))))
+      (ensure-true (typep failure 'http-invalid-header))
+      (ensure-equal :http3-header (http-error-operation failure))
+      (ensure-equal "content-length" (http-invalid-header-name failure))
+      (ensure-equal
+       "informational responses cannot contain content-length."
+       (http-invalid-header-reason failure)))))
+(deftest http3-scheduler-finish-response-rejects-missing-final-headers
+  (let* ((entry
+           (http-kit/http3::%make-http3-request-stream
+            :request-method "GET"))
+         (failure
+           (http3-boundary-error
+            (lambda ()
+              (http-kit/http3::%h3-scheduler-finish-response entry)))))
+    (ensure-true (typep failure 'http-protocol-error))
+    (ensure-equal :http3-transport (http-error-operation failure))
+    (ensure-equal
+     "The HTTP/3 stream ended before final response HEADERS."
+     (http-error-message failure))
+    (ensure-equal nil (http-protocol-error-detail failure))
+    (ensure-equal nil
+                  (http-kit/http3::%http3-request-stream-final-response-p entry))
+    (ensure-equal nil
+                  (http-kit/http3::%http3-request-stream-response-status entry))
+    (ensure-equal 0
+                  (http-kit/http3::%http3-request-stream-response-body-length
+                   entry))))
+(deftest http3-scheduler-process-push-promise-boundaries
+  (let* ((fields
+           (list (cons ":method" "GET")
+                 (cons ":scheme" "https")
+                 (cons ":authority" "example.test")
+                 (cons ":path" "/asset.css")))
+         (different-fields
+           (list (cons ":method" "GET")
+                 (cons ":scheme" "https")
+                 (cons ":authority" "example.test")
+                 (cons ":path" "/other")))
+         (callback-events nil)
+         (client (http3-transport-boundary-client :max-push-id 2))
+         (entry
+           (http-kit/http3::%make-http3-request-stream
+            :stream-id 0
+            :on-push-promise
+            (lambda (push-id promised-fields)
+              (push (list push-id promised-fields) callback-events)))))
+    (unwind-protect
+         (progn
+           (let ((failure
+                   (http3-boundary-error
+                    (lambda ()
+                      (http-kit/http3::%h3-scheduler-process-push-promise
+                       client entry (http-kit/http3:http3-varint-encode 3))))))
+             (http3-public-error-check
+              failure
+              "HTTP/3 PUSH_PROMISE exceeds the advertised MAX_PUSH_ID."
+              :h3-id-error)
+             (ensure-equal nil callback-events)
+             (ensure-equal nil
+                           (http-kit/http3:http3-client-promised-push-ids client))
+             (ensure-equal nil
+                           (http-kit/http3::http3-client-push-promises client)))
+           (let ((unadvertised-client (http3-transport-boundary-client)))
+             (unwind-protect
+                  (progn
+                    (ensure-equal
+                     nil
+                     (http-kit/http3::http3-client-max-push-id
+                      unadvertised-client))
+                    (let ((failure
+                            (http3-boundary-error
+                             (lambda ()
+                               (http-kit/http3::%h3-scheduler-process-push-promise
+                                unadvertised-client entry
+                                (http-kit/http3:http3-varint-encode 1))))))
+                      (http3-public-error-check
+                       failure
+                       "HTTP/3 PUSH_PROMISE exceeds the advertised MAX_PUSH_ID."
+                       :h3-id-error)
+                      (ensure-equal nil callback-events)
+                      (ensure-equal
+                       nil
+                       (http-kit/http3:http3-client-promised-push-ids
+                        unadvertised-client))
+                      (ensure-equal
+                       nil
+                       (http-kit/http3::http3-client-push-promises
+                        unadvertised-client))))
+               (when (http-kit/http3:http3-client-open-p unadvertised-client)
+                 (http-kit/http3:close-http3-client unadvertised-client))))
+           (flet ((process-promise (promised-fields)
+                    (setf (http-kit/http3::%http3-request-stream-qpack-resume-fields
+                           entry)
+                          promised-fields
+                          (http-kit/http3::%http3-request-stream-qpack-resume-fields-p
+                           entry)
+                          t)
+                    (http-kit/http3::%h3-scheduler-process-push-promise
+                     client entry (http-kit/http3:http3-varint-encode 1))))
+             (ensure-equal t (process-promise fields))
+             (ensure-equal t (process-promise fields))
+             (ensure-equal '(1)
+                           (http-kit/http3:http3-client-promised-push-ids client))
+             (ensure-equal 1
+                           (length
+                            (http-kit/http3::http3-client-push-promises client)))
+             (ensure-equal
+              (cons 1 fields)
+              (first (http-kit/http3::http3-client-push-promises client)))
+             (ensure-equal '(1 1) (mapcar #'first callback-events))
+             (dolist (event callback-events)
+               (let ((received (second event)))
+                 (ensure-equal fields received)
+                 (ensure-true (not (eq fields received)))
+                 (ensure-true
+                  (not (eq (car (first fields))
+                           (car (first received)))))
+                 (ensure-true
+                  (not (eq (cdr (first fields))
+                           (cdr (first received))))))
+             (ensure-true
+              (not (eq (second (first callback-events))
+                       (second (second callback-events)))))
+             (let ((changed-failure
+                     (http3-boundary-error
+                      (lambda ()
+                        (process-promise different-fields)))))
+               (http3-public-error-check
+                changed-failure
+                "Repeated HTTP/3 PUSH_PROMISE fields differ."
+                :h3-id-error)
+               (ensure-equal 2 (length callback-events))
+               (ensure-equal
+                '(1)
+                (http-kit/http3:http3-client-promised-push-ids client))
+               (ensure-equal
+                (cons 1 fields)
+                (first
+                 (http-kit/http3::http3-client-push-promises client)))))))
+      (when (http-kit/http3:http3-client-open-p client)
+        (http-kit/http3:close-http3-client client))))
+  (multiple-value-bind (decoder-context section instruction)
+      (http3-test-qpack-blocked-section
+       (list (cons ":method" "GET")
+             (cons ":scheme" "https")
+             (cons ":authority" "example.test")
+             (cons ":path" "/asset.css")
+             (cons "x-blocked" "ready")))
+    (declare (ignore instruction))
+    (let* ((adapter
+             (http-message-kit:qpack-make-http3-decoder-context
+              decoder-context :max-blocked-streams 1))
+           (callback-events nil)
+           (client (http3-transport-boundary-client :max-push-id 2))
+           (entry
+             (http-kit/http3::%make-http3-request-stream
+              :stream-id 0
+              :on-push-promise
+              (lambda (push-id promised-fields)
+                (push (list push-id promised-fields) callback-events))))
+           (payload
+             (http3-test-concat-octets
+              (http-kit/http3:http3-varint-encode 1)
+              section)))
+      (unwind-protect
+           (progn
+             (setf (http-kit/http3::http3-client-qpack-decoder-context client)
+                   decoder-context
+                   (http-kit/http3::http3-client-qpack-http3-decoder-context client)
+                   adapter)
+             (ensure-equal
+              nil
+              (http-kit/http3::%h3-scheduler-process-push-promise
+               client entry payload))
+             (ensure-true
+              (http-message-kit:qpack-blocked-stream-p
+               (http-kit/http3::%http3-request-stream-qpack-token entry)))
+             (ensure-equal nil callback-events)
+             (ensure-equal nil
+                           (http-kit/http3:http3-client-promised-push-ids client))
+             (ensure-equal nil
+                           (http-kit/http3::http3-client-push-promises client)))
+        (when (http-kit/http3:http3-client-open-p client)
+          (http-kit/http3:close-http3-client client))))))
+
+
 
