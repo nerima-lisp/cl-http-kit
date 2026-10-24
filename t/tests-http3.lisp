@@ -2240,13 +2240,13 @@
            (ensure-true (plusp try-reads))
            (ensure-equal 0 blocking-reads))
       (http-kit/http3:close-http3-client client))))
-(deftest http3-client-native-scheduler-qpack-write-failure-fails-entry
+(deftest http3-client-native-scheduler-request-stream-write-failure-fails-entry
   (let* ((client nil)
          (request-stream nil)
          (request-entry nil)
          (write-failure
            (handler-case
-               (error "Native request QPACK write failed.")
+               (error "Native request stream write failed.")
              (simple-error (condition) condition))))
     (setf client
           (http-kit/http3:make-http3-client
@@ -2313,7 +2313,7 @@
                          (http-kit/http3::http3-client-request-stream-count client)))
       (when (and client (http-kit/http3:http3-client-open-p client))
         (http-kit/http3:close-http3-client client)))))
-(deftest http3-client-native-scheduler-cancel-failure-closes-client
+(deftest http3-client-native-scheduler-cancel-unavailable-closes-client
   (let* ((client nil)
          (request-stream nil)
          (request-entry nil))
