@@ -1376,7 +1376,7 @@
            (find-symbol "%H2-CONNECTION-STREAM-WINDOW" "HTTP-KIT/HTTP2"))
          (original-window (symbol-function window-symbol))
          (shrink-frame
-           (h2-frame 4 0 0 (octets 0 5 0 0 64 0)))
+           (h2-frame-object 4 0 0 (octets 0 5 0 0 64 0)))
          (settings-applied-p nil)
          (producer-calls 0)
          (producer-thread nil)
