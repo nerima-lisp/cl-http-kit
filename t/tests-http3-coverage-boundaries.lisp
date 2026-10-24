@@ -2619,4 +2619,748 @@
      :message
      "A QPACK HTTP/3 decoder context is required with the decoder context."
      :detail decoder-context)))
+(deftest http3-native-client-optional-callback-validation
+  (let* ((poll (lambda () nil))
+         (try-read (lambda (stream &key timeout deadline)
+                     (declare (ignore stream timeout deadline))
+                     (values nil nil :would-block)))
+         (pending (lambda (stream) (declare (ignore stream)) nil))
+         (keys (list :poll-function :try-read-stream :stream-write-pending-p)))
+    (dolist (native-values
+             (list (list poll nil nil) (list nil try-read nil)
+                   (list nil nil pending) (list poll try-read nil)
+                   (list poll nil pending) (list nil try-read pending)))
+      (let* ((options
+               (loop for key in keys for value in native-values
+                     when value append (list key value)))
+             (failure
+               (http3-boundary-error
+                (lambda ()
+                  (apply (function http3-transport-boundary-client) options)))))
+        (http3-public-error-check
+         failure
+         "Native HTTP/3 polling, nonblocking reads, and write-pending callbacks must be supplied together."
+         native-values)))
+    (dolist (row
+             (list (list :poll-function 17 (list 17 try-read pending))
+                   (list :try-read-stream 17 (list poll 17 pending))
+                   (list :stream-write-pending-p 17 (list poll try-read 17))))
+      (destructuring-bind (key value detail) row
+        (let ((options
+                (list :poll-function poll :try-read-stream try-read
+                      :stream-write-pending-p pending)))
+          (setf (getf options key) value)
+          (http3-public-error-check
+           (http3-boundary-error
+            (lambda ()
+              (apply (function http3-transport-boundary-client) options)))
+           "Native HTTP/3 polling, nonblocking reads, and write-pending callbacks must be supplied together."
+           detail))))
+    (http3-public-error-check
+     (http3-boundary-error
+      (lambda () (http3-transport-boundary-client :try-write-stream 17)))
+     "HTTP/3 try-write-stream must be a function or NIL." (type-of 17))
+    (http3-public-error-check
+     (http3-boundary-error
+      (lambda ()
+        (http3-transport-boundary-client :accept-peer-unidirectional-stream 17)))
+     "HTTP/3 accept-peer-unidirectional-stream must be a function or NIL."
+     (type-of 17))
+    (let ((client (http3-transport-boundary-client)))
+      (unwind-protect
+           (ensure-true (http-kit/http3:http3-client-open-p client))
+        (http-kit/http3:close-http3-client client)))
+    (let ((client
+            (http3-transport-boundary-client
+             :poll-function poll :try-read-stream try-read
+             :stream-write-pending-p pending
+             :try-write-stream
+             (lambda (stream bytes &key fin-p timeout deadline)
+               (declare (ignore stream bytes fin-p timeout deadline)))
+             :accept-peer-unidirectional-stream (lambda () nil))))
+      (unwind-protect
+           (ensure-true (http-kit/http3:http3-client-open-p client))
+        (http-kit/http3:close-http3-client client)))))
+
+(deftest http3-native-write-callback-polls-and-checks-deadline
+  (let* ((stream (list :request))
+         (bytes (octets 1 2))
+         (deadline (+ (http-kit::%monotonic-time) 60))
+         (events nil)
+         (written-stream nil)
+         (written-bytes nil)
+         (written-fin-p nil)
+         (written-timeout nil)
+         (written-deadline nil)
+         (poll-count 0)
+         (pending-count 0)
+         (result
+           (http-kit/http3::%h3-write-stream-callback
+            (lambda (actual octets &key fin-p timeout deadline)
+              (push :write events)
+              (setf written-stream actual written-bytes (copy-seq octets)
+                    written-fin-p fin-p written-timeout timeout
+                    written-deadline deadline))
+            (lambda () (incf poll-count) (push :poll events))
+            (lambda (actual)
+              (ensure-true (eq stream actual))
+              (incf pending-count)
+              (push :pending events)
+              (= pending-count 1))
+            stream bytes :fin-p t :timeout 7 :deadline deadline)))
+    (ensure-true (eq stream result))
+    (ensure-true (eq stream written-stream))
+    (ensure-octets-equal bytes written-bytes)
+    (ensure-equal t written-fin-p)
+    (ensure-equal 7 written-timeout)
+    (ensure-equal deadline written-deadline)
+    (ensure-equal 1 poll-count)
+    (ensure-equal 2 pending-count)
+    (ensure-equal (list :write :pending :poll :pending) (nreverse events)))
+  (let* ((stream (list :request))
+         (writes 0)
+         (pending-checks 0)
+         (polls 0)
+         (failure
+           (http3-boundary-error
+            (lambda ()
+              (http-kit/http3::%h3-write-stream-callback
+               (lambda (actual bytes &key fin-p timeout deadline)
+                 (declare (ignore actual bytes fin-p timeout deadline))
+                 (incf writes))
+               (lambda () (incf polls))
+               (lambda (actual) (declare (ignore actual))
+                 (incf pending-checks) t)
+               stream (octets 3) :deadline 0)))))
+    (ensure-true (typep failure (quote http-timeout)))
+    (ensure-equal :write (http-error-operation failure))
+    (ensure-equal 1 writes)
+    (ensure-equal 1 pending-checks)
+    (ensure-equal 0 polls)))
+
+(deftest http3-native-try-read-client-stream-result-contracts
+  (let* ((poll (lambda () nil))
+         (pending (lambda (stream) (declare (ignore stream)) nil))
+         (fin-values (list (octets 1) t :fin))
+         (blocked-values (list (octets 2) nil :would-block))
+         (cases
+           (list
+            (list "The HTTP/3 try-read-stream callback returned an invalid status."
+                  :invalid-status (list nil nil :invalid-status))
+            (list "HTTP/3 try-read-stream :DATA must include an octet vector."
+                  (type-of :bad-chunk) (list :bad-chunk nil :data))
+            (list "HTTP/3 try-read-stream :FIN must return NIL and true."
+                  (list (first fin-values) (second fin-values)) fin-values)
+            (list "HTTP/3 try-read-stream :WOULD-BLOCK must return NIL and false."
+                  (list (first blocked-values) (second blocked-values))
+                  blocked-values))))
+    (dolist (case cases)
+      (destructuring-bind (message detail result-values) case
+        (let* ((calls 0)
+               (client
+                 (http3-transport-boundary-client
+                  :poll-function poll
+                  :try-read-stream
+                  (lambda (stream &key timeout deadline)
+                    (incf calls)
+                    (ensure-equal :request stream)
+                    (ensure-equal 2 timeout)
+                    (ensure-equal 3 deadline)
+                    (apply (function values) result-values))
+                  :stream-write-pending-p pending))
+               (failure
+                 (http3-boundary-error
+                  (lambda ()
+                    (http-kit/http3::%h3-try-read-client-stream
+                     client :request 2 3)))))
+          (unwind-protect
+               (progn
+                 (http3-public-error-check failure message detail)
+                 (ensure-equal 1 calls))
+            (http-kit/http3:close-http3-client client)))))
+    (dolist (result-values
+             (list (list (octets 4 5) t :data)
+                   (list nil t :fin) (list nil nil :would-block)))
+      (let* ((calls 0)
+             (client
+               (http3-transport-boundary-client
+                :poll-function poll
+                :try-read-stream
+                (lambda (stream &key timeout deadline)
+                  (incf calls)
+                  (ensure-equal :request stream)
+                  (ensure-equal 4 timeout)
+                  (ensure-equal 8 deadline)
+                  (apply (function values) result-values))
+                :stream-write-pending-p pending)))
+        (unwind-protect
+             (multiple-value-bind (chunk fin-p status)
+                 (http-kit/http3::%h3-try-read-client-stream client :request 4 8)
+               (if chunk
+                   (ensure-octets-equal (first result-values) chunk)
+                 (ensure-equal nil chunk))
+               (ensure-equal (second result-values) fin-p)
+               (ensure-equal (third result-values) status)
+               (ensure-equal 1 calls))
+          (http-kit/http3:close-http3-client client))))))
+(deftest http3-public-push-rejects-unpromised-valid-id
+  (let* ((wire
+           (http3-test-concat-octets
+            (http-kit/http3:http3-varint-encode
+             http-kit/http3:+http3-push-stream-type+)
+            (http-kit/http3:http3-varint-encode 1)))
+         (stream (make-http3-test-stream
+                  :kind :push :reads (list (list wire t))))
+         (closed nil)
+         (client
+           (http-kit/http3::%make-http3-client
+            :max-push-id 2
+            :push-promises (list (cons 2 (list (cons ":method" "GET"))))
+            :read-stream
+            (lambda (actual &key timeout deadline)
+              (declare (ignore actual timeout deadline))
+              (values wire t))
+            :close-stream
+            (lambda (actual &key condition)
+              (push (list actual condition) closed))))
+         (failure
+           (http3-boundary-error
+            (lambda ()
+              (http-kit/http3:receive-http3-push client stream)))))
+    (http3-public-error-check
+     failure "An HTTP/3 push stream used an unpromised push ID." :h3-id-error)
+    (ensure-equal (list (list stream failure)) (nreverse closed))
+    (ensure-true (http-kit/http3:http3-client-open-p client))))
+(deftest http3-native-client-discovers-fragmented-push-prefix
+  (let* ((response-wire
+           (http3-test-concat-octets
+            (http-kit/http3:encode-http3-frame
+             (http-kit/http3:make-http3-frame
+              :type http-kit/http3:+http3-headers-type+
+              :payload
+              (http3-test-qpack-encode
+               (list (cons ":status" "200")
+                     (cons "content-length" "0"))
+               :use-dynamic-p nil)))))
+         (push-wire
+           (http3-test-concat-octets
+            (http-kit/http3:http3-varint-encode
+             http-kit/http3:+http3-push-stream-type+)
+            (http-kit/http3:http3-varint-encode 1)))
+         (push-stream (make-http3-test-stream :kind :peer-push))
+         (pending-peer-streams (list push-stream))
+         (request-stream nil)
+         (push-read-count 0)
+         (response-sent-p nil)
+         (accepted-count 0)
+         (client
+           (http-kit/http3:make-http3-client
+            :open-stream
+            (lambda (request &key stream-type timeout deadline)
+              (declare (ignore timeout deadline))
+              (let ((stream
+                      (make-http3-test-stream
+                       :kind (if request
+                                 (http-kit:http-request-target request)
+                                 stream-type))))
+                (if request
+                    (progn
+                      (setf request-stream stream)
+                      (values stream 0))
+                  stream)))
+            :write-stream
+            (lambda (stream bytes &key fin-p timeout deadline)
+              (declare (ignore stream bytes fin-p timeout deadline)))
+            :read-stream
+            (lambda (stream &key timeout deadline)
+              (declare (ignore stream timeout deadline))
+              (values nil t))
+            :poll-function (lambda () nil)
+            :try-read-stream
+            (lambda (stream &key timeout deadline)
+              (declare (ignore timeout deadline))
+              (cond
+                ((eq stream push-stream)
+                 (incf push-read-count)
+                 (case push-read-count
+                   (1 (values nil nil :would-block))
+                   (2 (values (subseq push-wire 0 1) nil :data))
+                   (3 (values (subseq push-wire 1) nil :data))
+                   (t (values nil nil :would-block))))
+                ((eq stream request-stream)
+                 (if (or response-sent-p (< push-read-count 3))
+                     (values nil nil :would-block)
+                   (progn
+                     (setf response-sent-p t)
+                     (values response-wire t :data))))
+                (t (values nil nil :would-block))))
+            :stream-write-pending-p (lambda (stream)
+                                      (declare (ignore stream))
+                                      nil)
+            :accept-peer-unidirectional-stream
+            (lambda ()
+              (let ((stream (pop pending-peer-streams)))
+                (when stream (incf accepted-count))
+                stream)))))
+    (unwind-protect
+         (progn
+           (http-kit/http3:advertise-http3-max-push-id client 2)
+           (let ((response
+                   (http-kit/http3:send-http3-request
+                    client
+                    (make-http-request
+                     :method "GET"
+                     :uri "https://example.test/fragmented-push"))))
+             (ensure-equal 200 (http-response-status response))
+             (ensure-equal 3 push-read-count)
+             (ensure-equal 1 accepted-count)
+             (multiple-value-bind (stream push-id)
+                 (http-kit/http3:dequeue-http3-pending-push client)
+               (ensure-true (eq push-stream stream))
+               (ensure-equal 1 push-id))
+             (multiple-value-bind (stream push-id)
+                 (http-kit/http3:dequeue-http3-pending-push client)
+               (ensure-equal nil stream)
+               (ensure-equal nil push-id))))
+      (http-kit/http3:close-http3-client client))))
+(deftest http3-scheduler-data-frame-boundaries
+  (let* ((payload (octets 1 2))
+         (entry (http-kit/http3::%make-http3-request-stream))
+         (failure
+           (http3-boundary-error
+            (lambda ()
+              (http-kit/http3::%h3-scheduler-process-data-frame
+               entry payload)))))
+    (http3-public-error-check
+     failure "An HTTP/3 DATA frame arrived before final response HEADERS." nil)
+    (ensure-equal 0
+                  (http-kit/http3::%http3-request-stream-response-body-length
+                   entry)))
+  (let* ((payload (octets 3))
+         (entry
+           (http-kit/http3::%make-http3-request-stream
+            :request-method "GET" :response-status 200
+            :final-response-p t :trailers-seen-p t))
+         (failure
+           (http3-boundary-error
+            (lambda ()
+              (http-kit/http3::%h3-scheduler-process-data-frame
+               entry payload)))))
+    (http3-public-error-check
+     failure "An HTTP/3 DATA frame arrived after response trailers." nil)
+    (ensure-equal 0
+                  (http-kit/http3::%http3-request-stream-response-body-length
+                   entry)))
+  (dolist (case (list (list nil 200 nil)
+                      (list "GET" 200 nil)
+                      (list "HEAD" 200 t)
+                      (list "GET" 204 t)))
+    (destructuring-bind (method status error-p) case
+      (let* ((entry
+               (http-kit/http3::%make-http3-request-stream
+                :request-method method :response-status status
+                :final-response-p t))
+             (result nil)
+             (failure
+               (http3-boundary-error
+                (lambda ()
+                  (setf result
+                        (http-kit/http3::%h3-scheduler-process-data-frame
+                         entry (octets 4)))))))
+        (if error-p
+            (http3-public-error-check
+             failure "This HTTP/3 response cannot carry DATA."
+             (list method status))
+            (progn
+              (ensure-equal nil failure)
+              (ensure-equal t result)))
+        (ensure-equal (if error-p 0 1)
+                      (http-kit/http3::%http3-request-stream-response-body-length entry)))))
+  (let* ((entry
+           (http-kit/http3::%make-http3-request-stream
+            :request-method "GET" :response-status 200
+            :final-response-p t :max-body-bytes 3
+            :response-body (octets 8 9) :response-body-length 2
+            :collect-body-p t))
+         (failure
+           (http3-boundary-error
+            (lambda ()
+              (http-kit/http3::%h3-scheduler-process-data-frame
+               entry (octets 10 11)))))
+         (body (http-kit/http3::%http3-request-stream-response-body entry)))
+    (ensure-true (typep failure 'http-size-limit-exceeded))
+    (ensure-equal :body (http-size-limit-exceeded-kind failure))
+    (ensure-equal 3 (http-size-limit-exceeded-limit failure))
+    (ensure-equal 4 (http-size-limit-exceeded-observed failure))
+    (ensure-equal 2
+                  (http-kit/http3::%http3-request-stream-response-body-length
+                   entry))
+    (ensure-octets-equal (octets 8 9) body))
+  (let* ((entry
+           (http-kit/http3::%make-http3-request-stream
+            :request-method "GET" :response-status 200
+            :final-response-p t :max-body-bytes 3
+            :response-body (octets 9) :response-body-length 1
+            :collect-body-p t))
+         (result
+           (http-kit/http3::%h3-scheduler-process-data-frame
+            entry (octets 10 11))))
+    (ensure-equal t result)
+    (ensure-equal 3
+                  (http-kit/http3::%http3-request-stream-response-body-length
+                   entry))
+    (ensure-octets-equal
+     (octets 9 10 11)
+     (http-kit/http3::%http3-request-stream-response-body entry)))
+  (let* ((entry
+           (http-kit/http3::%make-http3-request-stream
+            :request-method "GET" :response-status 200
+            :final-response-p t :collect-body-p nil))
+         (result
+           (http-kit/http3::%h3-scheduler-process-data-frame
+            entry (octets 12))))
+    (ensure-equal t result)
+    (ensure-equal 1
+                  (http-kit/http3::%http3-request-stream-response-body-length
+                   entry))
+    (ensure-octets-equal
+     (octets)
+     (http-kit/http3::%http3-request-stream-response-body entry)))
+  (let* ((input (octets 20 21))
+         (original (copy-seq input))
+         (callback-chunk nil)
+         (callback-original nil)
+         (callback-count 0)
+         (entry
+           (http-kit/http3::%make-http3-request-stream
+            :request-method "GET" :response-status 200
+            :final-response-p t :collect-body-p t
+            :on-body-chunk
+            (lambda (chunk)
+              (incf callback-count)
+              (setf callback-chunk chunk
+                    callback-original (copy-seq chunk))
+              (setf (aref chunk 0) 99))))
+         (result
+           (http-kit/http3::%h3-scheduler-process-data-frame entry input)))
+    (ensure-equal t result)
+    (ensure-equal 1 callback-count)
+    (ensure-true (not (eq input callback-chunk)))
+    (ensure-octets-equal original callback-original)
+    (ensure-octets-equal original input)
+    (ensure-equal 2
+                  (http-kit/http3::%http3-request-stream-response-body-length
+                   entry))
+    (ensure-octets-equal
+     original
+     (http-kit/http3::%http3-request-stream-response-body entry))))
+(deftest http3-scheduler-frame-dispatch-ignores-extension-and-rejects-control
+  (let* ((entry (http-kit/http3::%make-http3-request-stream))
+         (extension-frame
+           (http-kit/http3:make-http3-frame
+            :type #x2a :payload (octets 1 2)))
+         (settings-frame (http-kit/http3:make-http3-settings-frame))
+         (failure
+           (http3-boundary-error
+            (lambda ()
+              (http-kit/http3::%h3-scheduler-process-frame
+               nil entry settings-frame)))))
+    (ensure-equal #x2a
+                  (http-kit/http3:http3-frame-type extension-frame))
+    (ensure-octets-equal
+     (octets 1 2)
+     (http-kit/http3:http3-frame-payload extension-frame))
+    (ensure-equal
+     t
+     (http-kit/http3::%h3-scheduler-process-frame
+      nil entry extension-frame))
+    (http3-public-error-check
+     failure
+     "HTTP/3 control frames are not valid on a request stream."
+     http-kit/http3:+http3-settings-type+)))
+(deftest http3-scheduler-headers-frame-callback-and-trailer-contract
+  (flet ((process-fields (entry fields)
+           (setf (http-kit/http3::%http3-request-stream-qpack-resume-fields entry)
+                 fields
+                 (http-kit/http3::%http3-request-stream-qpack-resume-fields-p entry)
+                 t)
+           (http-kit/http3::%h3-scheduler-process-headers-frame
+            nil entry (octets))))
+    (let* ((information nil)
+           (information-count 0)
+           (entry
+             (http-kit/http3::%make-http3-request-stream
+              :request-method "GET"
+              :on-information
+              (lambda (response)
+                (incf information-count)
+                (setf information response)))))
+      (ensure-equal
+       t
+       (process-fields
+        entry
+        (list (cons ":status" "103") (cons "link" "</early>"))))
+      (ensure-equal 1 information-count)
+      (ensure-equal "HTTP/3" (http-response-protocol-version information))
+      (ensure-equal 103 (http-response-status information))
+      (ensure-equal "</early>"
+                    (http-header-value (http-response-headers information) "link"))
+      (ensure-equal nil (http-response-trailers information))
+      (ensure-equal 0 (length (http-response-body information)))
+      (ensure-equal nil
+                    (http-kit/http3::%http3-request-stream-final-response-p entry))
+      (ensure-equal nil
+                    (http-kit/http3::%http3-request-stream-qpack-resume-fields-p entry))
+      (ensure-equal
+       t
+       (process-fields entry (list (cons ":status" "200")
+                                  (cons "content-type" "text/plain"))))
+      (ensure-equal 1 information-count)
+      (ensure-equal 200
+                    (http-kit/http3::%http3-request-stream-response-status entry))
+      (ensure-equal t
+                    (http-kit/http3::%http3-request-stream-final-response-p entry))
+      (ensure-equal "text/plain"
+                    (http-header-value
+                     (http-kit/http3::%http3-request-stream-response-headers entry)
+                     "content-type"))
+      (ensure-equal
+       t
+       (process-fields entry (list (cons "x-end" "done"))))
+      (ensure-equal t
+                    (http-kit/http3::%http3-request-stream-trailers-seen-p entry))
+      (ensure-equal "done"
+                    (http-header-value
+                     (http-kit/http3::%http3-request-stream-response-trailers entry)
+                     "x-end"))
+      (let ((failure
+              (http3-boundary-error
+               (lambda ()
+                 (process-fields entry (list (cons "x-end" "again")))))))
+        (http3-public-error-check
+         failure "An HTTP/3 response cannot contain multiple trailer blocks." nil)
+        (ensure-equal "done"
+                      (http-header-value
+                       (http-kit/http3::%http3-request-stream-response-trailers entry)
+                       "x-end")))
+      (let ((response (http-kit/http3::%h3-scheduler-finish-response entry)))
+        (ensure-equal "HTTP/3" (http-response-protocol-version response))
+        (ensure-equal 200 (http-response-status response))
+        (ensure-equal "done"
+                      (http-header-value (http-response-trailers response) "x-end"))))
+    (let ((entry (http-kit/http3::%make-http3-request-stream
+                  :request-method "GET")))
+      (ensure-equal
+       t
+       (process-fields entry (list (cons ":status" "100"))))
+      (ensure-equal nil
+                    (http-kit/http3::%http3-request-stream-final-response-p entry))
+      (ensure-equal nil
+                    (http-kit/http3::%http3-request-stream-response-status entry)))
+    (let* ((entry (http-kit/http3::%make-http3-request-stream
+                   :request-method "GET"))
+           (failure
+             (http3-boundary-error
+              (lambda ()
+                (process-fields entry (list (cons ":status" "101")))))))
+      (http3-public-error-check
+       failure
+       "HTTP/3 does not permit a 101 Switching Protocols response."
+       nil)
+      (ensure-equal nil
+                    (http-kit/http3::%http3-request-stream-final-response-p entry)))
+    (let* ((entry (http-kit/http3::%make-http3-request-stream
+                   :request-method "GET"))
+           (failure
+             (http3-boundary-error
+              (lambda ()
+                (process-fields
+                 entry
+                 (list (cons ":status" "103") (cons "content-length" "0")))))))
+      (ensure-true (typep failure 'http-invalid-header))
+      (ensure-equal :http3-header (http-error-operation failure))
+      (ensure-equal "content-length" (http-invalid-header-name failure))
+      (ensure-equal
+       "informational responses cannot contain content-length."
+       (http-invalid-header-reason failure)))))
+(deftest http3-scheduler-finish-response-rejects-missing-final-headers
+  (let* ((entry
+           (http-kit/http3::%make-http3-request-stream
+            :request-method "GET"))
+         (failure
+           (http3-boundary-error
+            (lambda ()
+              (http-kit/http3::%h3-scheduler-finish-response entry)))))
+    (ensure-true (typep failure 'http-protocol-error))
+    (ensure-equal :http3-transport (http-error-operation failure))
+    (ensure-equal
+     "The HTTP/3 stream ended before final response HEADERS."
+     (http-error-message failure))
+    (ensure-equal nil (http-protocol-error-detail failure))
+    (ensure-equal nil
+                  (http-kit/http3::%http3-request-stream-final-response-p entry))
+    (ensure-equal nil
+                  (http-kit/http3::%http3-request-stream-response-status entry))
+    (ensure-equal 0
+                  (http-kit/http3::%http3-request-stream-response-body-length
+                   entry))))
+(deftest http3-scheduler-process-push-promise-boundaries
+  (let* ((fields
+           (list (cons ":method" "GET")
+                 (cons ":scheme" "https")
+                 (cons ":authority" "example.test")
+                 (cons ":path" "/asset.css")))
+         (different-fields
+           (list (cons ":method" "GET")
+                 (cons ":scheme" "https")
+                 (cons ":authority" "example.test")
+                 (cons ":path" "/other")))
+         (callback-events nil)
+         (client (http3-transport-boundary-client :max-push-id 2))
+         (entry
+           (http-kit/http3::%make-http3-request-stream
+            :stream-id 0
+            :on-push-promise
+            (lambda (push-id promised-fields)
+              (push (list push-id promised-fields) callback-events)))))
+    (unwind-protect
+         (progn
+           (let ((failure
+                   (http3-boundary-error
+                    (lambda ()
+                      (http-kit/http3::%h3-scheduler-process-push-promise
+                       client entry (http-kit/http3:http3-varint-encode 3))))))
+             (http3-public-error-check
+              failure
+              "HTTP/3 PUSH_PROMISE exceeds the advertised MAX_PUSH_ID."
+              :h3-id-error)
+             (ensure-equal nil callback-events)
+             (ensure-equal nil
+                           (http-kit/http3:http3-client-promised-push-ids client))
+             (ensure-equal nil
+                           (http-kit/http3::http3-client-push-promises client)))
+           (let ((unadvertised-client (http3-transport-boundary-client)))
+             (unwind-protect
+                  (progn
+                    (ensure-equal
+                     nil
+                     (http-kit/http3::http3-client-max-push-id
+                      unadvertised-client))
+                    (let ((failure
+                            (http3-boundary-error
+                             (lambda ()
+                               (http-kit/http3::%h3-scheduler-process-push-promise
+                                unadvertised-client entry
+                                (http-kit/http3:http3-varint-encode 1))))))
+                      (http3-public-error-check
+                       failure
+                       "HTTP/3 PUSH_PROMISE exceeds the advertised MAX_PUSH_ID."
+                       :h3-id-error)
+                      (ensure-equal nil callback-events)
+                      (ensure-equal
+                       nil
+                       (http-kit/http3:http3-client-promised-push-ids
+                        unadvertised-client))
+                      (ensure-equal
+                       nil
+                       (http-kit/http3::http3-client-push-promises
+                        unadvertised-client))))
+               (when (http-kit/http3:http3-client-open-p unadvertised-client)
+                 (http-kit/http3:close-http3-client unadvertised-client))))
+           (flet ((process-promise (promised-fields)
+                    (setf (http-kit/http3::%http3-request-stream-qpack-resume-fields
+                           entry)
+                          promised-fields
+                          (http-kit/http3::%http3-request-stream-qpack-resume-fields-p
+                           entry)
+                          t)
+                    (http-kit/http3::%h3-scheduler-process-push-promise
+                     client entry (http-kit/http3:http3-varint-encode 1))))
+             (ensure-equal t (process-promise fields))
+             (ensure-equal t (process-promise fields))
+             (ensure-equal '(1)
+                           (http-kit/http3:http3-client-promised-push-ids client))
+             (ensure-equal 1
+                           (length
+                            (http-kit/http3::http3-client-push-promises client)))
+             (ensure-equal
+              (cons 1 fields)
+              (first (http-kit/http3::http3-client-push-promises client)))
+             (ensure-equal '(1 1) (mapcar #'first callback-events))
+             (dolist (event callback-events)
+               (let ((received (second event)))
+                 (ensure-equal fields received)
+                 (ensure-true (not (eq fields received)))
+                 (ensure-true
+                  (not (eq (car (first fields))
+                           (car (first received)))))
+                 (ensure-true
+                  (not (eq (cdr (first fields))
+                           (cdr (first received))))))
+             (ensure-true
+              (not (eq (second (first callback-events))
+                       (second (second callback-events)))))
+             (let ((changed-failure
+                     (http3-boundary-error
+                      (lambda ()
+                        (process-promise different-fields)))))
+               (http3-public-error-check
+                changed-failure
+                "Repeated HTTP/3 PUSH_PROMISE fields differ."
+                :h3-id-error)
+               (ensure-equal 2 (length callback-events))
+               (ensure-equal
+                '(1)
+                (http-kit/http3:http3-client-promised-push-ids client))
+               (ensure-equal
+                (cons 1 fields)
+                (first
+                 (http-kit/http3::http3-client-push-promises client)))))))
+      (when (http-kit/http3:http3-client-open-p client)
+        (http-kit/http3:close-http3-client client))))
+  (multiple-value-bind (decoder-context section instruction)
+      (http3-test-qpack-blocked-section
+       (list (cons ":method" "GET")
+             (cons ":scheme" "https")
+             (cons ":authority" "example.test")
+             (cons ":path" "/asset.css")
+             (cons "x-blocked" "ready")))
+    (declare (ignore instruction))
+    (let* ((adapter
+             (http-message-kit:qpack-make-http3-decoder-context
+              decoder-context :max-blocked-streams 1))
+           (callback-events nil)
+           (client (http3-transport-boundary-client :max-push-id 2))
+           (entry
+             (http-kit/http3::%make-http3-request-stream
+              :stream-id 0
+              :on-push-promise
+              (lambda (push-id promised-fields)
+                (push (list push-id promised-fields) callback-events))))
+           (payload
+             (http3-test-concat-octets
+              (http-kit/http3:http3-varint-encode 1)
+              section)))
+      (unwind-protect
+           (progn
+             (setf (http-kit/http3::http3-client-qpack-decoder-context client)
+                   decoder-context
+                   (http-kit/http3::http3-client-qpack-http3-decoder-context client)
+                   adapter)
+             (ensure-equal
+              nil
+              (http-kit/http3::%h3-scheduler-process-push-promise
+               client entry payload))
+             (ensure-true
+              (http-message-kit:qpack-blocked-stream-p
+               (http-kit/http3::%http3-request-stream-qpack-token entry)))
+             (ensure-equal nil callback-events)
+             (ensure-equal nil
+                           (http-kit/http3:http3-client-promised-push-ids client))
+             (ensure-equal nil
+                           (http-kit/http3::http3-client-push-promises client)))
+        (when (http-kit/http3:http3-client-open-p client)
+          (http-kit/http3:close-http3-client client))))))
+
+
 

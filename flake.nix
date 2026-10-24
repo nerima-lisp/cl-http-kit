@@ -57,8 +57,9 @@
     };
 
     cl-crypto-kit = {
-      url = "github:nerima-lisp/cl-crypto-kit/main";
-      flake = false;
+      url = "github:nerima-lisp/cl-crypto-kit/761e95926923eba809f3e5deac88e68414aef894";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.cl-weave.follows = "cl-weave";
     };
 
     cl-deflate-kit = {
@@ -75,8 +76,10 @@
     };
 
     cl-quic-kit = {
-      url = "github:nerima-lisp/cl-quic-kit/v0.1.1";
-      flake = false;
+      url = "github:nerima-lisp/cl-quic-kit/46bfeaccf2fa0854a434b06ffc291d71c9101323";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.cl-crypto-kit.follows = "cl-crypto-kit";
+      inputs.cl-tls-kit.follows = "cl-tls-kit";
     };
 
     paredit-cli = {
@@ -162,8 +165,8 @@
           codec = cl-codec-kit.packages.${system}.default;
           deflate = cl-deflate-kit.packages.${system}.default;
           tls = cl-tls-kit.packages.${system}.default;
-          crypto = cl-crypto-kit;
-          quic = cl-quic-kit;
+          crypto = cl-crypto-kit.outPath;
+          quic = cl-quic-kit.outPath;
           paredit = patchedParedit system;
         in
         {
@@ -228,8 +231,8 @@
           codec = cl-codec-kit.packages.${system}.default;
           deflate = cl-deflate-kit.packages.${system}.default;
           tls = cl-tls-kit.packages.${system}.default;
-          crypto = cl-crypto-kit;
-          quic = cl-quic-kit;
+          crypto = cl-crypto-kit.outPath;
+          quic = cl-quic-kit.outPath;
           paredit = patchedParedit system;
           sourceRegistry = pkgs.lib.concatStringsSep ":" [
             "${clWeave}/share/common-lisp/source//"
@@ -480,8 +483,8 @@
           codec = cl-codec-kit.packages.${system}.default;
           deflate = cl-deflate-kit.packages.${system}.default;
           tls = cl-tls-kit.packages.${system}.default;
-          crypto = cl-crypto-kit;
-          quic = cl-quic-kit;
+          crypto = cl-crypto-kit.outPath;
+          quic = cl-quic-kit.outPath;
           paredit = patchedParedit system;
           source = pkgs.lib.cleanSource ./.;
           sourceRegistry = pkgs.lib.concatStringsSep ":" [

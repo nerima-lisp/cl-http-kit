@@ -162,7 +162,8 @@
                 (let ((entry (pop (http3-test-stream-reads stream))))
                   (if entry
                       (values (first entry) (second entry))
-                      (values nil t)))))))
+                      (values nil t))))
+              :max-push-id 0)))
     (let* ((settings
              (http-kit/http3:encode-http3-frame
               (http-kit/http3:make-http3-settings-frame)))
@@ -247,8 +248,10 @@
               :reads
               (list
                (list
-                (http-kit/http3:http3-varint-encode
-                 http-kit/http3:+http3-push-stream-type+)
+                (http3-test-concat-octets
+                 (http-kit/http3:http3-varint-encode
+                  http-kit/http3:+http3-push-stream-type+)
+                 (http-kit/http3:http3-varint-encode 0))
                 nil))))
            (client (make-client)))
       (multiple-value-bind (kind events ended-p)
@@ -1132,14 +1135,34 @@
               (error "QPACK capacity write failed"))
             :open-p t
             :qpack-encoder-stream (make-http3-test-stream :kind :local-qpack-encoder)
-            :qpack-encoder-context capacity-context)))
+            :qpack-encoder-context capacity-context))
+         (request-stream (make-http3-test-stream :kind :request))
+         (entry (http-kit/http3::%make-http3-request-stream)))
+    (setf (http-kit/http3::http3-client-request-stream-count capacity-client) 1)
+    (http-kit/http3::%h3-scheduler-register-entry
+     capacity-client entry request-stream 0)
     (signals simple-error
       (http-kit/http3:http3-client-set-qpack-capacity capacity-client 256))
     (ensure-equal 0
                   (http-message-kit:qpack-context-table-capacity capacity-context))
     (ensure-equal 0
                   (http-message-kit:qpack-context-insert-count capacity-context))
-    (ensure-equal nil (http-kit/http3:http3-client-open-p capacity-client)))
+    (ensure-equal nil (http-kit/http3:http3-client-open-p capacity-client))
+    (ensure-true (typep (http-kit/http3::%http3-request-stream-failure entry)
+                        'simple-error))
+    (ensure-true (http-kit/http3::%http3-request-stream-done-p entry))
+    (ensure-equal 0
+                  (hash-table-count
+                   (http-kit/http3::http3-client-request-streams capacity-client)))
+    (ensure-equal nil
+                  (http-kit/http3::http3-client-pending-request-streams capacity-client))
+    (ensure-equal nil
+                  (http-kit/http3::http3-client-runnable-stream-ids capacity-client))
+    (ensure-equal 0
+                  (http-kit/http3::http3-client-request-stream-count capacity-client))
+    (ensure-true
+     (eq (http-kit/http3::%http3-request-stream-failure entry)
+         (http-kit/http3::http3-client-scheduler-close-state capacity-client))))
   (let* ((insert-context
            (http-message-kit:make-qpack-context
             :max-table-capacity 256 :table-capacity 256 :huffman nil))
@@ -2145,6 +2168,1633 @@
       (ensure-equal
        '(:read (:await nil) :resumed (:data #(1 2 3)))
        (nreverse events)))))
+(deftest http3-client-native-scheduler-delivers-response
+  (let* ((response-encoder-context
+           (http-message-kit:make-qpack-context
+            :max-table-capacity 0 :table-capacity 0 :huffman nil))
+         (response-wire
+           (http3-test-concat-octets
+            (http-kit/http3:encode-http3-frame
+             (http-kit/http3:make-http3-frame
+              :type http-kit/http3:+http3-headers-type+
+              :payload
+              (http3-test-qpack-encode
+               (list (cons ":status" "200")
+                     (cons "content-length" "3"))
+               :context response-encoder-context
+               :use-dynamic-p nil)))
+            (http-kit/http3:encode-http3-frame
+             (http-kit/http3:make-http3-frame
+              :type http-kit/http3:+http3-data-type+
+              :payload (octets 1 2 3)))))
+         (request-stream nil)
+         (polls 0)
+         (try-reads 0)
+         (blocking-reads 0)
+         (request-writes 0)
+         (response-sent-p nil)
+         (client
+           (http-kit/http3:make-http3-client
+            :open-stream
+            (lambda (request &key stream-type timeout deadline)
+              (declare (ignore request timeout deadline))
+              (let ((stream (make-http3-test-stream :kind stream-type)))
+                (when (eq stream-type :request)
+                  (setf request-stream stream))
+                (if (eq stream-type :request)
+                    (values stream 0)
+                    stream)))
+            :write-stream
+            (lambda (stream octets &key fin-p timeout deadline)
+              (declare (ignore octets fin-p timeout deadline))
+              (when (eq (http3-test-stream-kind stream) :request)
+                (incf request-writes)))
+            :read-stream
+            (lambda (stream &key timeout deadline)
+              (declare (ignore stream timeout deadline))
+              (incf blocking-reads)
+              (values response-wire t))
+            :poll-function
+            (lambda () (incf polls))
+            :try-read-stream
+            (lambda (stream &key timeout deadline)
+              (declare (ignore timeout deadline))
+              (ensure-true (eq request-stream stream))
+              (incf try-reads)
+              (if response-sent-p
+                  (values nil nil :would-block)
+                  (progn
+                    (setf response-sent-p t)
+                    (values response-wire t :data))))
+            :stream-write-pending-p
+            (lambda (stream)
+              (declare (ignore stream))
+              nil))))
+    (unwind-protect
+         (let ((response
+                 (http-kit/http3:send-http3-request
+                  client
+                  (make-http-request
+                   :method "GET" :uri "https://example.test/"))))
+           (ensure-equal 200 (http-response-status response))
+           (ensure-equal (octets 1 2 3) (http-response-body response))
+           (ensure-true (plusp polls))
+           (ensure-true (plusp request-writes))
+           (ensure-true (plusp try-reads))
+           (ensure-equal 0 blocking-reads))
+      (http-kit/http3:close-http3-client client))))
+(deftest http3-client-native-scheduler-request-stream-write-failure-fails-entry
+  (let* ((client nil)
+         (request-stream nil)
+         (request-entry nil)
+         (write-failure
+           (handler-case
+               (error "Native request stream write failed.")
+             (simple-error (condition) condition))))
+    (setf client
+          (http-kit/http3:make-http3-client
+           :open-stream
+           (lambda (request &key stream-type timeout deadline)
+             (declare (ignore request timeout deadline))
+             (let ((stream (make-http3-test-stream :kind stream-type)))
+               (when (eq stream-type :request)
+                 (setf request-stream stream))
+               (if (eq stream-type :request)
+                   (values stream 0)
+                   stream)))
+           :write-stream
+           (lambda (stream octets &key fin-p timeout deadline)
+             (declare (ignore octets fin-p timeout deadline))
+             (when (eq (http3-test-stream-kind stream) :request)
+               (setf request-entry
+                     (http-kit/http3::%h3-scheduler-entry-for-stream
+                      client stream))
+               (error write-failure)))
+           :read-stream
+           (lambda (stream &key timeout deadline)
+             (declare (ignore stream timeout deadline))
+             (values (octets) t))
+           :try-read-stream
+           (lambda (stream &key timeout deadline)
+             (declare (ignore stream timeout deadline))
+             (values nil nil :would-block))
+           :poll-function (lambda () nil)
+           :stream-write-pending-p (lambda (stream)
+                                     (declare (ignore stream))
+                                     nil)
+           :close-stream (lambda (stream &key condition)
+                           (declare (ignore condition))
+                           (setf (http3-test-stream-closed-p stream) t))))
+    (unwind-protect
+         (let ((failure
+                 (http3-boundary-error
+                  (lambda ()
+                    (http-kit/http3:send-http3-request
+                     client
+                     (make-http-request
+                      :method "GET" :uri "https://example.test/"))))))
+           (ensure-true (eq write-failure failure))
+           (ensure-true request-stream)
+           (ensure-true request-entry)
+           (ensure-true
+            (http-kit/http3::%http3-request-stream-done-p request-entry))
+           (ensure-true
+            (eq write-failure
+                (http-kit/http3::%http3-request-stream-failure request-entry)))
+           (ensure-true
+            (eq write-failure
+                (http-kit/http3::http3-client-scheduler-close-state client)))
+           (ensure-false (http-kit/http3:http3-client-open-p client))
+           (ensure-equal 0
+                         (hash-table-count
+                          (http-kit/http3::http3-client-request-streams client)))
+           (ensure-equal nil
+                         (http-kit/http3::http3-client-pending-request-streams client))
+           (ensure-equal nil
+                         (http-kit/http3::http3-client-runnable-stream-ids client))
+           (ensure-equal 0
+                         (http-kit/http3::http3-client-request-stream-count client)))
+      (when (and client (http-kit/http3:http3-client-open-p client))
+        (http-kit/http3:close-http3-client client)))))
+(deftest http3-client-native-scheduler-cancel-unavailable-closes-client
+  (let* ((client nil)
+         (request-stream nil)
+         (request-entry nil))
+    (setf client
+          (http-kit/http3:make-http3-client
+           :open-stream
+           (lambda (request &key stream-type timeout deadline)
+             (declare (ignore request timeout deadline))
+             (let ((stream (make-http3-test-stream :kind stream-type)))
+               (when (eq stream-type :request)
+                 (setf request-stream stream))
+               (if (eq stream-type :request)
+                   (values stream 0)
+                   stream)))
+           :write-stream
+           (lambda (stream octets &key fin-p timeout deadline)
+             (declare (ignore stream octets fin-p timeout deadline)))
+           :read-stream
+           (lambda (stream &key timeout deadline)
+             (declare (ignore stream timeout deadline))
+             (values (octets) t))
+           :try-read-stream
+           (lambda (stream &key timeout deadline)
+             (declare (ignore stream timeout deadline))
+             (values nil nil :would-block))
+           :poll-function (lambda () nil)
+           :stream-write-pending-p
+           (lambda (stream)
+             (declare (ignore stream))
+             nil)
+           :close-stream
+           (lambda (stream &key condition)
+             (declare (ignore condition))
+             (setf (http3-test-stream-closed-p stream) t))))
+    (unwind-protect
+         (let ((failure
+                 (http3-boundary-error
+                  (lambda ()
+                    (http-kit/http3:send-http3-request
+                     client
+                     (make-http-request
+                      :method "POST" :uri "https://example.test/upload")
+                     :request-body-length 1
+                     :request-body-function
+                     (lambda (maximum-size)
+                       (declare (ignore maximum-size))
+                       (setf request-entry
+                             (http-kit/http3::%h3-scheduler-entry-for-stream
+                              client request-stream))
+                       (error "Request body production failed.")))))))
+           (ensure-true (typep failure 'http-protocol-error))
+           (ensure-equal :http3-transport (http-error-operation failure))
+           (ensure-equal :unsupported (http-protocol-error-detail failure))
+           (ensure-true request-entry)
+           (ensure-true
+            (http-kit/http3::%http3-request-stream-done-p request-entry))
+           (ensure-true
+            (eq failure
+                (http-kit/http3::%http3-request-stream-failure request-entry)))
+           (ensure-false (http-kit/http3::http3-client-cancel-stream client))
+           (ensure-false (http-kit/http3:http3-client-open-p client))
+           (ensure-equal :http3-closed
+                         (http-kit/http3::http3-client-scheduler-close-state client))
+           (ensure-equal 0
+                         (hash-table-count
+                          (http-kit/http3::http3-client-request-streams client)))
+           (ensure-equal nil
+                         (http-kit/http3::http3-client-pending-request-streams client))
+           (ensure-equal nil
+                         (http-kit/http3::http3-client-runnable-stream-ids client))
+           (ensure-equal 0
+                         (http-kit/http3::http3-client-request-stream-count client))
+           (ensure-false (http3-test-stream-closed-p request-stream)))
+      (when (and client (http-kit/http3:http3-client-open-p client))
+        (http-kit/http3:close-http3-client client)))))
+(deftest http3-client-native-scheduler-close-in-body-producer-stops-progress
+  (let* ((client nil)
+         (request-stream nil)
+         (request-entry nil)
+         (request-frame-types nil)
+         (request-write-count 0)
+         (request-read-count 0)
+         (request-read-after-producer-count 0)
+         (producer-count 0))
+    (setf client
+          (http-kit/http3:make-http3-client
+           :open-stream
+           (lambda (request &key stream-type timeout deadline)
+             (declare (ignore request timeout deadline))
+             (let ((stream (make-http3-test-stream :kind stream-type)))
+               (when (eq stream-type :request)
+                 (setf request-stream stream))
+               (if (eq stream-type :request)
+                   (values stream 0)
+                   stream)))
+           :write-stream
+           (lambda (stream octets &key fin-p timeout deadline)
+             (declare (ignore fin-p timeout deadline))
+             (when (eq stream request-stream)
+               (incf request-write-count)
+               (setf request-frame-types
+                     (append request-frame-types
+                             (mapcar
+                              #'http-kit/http3:http3-frame-type
+                              (http-kit/http3:decode-http3-frames octets))))))
+           :read-stream
+           (lambda (stream &key timeout deadline)
+             (declare (ignore timeout deadline))
+             (when (eq stream request-stream)
+               (incf request-read-count)
+               (when (plusp producer-count)
+                 (incf request-read-after-producer-count)))
+             (values (octets) t))
+           :try-read-stream
+           (lambda (stream &key timeout deadline)
+             (declare (ignore timeout deadline))
+             (when (eq stream request-stream)
+               (incf request-read-count)
+               (when (plusp producer-count)
+                 (incf request-read-after-producer-count)))
+             (values nil nil :would-block))
+           :poll-function (lambda () nil)
+           :stream-write-pending-p (lambda (stream)
+                                     (declare (ignore stream))
+                                     nil)
+           :close-stream (lambda (stream &key condition)
+                           (declare (ignore condition))
+                           (setf (http3-test-stream-closed-p stream) t))))
+    (unwind-protect
+         (let ((failure
+                 (http3-boundary-error
+                  (lambda ()
+                    (http-kit/http3:send-http3-request
+                     client
+                     (make-http-request
+                      :method "POST" :uri "https://example.test/upload")
+                     :request-body-length 1
+                     :request-body-function
+                     (lambda (maximum-size)
+                       (declare (ignore maximum-size))
+                       (incf producer-count)
+                       (setf request-entry
+                             (http-kit/http3::%h3-scheduler-entry-for-stream
+                              client request-stream))
+                       (http-kit/http3:close-http3-client client)
+                       (octets 7)))))))
+           (ensure-true (typep failure 'http-connection-error))
+           (ensure-equal 1 producer-count)
+           (ensure-true request-entry)
+           (ensure-true (http-kit/http3::%http3-request-stream-done-p request-entry))
+           (ensure-true (http-kit/http3::%http3-request-stream-failure request-entry))
+           (ensure-equal 1 request-write-count)
+           (ensure-equal (list http-kit/http3:+http3-headers-type+)
+                         request-frame-types)
+           (ensure-true (plusp request-read-count))
+           (ensure-equal 0 request-read-after-producer-count)
+           (ensure-false (http3-test-stream-closed-p request-stream))
+           (ensure-equal 0
+                         (hash-table-count
+                          (http-kit/http3::http3-client-request-streams client)))
+           (ensure-equal nil
+                         (http-kit/http3::http3-client-pending-request-streams client))
+           (ensure-equal nil
+                         (http-kit/http3::http3-client-runnable-stream-ids client))
+           (ensure-equal 0
+                         (http-kit/http3::http3-client-request-stream-count client)))
+      (when (and client (http-kit/http3:http3-client-open-p client))
+        (http-kit/http3:close-http3-client client)))))
+#+sbcl
+
+
+
+(progn
+(defun http3-test-native-response-wire (&optional (body (octets)))
+    (http3-test-concat-octets
+     (http-kit/http3:encode-http3-frame
+      (http-kit/http3:make-http3-frame
+       :type http-kit/http3:+http3-headers-type+
+       :payload
+       (http3-test-qpack-encode
+        (list (cons ":status" "200")
+              (cons "content-length" (princ-to-string (length body))))
+        :use-dynamic-p nil)))
+     (when (plusp (length body))
+       (http-kit/http3:encode-http3-frame
+        (http-kit/http3:make-http3-frame
+         :type http-kit/http3:+http3-data-type+
+         :payload body)))))
+
+(defun http3-test-make-native-client
+      (&key poll-function try-read-stream write-stream read-stream
+            close-stream cancel-stream qpack-settings accept-peer-unidirectional-stream)
+    (let ((next-stream-id -4))
+      (http-kit/http3:make-http3-client
+       :open-stream
+       (lambda (request &key stream-type timeout deadline)
+         (declare (ignore timeout deadline))
+         (let ((stream
+                 (make-http3-test-stream
+                  :kind (if request
+                            (http-kit:http-request-target request)
+                            stream-type))))
+           (if request
+               (values stream (incf next-stream-id 4))
+               stream)))
+       :write-stream (or write-stream
+                         (lambda (stream bytes &key fin-p timeout deadline)
+                           (declare (ignore stream bytes fin-p timeout deadline))))
+       :read-stream (or read-stream
+                        (lambda (stream &key timeout deadline)
+                          (declare (ignore stream timeout deadline))
+                          (values nil t)))
+       :close-stream (or close-stream
+                         (lambda (stream &key condition)
+                           (declare (ignore condition))
+                           (setf (http3-test-stream-closed-p stream) t)))
+       :cancel-stream cancel-stream
+       :poll-function (or poll-function (lambda () nil))
+       :try-read-stream try-read-stream
+       :accept-peer-unidirectional-stream accept-peer-unidirectional-stream
+       :stream-write-pending-p (lambda (stream)
+                                 (declare (ignore stream))
+                                 nil)
+       :qpack-settings qpack-settings)))
+
+(defun http3-test-start-native-call (thunk)
+    (let ((finished (sb-thread:make-semaphore :count 0))
+          (result (list :pending nil)))
+      (values
+       (sb-thread:make-thread
+        (lambda ()
+          (unwind-protect
+              (let ((outcome
+                      (handler-case
+                          (list :response (funcall thunk))
+                        (error (condition)
+                          (list :error condition)))))
+                (setf (first result) (first outcome)
+                      (second result) (second outcome)))
+            (sb-thread:signal-semaphore finished))))
+       finished
+       result)))
+
+(defun http3-test-await-native-pending (client expected-count)
+    (loop repeat 3000
+          for pending-count =
+            (sb-thread:with-mutex
+                ((http-kit/http3::http3-client-scheduler-lock client))
+              (length
+               (http-kit/http3::http3-client-pending-request-streams client)))
+          when (>= pending-count expected-count)
+            do (return t)
+          do (sleep 0.001)
+          finally (return nil)))
+
+(defun http3-test-await-native-close-state (client expected-state)
+    (loop repeat 3000
+          for close-state =
+            (sb-thread:with-mutex
+                ((http-kit/http3::http3-client-scheduler-lock client))
+              (http-kit/http3::http3-client-scheduler-close-state client))
+          when (eq close-state expected-state)
+            do (return t)
+          do (sleep 0.001)
+          finally (return nil)))
+
+(defun http3-test-join-native-thread (thread finished)
+  (when thread
+    (when (sb-thread:thread-alive-p thread)
+      (sb-thread:wait-on-semaphore finished :timeout 3))
+    (sb-thread:join-thread thread :timeout 3)))
+
+(deftest http3-client-native-scheduler-concurrent-callers-share-progress
+    (let* ((poll-started (sb-thread:make-semaphore :count 0))
+           (release-poll (sb-thread:make-semaphore :count 0))
+           (response-wire (http3-test-native-response-wire))
+           (first-poll-p nil)
+           (body-chunks 0)
+           (body-chunks-when-fast-closed nil)
+           (body-finished-p nil)
+           (response-paths-sent nil)
+           (client
+             (http3-test-make-native-client
+              :poll-function
+              (lambda ()
+                (unless first-poll-p
+                  (setf first-poll-p t)
+                  (sb-thread:signal-semaphore poll-started)
+                  (sb-thread:wait-on-semaphore release-poll)))
+              :try-read-stream
+              (lambda (stream &key timeout deadline)
+                (declare (ignore timeout deadline))
+                (let ((path (http3-test-stream-kind stream)))
+                  (cond
+                    ((string= path "/upload")
+                     (if (and (= body-chunks 4)
+                              body-finished-p
+                              (not (member path response-paths-sent
+                                           :test (function string=))))
+                         (progn
+                           (push path response-paths-sent)
+                           (values response-wire t :data))
+                         (values nil nil :would-block)))
+                    ((string= path "/fast")
+                     (if (and (plusp body-chunks)
+                              (not (member path response-paths-sent
+                                           :test (function string=))))
+                         (progn
+                           (push path response-paths-sent)
+                           (values response-wire t :data))
+                         (values nil nil :would-block)))
+                    (t (values nil nil :would-block)))))
+              :close-stream
+              (lambda (stream &key condition)
+                (declare (ignore condition))
+                (when (string= "/fast" (http3-test-stream-kind stream))
+                  (setf body-chunks-when-fast-closed body-chunks))
+                (setf (http3-test-stream-closed-p stream) t))
+              :cancel-stream
+              (lambda (stream &key error-code timeout deadline)
+                (declare (ignore stream error-code timeout deadline)))))
+           (a-thread nil)
+           (a-finished nil)
+           (a-result nil)
+           (b-thread nil)
+           (b-finished nil)
+           (b-result nil))
+      (unwind-protect
+           (progn
+             (multiple-value-setq (a-thread a-finished a-result)
+               (http3-test-start-native-call
+                (lambda ()
+                  (http-kit/http3:send-http3-request
+                   client
+                   (make-http-request :method "POST"
+                                     :uri "https://example.test/upload")
+                   :request-body-length (* 4 4096)
+                   :request-body-function
+                   (lambda (maximum-size)
+                     (declare (ignore maximum-size))
+                     (if (< body-chunks 4)
+    (progn
+      (incf body-chunks)
+      (make-array 4096 :element-type (quote (unsigned-byte 8))
+                         :initial-element 7))
+    (progn
+      (setf body-finished-p t)
+      nil)))))))
+             (ensure-true (sb-thread:wait-on-semaphore poll-started :timeout 3))
+             (multiple-value-setq (b-thread b-finished b-result)
+               (http3-test-start-native-call
+                (lambda ()
+                  (http-kit/http3:send-http3-request
+                   client
+                   (make-http-request :method "GET"
+                                     :uri "https://example.test/fast")))))
+             (ensure-true (http3-test-await-native-pending client 2))
+             (sb-thread:signal-semaphore release-poll)
+             (ensure-true (sb-thread:wait-on-semaphore b-finished :timeout 3))
+             (ensure-true (sb-thread:wait-on-semaphore a-finished :timeout 3))
+             (ensure-equal
+              :response
+              (first a-result))
+             (ensure-equal :response (first b-result))
+             (ensure-equal 200 (http-response-status (second a-result)))
+             (ensure-equal 200 (http-response-status (second b-result)))
+             (ensure-equal 4 body-chunks)
+             (ensure-true (< body-chunks-when-fast-closed body-chunks)))
+        (sb-thread:signal-semaphore release-poll)
+        (when (http-kit/http3:http3-client-open-p client)
+          (http-kit/http3:close-http3-client client))
+        (http3-test-join-native-thread a-thread a-finished)
+        (http3-test-join-native-thread b-thread b-finished))))
+
+(deftest http3-client-native-scheduler-owner-deadline-returns-before-peer
+    (let* ((poll-started (sb-thread:make-semaphore :count 0))
+           (release-poll (sb-thread:make-semaphore :count 0))
+           (release-peer-p nil)
+           (peer-response-sent-p nil)
+           (response-wire (http3-test-native-response-wire))
+           (first-poll-p nil)
+           (client
+             (http3-test-make-native-client
+              :poll-function
+              (lambda ()
+                (unless first-poll-p
+                  (setf first-poll-p t)
+                  (sb-thread:signal-semaphore poll-started)
+                  (sb-thread:wait-on-semaphore release-poll)))
+              :cancel-stream
+              (lambda (stream &key error-code timeout deadline)
+                (declare (ignore stream error-code timeout deadline))
+                t)
+              :try-read-stream
+              (lambda (stream &key timeout deadline)
+                (declare (ignore timeout deadline))
+                (if (string= "/peer" (http3-test-stream-kind stream))
+                    (cond
+                      ((not release-peer-p) (values nil nil :would-block))
+                      (peer-response-sent-p (values nil nil :would-block))
+                      (t
+                       (setf peer-response-sent-p t)
+                       (values response-wire t :data)))
+                    (values nil nil :would-block))))) (owner-thread nil) (owner-finished nil) (owner-result nil) (peer-thread nil) (peer-finished nil) (peer-result nil) (owner-returned-before-peer-p nil)) (unwind-protect
+           (progn
+             (multiple-value-setq (owner-thread owner-finished owner-result)
+               (http3-test-start-native-call
+                (lambda ()
+                  (http-kit/http3:send-http3-request
+                   client
+                   (make-http-request :method "GET"
+                                     :uri "https://example.test/deadline")
+                   :deadline 0))))
+             (ensure-true (sb-thread:wait-on-semaphore poll-started :timeout 3))
+             (multiple-value-setq (peer-thread peer-finished peer-result)
+               (http3-test-start-native-call
+                (lambda ()
+                  (http-kit/http3:send-http3-request
+                   client
+                   (make-http-request :method "GET"
+                                     :uri "https://example.test/peer")))))
+             (ensure-true (http3-test-await-native-pending client 2))
+             (sb-thread:signal-semaphore release-poll)
+             (setf owner-returned-before-peer-p
+                   (sb-thread:wait-on-semaphore owner-finished :timeout 3))
+             (ensure-true owner-returned-before-peer-p)
+             (setf release-peer-p t)
+             (ensure-true (sb-thread:wait-on-semaphore peer-finished :timeout 3))
+             (ensure-true owner-returned-before-peer-p)
+             (ensure-equal :error (first owner-result))
+             (ensure-true (typep (second owner-result) 'http-timeout))
+             (ensure-equal :response (first peer-result))
+             (ensure-equal 200 (http-response-status (second peer-result))))
+        (sb-thread:signal-semaphore release-poll)
+        (setf release-peer-p t)
+        (when (http-kit/http3:http3-client-open-p client)
+          (http-kit/http3:close-http3-client client))
+        (http3-test-join-native-thread owner-thread owner-finished)
+        (http3-test-join-native-thread peer-thread peer-finished))))
+(defun http3-test-native-owner-exit-case (mode)
+    (let* ((poll-started (sb-thread:make-semaphore :count 0))
+           (release-poll (sb-thread:make-semaphore :count 0))
+           (response-wire (http3-test-native-response-wire))
+           (peer-response-sent-p nil)
+           (first-poll-p nil)
+           (peer-completed (sb-thread:make-semaphore :count 0))
+           (client
+             (http3-test-make-native-client
+              :poll-function
+              (lambda ()
+                (unless first-poll-p
+                  (setf first-poll-p t)
+                  (sb-thread:signal-semaphore poll-started)
+                  (sb-thread:wait-on-semaphore release-poll)
+                  (when (eq mode :throw)
+                    (throw 'http3-test-native-owner-exit :unwound))))
+              :cancel-stream
+              (lambda (stream &key error-code timeout deadline)
+                (declare (ignore stream error-code timeout deadline))
+                t)
+              :try-read-stream
+              (lambda (stream &key timeout deadline)
+                (declare (ignore timeout deadline))
+                (if (string= "/peer" (http3-test-stream-kind stream))
+                    (if peer-response-sent-p
+                        (values nil nil :would-block)
+                        (progn
+                          (setf peer-response-sent-p t)
+                          (values response-wire t :data)))
+                    (values nil nil :would-block)))
+              :close-stream
+              (lambda (stream &key condition)
+                (declare (ignore condition))
+                (when (string= "/peer" (http3-test-stream-kind stream))
+                  (sb-thread:signal-semaphore peer-completed))
+                (setf (http3-test-stream-closed-p stream) t))))
+           (owner-thread nil)
+           (owner-finished nil)
+           (owner-result nil)
+           (peer-thread nil)
+           (peer-finished nil)
+           (peer-result nil)
+           (peer-returned-before-cleanup-p nil)
+           (peer-response-observed-p nil))
+      (unwind-protect
+           (progn
+             (multiple-value-setq (owner-thread owner-finished owner-result)
+               (http3-test-start-native-call
+                (lambda ()
+                  (catch 'http3-test-native-owner-exit
+                    (http-kit/http3:send-http3-request
+                     client
+                     (make-http-request :method "GET"
+                                       :uri "https://example.test/owner"))))))
+             (ensure-true (sb-thread:wait-on-semaphore poll-started :timeout 3))
+             (multiple-value-setq (peer-thread peer-finished peer-result)
+               (http3-test-start-native-call
+                (lambda ()
+                  (http-kit/http3:send-http3-request
+                   client
+                   (make-http-request :method "GET"
+                                     :uri "https://example.test/peer")))))
+             (ensure-true (http3-test-await-native-pending client 2))
+             (if (eq mode :interrupt)
+                 (sb-thread:interrupt-thread
+                  owner-thread
+                  (lambda ()
+                    (throw 'http3-test-native-owner-exit :interrupted)))
+                 (sb-thread:signal-semaphore release-poll))
+             (setf peer-response-observed-p
+                   (sb-thread:wait-on-semaphore peer-completed :timeout 3))
+             (setf peer-returned-before-cleanup-p (sb-thread:wait-on-semaphore peer-finished :timeout 3))
+             (unless peer-returned-before-cleanup-p
+               (http-kit/http3:close-http3-client client))
+             (sb-thread:wait-on-semaphore peer-finished :timeout 3)
+             (values peer-response-observed-p
+                     peer-returned-before-cleanup-p
+                     owner-result
+                     peer-result))
+        (sb-thread:signal-semaphore release-poll)
+        (when (http-kit/http3:http3-client-open-p client)
+          (http-kit/http3:close-http3-client client))
+        (http3-test-join-native-thread owner-thread owner-finished)
+        (http3-test-join-native-thread peer-thread peer-finished))))
+
+(deftest http3-client-native-scheduler-owner-unwind-hands-off
+    (multiple-value-bind (peer-response-observed-p peer-returned-p owner-result
+                          peer-result)
+        (http3-test-native-owner-exit-case :throw)
+      (ensure-true peer-response-observed-p)
+      (ensure-true peer-returned-p)
+      (ensure-equal :unwound (second owner-result))
+      (ensure-equal :response (first peer-result))
+      (ensure-equal 200 (http-response-status (second peer-result)))))
+
+(deftest http3-client-native-scheduler-owner-interrupt-hands-off
+    (multiple-value-bind (peer-response-observed-p peer-returned-p owner-result
+                          peer-result)
+        (http3-test-native-owner-exit-case :interrupt)
+      (ensure-true peer-response-observed-p)
+      (ensure-true peer-returned-p)
+      (ensure-equal :interrupted (second owner-result))
+      (ensure-equal :response (first peer-result))
+      (ensure-equal 200 (http-response-status (second peer-result)))))
+
+(deftest http3-client-native-scheduler-owner-request-error-releases-caller
+    (let* ((poll-started (sb-thread:make-semaphore :count 0))
+           (release-poll (sb-thread:make-semaphore :count 0))
+           (first-poll-p nil)
+           (release-peer-p nil)
+           (peer-response-sent-p nil)
+           (owner-read-failed-p nil)
+           (owner-failure
+             (make-condition 'simple-error
+                             :format-control "Owner request read failed."))
+           (response-wire (http3-test-native-response-wire))
+           (client
+             (http3-test-make-native-client
+              :poll-function
+              (lambda ()
+                (unless first-poll-p
+                  (setf first-poll-p t)
+                  (sb-thread:signal-semaphore poll-started)
+                  (sb-thread:wait-on-semaphore release-poll)))
+              :cancel-stream
+              (lambda (stream &key error-code timeout deadline)
+                (declare (ignore stream error-code timeout deadline))
+                t)
+              :try-read-stream
+              (lambda (stream &key timeout deadline)
+                (declare (ignore timeout deadline))
+                (let ((path (http3-test-stream-kind stream)))
+                  (cond
+                    ((string= path "/owner")
+                     (if owner-read-failed-p
+                         (values nil nil :would-block)
+                         (progn
+                           (setf owner-read-failed-p t)
+                           (error owner-failure))))
+                    ((string= path "/peer")
+                     (if release-peer-p
+                         (if peer-response-sent-p
+                             (values nil nil :would-block)
+                             (progn
+                               (setf peer-response-sent-p t)
+                               (values response-wire t :data)))
+                         (values nil nil :would-block)))
+                    (t (values nil nil :would-block)))))))
+           (owner-thread nil)
+           (owner-finished nil)
+           (owner-result nil)
+           (peer-thread nil)
+           (peer-finished nil)
+           (peer-result nil)
+           (owner-returned-before-peer-p nil))
+      (unwind-protect
+           (progn
+             (multiple-value-setq (owner-thread owner-finished owner-result)
+               (http3-test-start-native-call
+                (lambda ()
+                  (http-kit/http3:send-http3-request
+                   client
+                   (make-http-request :method "GET"
+                                     :uri "https://example.test/owner")))))
+             (ensure-true (sb-thread:wait-on-semaphore poll-started :timeout 3))
+             (multiple-value-setq (peer-thread peer-finished peer-result)
+               (http3-test-start-native-call
+                (lambda ()
+                  (http-kit/http3:send-http3-request
+                   client
+                   (make-http-request :method "GET"
+                                     :uri "https://example.test/peer")))))
+             (ensure-true (http3-test-await-native-pending client 2))
+             (sb-thread:signal-semaphore release-poll)
+             (setf owner-returned-before-peer-p
+                   (sb-thread:wait-on-semaphore owner-finished :timeout 3))
+             (ensure-true owner-returned-before-peer-p)
+             (setf release-peer-p t)
+             (ensure-true (sb-thread:wait-on-semaphore peer-finished :timeout 3))
+             (ensure-true owner-returned-before-peer-p)
+             (ensure-equal :error (first owner-result))
+             (ensure-true (eq owner-failure (second owner-result)))
+             (ensure-equal :response (first peer-result))
+             (ensure-equal 200 (http-response-status (second peer-result))))
+        (sb-thread:signal-semaphore release-poll)
+        (setf release-peer-p t)
+        (when (http-kit/http3:http3-client-open-p client)
+          (http-kit/http3:close-http3-client client))
+        (http3-test-join-native-thread owner-thread owner-finished)
+        (http3-test-join-native-thread peer-thread peer-finished))))
+
+(deftest http3-client-native-scheduler-resumes-qpack-blocked-owner-entry
+    (multiple-value-bind (decoder-context section instruction)
+        (http3-test-qpack-blocked-section
+         (list (cons ":status" "200")
+               (cons "x-blocked" "ready")))
+      (declare (ignore decoder-context))
+      (let* ((response-wire
+               (http-kit/http3:encode-http3-frame
+                (http-kit/http3:make-http3-frame
+                 :type http-kit/http3:+http3-headers-type+
+                 :payload section)))
+             (peer-qpack (make-http3-test-stream :kind :peer-qpack-encoder))
+             (response-sent-p nil)
+             (encoder-sent-p nil)
+             (decoder-acks (make-array 0 :element-type (quote (unsigned-byte 8))))
+             (cancel-count 0)
+             (client
+               (http3-test-make-native-client
+                :cancel-stream
+                (lambda (stream &key error-code timeout deadline)
+                  (declare (ignore stream error-code timeout deadline))
+                  (incf cancel-count)
+                  t)
+                :qpack-settings
+                (list
+                 (cons http-kit/http3:+http3-setting-qpack-max-table-capacity+ 256)
+                 (cons http-kit/http3:+http3-setting-qpack-blocked-streams+ 1))
+                :write-stream
+                (lambda (stream bytes &key fin-p timeout deadline)
+                  (declare (ignore fin-p timeout deadline))
+                  (when (eq :qpack-decoder (http3-test-stream-kind stream))
+                    (setf decoder-acks
+                          (http3-test-concat-octets decoder-acks bytes))))
+                :try-read-stream
+                (lambda (stream &key timeout deadline)
+                  (declare (ignore timeout deadline))
+                  (cond
+                    ((eq stream peer-qpack)
+                     (if response-sent-p
+                         (if encoder-sent-p
+                             (values nil nil :would-block)
+                             (progn
+                               (setf encoder-sent-p t)
+                               (values
+                                (http3-test-concat-octets
+                                 (http-kit/http3:http3-qpack-encoder-stream-prefix)
+                                 instruction)
+                                nil :data)))
+                         (values nil nil :would-block)))
+                    ((string= "/qpack" (http3-test-stream-kind stream))
+                     (if response-sent-p
+                         (values nil nil :would-block)
+                         (progn
+                           (setf response-sent-p t)
+                           (values response-wire t :data))))
+                    (t (values nil nil :would-block)))))))
+        (http-kit/http3:attach-http3-peer-qpack-encoder-stream client peer-qpack)
+        (unwind-protect
+             (let ((response
+                     (http-kit/http3:send-http3-request
+                      client
+                      (make-http-request :method "GET"
+                                         :uri "https://example.test/qpack"))))
+               (ensure-equal 200 (http-response-status response))
+               (ensure-equal "ready"
+                             (http-header-value (http-response-headers response)
+                                                "x-blocked"))
+               (ensure-true encoder-sent-p)
+               (ensure-true (plusp (length decoder-acks)))
+               (ensure-equal 0 cancel-count))
+          (when (http-kit/http3:http3-client-open-p client)
+            (http-kit/http3:close-http3-client client))))))
+
+(deftest http3-client-native-scheduler-close-wakes-all-with-one-condition
+    (let* ((poll-started (sb-thread:make-semaphore :count 0))
+           (release-poll (sb-thread:make-semaphore :count 0))
+           (first-poll-p nil)
+           (client
+             (http3-test-make-native-client
+              :poll-function
+              (lambda ()
+                (unless first-poll-p
+                  (setf first-poll-p t)
+                  (sb-thread:signal-semaphore poll-started)
+                  (sb-thread:wait-on-semaphore release-poll)))
+              :try-read-stream
+              (lambda (stream &key timeout deadline)
+                (declare (ignore stream timeout deadline))
+                (values nil nil :would-block)))))
+      (multiple-value-bind (a-thread a-finished a-result)
+          (http3-test-start-native-call
+           (lambda ()
+             (http-kit/http3:send-http3-request
+              client
+              (make-http-request :method "GET"
+                                 :uri "https://example.test/a"))))
+        (multiple-value-bind (b-thread b-finished b-result)
+            (http3-test-start-native-call
+             (lambda ()
+               (http-kit/http3:send-http3-request
+                client
+                (make-http-request :method "GET"
+                                   :uri "https://example.test/b"))))
+          (multiple-value-bind (c-thread c-finished c-result)
+              (http3-test-start-native-call
+               (lambda ()
+                 (http-kit/http3:send-http3-request
+                  client
+                  (make-http-request :method "GET"
+                                     :uri "https://example.test/c"))))
+            (multiple-value-bind (close-thread close-finished close-result)
+                (progn
+                  (ensure-true (sb-thread:wait-on-semaphore poll-started
+                                                            :timeout 3))
+                  (ensure-true (http3-test-await-native-pending client 3))
+                  (http3-test-start-native-call
+                   (lambda ()
+                     (http-kit/http3:close-http3-client client))))
+              (unwind-protect
+                   (progn
+                     (ensure-true
+                      (http3-test-await-native-close-state client :closing))
+                     (sb-thread:signal-semaphore release-poll)
+                     (ensure-true (sb-thread:wait-on-semaphore close-finished
+                                                               :timeout 3))
+                     (ensure-true (sb-thread:wait-on-semaphore a-finished
+                                                               :timeout 3))
+                     (ensure-true (sb-thread:wait-on-semaphore b-finished
+                                                               :timeout 3))
+                     (ensure-true (sb-thread:wait-on-semaphore c-finished
+                                                               :timeout 3))
+                     (ensure-equal :error (first a-result))
+                     (ensure-equal :error (first b-result))
+                     (ensure-equal :error (first c-result))
+                     (ensure-equal :response (first close-result))
+                     (ensure-true (typep (second a-result)
+                                         'http-connection-error))
+                     (ensure-true (eq (second a-result) (second b-result)))
+                     (ensure-true (eq (second b-result) (second c-result)))
+                     (ensure-equal
+                      0 (http-kit/http3::http3-client-request-stream-count client)))
+                (sb-thread:signal-semaphore release-poll)
+                (when (http-kit/http3:http3-client-open-p client)
+                  (http-kit/http3:close-http3-client client))
+                (http3-test-join-native-thread a-thread a-finished)
+                (http3-test-join-native-thread b-thread b-finished)
+                (http3-test-join-native-thread c-thread c-finished)
+                (http3-test-join-native-thread close-thread close-finished))))))))
+
+(deftest http3-client-native-scheduler-quic-close-retains-first-failure
+    (let* ((quic (make-http3-quic-adapter-test-client))
+           (stream (make-http3-test-stream :kind :control))
+           (http3-failure
+             (make-condition 'simple-error
+                             :format-control "HTTP/3 cleanup failed."))
+           (quic-failure
+             (make-condition 'simple-error
+                             :format-control "QUIC cleanup failed."))
+           (fail-once-p t)
+           (cleanup-calls nil)
+           (client
+             (http-kit/http3::%make-http3-client
+              :control-stream stream
+              :close-stream
+              (lambda (closed-stream &key condition)
+                (push (list closed-stream condition) cleanup-calls)
+                (if fail-once-p
+                    (progn
+                      (setf fail-once-p nil)
+                      (error http3-failure))
+                    (setf (http3-test-stream-closed-p closed-stream) t)))))
+           (adapter
+             (http-kit/http3::%make-http3-quic-adapter
+              :quic-client quic :http3-client client))
+           (failure nil)
+           (warning-text nil))
+      (unwind-protect
+           (call-with-http3-quic-lifecycle-spies
+            (lambda (calls)
+              (let ((*error-output* (make-string-output-stream)))
+                (setf failure
+                      (http3-boundary-error
+                       (lambda ()
+                         (http-kit/http3:close-http3-quic-adapter adapter)))
+                      warning-text (get-output-stream-string *error-output*))
+                (ensure-true (eq http3-failure failure))
+                (ensure-true (and (search "QUIC close also failed" warning-text) (search "QUIC cleanup failed." warning-text)))
+                (ensure-true (gethash 'cl-quic-kit:client-close calls))
+                (ensure-equal 1 (length cleanup-calls))))
+            :client-close
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              (error quic-failure)))
+        (http-kit/http3:close-http3-quic-adapter adapter))))
+
+(deftest http3-client-native-scheduler-owner-attaches-late-peer-streams
+    (let* ((response-wire (http3-test-native-response-wire))
+           (control-settings
+             (http-kit/http3:encode-http3-frame
+              (http-kit/http3:make-http3-settings-frame
+               :qpack-max-table-capacity 0
+               :qpack-blocked-streams 0)))
+           (control
+             (make-http3-test-stream
+              :kind :peer-control
+              :reads
+              (list
+               (list (http-kit/http3:http3-control-stream-prefix) nil)
+               (list control-settings nil))))
+           (encoder
+             (make-http3-test-stream
+              :kind :peer-qpack-encoder
+              :reads
+              (list
+               (list
+                (http-kit/http3:http3-qpack-encoder-stream-prefix)
+                nil))))
+           (decoder
+             (make-http3-test-stream
+              :kind :peer-qpack-decoder
+              :reads
+              (list
+               (list
+                (http-kit/http3:http3-qpack-decoder-stream-prefix)
+                nil))))
+           (extension-prefix (http-kit/http3:http3-varint-encode 64))
+           (extension
+             (make-http3-test-stream
+              :kind :peer-extension
+              :reads
+              (list
+               (list (subseq extension-prefix 0 1) nil)
+               (list (subseq extension-prefix 1) nil))))
+           (peer-streams (list control encoder decoder extension))
+           (pending-peer-streams nil)
+           (accepted-count 0)
+           (first-poll-p nil)
+           (response-sent-p nil)
+           (client
+             (http3-test-make-native-client
+              :poll-function
+              (lambda ()
+                (unless first-poll-p
+                  (setf first-poll-p t
+                        pending-peer-streams (copy-list peer-streams))))
+              :accept-peer-unidirectional-stream
+              (lambda ()
+                (let ((stream (pop pending-peer-streams)))
+                  (when stream
+                    (incf accepted-count))
+                  stream))
+              :read-stream
+              (lambda (stream &key timeout deadline)
+                (declare (ignore timeout deadline))
+                (if (member stream peer-streams :test #'eq)
+                    (let ((entry (pop (http3-test-stream-reads stream))))
+                      (if entry
+                          (values (first entry) (second entry))
+                          (values nil t)))
+                    (values nil t)))
+              :try-read-stream
+              (lambda (stream &key timeout deadline)
+                (declare (ignore timeout deadline))
+                (cond
+                  ((member stream peer-streams :test #'eq)
+                   (let ((entry (pop (http3-test-stream-reads stream))))
+                     (if entry
+                         (values (first entry) (second entry) :data)
+                         (values nil nil :would-block)))) ((and (stringp (http3-test-stream-kind stream))
+                        (string= "/late-streams"
+                                 (http3-test-stream-kind stream)))
+                   (if response-sent-p
+                       (values nil nil :would-block)
+                       (progn
+                         (setf response-sent-p t)
+                         (values response-wire t :data)))) (t (values nil nil :would-block))))))) (unwind-protect
+           (let ((response
+                   (http-kit/http3:send-http3-request
+                    client
+                    (make-http-request
+                     :method "GET"
+                     :uri "https://example.test/late-streams"))))
+             (ensure-true first-poll-p)
+             (ensure-equal nil pending-peer-streams)
+             (ensure-equal 4 accepted-count)
+             (ensure-true
+              (eq control
+                  (http-kit/http3:http3-client-peer-control-stream client)))
+             (ensure-true
+              (eq encoder
+                  (http-kit/http3:http3-client-peer-qpack-encoder-stream client)))
+             (ensure-true
+              (eq decoder
+                  (http-kit/http3:http3-client-peer-qpack-decoder-stream client)))
+             (ensure-true
+              (http-kit/http3:http3-control-state-settings-received-p
+               (http-kit/http3:http3-client-peer-control-state client)))
+             (ensure-equal
+              4
+              (http-kit/http3::http3-client-peer-unidirectional-stream-count
+               client))
+             (ensure-equal 200 (http-response-status response))
+             (ensure-equal nil (http3-test-stream-reads extension)))
+        (when (http-kit/http3:http3-client-open-p client)
+          (http-kit/http3:close-http3-client client)))
+))
+
+(deftest http3-client-native-scheduler-owner-cleanup-failure-clears-state-and-wakes-peer
+    (let* ((first-poll-started (sb-thread:make-semaphore :count 0))
+           (release-first-poll (sb-thread:make-semaphore :count 0))
+           (second-poll-started (sb-thread:make-semaphore :count 0))
+           (release-owner-exit (sb-thread:make-semaphore :count 0))
+           (cleanup-failure
+             (make-condition 'simple-error
+                             :format-control "Owner cancellation cleanup failed."))
+           (poll-count 0)
+           (owner-cancel-failed-p nil)
+           (cancelled-stream nil)
+           (client
+             (http3-test-make-native-client
+              :poll-function
+              (lambda ()
+                (case (incf poll-count)
+                  (1
+                   (sb-thread:signal-semaphore first-poll-started)
+                   (sb-thread:wait-on-semaphore release-first-poll))
+                  (2
+                   (sb-thread:signal-semaphore second-poll-started)
+                   (sb-thread:wait-on-semaphore release-owner-exit)
+                   (throw 'http3-test-native-owner-cleanup-exit :unwound))))
+              :try-read-stream
+              (lambda (stream &key timeout deadline)
+                (declare (ignore stream timeout deadline))
+                (values nil nil :would-block))
+              :cancel-stream
+              (lambda (stream &key error-code timeout deadline)
+                (declare (ignore error-code timeout deadline))
+                (when (string= "/owner" (http3-test-stream-kind stream))
+                  (setf owner-cancel-failed-p t
+                        cancelled-stream stream)
+                  (error cleanup-failure)))))
+           (owner-thread nil)
+           (owner-finished nil)
+           (owner-result nil)
+           (peer-thread nil)
+           (peer-finished nil)
+           (peer-result nil))
+      (unwind-protect
+           (progn
+             (multiple-value-setq (owner-thread owner-finished owner-result)
+               (http3-test-start-native-call
+                (lambda ()
+                  (catch 'http3-test-native-owner-cleanup-exit
+                    (http-kit/http3:send-http3-request
+                     client
+                     (make-http-request :method "GET"
+                                       :uri "https://example.test/owner"))))))
+             (ensure-true
+              (sb-thread:wait-on-semaphore first-poll-started :timeout 3))
+             (multiple-value-setq (peer-thread peer-finished peer-result)
+               (http3-test-start-native-call
+                (lambda ()
+                  (http-kit/http3:send-http3-request
+                   client
+                   (make-http-request :method "GET"
+                                     :uri "https://example.test/peer")))))
+             (ensure-true (http3-test-await-native-pending client 2))
+             (sb-thread:signal-semaphore release-first-poll)
+             (ensure-true
+              (sb-thread:wait-on-semaphore second-poll-started :timeout 3))
+             (sb-thread:with-mutex
+                 ((http-kit/http3::http3-client-scheduler-lock client))
+               (ensure-equal
+                2 (hash-table-count
+                   (http-kit/http3::http3-client-request-streams client)))
+               (ensure-equal 2
+                             (http-kit/http3::http3-client-request-stream-count
+                              client))
+               (ensure-equal nil
+                             (http-kit/http3::http3-client-pending-request-streams
+                              client)))
+             (sb-thread:signal-semaphore release-owner-exit)
+             (ensure-true
+              (sb-thread:wait-on-semaphore owner-finished :timeout 3))
+             (ensure-true
+              (sb-thread:wait-on-semaphore peer-finished :timeout 3))
+             (ensure-true owner-cancel-failed-p)
+             (ensure-true (string= "/owner"
+                                   (http3-test-stream-kind cancelled-stream)))
+             (ensure-equal :error (first owner-result))
+             (ensure-true (eq cleanup-failure (second owner-result)))
+             (ensure-equal :error (first peer-result))
+             (ensure-true (eq cleanup-failure (second peer-result)))
+             (sb-thread:with-mutex
+                 ((http-kit/http3::http3-client-scheduler-lock client))
+               (ensure-true
+                (eq :http3-closed
+                    (http-kit/http3::http3-client-scheduler-close-state client)))
+               (ensure-equal
+                0 (hash-table-count
+                   (http-kit/http3::http3-client-request-streams client)))
+               (ensure-equal nil
+                             (http-kit/http3::http3-client-pending-request-streams
+                              client))
+               (ensure-equal nil
+                             (http-kit/http3::http3-client-runnable-stream-ids
+                              client))
+               (ensure-equal 0
+                             (http-kit/http3::http3-client-request-stream-count
+                              client))
+               (ensure-equal nil
+                             (http-kit/http3::http3-client-scheduler-owner-thread
+                              client))
+               (ensure-false
+                (http-kit/http3::http3-client-scheduler-close-owner-active-p
+                 client))))
+        (sb-thread:signal-semaphore release-first-poll)
+        (sb-thread:signal-semaphore release-owner-exit)
+        (when (http-kit/http3:http3-client-open-p client)
+          (http-kit/http3:close-http3-client client))
+        (http3-test-join-native-thread owner-thread owner-finished)
+        (http3-test-join-native-thread peer-thread peer-finished))))
+
+(deftest http3-client-native-scheduler-discards-unknown-peer-stream-through-fin
+  (let* ((response-wire (http3-test-native-response-wire))
+         (extension-type (http-kit/http3:http3-varint-encode 64))
+         (extension
+           (make-http3-test-stream
+            :kind :peer-extension
+            :reads
+            (list (list (subseq extension-type 0 1) nil)
+                  (list (subseq extension-type 1) nil)
+                  (list (octets 1 2 3) nil)
+                  (list (octets 4 5) t))))
+         (pending-peer-streams nil)
+         (accepted-count 0)
+         (first-poll-p nil)
+         (response-streams (make-hash-table :test 'eq))
+         (client
+           (http3-test-make-native-client
+            :poll-function
+            (lambda ()
+              (unless first-poll-p
+                (setf first-poll-p t
+                      pending-peer-streams (list extension))))
+            :accept-peer-unidirectional-stream
+            (lambda ()
+              (let ((stream (pop pending-peer-streams)))
+                (when stream
+                  (incf accepted-count))
+                stream))
+            :try-read-stream
+            (lambda (stream &key timeout deadline)
+              (declare (ignore timeout deadline))
+              (cond
+                ((eq stream extension)
+                 (let ((entry (pop (http3-test-stream-reads stream))))
+                   (if entry
+                       (values (first entry) (second entry) :data)
+                       (values nil nil :would-block))))
+                ((stringp (http3-test-stream-kind stream))
+                 (if (gethash stream response-streams)
+                     (values nil nil :would-block)
+                     (progn
+                       (setf (gethash stream response-streams) t)
+                       (values response-wire t :data))))
+                (t (values nil nil :would-block)))))))
+    (unwind-protect
+         (progn
+           (dolist (path '("/after-unknown-a" "/after-unknown-b"))
+             (let ((response
+                     (http-kit/http3:send-http3-request
+                      client
+                      (make-http-request
+                       :method "GET"
+                       :uri (concatenate 'string "https://example.test" path)))))
+               (ensure-equal 200 (http-response-status response))))
+           (ensure-true first-poll-p)
+           (ensure-equal 1 accepted-count)
+           (ensure-equal nil (http3-test-stream-reads extension))
+           (ensure-false (http-kit/http3::http3-client-cancel-stream client))
+           (ensure-equal 2 (hash-table-count response-streams)))
+      (when (http-kit/http3:http3-client-open-p client)
+        (http-kit/http3:close-http3-client client)))))
+(deftest http3-client-native-scheduler-drains-after-cancel-error-without-fin
+  (let* ((unknown-stream
+           (make-http3-test-stream :kind :peer-extension))
+         (pending-peer-streams nil)
+         (accepted-count 0)
+         (first-poll-p nil)
+         (poll-count 0)
+         (unknown-read-count 0)
+         (unknown-read-statuses nil)
+         (cancel-error-seen-p nil)
+         (cancel-count 0)
+         (cancelled-stream nil)
+         (cancel-error-code nil)
+         (response-wire (http3-test-native-response-wire))
+         (response-sent-p nil)
+         (client
+           (http3-test-make-native-client
+            :poll-function
+            (lambda ()
+              (incf poll-count)
+              (unless first-poll-p
+                (setf first-poll-p t
+                      pending-peer-streams (list unknown-stream))))
+            :accept-peer-unidirectional-stream
+            (lambda ()
+              (let ((stream (pop pending-peer-streams)))
+                (when stream
+                  (incf accepted-count))
+                stream))
+            :cancel-stream
+            (lambda (stream &key error-code timeout deadline)
+              (declare (ignore timeout deadline))
+              (incf cancel-count)
+              (setf cancelled-stream stream
+                    cancel-error-code error-code
+                    cancel-error-seen-p t)
+              (when (= cancel-count 1)
+                (error "Unknown stream cancel callback failed.")))
+            :try-read-stream
+            (lambda (stream &key timeout deadline)
+              (declare (ignore timeout deadline))
+              (cond
+                ((eq stream unknown-stream)
+                 (incf unknown-read-count)
+                 (if (= unknown-read-count 1)
+                     (progn
+                       (push :data unknown-read-statuses)
+                       (values
+                        (http-kit/http3:http3-varint-encode 64)
+                        nil :data))
+                     (progn
+                       (push :would-block unknown-read-statuses)
+                       (values nil nil :would-block))))
+                ((stringp (http3-test-stream-kind stream))
+                 (if (and cancel-error-seen-p (not response-sent-p))
+                     (progn
+                       (setf response-sent-p t)
+                       (values response-wire t :data))
+                     (values nil nil :would-block)))
+                (t (values nil nil :would-block)))))))
+    (unwind-protect
+         (let ((response
+                 (http-kit/http3:send-http3-request
+                  client
+                  (make-http-request
+                   :method "GET"
+                   :uri "https://example.test/cancel-error-drain"))))
+           (ensure-equal 200 (http-response-status response))
+           (ensure-equal 1 cancel-count)
+           (ensure-true (eq unknown-stream cancelled-stream))
+           (ensure-equal #x103 cancel-error-code)
+           (ensure-equal 1 accepted-count)
+           (ensure-true (member :data unknown-read-statuses))
+           (ensure-true cancel-error-seen-p)
+           (ensure-true (> unknown-read-count 1))
+           (ensure-true (member :would-block unknown-read-statuses))
+           (ensure-false (member :fin unknown-read-statuses))
+           (ensure-true (http-kit/http3:http3-client-open-p client))
+           (ensure-equal
+            nil
+            (http-kit/http3::http3-client-pending-peer-unidirectional-streams
+             client))
+           (ensure-equal
+            :drain
+            (cdr
+             (assoc
+              unknown-stream
+              (http-kit/http3::http3-client-discard-peer-unidirectional-streams
+               client)
+              :test (function eq))))
+           (ensure-equal
+            nil (http-kit/http3::http3-client-scheduler-close-state client)))
+      (when (http-kit/http3:http3-client-open-p client)
+        (http-kit/http3:close-http3-client client)))))
+
+(deftest http3-client-native-scheduler-dequeues-push-with-prefetched-wire
+  (let* ((promised-fields
+           (list (cons ":method" "GET")
+                 (cons ":scheme" "https")
+                 (cons ":authority" "example.test")
+                 (cons ":path" "/asset.css")))
+         (push-promise-wire
+           (http-kit/http3:encode-http3-frame
+            (http-kit/http3:make-http3-frame
+             :type http-kit/http3:+http3-push-promise-type+
+             :payload
+             (http3-test-concat-octets
+              (http-kit/http3:http3-varint-encode 2)
+              (http3-test-qpack-encode promised-fields)))))
+         (response-wire
+           (http3-test-concat-octets
+            push-promise-wire
+            (http-kit/http3:encode-http3-frame
+             (http-kit/http3:make-http3-frame
+              :type http-kit/http3:+http3-headers-type+
+              :payload
+              (http3-test-qpack-encode
+               (list (cons ":status" "204")))))))
+         (push-wire
+           (http3-test-concat-octets
+            (http-kit/http3:http3-varint-encode
+             http-kit/http3:+http3-push-stream-type+)
+            (http-kit/http3:http3-varint-encode 2)
+            (http3-test-native-response-wire (octets 1 2 3))))
+         (push-stream (make-http3-test-stream :kind :peer-push))
+         (pending-peer-streams nil)
+         (first-poll-p nil)
+         (push-wire-sent-p nil)
+         (response-streams (make-hash-table :test 'eq))
+         (promises nil)
+         (client
+           (http3-test-make-native-client
+            :poll-function
+            (lambda ()
+              (unless first-poll-p
+                (setf first-poll-p t
+                      pending-peer-streams (list push-stream))))
+            :accept-peer-unidirectional-stream
+            (lambda () (pop pending-peer-streams))
+            :read-stream
+            (lambda (stream &key timeout deadline)
+              (declare (ignore stream timeout deadline))
+              (values nil t))
+            :try-read-stream
+            (lambda (stream &key timeout deadline)
+              (declare (ignore timeout deadline))
+              (cond
+                ((eq stream push-stream)
+                 (if push-wire-sent-p
+                     (values nil nil :would-block)
+                     (progn
+                       (setf push-wire-sent-p t)
+                       (values push-wire t :data))))
+                ((stringp (http3-test-stream-kind stream))
+                 (if (gethash stream response-streams)
+                     (values nil nil :would-block)
+                     (progn
+                       (setf (gethash stream response-streams) t)
+                       (values response-wire t :data))))
+                (t (values nil nil :would-block)))))))
+    (unwind-protect
+         (progn
+           (http-kit/http3:advertise-http3-max-push-id client 2)
+           (let ((response
+                   (http-kit/http3:send-http3-request
+                    client
+                    (make-http-request
+                     :method "GET" :uri "https://example.test/push-parent")
+                    :on-push-promise
+                    (lambda (push-id fields)
+                      (push (list push-id fields) promises)))))
+             (ensure-equal 204 (http-response-status response)))
+           (ensure-equal (list (list 2 promised-fields)) promises)
+           (ensure-equal nil (http3-test-stream-reads push-stream))
+           (multiple-value-bind (dequeued-stream push-id)
+               (http-kit/http3:dequeue-http3-pending-push client)
+             (ensure-true (eq push-stream dequeued-stream))
+             (ensure-equal 2 push-id)
+             (multiple-value-bind (empty-stream empty-id)
+                 (http-kit/http3:dequeue-http3-pending-push client)
+               (ensure-equal nil empty-stream)
+               (ensure-equal nil empty-id))
+             (multiple-value-bind (received-id push-response)
+                 (http-kit/http3:receive-http3-push
+                  client dequeued-stream :stream-id 3)
+               (ensure-equal 2 received-id)
+               (ensure-equal 200 (http-response-status push-response))
+               (ensure-equal (octets 1 2 3)
+                             (http-response-body push-response))))
+           (ensure-equal '(2)
+                         (http-kit/http3:http3-client-consumed-push-ids client)))
+      (when (http-kit/http3:http3-client-open-p client)
+        (http-kit/http3:close-http3-client client)))))
+
+(deftest http3-client-native-scheduler-rejects-invalid-peer-push-ids
+  (dolist (case '((:unset nil (2))
+                  (:exceeded 1 (2))
+                  (:duplicate 2 (2 2))))
+    (destructuring-bind (name max-push-id push-ids) case
+      (let* ((peer-streams
+               (mapcar
+                (lambda (push-id)
+                  (make-http3-test-stream
+                   :kind :peer-push
+                   :reads
+                   (list
+                    (list
+                     (http3-test-concat-octets
+                      (http-kit/http3:http3-varint-encode
+                       http-kit/http3:+http3-push-stream-type+)
+                      (http-kit/http3:http3-varint-encode push-id))
+                     t))))
+                push-ids))
+             (pending-peer-streams nil)
+             (accepted-count 0)
+             (first-poll-p nil)
+             (client
+               (http3-test-make-native-client
+                :poll-function
+                (lambda ()
+                  (unless first-poll-p
+                    (setf first-poll-p t
+                          pending-peer-streams (copy-list peer-streams))))
+                :accept-peer-unidirectional-stream
+                (lambda ()
+                  (let ((stream (pop pending-peer-streams)))
+                    (when stream
+                      (incf accepted-count))
+                    stream))
+                :try-read-stream
+                (lambda (stream &key timeout deadline)
+                  (declare (ignore timeout deadline))
+                  (if (member stream peer-streams :test #'eq)
+                      (let ((entry (pop (http3-test-stream-reads stream))))
+                        (if entry
+                            (values (first entry) (second entry) :data)
+                            (values nil nil :would-block)))
+                      (values nil nil :would-block))))))
+        (unwind-protect
+             (progn
+               (when max-push-id
+                 (http-kit/http3:advertise-http3-max-push-id
+                  client max-push-id))
+               (let* ((failure
+                        (http3-boundary-error
+                         (lambda ()
+                           (http-kit/http3:send-http3-request
+                            client
+                            (make-http-request
+                             :method "GET"
+                             :uri (format nil "https://example.test/~(~A~)"
+                                          name))))))
+                      (protocol-failure
+                        (if (typep failure 'http-connection-error)
+                            (http-connection-error-cause failure)
+                            failure)))
+                 (ensure-true failure)
+                 (ensure-true (typep protocol-failure 'http-protocol-error))
+                 (ensure-equal
+                  :h3-id-error
+                  (and (typep protocol-failure 'http-protocol-error)
+                       (http-protocol-error-detail protocol-failure)))
+                 (ensure-equal (length peer-streams) accepted-count)))
+          (when (http-kit/http3:http3-client-open-p client)
+            (http-kit/http3:close-http3-client client)))))))
+
+(deftest http3-client-native-scheduler-push-dequeue-races-owner-enqueue
+  (let* ((push-read-started (sb-thread:make-semaphore :count 0))
+         (release-push-read (sb-thread:make-semaphore :count 0))
+         (response-read-started (sb-thread:make-semaphore :count 0))
+         (release-response (sb-thread:make-semaphore :count 0))
+         (push-prefix
+           (http3-test-concat-octets
+            (http-kit/http3:http3-varint-encode
+             http-kit/http3:+http3-push-stream-type+)
+            (http-kit/http3:http3-varint-encode 2)))
+         (response-wire (http3-test-native-response-wire))
+         (push-stream (make-http3-test-stream :kind :peer-push))
+         (pending-peer-streams nil)
+         (accepted-count 0)
+         (first-poll-p nil)
+         (push-prefix-sent-p nil)
+         (response-sent-p nil)
+         (client
+           (http3-test-make-native-client
+            :poll-function
+            (lambda ()
+              (unless first-poll-p
+                (setf first-poll-p t
+                      pending-peer-streams (list push-stream))))
+            :accept-peer-unidirectional-stream
+            (lambda ()
+              (let ((stream (pop pending-peer-streams)))
+                (when stream
+                  (incf accepted-count))
+                stream))
+            :try-read-stream
+            (lambda (stream &key timeout deadline)
+              (declare (ignore timeout deadline))
+              (cond
+                ((eq stream push-stream)
+                 (if push-prefix-sent-p
+                     (values nil nil :would-block)
+                     (progn
+                       (sb-thread:signal-semaphore push-read-started)
+                       (sb-thread:wait-on-semaphore release-push-read)
+                       (setf push-prefix-sent-p t)
+                       (values push-prefix nil :data))))
+                ((stringp (http3-test-stream-kind stream))
+                 (if response-sent-p
+                     (values nil nil :would-block)
+                     (progn
+                       (sb-thread:signal-semaphore response-read-started)
+                       (sb-thread:wait-on-semaphore release-response)
+                       (setf response-sent-p t)
+                       (values response-wire t :data))))
+                (t (values nil nil :would-block))))))
+         (owner-thread nil)
+         (owner-finished nil)
+         (owner-result nil))
+    (unwind-protect
+         (progn
+           (http-kit/http3:advertise-http3-max-push-id client 2)
+           (multiple-value-setq (owner-thread owner-finished owner-result)
+             (http3-test-start-native-call
+              (lambda ()
+                (http-kit/http3:send-http3-request
+                 client
+                 (make-http-request
+                  :method "GET"
+                  :uri "https://example.test/push-dequeue-race")))))
+           (ensure-true
+            (sb-thread:wait-on-semaphore push-read-started :timeout 3))
+           (multiple-value-bind (stream push-id)
+               (http-kit/http3:dequeue-http3-pending-push client)
+             (ensure-equal nil stream)
+             (ensure-equal nil push-id))
+           (sb-thread:signal-semaphore release-push-read)
+           (ensure-true
+            (sb-thread:wait-on-semaphore response-read-started :timeout 3))
+           (ensure-true (sb-thread:thread-alive-p owner-thread))
+           (multiple-value-bind (stream push-id)
+               (http-kit/http3:dequeue-http3-pending-push client)
+             (ensure-true (eq push-stream stream))
+             (ensure-equal 2 push-id)
+             (multiple-value-bind (duplicate-stream duplicate-id)
+                 (http-kit/http3:dequeue-http3-pending-push client)
+               (ensure-equal nil duplicate-stream)
+               (ensure-equal nil duplicate-id)))
+           (sb-thread:signal-semaphore release-response)
+           (ensure-true
+            (sb-thread:wait-on-semaphore owner-finished :timeout 3))
+           (ensure-equal :response (first owner-result))
+           (when (eq :response (first owner-result))
+             (ensure-equal
+              200
+              (http-response-status (second owner-result))))
+           (ensure-equal 1 accepted-count))
+      (sb-thread:signal-semaphore release-push-read)
+      (sb-thread:signal-semaphore release-response)
+      (when (http-kit/http3:http3-client-open-p client)
+        (http-kit/http3:close-http3-client client))
+      (http3-test-join-native-thread owner-thread owner-finished)))))
 
 (deftest http3-server-blocked-request-pauses-same-chunk
   (multiple-value-bind (decoder-table section instruction)
@@ -2374,6 +4024,7 @@
                      (http-kit/http3:make-http3-control-state :peer-role :server)
                      :qpack-decoder-context push-table
                      :qpack-http3-decoder-context push-adapter
+                     :max-push-id 2
                      :promised-push-ids (list 2)
                      :push-promises (list (cons 2 promise-fields))
                      :read-stream
@@ -2784,6 +4435,7 @@
                     (http-message-kit:qpack-make-http3-decoder-context
                      decoder-context :max-blocked-streams 1)))
              (http-kit/http3::%make-http3-client
+              :max-push-id 2
               :qpack-decoder-context decoder-context
               :qpack-http3-decoder-context decoder-adapter
               :push-promises (list (cons 2 promised-fields))
@@ -2833,6 +4485,7 @@
                       (http-message-kit:qpack-make-http3-decoder-context
                        decoder-context :max-blocked-streams 1)))
                (http-kit/http3::%make-http3-client
+                :max-push-id 2
                 :qpack-decoder-context decoder-context
                 :qpack-http3-decoder-context decoder-adapter
                 :push-promises (list (cons 2 promised-fields))
@@ -2911,6 +4564,7 @@
                       (http-message-kit:qpack-make-http3-decoder-context
                        decoder-context :max-blocked-streams 1)))
                (http-kit/http3::%make-http3-client
+                :max-push-id 2
                 :qpack-decoder-context decoder-context
                 :qpack-http3-decoder-context decoder-adapter
                 :read-stream
@@ -2944,7 +4598,8 @@
              (list
               (list 0 2 '() :h3-stream-creation-error)
               (list http-kit/http3:+http3-push-stream-type+ 3 '() :h3-id-error)
-              (list http-kit/http3:+http3-push-stream-type+ 2 '(2) :h3-id-error)))
+              (list http-kit/http3:+http3-push-stream-type+ 2 '(2) :h3-id-error)
+              (list http-kit/http3:+http3-push-stream-type+ 1 nil :h3-id-error)))
       (let* ((wire
                (http3-test-concat-octets
                 (http-kit/http3:http3-varint-encode (first case))
@@ -2952,6 +4607,7 @@
              (closed '())
              (client
                (http-kit/http3::%make-http3-client
+                :max-push-id 2
                 :push-promises (list (cons 2 promised-fields))
                 :consumed-push-ids (copy-list (third case))
                 :read-stream
@@ -3077,6 +4733,7 @@
            (http-kit/http3:http3-varint-encode 2))))
     (let ((client
             (http-kit/http3::%make-http3-client
+             :max-push-id 2
              :push-promises (list (cons 2 '()))
              :cancelled-push-ids '(2)
              :read-stream
@@ -3283,24 +4940,26 @@
      :hostname "example.test"
      :http3-options '(max-fields 16))))
 
-(defun make-http3-quic-adapter-test-client (&key (established-p t))
+(defun make-http3-quic-adapter-test-client (&key (established-p t) io-write)
   (http-kit/http3::%http3-quic-adapter-configure-protection)
   (let* ((connection (cl-quic-kit:make-quic-connection
-                      :now-fn (constantly 0)))
+                      :now-fn (constantly 0) :io-write io-write))
          (client (cl-quic-kit:make-quic-client
                   :connection connection :hostname "example.test"
                   :local-connection-id (octets 1 2 3 4)
                   :destination-connection-id (octets 5 6 7 8)
                   :now-fn (constantly 0))))
-    (setf (cl-quic-kit::quic-client-started-p client) t)
+    (cl-quic-kit:client-start client)
     (when established-p
       (cl-quic-kit:connection-set-state connection :established))
     client))
 
-(defun call-with-http3-quic-lifecycle-spies (operation &key client-poll)
+(defun call-with-http3-quic-lifecycle-spies
+    (operation &key client-poll client-close client-accept client-accept-streams)
   ;; These process-global spies require an isolated, serial test subprocess.
   (let* ((symbols '(cl-quic-kit:client-start cl-quic-kit:client-poll
-                    cl-quic-kit:client-close))
+                    cl-quic-kit:client-close cl-quic-kit:client-open-stream
+                    cl-quic-kit:client-accept-peer-stream))
          (originals (mapcar #'symbol-function symbols))
          (calls (make-hash-table :test #'eq)))
     (unwind-protect
@@ -3312,10 +4971,29 @@
                       (setf (symbol-function name)
                             (lambda (&rest arguments)
                               (push arguments (gethash name calls))
-                              (if (and (eq name 'cl-quic-kit:client-poll)
-                                       client-poll)
-                                  (apply client-poll arguments)
-                                  (apply function arguments))))))
+                              (cond
+                                ((and (eq name 'cl-quic-kit:client-poll) client-poll)
+                                 (apply client-poll arguments))
+                                ((and (eq name 'cl-quic-kit:client-close) client-close)
+                                 (apply client-close arguments))
+                                ((and (eq name 'cl-quic-kit:client-accept-peer-stream)
+                                      client-accept-streams)
+                                 (let ((values
+                                         (multiple-value-list
+                                          (apply client-accept-streams arguments))))
+                                   (when client-accept
+                                     (funcall client-accept
+                                              (first arguments) (first values)))
+                                   (values-list values)))
+                                ((and (eq name 'cl-quic-kit:client-accept-peer-stream)
+                                      client-accept)
+                                 (let ((values
+                                         (multiple-value-list
+                                          (apply function arguments))))
+                                   (funcall client-accept
+                                            (first arguments) (first values))
+                                   (values-list values)))
+                                (t (apply function arguments)))))))
            (funcall operation calls))
       (loop for symbol in symbols
             for original in originals
@@ -3339,44 +5017,109 @@
            (ensure-false (gethash 'cl-quic-kit:client-close calls))
            (ensure-equal :established
                          (cl-quic-kit:connection-state
-                          (cl-quic-kit::quic-client-connection quic)))
-           (ensure-false (cl-quic-kit::quic-client-closed-p quic))))
+                          (cl-quic-kit:quic-client-connection quic)))
+           (ensure-false (cl-quic-kit:quic-client-closed-p quic))))
       (http-kit/http3:close-http3-quic-adapter adapter))))
 
 (deftest http3-quic-adapter-lifecycle-close-and-closed-poll
-  (let* ((quic (make-http3-quic-adapter-test-client))
+  (let* ((writes nil)
+         (quic (make-http3-quic-adapter-test-client
+                :io-write (lambda (ignored bytes)
+                            (declare (ignore ignored))
+                            (push bytes writes))))
          (client (http-kit/http3::%make-http3-client))
          (adapter (http-kit/http3::%make-http3-quic-adapter
                    :quic-client quic :http3-client client)))
     (unwind-protect
          (call-with-http3-quic-lifecycle-spies
           (lambda (calls)
-           (ensure-true (http-kit/http3:http3-client-open-p client))
-           (ensure-true (http-kit/http3:close-http3-quic-adapter
-                         adapter :error-code :no-error :reason "Lifecycle close."))
-           (ensure-equal (list (list quic :error-code :no-error :reason "Lifecycle close."))
-                         (gethash 'cl-quic-kit:client-close calls))
-           (ensure-true (http-kit/http3::http3-quic-adapter-closed-p adapter))
-           (ensure-true (cl-quic-kit::quic-client-closed-p quic))
-           (ensure-false (http-kit/http3:http3-client-open-p client))
-           (let ((state (cl-quic-kit:connection-state
-                         (cl-quic-kit::quic-client-connection quic)))
-                 (frames (copy-list (cl-quic-kit::quic-client-pending-frames quic))))
-             (ensure-true (http-kit/http3:close-http3-quic-adapter adapter))
-             (ensure-equal (list (list quic :error-code :no-error :reason "Lifecycle close."))
-                           (gethash 'cl-quic-kit:client-close calls))
-             (ensure-true (eq adapter
-                              (http-kit/http3:http3-quic-adapter-poll adapter 100000)))
-             (ensure-equal state (cl-quic-kit:connection-state
-                                  (cl-quic-kit::quic-client-connection quic)))
-             (ensure-equal frames (cl-quic-kit::quic-client-pending-frames quic)))
-           (signals http-protocol-error
-             (http-kit/http3:http3-quic-adapter-start adapter))
-           (ensure-false (gethash 'cl-quic-kit:client-start calls))
-           (ensure-false (gethash 'cl-quic-kit:client-poll calls))
-           (ensure-equal (list (list quic :error-code :no-error :reason "Lifecycle close."))
-                         (gethash 'cl-quic-kit:client-close calls))))
+            (ensure-true (http-kit/http3:http3-client-open-p client))
+            (ensure-true (http-kit/http3:close-http3-quic-adapter
+                          adapter :error-code :no-error :reason "Lifecycle close."))
+            (ensure-equal (list (list quic :error-code :no-error :reason "Lifecycle close."))
+                          (gethash 'cl-quic-kit:client-close calls))
+            (ensure-true (http-kit/http3::http3-quic-adapter-closed-p adapter))
+            (ensure-true (cl-quic-kit:quic-client-closed-p quic))
+            (ensure-false (http-kit/http3:http3-client-open-p client))
+            (let ((state (cl-quic-kit:connection-state
+                          (cl-quic-kit:quic-client-connection quic)))
+                  (writes-after-close (copy-list writes)))
+              (ensure-true (http-kit/http3:close-http3-quic-adapter adapter))
+              (ensure-equal (list (list quic :error-code :no-error :reason "Lifecycle close."))
+                            (gethash 'cl-quic-kit:client-close calls))
+              (ensure-true (eq adapter
+                               (http-kit/http3:http3-quic-adapter-poll adapter 100000)))
+              (ensure-equal state
+                            (cl-quic-kit:connection-state
+                             (cl-quic-kit:quic-client-connection quic)))
+              (ensure-equal writes-after-close writes))
+            (signals http-protocol-error
+              (http-kit/http3:http3-quic-adapter-start adapter))
+            (ensure-false (gethash 'cl-quic-kit:client-start calls))
+            (ensure-false (gethash 'cl-quic-kit:client-poll calls))
+            (ensure-equal (list (list quic :error-code :no-error :reason "Lifecycle close."))
+                          (gethash 'cl-quic-kit:client-close calls))))
       (http-kit/http3:close-http3-quic-adapter adapter))))
+(deftest http3-quic-adapter-nested-close-releases-owner-claim
+  (let* ((quic (make-http3-quic-adapter-test-client))
+         (adapter nil)
+         (client nil)
+         (reentered-p nil))
+    (setf client
+          (http-kit/http3:make-http3-client
+           :open-stream
+           (lambda (request &key stream-type timeout deadline)
+             (declare (ignore request timeout deadline))
+             (make-http3-test-stream :kind stream-type))
+           :write-stream
+           (lambda (stream octets &key fin-p timeout deadline)
+             (declare (ignore stream octets fin-p timeout deadline)))
+           :read-stream
+           (lambda (stream &key timeout deadline)
+             (declare (ignore stream timeout deadline))
+             (values nil t))
+           :close-stream
+           (lambda (stream &key condition)
+             (declare (ignore condition))
+             (setf (http3-test-stream-closed-p stream) t))
+           :serialize
+           (lambda (thunk)
+             (unless reentered-p
+               (setf reentered-p t)
+               (ensure-false
+                (http-kit/http3:close-http3-quic-adapter adapter))
+               (ensure-true
+                (http-kit/http3::http3-client-scheduler-close-owner-active-p
+                 client))
+               (ensure-true
+                (eq (http-kit/http3::http3-client-scheduler-close-owner-thread
+                     client)
+                    (http-kit/http3::%h3-scheduler-current-thread)))
+               (ensure-false
+                (http-kit/http3::http3-quic-adapter-closed-p adapter))
+               (ensure-false (cl-quic-kit:quic-client-closed-p quic)))
+             (funcall thunk))))
+    (setf adapter
+          (http-kit/http3::%make-http3-quic-adapter
+           :quic-client quic :http3-client client))
+    (unwind-protect
+         (progn
+           (ensure-true (http-kit/http3:close-http3-client client))
+           (ensure-true reentered-p)
+           (ensure-equal :http3-closed
+                         (http-kit/http3::http3-client-scheduler-close-state client))
+           (ensure-false
+            (http-kit/http3::http3-client-scheduler-close-owner-active-p client))
+           (ensure-equal nil
+                         (http-kit/http3::http3-client-scheduler-close-owner-thread
+                          client))
+           (ensure-false (http-kit/http3::http3-quic-adapter-closed-p adapter))
+           (ensure-false (cl-quic-kit:quic-client-closed-p quic))
+           (ensure-true (http-kit/http3:close-http3-quic-adapter adapter))
+           (ensure-true (http-kit/http3::http3-quic-adapter-closed-p adapter))
+           (ensure-true (cl-quic-kit:quic-client-closed-p quic)))
+      (unless (http-kit/http3::http3-quic-adapter-closed-p adapter)
+        (http-kit/http3:close-http3-quic-adapter adapter)))))
 
 (deftest http3-quic-adapter-lifecycle-invalid-arguments
   (call-with-http3-quic-lifecycle-spies
@@ -3394,6 +5137,7 @@
          (failure (make-condition 'simple-error :format-control "Stream cleanup failed."))
          (cleanup-calls nil)
          (signaled 0)
+         (observed-failure nil)
          (client (http-kit/http3::%make-http3-client
                   :control-stream stream
                   :close-stream (lambda (closed-stream &key condition)
@@ -3408,16 +5152,21 @@
     (unwind-protect
          (call-with-http3-quic-lifecycle-spies
           (lambda (calls)
-            (ensure-true (http-kit/http3:close-http3-quic-adapter
-                          adapter :reason "Cleanup failure."))
+            (handler-case
+                (http-kit/http3:close-http3-quic-adapter
+                 adapter :reason "Cleanup failure.")
+              (error (condition)
+                (setf observed-failure condition)))
+            (ensure-true (eq failure observed-failure))
             (ensure-equal 1 signaled)
             (ensure-equal (list (list stream nil)) cleanup-calls)
             (ensure-equal (list (list quic :error-code :no-error :reason "Cleanup failure."))
                           (gethash 'cl-quic-kit:client-close calls))
             (ensure-true (http-kit/http3::http3-quic-adapter-closed-p adapter))
-            (ensure-true (cl-quic-kit::quic-client-closed-p quic))
+            (ensure-true (cl-quic-kit:quic-client-closed-p quic))
             (ensure-false (http-kit/http3:http3-client-open-p client))))
-      (http-kit/http3:close-http3-quic-adapter adapter))))
+      (unless (http-kit/http3::http3-quic-adapter-closed-p adapter)
+        (http-kit/http3:close-http3-quic-adapter adapter)))))
 
 (defun ensure-http3-quic-adapter-timeout (operation &key connect-p)
   (handler-case
@@ -3486,11 +5235,7 @@
                      (ensure-true (eq quic client))
                      (prog1 (funcall poll client at)
                        (when (= 2 (incf polls))
-                         (cl-quic-kit::%client-receive-frames
-                          client :1-rtt 1
-                          (list (cl-quic-kit:make-frame
-                                 :stream :stream-id (cl-quic-kit:stream-id stream)
-                                 :offset 0 :data payload :fin t :len-present t)))))))
+                         (cl-quic-kit:client-receive-frame client (cl-quic-kit:make-frame :stream :stream-id (cl-quic-kit:stream-id stream) :offset 0 :data payload :fin t :len-present t) :level :1-rtt)))))
              (setf (symbol-function 'cl-quic-kit:client-read-stream)
                    (lambda (&rest arguments)
                      (incf reads)
@@ -3530,32 +5275,36 @@
                 :destination-connection-id (octets 5 6 7 8)
                 :now-fn (constantly 0)))
          (stream (cl-quic-kit:client-open-stream quic nil))
-         (flow (cl-quic-kit::quic-client-flow-control quic))
          (payload (octets 17 23 42))
          (poll (symbol-function 'cl-quic-kit:client-poll))
-         (polls 0))
-    (setf (cl-quic-kit::quic-client-started-p quic) t
-          (cl-quic-kit::stream-send-max-offset stream) 0
-          (cl-quic-kit::flow-control-state-connection-max-data flow) 0)
+         (polls 0)
+         (writes-before-credit 0))
+    (cl-quic-kit:client-start quic)
     (cl-quic-kit:connection-set-state connection :established)
+    (cl-quic-kit:client-receive-frame
+     quic (cl-quic-kit:make-frame :max-data :maximum 0) :level :1-rtt)
+    (cl-quic-kit:client-receive-frame
+     quic (cl-quic-kit:make-frame
+           :max-stream-data :stream-id (cl-quic-kit:stream-id stream) :maximum 0)
+     :level :1-rtt)
     (unwind-protect
          (progn
            (cl-quic-kit:client-write-stream quic stream payload :fin-p t)
            (ensure-true (cl-quic-kit:client-stream-write-pending-p quic stream))
+           (setf writes-before-credit (length writes))
            (setf (symbol-function 'cl-quic-kit:client-poll)
                  (lambda (client &optional at)
                    (ensure-true (eq quic client))
                    (prog1 (funcall poll client at)
                      (case (incf polls)
                        (1
-                        (cl-quic-kit::%client-receive-frames
+                        (cl-quic-kit:client-receive-frames
                          client :1-rtt 1
                          (list (cl-quic-kit:make-frame :max-data :maximum 3)))
-                        (ensure-equal 3 (cl-quic-kit:flow-control-connection-max-data flow))
-                        (ensure-equal 0 (cl-quic-kit::stream-send-offset stream))
+                        (ensure-equal 0 (cl-quic-kit:stream-send-offset stream))
                         (ensure-true (cl-quic-kit:client-stream-write-pending-p client stream)))
                        (2
-                        (cl-quic-kit::%client-receive-frames
+                        (cl-quic-kit:client-receive-frames
                          client :1-rtt 2
                          (list (cl-quic-kit:make-frame
                                 :max-stream-data :stream-id (cl-quic-kit:stream-id stream)
@@ -3564,25 +5313,16 @@
             (eq quic (http-kit/http3::%http3-quic-adapter-await-stream-write
                       quic stream :timeout 1)))
            (ensure-equal 2 polls)
+           (ensure-true (> (length writes) writes-before-credit))
            (ensure-false (cl-quic-kit:client-stream-write-pending-p quic stream))
-           (ensure-equal 3 (cl-quic-kit::stream-send-offset stream))
-           (ensure-equal 3 (cl-quic-kit:flow-control-connection-sent flow))
-           (let ((frames (remove-if-not
-                          (lambda (frame) (eq :stream (cl-quic-kit:frame-type frame)))
-                          (mapcar #'cl-quic-kit:decode-frame (reverse writes)))))
-             (ensure-equal 1 (length frames))
-             (let ((frame (first frames)))
-               (ensure-equal (cl-quic-kit:stream-id stream)
-                             (cl-quic-kit:frame-field frame :stream-id))
-               (ensure-equal 0 (cl-quic-kit:frame-field frame :offset))
-               (ensure-octets-equal payload (cl-quic-kit:frame-field frame :data))
-               (ensure-true (cl-quic-kit:frame-field frame :fin)))))
+           (ensure-equal 3 (cl-quic-kit:stream-send-offset stream)))
       (setf (symbol-function 'cl-quic-kit:client-poll) poll)
       (cl-quic-kit:client-close quic))
     (ensure-true (eq poll (symbol-function 'cl-quic-kit:client-poll)))))
 
 (deftest http3-quic-adapter-factory-options-and-timeout-cleanup
   (let* ((constructor (symbol-function 'cl-quic-kit:make-quic-client))
+         (tls-driver-constructor (symbol-function 'cl-quic-kit:make-client-tls-driver))
          (provider (cl-tls-kit:make-cl-crypto-kit-provider))
          (clock (constantly 0))
          (local-id (octets 1 2 3 4))
@@ -3596,12 +5336,16 @@
          (close (lambda (&rest ignored)
                   (declare (ignore ignored)) (incf closed)))
          (arguments nil)
-         (quic nil))
+         (quic nil)
+         (driver nil))
     (unwind-protect
          (progn
            (setf (symbol-function 'cl-quic-kit:make-quic-client)
                  (lambda (&rest options)
-                   (setf arguments options quic (apply constructor options))))
+                   (setf arguments options quic (apply constructor options)))
+                 (symbol-function 'cl-quic-kit:make-client-tls-driver)
+                 (lambda (client)
+                   (setf driver (funcall tls-driver-constructor client))))
            (call-with-http3-quic-lifecycle-spies
             (lambda (calls)
               (ensure-http3-quic-adapter-timeout
@@ -3623,23 +5367,26 @@
              (ensure-true (eq (cdr option) (getf arguments (car option)))))
            (ensure-equal "example.test" (getf arguments :hostname))
            (ensure-equal 17 (getf arguments :idle-timeout))
-           (let ((driver (cl-quic-kit::quic-client-tls-driver quic)))
-             (ensure-true (eq provider (cl-tls-kit::tls13-client-driver-provider driver)))
-             (ensure-equal "example.test" (cl-tls-kit::tls13-client-driver-hostname driver))
-             (ensure-equal :required (cl-tls-kit::tls13-client-driver-verify driver))
-             (ensure-true (eq algorithms (cl-tls-kit::tls13-client-driver-signature-algorithms driver))))
-           (ensure-true (cl-quic-kit::quic-client-started-p quic))
-           (ensure-true (cl-quic-kit::quic-client-closed-p quic))
+           (ensure-true driver)
+           (ensure-true (eq provider (cl-tls-kit::tls13-client-driver-provider driver)))
+           (ensure-equal "example.test" (cl-tls-kit::tls13-client-driver-hostname driver))
+           (ensure-equal :required (cl-tls-kit::tls13-client-driver-verify driver))
+           (ensure-true (eq algorithms
+                            (cl-tls-kit::tls13-client-driver-signature-algorithms driver)))
+           (ensure-true (cl-quic-kit:quic-client-closed-p quic))
            (ensure-true (some (lambda (bytes) (plusp (length bytes))) writes))
            ;; The close callback runs after draining, not when cleanup initiates close.
            (ensure-equal :closing
                          (cl-quic-kit:connection-state
                           (cl-quic-kit:quic-client-connection quic)))
            (ensure-equal 0 closed))
-      (setf (symbol-function 'cl-quic-kit:make-quic-client) constructor)
-      (when (and quic (not (cl-quic-kit::quic-client-closed-p quic)))
+      (setf (symbol-function 'cl-quic-kit:make-quic-client) constructor
+            (symbol-function 'cl-quic-kit:make-client-tls-driver) tls-driver-constructor)
+      (when (and quic (not (cl-quic-kit:quic-client-closed-p quic)))
         (cl-quic-kit:client-close quic)))
-    (ensure-true (eq constructor (symbol-function 'cl-quic-kit:make-quic-client)))))
+    (ensure-true (eq constructor (symbol-function 'cl-quic-kit:make-quic-client)))
+    (ensure-true (eq tls-driver-constructor
+                     (symbol-function 'cl-quic-kit:make-client-tls-driver)))))
 
 (deftest http3-quic-adapter-factory-tls-refusal-cleanup
   (let ((constructor (symbol-function 'cl-quic-kit:make-quic-client))
@@ -3660,14 +5407,7 @@
                      ;; Finished before ServerHello exercises the actual TLS state machine.
                      (handler-bind ((cl-tls-kit:tls13-client-driver-error
                                       (lambda (condition) (setf tls-failure condition))))
-                       (cl-quic-kit::%client-receive-frames
-                        client :initial 1
-                        (list (cl-quic-kit:make-frame
-                               :crypto :offset 0
-                               :data (concatenate '(vector (unsigned-byte 8))
-                                                  (octets 20 0 0 32)
-                                                  (make-array 32 :element-type '(unsigned-byte 8)
-                                                                 :initial-element 0)))))))))
+                       (cl-quic-kit:client-receive-frame client (cl-quic-kit:make-frame :crypto :offset 0 :data (concatenate '(vector (unsigned-byte 8)) (octets 20 0 0 32) (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))) :level :initial)))))
            (call-with-http3-quic-lifecycle-spies
             (lambda (calls)
               (handler-case
@@ -3690,10 +5430,10 @@
              (ensure-equal (cl-tls-kit:tls13-client-driver-error-reason tls-failure)
                            (http-protocol-error-detail cause)))
            (ensure-equal 1 polls)
-           (ensure-true (cl-quic-kit::quic-client-closed-p quic)))
+           (ensure-true (cl-quic-kit:quic-client-closed-p quic)))
       (setf (symbol-function 'cl-quic-kit:make-quic-client) constructor
             (symbol-function 'cl-quic-kit:client-poll) poll)
-      (when (and quic (not (cl-quic-kit::quic-client-closed-p quic)))
+      (when (and quic (not (cl-quic-kit:quic-client-closed-p quic)))
         (cl-quic-kit:client-close quic)))
     (ensure-true (eq constructor (symbol-function 'cl-quic-kit:make-quic-client)))
     (ensure-true (eq poll (symbol-function 'cl-quic-kit:client-poll)))))
@@ -3714,13 +5454,14 @@
 (deftest http3-quic-adapter-expired-write-flow-control-deadlines
   (dolist (limits '((:timeout 0) (:deadline 0)))
     (let* ((quic (make-http3-quic-adapter-test-client))
-           (stream (cl-quic-kit:client-open-stream quic nil))
-           (flow (cl-quic-kit::quic-client-flow-control quic)))
+           (stream (cl-quic-kit:client-open-stream quic nil)))
       (unwind-protect
            (progn
-             (setf (cl-quic-kit::flow-control-state-connection-max-data flow) 0)
+             (cl-quic-kit:client-receive-frame
+              quic (cl-quic-kit:make-frame :max-data :maximum 0) :level :1-rtt)
              (cl-quic-kit:client-write-stream quic stream (octets 1))
              (ensure-true (cl-quic-kit:client-stream-write-pending-p quic stream))
+             (ensure-equal 0 (cl-quic-kit:stream-send-offset stream))
              (ensure-http3-quic-adapter-timeout
               (lambda ()
                 (apply #'http-kit/http3::%http3-quic-adapter-await-stream-write
@@ -3785,7 +5526,7 @@
                 (setf (http-kit/http3:http3-quic-adapter-http3-client adapter) client)
                 (http-kit/http3::%http3-quic-adapter-await-peer-settings
                  quic client :timeout 0)))))
-           (ensure-true (cl-quic-kit::quic-client-closed-p quic))
+           (ensure-true (cl-quic-kit:quic-client-closed-p quic))
            (ensure-true (not (http-kit/http3:http3-client-open-p client)))
            (ensure-true (http-kit/http3::http3-quic-adapter-closed-p adapter)))
       (http-kit/http3:close-http3-quic-adapter adapter))))
@@ -3803,7 +5544,7 @@
                            (setf (http-kit/http3:http3-quic-adapter-http3-client
                                   adapter) client)
                            adapter))))
-           (ensure-true (not (cl-quic-kit::quic-client-closed-p quic)))
+           (ensure-true (not (cl-quic-kit:quic-client-closed-p quic)))
            (ensure-true (http-kit/http3:http3-client-open-p client)))
       (http-kit/http3:close-http3-quic-adapter adapter))))
 
@@ -3812,21 +5553,22 @@
     (let* ((quic (make-http3-quic-adapter-test-client :established-p nil))
            (adapter (http-kit/http3::%make-http3-quic-adapter :quic-client quic)))
       (unwind-protect
-           (progn
-             (ensure-http3-quic-adapter-timeout
-              (lambda ()
-                (http-kit/http3::%http3-quic-adapter-initialize
-                 adapter
-                 (lambda ()
-                   (http-kit/http3::%http3-quic-adapter-connect
-                    (lambda ()
-                      (cl-quic-kit:client-start quic)
-                      (apply #'http-kit/http3::%http3-quic-adapter-await-established
-                             quic limits)))
-                   (error "HTTP/3 initialization must not run after a failed handshake."))))
-              :connect-p t)
-             (ensure-true (cl-quic-kit::quic-client-closed-p quic))
-             (ensure-equal 0 (hash-table-count (cl-quic-kit::quic-client-streams quic))))
+           (call-with-http3-quic-lifecycle-spies
+            (lambda (calls)
+              (ensure-http3-quic-adapter-timeout
+               (lambda ()
+                 (http-kit/http3::%http3-quic-adapter-initialize
+                  adapter
+                  (lambda ()
+                    (http-kit/http3::%http3-quic-adapter-connect
+                     (lambda ()
+                       (cl-quic-kit:client-start quic)
+                       (apply #'http-kit/http3::%http3-quic-adapter-await-established
+                              quic limits)))
+                    (error "HTTP/3 initialization must not run after a failed handshake."))))
+               :connect-p t)
+              (ensure-true (cl-quic-kit:quic-client-closed-p quic))
+              (ensure-false (gethash 'cl-quic-kit:client-open-stream calls))))
         (http-kit/http3:close-http3-quic-adapter adapter)))))
 
 (deftest http3-quic-adapter-handshake-failure-is-unsent
@@ -3834,24 +5576,25 @@
          (adapter (http-kit/http3::%make-http3-quic-adapter :quic-client quic))
          (failure nil))
     (unwind-protect
-         (progn
-           (handler-case
-               (http-kit/http3::%http3-quic-adapter-initialize
-                adapter
-                (lambda ()
-                  (http-kit/http3::%http3-quic-adapter-connect
-                   (lambda ()
-                     (cl-quic-kit:client-close quic)
-                     (http-kit/http3::%http3-quic-adapter-await-established
-                      quic)))
-                  (error "HTTP/3 initialization must not run after a failed handshake.")))
-             (http-connection-error (condition)
-               (setf failure condition)))
-           (ensure-true failure)
-           (ensure-true (cl-quic-kit::quic-client-closed-p quic))
-           (ensure-true (not (http-connection-error-request-sent-p failure)))
-           (ensure-true (typep (http-connection-error-cause failure) 'http-protocol-error))
-           (ensure-equal 0 (hash-table-count (cl-quic-kit::quic-client-streams quic))))
+         (call-with-http3-quic-lifecycle-spies
+          (lambda (calls)
+            (handler-case
+                (http-kit/http3::%http3-quic-adapter-initialize
+                 adapter
+                 (lambda ()
+                   (http-kit/http3::%http3-quic-adapter-connect
+                    (lambda ()
+                      (cl-quic-kit:client-close quic)
+                      (http-kit/http3::%http3-quic-adapter-await-established
+                       quic)))
+                   (error "HTTP/3 initialization must not run after a failed handshake.")))
+              (http-connection-error (condition)
+                (setf failure condition)))
+            (ensure-true failure)
+            (ensure-true (cl-quic-kit:quic-client-closed-p quic))
+            (ensure-true (not (http-connection-error-request-sent-p failure)))
+            (ensure-true (typep (http-connection-error-cause failure) 'http-protocol-error))
+            (ensure-false (gethash 'cl-quic-kit:client-open-stream calls))))
       (http-kit/http3:close-http3-quic-adapter adapter))))
 
 (deftest http3-quic-adapter-request-failures-remain-sent
@@ -3910,12 +5653,14 @@
 
 (deftest http3-quic-adapter-peer-control-stream-id
   (dolist (id '(3 7))
-    (let* ((quic (make-http3-quic-adapter-test-client))
-           (stream (cl-quic-kit:make-stream id)))
+    (let ((quic (make-http3-quic-adapter-test-client)))
       (unwind-protect
            (progn
-             (cl-quic-kit:stream-receive-data stream 0 (octets 0 4 0))
-             (setf (gethash id (cl-quic-kit::quic-client-streams quic)) stream)
+             (cl-quic-kit:client-receive-frame
+              quic (cl-quic-kit:make-frame
+                    :stream :stream-id id :offset 0 :data (octets 0 4 0)
+                    :len-present t)
+              :level :1-rtt)
              (ensure-true
               (eq quic
                   (http-kit/http3::%http3-quic-adapter-await-peer-control-data
@@ -3926,9 +5671,11 @@
   (let* ((quic (make-http3-quic-adapter-test-client))
          (encoder (cl-quic-kit:make-stream 3))
          (control (cl-quic-kit:make-stream 7))
+         (pending-streams (list encoder control))
+         (accepted-streams nil)
          (polls 0)
-         (reads 0)
-         (table (http-message-kit:make-qpack-context :max-table-capacity 0 :table-capacity 0 :huffman nil))
+         (table (http-message-kit:make-qpack-context
+                 :max-table-capacity 0 :table-capacity 0 :huffman nil))
          (client
            (http-kit/http3::%make-http3-client
             :qpack-encoder-context table
@@ -3938,80 +5685,251 @@
             :read-stream
             (lambda (stream &key timeout deadline)
               (declare (ignore timeout deadline))
-              (incf reads)
               (ensure-true (plusp (cl-quic-kit:stream-readable-bytes stream)))
               (cl-quic-kit:client-read-stream quic stream)))))
     (unwind-protect
          (progn
-           (ensure-true
-            (eq client
-                (http-kit/http3::%http3-quic-adapter-await-peer-settings
-                 quic client :timeout 1
-                 :poll
-                 (lambda (ignored-client)
-                   (declare (ignore ignored-client))
-                   (incf polls)
-                   (case polls
-                     (1
-                      (cl-quic-kit:stream-receive-data encoder 0 (octets 2))
-                      (setf (gethash 3 (cl-quic-kit::quic-client-streams quic)) encoder))
-                     (2
-                      (cl-quic-kit:stream-receive-data encoder 1 (octets 32))
-                      (setf (gethash 7 (cl-quic-kit::quic-client-streams quic)) control))
-                     (3
-                      (cl-quic-kit:stream-receive-data control 0 (octets 0 4 0))))))))
+           (call-with-http3-quic-lifecycle-spies
+            (lambda (calls)
+              (declare (ignore calls))
+              (ensure-true
+               (eq client
+                   (http-kit/http3::%http3-quic-adapter-await-peer-settings
+                    quic client :timeout 1
+                    :poll
+                    (lambda (ignored-client)
+                      (declare (ignore ignored-client))
+                      (incf polls)
+                      (case polls
+                        (1
+                         (cl-quic-kit:stream-receive-data
+                          encoder 0 (octets 2)))
+                        (2
+                         (cl-quic-kit:stream-receive-data
+                          encoder 1 (octets 32))
+                         (cl-quic-kit:stream-receive-data
+                          control 0 (octets)))
+                        (3
+                         (cl-quic-kit:stream-receive-data
+                          control 0 (octets 0 4 0)))))))))
+            :client-accept-streams
+            (lambda (&rest ignored)
+              (declare (ignore ignored))
+              (pop pending-streams))
+            :client-accept
+            (lambda (ignored-client stream)
+              (declare (ignore ignored-client))
+              (when stream (push stream accepted-streams))))
            (ensure-equal 3 polls)
-           (ensure-equal 2 reads)
            (ensure-equal 2 (http-kit/http3::http3-client-peer-unidirectional-stream-count
                             client))
-           (ensure-true (eq encoder
-                            (http-kit/http3:http3-client-peer-qpack-encoder-stream client)))
-           (ensure-true (eq control
-                            (http-kit/http3:http3-client-peer-control-stream client)))
-           (ensure-equal 1 (cl-quic-kit:stream-readable-bytes encoder)))
+           (let ((encoder (find 3 accepted-streams :key #'cl-quic-kit:stream-id))
+                 (control (find 7 accepted-streams :key #'cl-quic-kit:stream-id)))
+             (ensure-true encoder)
+             (ensure-true control)
+             (ensure-true (eq encoder
+                              (http-kit/http3:http3-client-peer-qpack-encoder-stream client)))
+             (ensure-true (eq control
+                              (http-kit/http3:http3-client-peer-control-stream client)))
+             (ensure-equal 1 (cl-quic-kit:stream-readable-bytes encoder))))
       (cl-quic-kit:client-close quic))))
+
+(deftest http3-quic-adapter-queues-push-before-peer-settings
+  (let* ((quic (make-http3-quic-adapter-test-client))
+         (push-stream (cl-quic-kit:make-stream 3))
+         (control (cl-quic-kit:make-stream 7))
+         (pending-streams nil)
+         (polls 0)
+         (push-accepted-poll nil)
+         (settings-received-when-push-accepted-p nil)
+         (body (octets 9 8 7))
+         (promise-fields
+           (list (cons ":method" "GET")
+                 (cons ":scheme" "https")
+                 (cons ":authority" "example.test")
+                 (cons ":path" "/asset")))
+         (response-wire
+           (http3-test-concat-octets
+            (http-kit/http3:encode-http3-frame
+             (http-kit/http3:make-http3-frame
+              :type http-kit/http3:+http3-headers-type+
+              :payload
+              (http3-test-qpack-encode
+               (list (cons ":status" "200")
+                     (cons "content-length" "3"))
+               :use-dynamic-p nil)))
+            (http-kit/http3:encode-http3-frame
+             (http-kit/http3:make-http3-frame
+              :type http-kit/http3:+http3-data-type+
+              :payload body))))
+         (push-wire
+           (http3-test-concat-octets
+            (http-kit/http3:http3-varint-encode
+             http-kit/http3:+http3-push-stream-type+)
+            (http-kit/http3:http3-varint-encode 2)
+            response-wire))
+         (control-wire
+           (http3-test-concat-octets
+            (http-kit/http3:http3-control-stream-prefix)
+            (http-kit/http3:encode-http3-frame
+             (http-kit/http3:make-http3-settings-frame
+              :qpack-max-table-capacity 0
+              :qpack-blocked-streams 0))))
+         (table (http-message-kit:make-qpack-context
+                 :max-table-capacity 0 :table-capacity 0 :huffman nil))
+         (decoder
+           (http-message-kit:qpack-make-http3-decoder-context
+            table :max-blocked-streams 0))
+         (client
+           (http-kit/http3::%make-http3-client
+            :qpack-encoder-context table
+            :qpack-decoder-context table
+            :qpack-http3-decoder-context decoder
+            :max-push-id 2
+            :promised-push-ids (list 2)
+            :push-promises (list (cons 2 promise-fields))
+            :peer-control-state
+            (http-kit/http3:make-http3-control-state :peer-role :server)
+            :read-stream
+            (lambda (stream &key timeout deadline)
+              (declare (ignore timeout deadline))
+              (cl-quic-kit:client-read-stream quic stream))
+            :close-stream
+            (lambda (stream &key condition)
+              (declare (ignore stream condition)))))
+         (adapter
+           (http-kit/http3::%make-http3-quic-adapter
+            :quic-client quic :http3-client client)))
+    (unwind-protect
+         (progn
+           (call-with-http3-quic-lifecycle-spies
+            (lambda (calls)
+              (declare (ignore calls))
+              (ensure-true
+               (eq client
+                   (http-kit/http3::%http3-quic-adapter-await-peer-settings
+                    quic client :timeout 1 :adapter adapter
+                    :poll
+                    (lambda (ignored-client)
+                      (declare (ignore ignored-client))
+                      (incf polls)
+                      (case polls
+                        (1
+                         (cl-quic-kit:stream-receive-data
+                          push-stream 0 push-wire :fin t)
+                         (setf pending-streams (list push-stream)))
+                        (2
+                         (cl-quic-kit:stream-receive-data
+                          control 0 control-wire)
+                         (setf pending-streams (list control)))))))))
+            :client-accept-streams
+            (lambda (&rest ignored)
+              (declare (ignore ignored))
+              (pop pending-streams))
+            :client-accept
+            (lambda (ignored-client stream)
+              (declare (ignore ignored-client))
+              (when (eq stream push-stream)
+                (setf push-accepted-poll polls
+                      settings-received-when-push-accepted-p
+                      (http-kit/http3:http3-control-state-settings-received-p
+                       (http-kit/http3:http3-client-peer-control-state client))))))
+           (ensure-equal 2 polls)
+           (ensure-equal 1 push-accepted-poll)
+           (ensure-false settings-received-when-push-accepted-p)
+           (ensure-true
+            (http-kit/http3:http3-control-state-settings-received-p
+             (http-kit/http3:http3-client-peer-control-state client)))
+           (ensure-equal 2 (http-kit/http3:http3-client-max-push-id client))
+           (multiple-value-bind (dequeued-stream push-id)
+               (http-kit/http3:dequeue-http3-pending-push client)
+             (ensure-true (eq push-stream dequeued-stream))
+             (ensure-equal 2 push-id)
+             (multiple-value-bind (empty-stream empty-id)
+                 (http-kit/http3:dequeue-http3-pending-push client)
+               (ensure-equal nil empty-stream)
+               (ensure-equal nil empty-id))
+             (multiple-value-bind (received-id response)
+                 (http-kit/http3:receive-http3-push
+                  client dequeued-stream :stream-id 3)
+               (ensure-equal 2 received-id)
+               (ensure-equal 200 (http-response-status response))
+               (ensure-equal body (http-response-body response))))
+           (ensure-equal
+            (list 2) (http-kit/http3:http3-client-consumed-push-ids client)))
+      (http-kit/http3:close-http3-quic-adapter adapter))))
 
 (deftest http3-quic-adapter-fragmented-prefix-does-not-block-control
   (let* ((quic (make-http3-quic-adapter-test-client))
          (incomplete (cl-quic-kit:make-stream 3))
          (control (cl-quic-kit:make-stream 7))
-         (reads 0)
-         (table (http-message-kit:make-qpack-context :max-table-capacity 0 :table-capacity 0 :huffman nil))
+         (pending-streams (list incomplete control))
+         (incomplete-observed nil)
+         (control-observed nil)
+         (table (http-message-kit:make-qpack-context
+                 :max-table-capacity 0 :table-capacity 0 :huffman nil))
          (client
            (http-kit/http3::%make-http3-client
             :qpack-encoder-context table
             :qpack-decoder-context table
+            :qpack-http3-decoder-context
+            (http-message-kit:qpack-make-http3-decoder-context
+             table :max-blocked-streams 0)
             :peer-control-state
             (http-kit/http3:make-http3-control-state :peer-role :server)
             :read-stream
             (lambda (stream &key timeout deadline)
               (declare (ignore timeout deadline))
-              (incf reads)
-              (ensure-true (eq stream control))
               (cl-quic-kit:client-read-stream quic stream)))))
+    (cl-quic-kit:stream-receive-data incomplete 0 (octets 128))
+    (cl-quic-kit:stream-receive-data control 0 (octets 0 4 0))
     (unwind-protect
          (progn
-           (cl-quic-kit:stream-receive-data incomplete 0 (octets 64))
-           (cl-quic-kit:stream-receive-data control 0 (octets 0 4 0))
-           (setf (gethash 3 (cl-quic-kit::quic-client-streams quic)) incomplete
-                 (gethash 7 (cl-quic-kit::quic-client-streams quic)) control)
-           (ensure-true
-            (eq client
-                (http-kit/http3::%http3-quic-adapter-await-peer-settings
-                 quic client :timeout 1
-                 :poll (lambda (ignored-client) (declare (ignore ignored-client))))))
-           (ensure-equal 1 reads)
+           (call-with-http3-quic-lifecycle-spies
+            (lambda (calls)
+              (declare (ignore calls))
+              (ensure-true
+               (eq client
+                   (http-kit/http3::%http3-quic-adapter-await-peer-settings
+                    quic client :timeout 1
+                    :poll
+                    (lambda (ignored-client)
+                      (declare (ignore ignored-client)))))))
+            :client-accept-streams
+            (lambda (&rest ignored)
+              (declare (ignore ignored))
+              (pop pending-streams))
+            :client-accept
+            (lambda (ignored-client stream)
+              (declare (ignore ignored-client))
+              (when stream
+                (case (cl-quic-kit:stream-id stream)
+                  (3 (setf incomplete-observed stream))
+                  (7 (setf control-observed stream))))))
            (ensure-equal 1 (http-kit/http3::http3-client-peer-unidirectional-stream-count
                             client))
-           (ensure-equal 1 (cl-quic-kit:stream-readable-bytes incomplete)))
+           (ensure-true (eq incomplete incomplete-observed))
+           (ensure-true (eq control control-observed))
+           (ensure-equal 0 (cl-quic-kit:stream-readable-bytes incomplete))
+           (cl-quic-kit:stream-receive-data incomplete 1 (octets 0 0 2 32))
+           (ensure-equal
+            :qpack-encoder
+            (http-kit/http3:accept-http3-peer-unidirectional-stream
+             client incomplete))
+           (multiple-value-bind (events ended-p)
+               (http-kit/http3:read-http3-qpack-encoder-stream client)
+             (ensure-equal '((:set-capacity 0)) events)
+             (ensure-equal nil ended-p)))
       (cl-quic-kit:client-close quic))))
 
 (deftest http3-quic-adapter-fragmented-settings
   (let* ((quic (make-http3-quic-adapter-test-client))
          (control (cl-quic-kit:make-stream 3))
+         (pending-streams (list control))
          (polls 0)
          (reads 0)
-         (table (http-message-kit:make-qpack-context :max-table-capacity 0 :table-capacity 0 :huffman nil))
+         (table (http-message-kit:make-qpack-context
+                 :max-table-capacity 0 :table-capacity 0 :huffman nil))
          (client
            (http-kit/http3::%make-http3-client
             :qpack-encoder-context table
@@ -4024,23 +5942,36 @@
               (incf reads)
               (ensure-true (plusp (cl-quic-kit:stream-readable-bytes stream)))
               (cl-quic-kit:client-read-stream quic stream)))))
+    (cl-quic-kit:stream-receive-data control 0 (octets))
     (unwind-protect
          (progn
-           (setf (gethash 3 (cl-quic-kit::quic-client-streams quic)) control)
-           (ensure-true
-            (eq client
-                (http-kit/http3::%http3-quic-adapter-await-peer-settings
-                 quic client :timeout 1
-                 :poll
-                 (lambda (ignored-client)
-                   (declare (ignore ignored-client))
-                   (incf polls)
-                   (case polls
-                     (1 (cl-quic-kit:stream-receive-data control 0 (octets 0)))
-                     (3 (cl-quic-kit:stream-receive-data control 1 (octets 4)))
-                     (5 (cl-quic-kit:stream-receive-data control 2 (octets 0))))))))
+           (call-with-http3-quic-lifecycle-spies
+            (lambda (calls)
+              (declare (ignore calls))
+              (ensure-true
+               (eq client
+                   (http-kit/http3::%http3-quic-adapter-await-peer-settings
+                    quic client :timeout 1
+                    :poll
+                    (lambda (ignored-client)
+                      (declare (ignore ignored-client))
+                      (incf polls)
+                      (case polls
+                        (1
+                         (cl-quic-kit:stream-receive-data
+                          control 0 (octets 0)))
+                        (3
+                         (cl-quic-kit:stream-receive-data
+                          control 1 (octets 4)))
+                        (5
+                         (cl-quic-kit:stream-receive-data
+                          control 2 (octets 0)))))))))
+            :client-accept-streams
+            (lambda (&rest ignored)
+              (declare (ignore ignored))
+              (pop pending-streams)))
            (ensure-equal 5 polls)
-           (ensure-equal 3 reads)
+           (ensure-equal 2 reads)
            (ensure-true
             (http-kit/http3:http3-control-state-settings-received-p
              (http-kit/http3::http3-client-peer-control-state client))))
@@ -5883,6 +7814,77 @@
                            (http-protocol-error-detail failure)))
            (ensure-equal nil (http3-test-stream-reads decoder)))
       (http-kit/http3:close-http3-client client))))
+(deftest http3-transport-boundary-peer-stream-buffer-limit
+  (let* ((client
+           (http3-transport-boundary-client
+            :max-state-bytes 2
+            :max-push-id 0))
+         (stream
+           (make-http3-test-stream
+            :reads (list (list (octets #x01 #x00 #x05 #x06 #x07) nil))))
+         (failure nil))
+    (unwind-protect
+         (progn
+           (handler-case
+               (http-kit/http3:accept-http3-peer-unidirectional-stream
+                client stream)
+             (http-protocol-error (condition)
+               (setf failure condition)))
+           (ensure-true
+            (typep failure (quote http-protocol-error)))
+           (ensure-equal :http3-transport (http-error-operation failure))
+           (ensure-equal (list :h3-excessive-load 2 5)
+                         (http-protocol-error-detail failure))
+           (ensure-equal nil
+                         (http-kit/http3::http3-client-prefetched-stream-inputs
+                          client))
+           (ensure-equal nil (http3-test-stream-reads stream)))
+      (http-kit/http3:close-http3-client client))))
+(deftest http3-client-native-scheduler-peer-stream-buffer-limit
+  (let* ((stream (make-http3-test-stream :kind :push))
+         (wire (octets #x01 #x00 #x05 #x06))
+         (accepted (list stream))
+         (client
+           (http3-transport-boundary-client
+            :max-state-bytes 3
+            :max-push-id 0
+            :poll-function (lambda () nil)
+            :try-read-stream
+            (lambda (actual &key timeout deadline)
+              (declare (ignore timeout deadline))
+              (ensure-true (eq stream actual))
+              (values wire nil :data))
+            :stream-write-pending-p
+            (lambda (actual)
+              (declare (ignore actual))
+              nil)
+            :accept-peer-unidirectional-stream
+            (lambda () (pop accepted))))
+         (failure nil))
+    (unwind-protect
+         (progn
+           (handler-case
+               (http-kit/http3::%h3-scheduler-discover-peer-unidirectional-streams
+                client)
+             (http-protocol-error (condition)
+               (setf failure condition)))
+           (ensure-true (typep failure 'http-protocol-error))
+           (ensure-equal :http3-transport (http-error-operation failure))
+           (ensure-equal
+            (list :h3-excessive-load 3 4)
+            (http-protocol-error-detail failure))
+           (ensure-equal nil
+                         (http-kit/http3::http3-client-prefetched-stream-inputs
+                          client))
+           (ensure-equal nil
+                         (http-kit/http3::http3-client-peer-unidirectional-prefix-buffers
+                          client))
+           (ensure-equal nil (http-kit/http3::http3-client-pending-push-streams
+                              client))
+           (ensure-equal 1
+                         (http-kit/http3::http3-client-peer-unidirectional-stream-count
+                          client)))
+      (http-kit/http3:close-http3-client client))))
 
 (deftest http3-transport-boundary-peer-stream-cap
   (let* ((reads 0)
@@ -6214,7 +8216,7 @@
                   :destination-connection-id
                   (make-array 4 :element-type '(unsigned-byte 8)
                                 :initial-element 2))))
-    (setf (cl-quic-kit::quic-client-started-p client) t)
+    (cl-quic-kit:client-start client)
     (cl-quic-kit:connection-set-state connection :established)
     (let ((stream (cl-quic-kit:client-open-stream client nil)))
       (cl-quic-kit:stream-receive-data
@@ -6350,12 +8352,14 @@
            (setf (symbol-function name)
                  (lambda (&rest arguments)
                    (setf quic (apply original arguments))
-                   (let ((peer-control (cl-quic-kit:make-stream 3)))
-                     (cl-quic-kit:stream-receive-data peer-control 0 (octets 0 4 0))
-                     (setf (gethash 3 (cl-quic-kit::quic-client-streams quic))
-                           peer-control))
-                   (setf (cl-quic-kit::quic-client-started-p quic) t)
+                   (cl-quic-kit:client-start quic)
+                   (setf writes nil)
                    (cl-quic-kit:connection-set-state connection :established)
+                   (cl-quic-kit:client-receive-frame
+                    quic (cl-quic-kit:make-frame
+                          :stream :stream-id 3 :offset 0
+                          :data (octets 0 4 0) :len-present t)
+                    :level :1-rtt)
                    quic))
            (setf adapter
                  (http-kit/http3:make-http3-quic-adapter
@@ -6405,7 +8409,7 @@
         (ensure-equal (length expected) offset)))
     (ensure-octets-equal expected received)
     (ensure-equal (length expected) offset)
-    (ensure-equal offset (cl-quic-kit::stream-send-offset stream))
+    (ensure-equal offset (cl-quic-kit:stream-send-offset stream))
     (ensure-equal (if fin-p 1 0) fin-count)
     selected))
 
@@ -6461,7 +8465,7 @@
                   nil :stream-type :request)
        (ensure-equal 0 id)
        (ensure-equal id (cl-quic-kit:stream-id stream))
-       (ensure-equal 0 (cl-quic-kit::stream-send-offset stream))
+       (ensure-equal 0 (cl-quic-kit:stream-send-offset stream))
        (funcall (http-kit/http3:http3-client-write-stream client)
                 stream (octets 0 2 3 90) :fin-p t)
        (ensure-false (cl-quic-kit:client-stream-write-pending-p quic stream))
@@ -10218,7 +12222,6 @@
                  (count owned (http3-boundary-fixture-closes fixture)
                         :key (function car) :test (function eq)))))))))
 ))
-
 (defun http3-check-manager-proxy-plan (plan accepted-p)
   (let* ((request (make-http-request
                    :method "GET" :uri "https://proxy-plan.example/resource"))
@@ -11082,4 +13085,526 @@
        0)
       (ensure-equal 0 reads)
       (http-kit/http3:close-http3-client client))))
+(deftest http3-client-native-scheduler-submit-rejects-at-stream-limit
+  (let* ((poll-started (sb-thread:make-semaphore :count 0))
+         (release-poll (sb-thread:make-semaphore :count 0))
+         (response-wire (http3-test-native-response-wire))
+         (first-poll-p nil)
+         (response-sent-p nil)
+         (client
+           (http3-test-make-native-client
+            :poll-function
+            (lambda ()
+              (unless first-poll-p
+                (setf first-poll-p t)
+                (sb-thread:signal-semaphore poll-started)
+                (sb-thread:wait-on-semaphore release-poll)))
+            :try-read-stream
+            (lambda (stream &key timeout deadline)
+              (declare (ignore timeout deadline))
+              (if (and (string= "/limited"
+                                (http3-test-stream-kind stream))
+                       (not response-sent-p))
+                  (progn
+                    (setf response-sent-p t)
+                    (values response-wire t :data))
+                (values nil nil :would-block)))))
+         (owner-thread nil)
+         (owner-finished nil)
+         (owner-result nil))
+    (setf (http-kit/http3::http3-client-max-request-streams client) 1)
+    (unwind-protect
+         (progn
+           (multiple-value-setq (owner-thread owner-finished owner-result)
+             (http3-test-start-native-call
+              (lambda ()
+                (http-kit/http3:send-http3-request
+                 client
+                 (make-http-request
+                  :method "GET"
+                  :uri "https://example.test/limited")))))
+           (ensure-true
+            (sb-thread:wait-on-semaphore poll-started :timeout 3))
+           (let ((failure
+                   (http3-boundary-error
+                    (lambda ()
+                      (http-kit/http3:send-http3-request
+                       client
+                       (make-http-request
+                        :method "GET"
+                        :uri "https://example.test/rejected")
+                       :timeout 0.1)))))
+             (http3-public-error-check
+              failure
+              "The HTTP/3 request-stream limit was exceeded."
+              :h3-excessive-load))
+           (ensure-equal
+            1 (http-kit/http3::http3-client-request-stream-count client))
+           (ensure-equal
+            1 (length
+               (http-kit/http3::http3-client-pending-request-streams client)))
+           (sb-thread:signal-semaphore release-poll)
+           (ensure-true
+            (sb-thread:wait-on-semaphore owner-finished :timeout 3))
+           (ensure-equal :response (first owner-result))
+           (ensure-equal
+            200 (http-response-status (second owner-result))))
+      (sb-thread:signal-semaphore release-poll)
+      (when (http-kit/http3:http3-client-open-p client)
+        (http-kit/http3:close-http3-client client))
+      (http3-test-join-native-thread owner-thread owner-finished))))
+(deftest http3-client-native-scheduler-submit-rejects-reentrant-owner-call
+  (let* ((response-wire (http3-test-native-response-wire))
+         (response-sent-p nil)
+         (outer-open-count 0)
+         (nested-open-count 0)
+         (nested-failure nil)
+         (count-after-nested nil)
+         (client
+           (http3-test-make-native-client
+            :try-read-stream
+            (lambda (stream &key timeout deadline)
+              (declare (ignore timeout deadline))
+              (if (and (string= "/outer"
+                                (http3-test-stream-kind stream))
+                       (not response-sent-p))
+                  (progn
+                    (setf response-sent-p t)
+                    (values response-wire t :data))
+                (values nil nil :would-block)))))
+         (response nil))
+    (setf (http-kit/http3::http3-client-max-request-streams client) 2)
+    (unwind-protect
+         (progn
+           (setf response
+                 (http-kit/http3:send-http3-request
+                  client
+                  (make-http-request
+                   :method "GET"
+                   :uri "https://example.test/outer")
+                  :on-stream-open
+                  (lambda (stream stream-id cancel)
+                    (declare (ignore stream stream-id cancel))
+                    (incf outer-open-count)
+                    (setf nested-failure
+                          (http3-boundary-error
+                           (lambda ()
+                             (http-kit/http3:send-http3-request
+                              client
+                              (make-http-request
+                               :method "GET"
+                               :uri "https://example.test/nested")
+                              :timeout 0.1
+                              :on-stream-open
+                              (lambda (&rest arguments)
+                                (declare (ignore arguments))
+                                (incf nested-open-count))))))
+                    (setf count-after-nested
+                          (http-kit/http3::http3-client-request-stream-count
+                           client)))))
+           (http3-public-error-check
+            nested-failure
+            "A native HTTP/3 request cannot be started reentrantly by its scheduler owner."
+            :h3-excessive-load)
+           (ensure-equal 1 outer-open-count)
+           (ensure-equal 0 nested-open-count)
+           (ensure-equal 1 count-after-nested)
+           (ensure-equal 200 (http-response-status response))
+           (ensure-equal
+            0 (http-kit/http3::http3-client-request-stream-count client)))
+      (when (http-kit/http3:http3-client-open-p client)
+        (http-kit/http3:close-http3-client client)))))
+(deftest http3-client-native-scheduler-cancels-qpack-blocked-entry
+  (multiple-value-bind (decoder-context section instruction)
+      (http3-test-qpack-blocked-section
+       (list (cons ":status" "200")
+             (cons "x-blocked" "ready")))
+    (declare (ignore decoder-context instruction))
+    (let* ((response-wire
+             (http-kit/http3:encode-http3-frame
+              (http-kit/http3:make-http3-frame
+               :type http-kit/http3:+http3-headers-type+
+               :payload section)))
+           (peer-qpack
+             (make-http3-test-stream :kind :peer-qpack-encoder))
+           (request-opened (sb-thread:make-semaphore :count 0))
+           (request-stream nil)
+           (request-id nil)
+           (response-sent-p nil)
+           (cancel-calls nil)
+           (decoder-writes nil)
+           (client
+             (http3-test-make-native-client
+              :qpack-settings
+              (list
+               (cons http-kit/http3:+http3-setting-qpack-max-table-capacity+ 256)
+               (cons http-kit/http3:+http3-setting-qpack-blocked-streams+ 1))
+              :cancel-stream
+              (lambda (stream &key error-code timeout deadline)
+                (declare (ignore timeout deadline))
+                (push (list stream error-code) cancel-calls)
+                t)
+              :write-stream
+              (lambda (stream bytes &key fin-p timeout deadline)
+                (declare (ignore fin-p timeout deadline))
+                (when (eq :qpack-decoder (http3-test-stream-kind stream))
+                  (push (copy-seq bytes) decoder-writes)))
+              :try-read-stream
+              (lambda (stream &key timeout deadline)
+                (declare (ignore timeout deadline))
+                (cond
+                  ((eq stream peer-qpack)
+                   (values nil nil :would-block))
+                  ((and (stringp (http3-test-stream-kind stream))
+                        (string= "/blocked"
+                                 (http3-test-stream-kind stream)))
+                   (if response-sent-p
+                       (values nil nil :would-block)
+                     (progn
+                       (setf response-sent-p t)
+                       (values response-wire t :data))))
+                  (t
+                   (values nil nil :would-block))))))
+           (owner-thread nil)
+           (owner-finished nil)
+           (owner-result nil)
+           (request-entry nil))
+      (http-kit/http3:attach-http3-peer-qpack-encoder-stream
+       client peer-qpack)
+      (unwind-protect
+           (progn
+             (multiple-value-setq (owner-thread owner-finished owner-result)
+               (http3-test-start-native-call
+                (lambda ()
+                  (http-kit/http3:send-http3-request
+                   client
+                   (make-http-request
+                    :method "GET"
+                    :uri "https://example.test/blocked")
+                   :on-stream-open
+                   (lambda (stream stream-id cancel)
+                     (declare (ignore cancel))
+                     (setf request-stream stream
+                           request-id stream-id)
+                     (sb-thread:signal-semaphore request-opened))))))
+             (ensure-true
+              (sb-thread:wait-on-semaphore request-opened :timeout 3))
+             (ensure-equal 0 request-id)
+             (ensure-true
+              (loop repeat 3000
+                    for entry =
+                      (http-kit/http3::%h3-scheduler-entry-for-stream
+                       client request-stream)
+                    when (and entry
+                              (http-kit/http3::%http3-request-stream-qpack-token
+                               entry))
+                      do (return t)
+                    do (sleep 0.001)
+                    finally (return nil)))
+             (setf request-entry
+                   (http-kit/http3::%h3-scheduler-entry-for-stream
+                    client request-stream))
+             (ensure-true
+              (http-kit/http3::%http3-request-stream-qpack-token request-entry))
+             (ensure-true
+              (http-kit/http3:cancel-http3-stream client request-stream))
+             (ensure-true
+              (sb-thread:wait-on-semaphore owner-finished :timeout 3))
+             (ensure-equal :error (first owner-result))
+             (ensure-true
+              (typep (second owner-result) 'http-connection-error))
+             (ensure-equal :http3-request
+                           (http-error-operation (second owner-result)))
+             (ensure-true
+              (http-connection-error-request-sent-p (second owner-result)))
+             (ensure-equal 1 (length cancel-calls))
+             (ensure-true (eq request-stream (first (first cancel-calls))))
+             (ensure-equal #x10c (second (first cancel-calls)))
+             (ensure-true
+              (member
+               (http-message-kit:qpack-encode-stream-cancellation 0)
+               decoder-writes
+               :test (function equalp)))
+             (ensure-true
+              (http-kit/http3::%http3-request-stream-done-p request-entry))
+             (ensure-false
+              (http-kit/http3::%http3-request-stream-qpack-token request-entry))
+             (ensure-true (http-kit/http3:http3-client-open-p client)))
+        (when (http-kit/http3:http3-client-open-p client)
+          (http-kit/http3:close-http3-client client))
+        (http3-test-join-native-thread owner-thread owner-finished)))))
+(deftest http3-client-native-scheduler-rejects-submit-after-close-starts
+  (let* ((poll-started (sb-thread:make-semaphore :count 0))
+         (release-poll (sb-thread:make-semaphore :count 0))
+         (first-poll-p nil)
+         (first-open-count 0)
+         (rejected-open-count 0)
+         (client
+          (http3-test-make-native-client :poll-function
+                                         (lambda ()
+                                           (unless first-poll-p
+                                             (setf first-poll-p t)
+                                             (sb-thread:signal-semaphore poll-started)
+                                             (sb-thread:wait-on-semaphore release-poll)))
+                                         :try-read-stream
+                                         (lambda (stream &key timeout deadline)
+                                           (declare (ignore stream timeout deadline))
+                                           (values nil nil :would-block))))
+         (owner-thread nil)
+         (owner-finished nil)
+         (owner-result nil)
+         (close-thread nil)
+         (close-finished nil)
+         (close-result nil))
+    (unwind-protect
+        (progn
+          (multiple-value-setq (owner-thread owner-finished owner-result) (http3-test-start-native-call
+                                                                           (lambda ()
+                                                                             (http-kit/http3:send-http3-request
+                                                                              client
+                                                                              (make-http-request
+                                                                               :method
+                                                                               "GET"
+                                                                               :uri
+                                                                               "https://example.test/before-close")
+                                                                              :on-stream-open
+                                                                              (lambda
+                                                                                  (stream stream-id
+                                                                                          cancel)
+                                                                                (declare (ignore
+                                                                                          stream
+                                                                                          stream-id
+                                                                                          cancel))
+                                                                                (incf
+                                                                                 first-open-count))))))
+          (ensure-true (sb-thread:wait-on-semaphore poll-started :timeout 3))
+          (ensure-true (http3-test-await-native-pending client 1))
+          (multiple-value-setq (close-thread close-finished close-result) (http3-test-start-native-call
+                                                                           (lambda ()
+                                                                             (http-kit/http3:close-http3-client
+                                                                              client))))
+          (ensure-true (http3-test-await-native-close-state client :closing))
+          (let ((failure
+                 (http3-boundary-error
+                  (lambda ()
+                    (http-kit/http3:send-http3-request client
+                                                       (make-http-request :method
+                                                                          "GET"
+                                                                          :uri
+                                                                          "https://example.test/after-close")
+                                                       :on-stream-open
+                                                       (lambda (stream stream-id cancel)
+                                                         (declare (ignore stream stream-id cancel))
+                                                         (incf rejected-open-count)))))))
+            (ensure-true (typep failure (quote http-connection-error)))
+            (ensure-equal "The HTTP/3 QUIC connection is closing." (http-error-message failure))
+            (ensure-equal :http3-request (http-error-operation failure))
+            (ensure-false (http-connection-error-request-sent-p failure))
+            (ensure-equal 0 rejected-open-count)
+            (ensure-equal 0 first-open-count)
+            (ensure-equal 1 (http-kit/http3::http3-client-request-stream-count client))
+            (ensure-equal 1 (length (http-kit/http3::http3-client-pending-request-streams client))))
+          (sb-thread:signal-semaphore release-poll)
+          (ensure-true (sb-thread:wait-on-semaphore close-finished :timeout 3))
+          (ensure-true (sb-thread:wait-on-semaphore owner-finished :timeout 3))
+          (ensure-equal :error (first owner-result))
+          (ensure-true (typep (second owner-result) (quote http-connection-error)))
+          (ensure-equal :response (first close-result))
+          (ensure-equal 0 first-open-count)
+          (ensure-equal 0 rejected-open-count)
+          (ensure-equal 0 (http-kit/http3::http3-client-request-stream-count client))
+          (sb-thread:signal-semaphore release-poll)
+          (when (and (null close-thread) (http-kit/http3:http3-client-open-p client))
+            (http-kit/http3:close-http3-client client))
+          (http3-test-join-native-thread owner-thread owner-finished)))))
+
+(deftest http3-client-native-scheduler-enforces-producer-content-length
+  (dolist (case
+           (list
+            (list :overrun
+                  2
+                  (list (octets 1 2 3) nil)
+                  1
+                  (list http-kit/http3:+http3-headers-type+)
+                  nil
+                  (list 3 2)
+                  "The HTTP/3 request body producer exceeded its declared length.")
+            (list :underrun
+                  2
+                  (list (octets 1) nil)
+                  2
+                  (list http-kit/http3:+http3-headers-type+
+                        http-kit/http3:+http3-data-type+)
+                  (list (list 1))
+                  (list 1 2)
+                  "The HTTP/3 request body producer ended before its declared length.")))
+    (destructuring-bind
+        (name declared chunks expected-producer-calls expected-frame-types
+         expected-data-payloads expected-detail expected-message)
+        case
+      (let* ((writes nil)
+             (producer-limits nil)
+             (producer-calls 0)
+             (cancel-calls nil)
+             (client
+               (http3-test-make-native-client
+                :write-stream
+                (lambda (stream bytes &key fin-p timeout deadline)
+                  (declare (ignore timeout deadline))
+                  (when (stringp (http3-test-stream-kind stream))
+                    (push (list (subseq bytes 0) fin-p) writes)))
+                :cancel-stream
+                (lambda (stream &key error-code timeout deadline)
+                  (declare (ignore timeout deadline))
+                  (push (list stream error-code) cancel-calls)
+                  t)
+                :try-read-stream
+                (lambda (stream &key timeout deadline)
+                  (declare (ignore stream timeout deadline))
+                  (values nil nil :would-block)))))
+        (unwind-protect
+             (let* ((failure
+                      (http3-boundary-error
+                       (lambda ()
+                         (http-kit/http3:send-http3-request
+                          client
+                          (make-http-request
+                           :method "POST"
+                           :uri (if (eq name :overrun) "https://example.test/overrun" "https://example.test/underrun"))
+                          :request-body-length declared
+                          :request-body-function
+                          (lambda (maximum-size)
+                            (push maximum-size producer-limits)
+                            (incf producer-calls)
+                            (pop chunks))))))
+                    (ordered-writes (reverse writes))
+                    (frames
+                      (loop for (bytes fin-p) in ordered-writes
+                            append (http-kit/http3:decode-http3-frames bytes)))
+                    (data-frames
+                      (remove-if-not
+                       (lambda (frame)
+                         (= http-kit/http3:+http3-data-type+
+                            (http-kit/http3:http3-frame-type frame)))
+                       frames)))
+               (ensure-equal expected-message (http-error-message failure))
+               (ensure-true (typep failure (quote http-protocol-error)))
+               (ensure-equal :http3-transport (http-error-operation failure))
+               (ensure-equal expected-detail
+                             (http-protocol-error-detail failure))
+               (ensure-equal expected-producer-calls producer-calls)
+               (ensure-equal expected-producer-calls
+                             (length producer-limits))
+               (ensure-true (every (function plusp) producer-limits))
+               (ensure-equal expected-frame-types
+                             (mapcar
+                              (function http-kit/http3:http3-frame-type)
+                              frames))
+               (ensure-equal (make-list (length expected-frame-types)
+                                       :initial-element nil)
+                             (mapcar (function second) ordered-writes))
+               (ensure-equal expected-data-payloads
+                             (mapcar
+                              (lambda (frame)
+                                (coerce
+                                 (http-kit/http3:http3-frame-payload frame)
+                                 (quote list)))
+                              data-frames))
+               (ensure-equal (write-to-string declared)
+                             (cdr
+                              (assoc
+                               "content-length"
+                               (http3-test-qpack-decode
+                                (http-kit/http3:http3-frame-payload
+                                 (first frames)))
+                               :test (function string=))))
+               (ensure-equal 1 (length cancel-calls))
+               (ensure-true (stringp
+                             (http3-test-stream-kind
+                              (first (first cancel-calls)))))
+               (ensure-equal #x10c (second (first cancel-calls)))
+               (ensure-true (http-kit/http3:http3-client-open-p client))
+               (ensure-equal 0
+                             (http-kit/http3::http3-client-request-stream-count
+                              client))
+               (ensure-equal 0
+                             (hash-table-count
+                              (http-kit/http3::http3-client-request-streams
+                               client))))
+          (when (http-kit/http3:http3-client-open-p client)
+            (http-kit/http3:close-http3-client client)))))))
+(deftest http3-client-native-scheduler-rejects-invalid-response-frames
+  (dolist
+      (row
+       (list
+        (list "/truncated" (octets 0 2 1) "The HTTP/3 stream ended with a truncated frame." nil)
+        (list "/control"
+              (http-kit/http3:encode-http3-frame
+               (http-kit/http3:make-http3-frame :type
+                                                http-kit/http3:+http3-settings-type+
+                                                :payload
+                                                (octets)))
+              "HTTP/3 control frames are not valid on a request stream."
+              http-kit/http3:+http3-settings-type+)))
+    (destructuring-bind (path response-wire expected-message expected-detail) row
+      (let* ((response-sent-p nil)
+             (request-stream nil)
+             (request-id nil)
+             (request-entry nil)
+             (cancel-calls nil)
+             (client
+              (http3-test-make-native-client :cancel-stream
+                                             (lambda (stream &key error-code timeout deadline)
+                                               (declare (ignore timeout deadline))
+                                               (push (list stream error-code) cancel-calls)
+                                               t)
+                                             :try-read-stream
+                                             (lambda (stream &key timeout deadline)
+                                               (declare (ignore timeout deadline))
+                                               (if (and (stringp (http3-test-stream-kind stream))
+                                                        (string= path
+                                                                 (http3-test-stream-kind stream))
+                                                        (not response-sent-p))
+                                                   (progn
+                                                     (setf response-sent-p t)
+                                                     (values response-wire t :data))
+                                                   (values nil nil :would-block))))))
+        (unwind-protect
+            (let ((failure
+                   (http3-boundary-error
+                    (lambda ()
+                      (http-kit/http3:send-http3-request client
+                                                         (make-http-request :method
+                                                                            "GET"
+                                                                            :uri
+                                                                            (concatenate 'string
+                                                                                         "https://example.test"
+                                                                                         path))
+                                                         :on-stream-open
+                                                         (lambda (stream stream-id cancel)
+                                                           (declare (ignore cancel))
+                                                           (setf request-stream stream
+                                                                 request-id stream-id
+                                                                 request-entry (http-kit/http3::%h3-scheduler-entry-for-stream
+                                                                                client
+                                                                                stream))))))))
+              (http3-public-error-check failure expected-message expected-detail)
+              (ensure-true request-stream)
+              (ensure-equal 0 request-id)
+              (ensure-true request-entry)
+              (ensure-true (http-kit/http3::%http3-request-stream-done-p request-entry))
+              (ensure-true
+               (eq failure (http-kit/http3::%http3-request-stream-failure request-entry)))
+              (ensure-equal 1 (length cancel-calls))
+              (ensure-true (eq request-stream (first (first cancel-calls))))
+              (ensure-equal #x10c (second (first cancel-calls)))
+              (ensure-true (http-kit/http3:http3-client-open-p client))
+              (ensure-equal 0
+                            (hash-table-count (http-kit/http3::http3-client-request-streams client)))
+              (ensure-equal nil (http-kit/http3::http3-client-pending-request-streams client))
+              (ensure-equal nil (http-kit/http3::http3-client-runnable-stream-ids client))
+              (ensure-equal 0 (http-kit/http3::http3-client-request-stream-count client)))
+          (when (http-kit/http3:http3-client-open-p client)
+            (http-kit/http3:close-http3-client client)))))))
+
 
