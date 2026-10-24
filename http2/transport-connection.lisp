@@ -2131,10 +2131,12 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                 (when on-stream-open
                   (funcall on-stream-open
                            (%h2-batch-entry-stream-id entry)
-                           (lambda (&key (error-code 8))
+                           (lambda (&rest cancel-arguments)
+                             (apply (lambda (&key error-code) error-code)
+                                    cancel-arguments)
                              (cancel-http2-stream
                               connection (%h2-batch-entry-stream-id entry)
-                              :error-code error-code
+                              :error-code (getf cancel-arguments :error-code 8)
                               :deadline absolute-deadline
                               :clock-function clock))))
                 (%h2-connection-send-request-body
