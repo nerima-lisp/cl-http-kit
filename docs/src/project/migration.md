@@ -4,6 +4,9 @@ This guide describes the 0.4.0 integration and the planned 0.5.0 QPACK API
 break from the current 0.4.1 API. It does not announce a 0.5.0 release. See the
 [changelog](changelog.md) for the 0.4.x security and protocol fixes.
 
+For the planned WebSocket and SSE API removal, see the
+[WebSocket and SSE API migration](#websocket-and-sse-api-migration).
+
 ## 0.3.x client boundary carried into 0.4.0
 
 The current high-level client permits `make-http-client` without a supplied
@@ -390,6 +393,74 @@ The downstream cl-websocket-kit migration follows its update to cl-http-kit
    inspect or construct the removed table and state objects.
 3. Run the cl-websocket-kit test suite and require its GitHub PR checks to pass
    against the 0.5.0 pin before landing the dependency update.
+
+### WebSocket and SSE API migration
+
+The 0.4.1 release includes the `http-kit/websocket` package and SSE exports
+from `http-kit/client`. The planned 0.5.0 release removes them. When upgrading,
+add the relevant kit to your application's dependencies: use `cl-websocket-kit`
+for `websocket-kit` and `cl-sse-kit` for `sse-kit`. Neither kit is a dependency
+of `cl-http-kit`. The replacement names below were verified against the
+[cl-websocket-kit API at revision
+`cf3dfb4ac796d396e4d7fededaa3effefbc642d4`](https://github.com/nerima-lisp/cl-websocket-kit/tree/cf3dfb4ac796d396e4d7fededaa3effefbc642d4)
+and the
+[cl-sse-kit API at revision
+`161951de39e73544b9e7a05fb6385d7d68364fae`](https://github.com/nerima-lisp/cl-sse-kit/tree/161951de39e73544b9e7a05fb6385d7d68364fae).
+
+| Removed symbol | Replacement |
+| --- | --- |
+| `http-kit/websocket:websocket-frame` | `websocket-kit:websocket-frame` |
+| `http-kit/websocket:websocket-frame-p` | `websocket-kit:websocket-frame-p` |
+| `http-kit/websocket:websocket-frame-fin-p` | `websocket-kit:websocket-frame-fin-p` |
+| `http-kit/websocket:websocket-frame-rsv1-p` | `websocket-kit:websocket-frame-reserved-bits` |
+| `http-kit/websocket:websocket-frame-opcode` | `websocket-kit:websocket-frame-opcode` |
+| `http-kit/websocket:websocket-frame-mask-p` | `websocket-kit:websocket-frame-mask-p` |
+| `http-kit/websocket:websocket-frame-masking-key` | `websocket-kit:websocket-frame-masking-key` |
+| `http-kit/websocket:websocket-frame-payload` | `websocket-kit:websocket-frame-payload` |
+| `http-kit/websocket:make-websocket-frame` | `websocket-kit:make-websocket-frame` |
+| `http-kit/websocket:serialize-websocket-frame` | `websocket-kit:serialize-websocket-frame` |
+| `http-kit/websocket:parse-websocket-frame` | `websocket-kit:parse-websocket-frame` |
+| `http-kit/websocket:read-websocket-frame` | `websocket-kit:read-websocket-frame` |
+| `http-kit/websocket:write-websocket-frame` | `websocket-kit:write-websocket-frame` |
+| `http-kit/websocket:read-websocket-message` | `websocket-kit:read-websocket-message` |
+| `http-kit/websocket:write-websocket-message` | `websocket-kit:write-websocket-message` |
+| `http-kit/websocket:websocket-ping` | `websocket-kit:websocket-ping` |
+| `http-kit/websocket:websocket-pong` | `websocket-kit:websocket-pong` |
+| `http-kit/websocket:websocket-close` | `websocket-kit:websocket-close` |
+| `http-kit/websocket:serve-websocket-session` | `websocket-kit:serve-websocket-session` |
+| `http-kit/websocket:make-websocket-client-key` | `websocket-kit:generate-websocket-key` |
+| `http-kit/websocket:websocket-accept-key` | `websocket-kit:websocket-accept-key` |
+| `http-kit/websocket:websocket-extension` | No direct replacement |
+| `http-kit/websocket:websocket-extension-p` | No direct replacement |
+| `http-kit/websocket:websocket-extension-name` | No direct replacement |
+| `http-kit/websocket:websocket-extension-parameters` | No direct replacement |
+| `http-kit/websocket:parse-websocket-extensions` | No direct replacement |
+| `http-kit/websocket:websocket-upgrade-request-p` | `websocket-kit:websocket-upgrade-request-p` |
+| `http-kit/websocket:websocket-upgrade-response` | `websocket-kit:websocket-upgrade-response` |
+| `http-kit/websocket:make-websocket-upgrade-request` | `websocket-kit:make-websocket-upgrade-request` |
+| `http-kit/websocket:websocket-client-handshake` | `websocket-kit:websocket-client-handshake` |
+| `http-kit/websocket:websocket-valid-close-code-p` | `websocket-kit:websocket-valid-close-code-p` |
+| `http-kit/websocket:make-websocket-close-payload` | `websocket-kit:make-websocket-close-payload` |
+| `http-kit/websocket:parse-websocket-close-payload` | `websocket-kit:parse-websocket-close-payload` |
+| `http-kit/client:http-sse-event` | `sse-kit:http-sse-event` |
+| `http-kit/client:http-sse-event-p` | `sse-kit:http-sse-event-p` |
+| `http-kit/client:make-http-sse-event` | `sse-kit:make-http-sse-event` |
+| `http-kit/client:http-sse-event-event` | `sse-kit:http-sse-event-event` |
+| `http-kit/client:http-sse-event-data` | `sse-kit:http-sse-event-data` |
+| `http-kit/client:http-sse-event-id` | `sse-kit:http-sse-event-id` |
+| `http-kit/client:http-sse-event-retry` | `sse-kit:http-sse-event-retry` |
+| `http-kit/client:http-sse-event-comments` | `sse-kit:http-sse-event-comments` |
+| `http-kit/client:parse-http-sse-events` | `sse-kit:parse-http-sse-events` |
+| `http-kit/client:read-http-sse-events` | `sse-kit:read-http-sse-events` |
+| `http-kit/client:serialize-http-sse-event` | `sse-kit:serialize-http-sse-event` |
+
+For RSV1, test bit `#x40` in `websocket-frame-reserved-bits`. Construct frames
+with `:reserved-bits` instead of `:rsv1-p`, setting bit `#x40` for RSV1.
+The generic WebSocket extension structure, accessors, and parser have no direct
+replacement. Consumers of other extensions must supply their own
+extension-specific negotiation and framing or stop negotiating those
+extensions. Upstream exports only `websocket-permessage-deflate-extension`,
+which is specific to permessage-deflate.
 
 ## Migration checklist
 
