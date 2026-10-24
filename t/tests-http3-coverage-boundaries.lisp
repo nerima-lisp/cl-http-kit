@@ -4638,6 +4638,10 @@
         (http-kit/http3:close-http3-client client)))))
 (deftest http3-native-scheduler-open-cancel-uses-default-error-code
   (let* ((cancel-calls nil)
+         (cancel-return-value nil)
+         (request-stream nil)
+         (request-id nil)
+         (request-entry nil)
          (client
           (http3-test-make-native-client
            :try-read-stream
@@ -4648,29 +4652,53 @@
            (lambda (stream &key error-code timeout deadline)
              (declare (ignore timeout deadline))
              (push (list stream error-code) cancel-calls)
-             t)))
-         (entry
-          (http-kit/http3::%make-http3-request-stream
-           :request
-           (make-http-request
-            :method "GET" :uri "https://example.test/cancel")
-           :on-stream-open
-           (lambda (stream stream-id cancel)
-             (declare (ignore stream stream-id))
-             (funcall cancel)))))
+             t))))
     (unwind-protect
-         (progn
-           (http-kit/http3::%h3-scheduler-start-entry client entry)
+         (let ((failure
+                 (http3-boundary-error
+                  (lambda ()
+                    (http-kit/http3:send-http3-request
+                     client
+                     (make-http-request
+                      :method "GET" :uri "https://example.test/cancel")
+                     :on-stream-open
+                     (lambda (stream stream-id cancel)
+                       (setf request-stream stream
+                             request-id stream-id
+                             request-entry
+                             (http-kit/http3::%h3-scheduler-entry-for-stream
+                              client stream)
+                             cancel-return-value (funcall cancel))))))))
+           (ensure-true request-stream)
+           (ensure-equal 0 request-id)
+           (ensure-equal t cancel-return-value)
            (ensure-equal 1 (length cancel-calls))
+           (ensure-true (eq request-stream (first (first cancel-calls))))
            (ensure-equal #x10c (second (first cancel-calls)))
            (ensure-true
-            (eq (http-kit/http3::%http3-request-stream-stream entry)
-                (first (first cancel-calls))))
+            (typep failure (quote http-kit:http-connection-error)))
+           (when (typep failure (quote http-kit:http-connection-error))
+             (ensure-equal
+              "The HTTP/3 request stream was cancelled."
+              (http-error-message failure))
+             (ensure-equal :http3-request (http-error-operation failure))
+             (ensure-true
+              (http-kit:http-connection-error-request-sent-p failure)))
+           (ensure-true request-entry)
            (ensure-true
-            (http-kit/http3::%http3-request-stream-done-p entry))
+            (http-kit/http3::%http3-request-stream-done-p request-entry))
+           (ensure-true
+            (eq failure
+                (http-kit/http3::%http3-request-stream-failure request-entry)))
            (ensure-equal
             0
             (hash-table-count
-             (http-kit/http3::http3-client-request-streams client))))
+             (http-kit/http3::http3-client-request-streams client)))
+           (ensure-equal nil
+                         (http-kit/http3::http3-client-pending-request-streams
+                          client))
+           (ensure-equal
+            0
+            (http-kit/http3::http3-client-request-stream-count client)))
       (when (http-kit/http3:http3-client-open-p client)
         (http-kit/http3:close-http3-client client)))))
