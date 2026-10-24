@@ -1410,18 +1410,22 @@
                         connection))))
                    (funcall original-window window-connection stream-id)))
            (setf response
-                 (http-kit/http2:send-http2-request-over-connection
-                  connection
-                  (make-http-request :method "POST"
-                                     :uri "https://127.0.0.1/frame-size-upload")
-                  :request-body-function
-                  (lambda (maximum-size)
-                    (incf producer-calls)
-                    (setf producer-thread sb-thread:*current-thread*)
-                    (when (= producer-calls 1)
-                      (ensure-equal initial-frame-size maximum-size)
-                      body))
-                  :request-body-length (length body)))
+                 (handler-case
+                     (http-kit/http2:send-http2-request-over-connection
+                      connection
+                      (make-http-request :method "POST"
+                                         :uri "https://127.0.0.1/frame-size-upload")
+                      :request-body-function
+                      (lambda (maximum-size)
+                        (incf producer-calls)
+                        (setf producer-thread sb-thread:*current-thread*)
+                        (when (= producer-calls 1)
+                          (ensure-equal initial-frame-size maximum-size)
+                          body))
+                      :request-body-length (length body))
+                   (http-kit:http-connection-error (condition)
+                     (error "HTTP/2 frame-size request failed with cause: ~A"
+                            (http-kit:http-connection-error-cause condition)))))
            (ensure-equal 200 (http-response-status response))
            (ensure-true settings-applied-p)
            (ensure-equal
