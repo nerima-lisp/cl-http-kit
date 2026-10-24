@@ -14,6 +14,37 @@
                      (setf status (http-response-status response))
                      :success)))
     (ensure-equal 204 status)))
+(deftest recording-request-copies-trailer-headers
+  (let* ((request
+           (make-http-request
+            :method "POST"
+            :uri "http://example.test/upload"
+            :headers (list (make-http-header "Transfer-Encoding" "chunked")
+                           (make-http-header "Trailer" "X-Checksum"))
+            :body (ascii "payload")
+            :trailers (list (make-http-header "X-Checksum" "done"))))
+         (source-trailer (first (http-request-trailers request)))
+         (transport
+           (make-recording-session
+            :responses (list (make-http-response :status 204))))
+         (result
+           (send-recorded-http-request/cps
+            transport request
+            (lambda (response)
+              (ensure-equal 204 (http-response-status response))
+              :success)))
+         (recorded-trailer
+           (first (http-request-trailers
+                   (first (recording-session-requests transport))))))
+    (ensure-equal :success result)
+    (ensure-equal "X-Checksum" (http-header-name recorded-trailer))
+    (ensure-equal "done" (http-header-content recorded-trailer))
+    (ensure-false
+     (eq (http-header-name source-trailer)
+         (http-header-name recorded-trailer)))
+    (ensure-false
+     (eq (http-header-content source-trailer)
+         (http-header-content recorded-trailer)))))
 
 (deftest recording-request-cps-error
   (let* ((request (make-http-request :method "GET"
@@ -112,37 +143,114 @@
         (ensure-equal expected (http-response-reusable-p request response))))))
 
 #+sbcl
-(deftest core-coverage-transport-continue-chunked-trailers
-  (dolist (body '("ab" ""))
-    (let* ((request
-             (make-http-request
-              :method "POST" :uri "http://example.test/upload"
-              :headers (list (make-http-header "Expect" "100-continue"))
-              :body (ascii body)
-              :trailers (list (make-http-header "X-Checksum" "done"))))
-           (stream
-             (make-instance 'binary-test-stream
-                            :input (ascii "HTTP/1.1 100 Continue|CRLF||CRLF|HTTP/1.1 204 No Content|CRLF||CRLF|")))
-           (head (ascii "POST /upload HTTP/1.1|CRLF|Expect: 100-continue|CRLF|Host: example.test|CRLF|Transfer-Encoding: chunked|CRLF|Trailer: X-Checksum|CRLF||CRLF|"))
-           (information-statuses nil))
-      (unwind-protect
-           (progn
-             (multiple-value-bind (response reusable-p)
+(progn
+  (deftest core-coverage-transport-continue-chunked-trailers
+    (dolist (body '("ab" ""))
+      (let* ((request
+               (make-http-request
+                :method "POST" :uri "http://example.test/upload"
+                :headers (list (make-http-header "Expect" "100-continue"))
+                :body (ascii body)
+                :trailers (list (make-http-header "X-Checksum" "done"))))
+             (stream
+               (make-instance 'binary-test-stream
+                              :input (ascii "HTTP/1.1 100 Continue|CRLF||CRLF|HTTP/1.1 204 No Content|CRLF||CRLF|")))
+             (head (ascii "POST /upload HTTP/1.1|CRLF|Expect: 100-continue|CRLF|Host: example.test|CRLF|Transfer-Encoding: chunked|CRLF|Trailer: X-Checksum|CRLF||CRLF|"))
+             (information-statuses nil))
+        (unwind-protect
+             (progn
+               (multiple-value-bind (response reusable-p)
+                   (send-http-request-over-open-stream
+                    request stream
+                    :on-information
+                    (lambda (information)
+                      (push (http-response-status information) information-statuses)
+                      (ensure-equal head (binary-test-output stream))))
+                 (ensure-equal 204 (http-response-status response))
+                 (ensure-equal t reusable-p))
+               (ensure-equal '(100) information-statuses)
+               (ensure-equal
+                (concatenate-octets
+                 head
+                 (ascii (if (string= body "")
+                            "0|CRLF|X-Checksum: done|CRLF||CRLF|"
+                            "2|CRLF|ab|CRLF|0|CRLF|X-Checksum: done|CRLF||CRLF|")))
+                (binary-test-output stream))
+               (ensure-true (open-stream-p stream)))
+          (close stream)))))
+
+  (deftest core-coverage-transport-stream-producer-boundaries
+    (let* ((request (make-http-request :method "POST"
+                                       :uri "http://example.test/upload"))
+           (stream (make-instance
+                    'binary-test-stream
+                    :input (ascii "HTTP/1.1 204 No Content|CRLF||CRLF|")))
+           (chunk (vector :not-an-octet))
+           (calls 0)
+           (condition
+             (handler-case
                  (send-http-request-over-open-stream
                   request stream
+                  :request-body-function
+                  (lambda (maximum-size)
+                    (ensure-equal 65536 maximum-size)
+                    (incf calls)
+                    chunk))
+               (http-protocol-error (condition) condition))))
+      (ensure-true (typep condition 'http-protocol-error))
+      (ensure-equal :body (http-error-operation condition))
+      (ensure-equal (type-of chunk) (http-protocol-error-detail condition))
+      (ensure-equal 1 calls)
+      (ensure-equal 0 (binary-test-input-position stream))
+      (ensure-equal
+       (ascii "POST /upload HTTP/1.1|CRLF|Host: example.test|CRLF|Transfer-Encoding: chunked|CRLF||CRLF|")
+       (binary-test-output stream))
+      (close stream))
+
+    (dolist (body-length '(3 nil))
+      (let* ((request (make-http-request
+                       :method "POST"
+                       :uri "http://example.test/upload"
+                       :headers (list (make-http-header "Expect" "100-continue"))))
+             (payload (ascii "abc"))
+             (chunks (list payload nil))
+             (calls 0)
+             (producer (lambda (maximum-size)
+                         (ensure-equal 65536 maximum-size)
+                         (incf calls)
+                         (pop chunks)))
+             (head (ascii
+                    (if body-length
+                        "POST /upload HTTP/1.1|CRLF|Expect: 100-continue|CRLF|Host: example.test|CRLF|Content-Length: 3|CRLF||CRLF|"
+                        "POST /upload HTTP/1.1|CRLF|Expect: 100-continue|CRLF|Host: example.test|CRLF|Transfer-Encoding: chunked|CRLF||CRLF|")))
+             (stream
+               (make-instance
+                'binary-test-stream
+                :input (ascii "HTTP/1.1 100 Continue|CRLF||CRLF|HTTP/1.1 204 No Content|CRLF||CRLF|")))
+             (statuses nil)
+             (response nil)
+             (reusable nil))
+        (unwind-protect
+             (progn
+               (multiple-value-setq (response reusable)
+                 (send-http-request-over-open-stream
+                  request stream
+                  :request-body-function producer
+                  :request-body-length body-length
                   :on-information
                   (lambda (information)
-                    (push (http-response-status information) information-statuses)
-                    (ensure-equal head (binary-test-output stream))))
+                    (push (http-response-status information) statuses)
+                    (ensure-equal head (binary-test-output stream)))))
                (ensure-equal 204 (http-response-status response))
-               (ensure-equal t reusable-p))
-             (ensure-equal '(100) information-statuses)
-             (ensure-equal
-              (concatenate-octets
-               head
-               (ascii (if (string= body "")
-                          "0|CRLF|X-Checksum: done|CRLF||CRLF|"
-                          "2|CRLF|ab|CRLF|0|CRLF|X-Checksum: done|CRLF||CRLF|")))
-              (binary-test-output stream))
-             (ensure-true (open-stream-p stream)))
-        (close stream)))))
+               (ensure-true reusable)
+               (ensure-equal '(100) (nreverse statuses))
+               (ensure-equal 2 calls)
+               (ensure-true (null chunks))
+               (ensure-equal
+                (concatenate-octets
+                 head
+                 (if body-length
+                     payload
+                     (ascii "3|CRLF|abc|CRLF|0|CRLF||CRLF|")))
+                (binary-test-output stream)))
+          (close stream))))))
