@@ -289,16 +289,6 @@
                :missing-close-notify)
               (%tls-driver-error condition))))))
 
-  (defmethod sb-gray:stream-read-byte ((stream http-tls-stream))
-    (let ((input (%tls-stream-input stream))
-          (position (%tls-stream-input-position stream)))
-      (if (< position (length input))
-          (prog1 (aref input position)
-            (incf (%tls-stream-input-position stream)))
-          (if (%tls-stream-fill stream)
-              (sb-gray:stream-read-byte stream)
-              :eof))))
-
   (defmethod sb-gray:stream-read-sequence
       ((stream http-tls-stream) sequence &optional (start 0) end)
     (let ((end (or end (length sequence)))
@@ -312,21 +302,6 @@
                      (incf position))))
       position))
 
-  (defmethod sb-gray:stream-write-byte ((stream http-tls-stream) byte)
-    (cl-tls-kit:tls13-client-driver-write
-     (%tls-stream-driver stream)
-     (vector byte))
-    byte)
-
-  (defmethod sb-gray:stream-write-sequence
-      ((stream http-tls-stream) sequence &optional (start 0) end)
-    (let ((end (or end (length sequence))))
-      (when (< start end)
-        (cl-tls-kit:tls13-client-driver-write
-         (%tls-stream-driver stream)
-         (subseq sequence start end)))
-      sequence))
-
   (defmethod sb-gray:stream-finish-output ((stream http-tls-stream))
     (declare (ignore stream))
     nil)
@@ -336,26 +311,7 @@
     nil)
 
   (defmethod open-stream-p ((stream http-tls-stream))
-    (not (%tls-stream-closed-p stream)))
-
-  (defmethod close ((stream http-tls-stream) &key abort)
-    (unless (%tls-stream-closed-p stream)
-      (let ((completed-p nil)
-            (transport (%tls-stream-transport-stream stream)))
-        (unwind-protect
-             (progn
-               (unless abort
-                 (cl-tls-kit:tls13-client-driver-close
-                  (%tls-stream-driver stream)))
-               (setf completed-p t))
-          (unwind-protect
-               (when (open-stream-p transport)
-                 (if completed-p
-                     (close transport :abort abort)
-                     (http-kit::%with-http-cleanup
-                       (close transport :abort t))))
-            (setf (%tls-stream-closed-p stream) t)))))
-    t))
+    (not (%tls-stream-closed-p stream))))
 
 (defun %make-http-tls-stream (driver stream)
   #+sbcl

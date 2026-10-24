@@ -826,4 +826,191 @@
                   (http-kit/tls::%tls-server-process-record state (apply #'octets wire))))))
         (ensure-true condition)
         (close raw :abort t))))
+  (deftest network-tls-server-transport-timeout-and-truncation-boundaries
+    (let* ((timeout (make-condition (quote http-timeout)
+                                    :message "TLS plaintext write expired."
+                                    :operation :tls :kind :tls))
+           (stream (make-instance (quote %tls-server-failure-test-stream)
+                                  :input (octets) :fail-on timeout))
+           (state (http-kit/tls::%make-http-tls-server-state
+                   :driver nil :provider nil :transport-stream stream))
+           (observed
+             (handler-case
+                 (progn
+                   (http-kit/tls::%tls-server-send-plaintext
+                    state :initial cl-tls-kit:+tls-content-type-handshake+ (octets 1))
+                   nil)
+               (http-timeout (condition) condition))))
+      (ensure-true (eq timeout observed))
+      (close stream :abort t))
+    (dolist (input (list (octets 22 3 3 0)
+                         (octets 22 3 3 0 2 1)))
+      (let* ((raw (make-instance (quote %tls-server-test-stream) :input input))
+             (state (http-kit/tls::%make-http-tls-server-state
+                     :driver nil :provider nil :transport-stream raw))
+             (condition
+               (%tls-server-test-condition
+                (lambda () (http-kit/tls::%tls-server-read-next-record state)))))
+        (ensure-equal :truncated-record (http-protocol-error-detail condition))
+        (ensure-equal 0 (length (binary-test-output raw)))
+        (close raw :abort t)))
+    (let* ((raw (make-instance (quote %tls-server-test-stream) :input (octets)))
+           (state (http-kit/tls::%make-http-tls-server-state
+                   :driver nil :provider nil :transport-stream raw))
+           (condition
+             (%tls-server-test-condition
+              (lambda ()
+                (http-kit/tls::%tls-server-process-record
+                 state (octets 21 3 3 0 0))))))
+      (ensure-equal :invalid-record (http-protocol-error-detail condition))
+      (ensure-equal 0 (length (binary-test-output raw)))
+      (close raw :abort t))
+    (let* ((provider (cl-tls-kit:make-cl-crypto-kit-provider))
+           (secret (make-array 32 :element-type (quote (unsigned-byte 8))
+                               :initial-element 7))
+           (timeout (make-condition (quote http-timeout)
+                                    :message "TLS application write expired."
+                                    :operation :tls :kind :tls))
+           (raw (make-instance (quote %tls-server-failure-test-stream)
+                               :input (octets) :fail-on timeout))
+           (state (http-kit/tls::%make-http-tls-server-state
+                   :driver nil :provider provider :transport-stream raw :suite #x1301))
+           (secure (make-instance (quote http-kit/tls::http-tls-stream)
+                                  :driver state :transport-stream raw))
+           (observed nil))
+      (setf (http-kit/tls::http-tls-server-state-write-state state)
+            (cl-tls-kit:make-tls13-traffic-state
+             provider :sha256 :aes-128-gcm secret 16 12))
+      (unwind-protect
+           (progn
+             (setf observed
+                   (handler-case
+                       (progn (write-sequence (octets 65 66) secure) nil)
+                     (http-timeout (condition) condition)))
+             (ensure-true (eq timeout observed))
+             (ensure-equal 0 (length (binary-test-output raw))))
+        (close secure :abort t)))
+    (let* ((provider (cl-tls-kit:make-cl-crypto-kit-provider))
+           (secret (make-array 32 :element-type (quote (unsigned-byte 8))
+                               :initial-element 7))
+           (raw (make-instance (quote %tls-server-failure-test-stream)
+                               :input (octets) :fail-on :write))
+           (state (http-kit/tls::%make-http-tls-server-state
+                   :driver nil :provider provider :transport-stream raw :suite #x1301))
+           (secure (make-instance (quote http-kit/tls::http-tls-stream)
+                                  :driver state :transport-stream raw))
+           (condition nil))
+      (setf (http-kit/tls::http-tls-server-state-write-state state)
+            (cl-tls-kit:make-tls13-traffic-state
+             provider :sha256 :aes-128-gcm secret 16 12))
+      (unwind-protect
+           (progn
+             (setf condition
+                   (%tls-server-test-condition
+                    (lambda () (write-sequence (octets 67 68) secure))))
+             (ensure-equal :transport-error
+                           (http-protocol-error-detail condition))
+             (ensure-equal 0 (length (binary-test-output raw))))
+        (close secure :abort t)))
+    (let* ((provider (cl-tls-kit:make-cl-crypto-kit-provider))
+           (secret (make-array 32 :element-type (quote (unsigned-byte 8))
+                               :initial-element 7))
+           (raw (make-instance (quote %tls-server-test-stream) :input (octets)))
+           (state (http-kit/tls::%make-http-tls-server-state
+                   :driver nil :provider provider :transport-stream raw)))
+      (setf (http-kit/tls::http-tls-server-state-write-state state)
+            (cl-tls-kit:make-tls13-traffic-state
+             provider :sha256 :aes-128-gcm secret 16 12))
+      (http-kit/tls::%tls-server-send-close-notify state)
+      (let ((first-record (copy-seq (binary-test-output raw))))
+        (ensure-true (plusp (length first-record)))
+        (ensure-true (http-kit/tls::http-tls-server-state-close-sent-p state))
+        (http-kit/tls::%tls-server-send-close-notify state)
+        (ensure-octets-equal first-record (binary-test-output raw)))
+      (close raw :abort t)))
+  (deftest network-tls-server-invalid-driver-and-handshake-timeout-boundaries
+    (let* ((provider (cl-tls-kit:make-cl-crypto-kit-provider))
+           (secret (make-array 32 :element-type '(unsigned-byte 8)
+                               :initial-element 7))
+           (state (http-kit/tls::%make-http-tls-server-state
+                   :driver nil :provider provider :transport-stream nil)))
+      (setf (http-kit/tls::http-tls-server-state-read-state state)
+            (cl-tls-kit:make-tls13-traffic-state
+             provider :sha256 :aes-128-gcm secret 16 12))
+      (let* ((write-state
+               (cl-tls-kit:make-tls13-traffic-state
+                provider :sha256 :aes-128-gcm secret 16 12))
+             (wire
+               (cl-tls-kit:encrypt-tls13-traffic-record
+                (cl-tls-kit:make-tls-plaintext
+                 cl-tls-kit:+tls-content-type-application-data+ (octets 65))
+                write-state))
+             (condition
+               (%tls-server-test-condition
+                (lambda ()
+                  (http-kit/tls::%tls-server-decrypt-record state wire)))))
+        (ensure-equal :invalid-driver-state
+                      (http-protocol-error-detail condition))))
+    (let* ((material (%tls-server-test-material))
+           (client-stream
+             (make-instance '%tls-server-test-stream :input (octets)))
+           (timeout
+             (make-condition (quote http-timeout)
+                             :message "TLS server handshake write expired."
+                             :operation :tls :kind :tls))
+           (server-stream
+             (make-instance '%tls-server-failure-test-stream
+                            :input (octets) :fail-on timeout))
+           (observed nil))
+      (unwind-protect
+           (let* ((client-provider (cl-tls-kit:make-cl-crypto-kit-provider))
+                  (client-driver
+                    (cl-tls-kit:make-tls13-client-driver
+                     :provider client-provider
+                     :key-exchange (http-kit/tls::%tls-key-exchange)
+                     :transport (http-kit/tls::%tls-transport client-stream)
+                     :hostname "localhost"
+                     :alpn '("h2" "http/1.1")
+                     :supported-groups '(#x001d #x0017)
+                     :ticket-store (cl-tls-kit:make-tls13-ticket-store)
+                     :trust-anchors nil
+                     :verify-signature #'crypto-kit:verify-signature))
+                  (server-provider (cl-tls-kit:make-cl-crypto-kit-provider))
+                  (server-driver
+                    (cl-tls-kit:make-tls13-server-driver
+                     :provider server-provider
+                     :certificate-chain (getf material :certificate-chain)
+                     :private-key (getf material :private-key)
+                     :ticket-key-store
+                     (cl-tls-kit:make-tls13-server-ticket-key-store)
+                     :alpn-protocols '("h2" "http/1.1")))
+                  (state
+                    (http-kit/tls::%make-http-tls-server-state
+                     :driver server-driver
+                     :provider server-provider
+                     :transport-stream server-stream)))
+             (handler-case
+                 (cl-tls-kit:tls13-client-driver-connect client-driver)
+               (error () nil))
+             (let ((client-wire (binary-test-output client-stream)))
+               (ensure-true (> (length client-wire) 5))
+               (ensure-equal cl-tls-kit:+tls-content-type-handshake+
+                             (aref client-wire 0))
+               (let ((record-length (+ (ash (aref client-wire 3) 8)
+                                       (aref client-wire 4))))
+                 (ensure-true (>= (length client-wire) (+ 5 record-length)))
+                 (let ((hello-wire (subseq client-wire 5 (+ 5 record-length))))
+                   (setf observed
+                         (handler-case
+                             (progn
+                               (http-kit/tls::%tls-server-step-handshake-message
+                                state hello-wire)
+                               nil)
+                           (http-timeout (condition) condition)))
+                   (ensure-true (eq timeout observed))))))
+        (close client-stream :abort t)
+        (close server-stream :abort t)
+        (%tls-server-test-remove-material material))))
+
+
   )

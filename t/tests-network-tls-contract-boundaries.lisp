@@ -1465,7 +1465,7 @@
          (list (list 23 (octets)) (list 23 (octets 7 8)) (list 21 (octets 1 0))))
       (unwind-protect
            (let ((buffer (octets 99 99 99 99 99 99)))
-             (ensure-equal 3 (read-sequence buffer stream :start 1 :end 5))
+             (ensure-equal 3 (sb-gray:stream-read-sequence stream buffer 1 5))
              (ensure-octets-equal #(99 7 8 99 99 99) buffer)
              (ensure-equal :eof (read-byte stream nil :eof))
              (ensure-equal 2 (read-sequence buffer stream :start 2 :end 2))
@@ -1478,6 +1478,7 @@
                (ensure-equal 21 (cl-tls-kit:tls-plaintext-content-type plaintext))
                (ensure-octets-equal #(1 0) (cl-tls-kit:tls-plaintext-fragment plaintext)))
              (ensure-true (open-stream-p raw))
+             (ensure-true (search "TLS stream" (princ-to-string stream)))
              (ensure-true (close stream))
              (ensure-false (open-stream-p stream))
              (ensure-false (open-stream-p raw))
