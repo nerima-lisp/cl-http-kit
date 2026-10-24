@@ -510,8 +510,6 @@ system supplies the HTTP/3 stream and codec layer."
                        (max 0 (- deadline (funcall clock-function))))))
     (sb-thread:condition-wait
      (http3-client-scheduler-condition client) lock :timeout timeout)
-    (unless (sb-thread:holding-mutex-p lock)
-      (sb-thread:grab-mutex lock))
     (http-kit::%check-deadline deadline clock-function :read))
   #-sbcl
   (progn
@@ -753,10 +751,6 @@ bytes are replayed to the corresponding reader. Returns :CONTROL,
                    (%h3-retain-unknown-peer-stream client stream prefetched-fin-p)
                  (%h3-prefetch-stream-input client stream buffer prefetched-fin-p))
                (return kind)))))
-       (when prefetched-fin-p
-         (%h3-transport-error
-          "A peer HTTP/3 unidirectional stream ended before its type prefix."
-          :h3-stream-creation-error))
        (multiple-value-bind (chunk fin-p)
            (funcall (http3-client-read-stream client)
                     stream :timeout timeout :deadline deadline)

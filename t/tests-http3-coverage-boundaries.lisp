@@ -2923,6 +2923,28 @@
                (ensure-equal nil stream)
                (ensure-equal nil push-id))))
       (http-kit/http3:close-http3-client client))))
+(deftest http3-public-dequeue-pending-push-rejects-invalid-and-closed-clients
+  (cl-weave:expect-assertions 11)
+  (let ((invalid :not-a-client))
+    (http3-public-error-check
+     (http3-boundary-error
+      (lambda ()
+        (http-kit/http3:dequeue-http3-pending-push invalid)))
+     "DEQUEUE-HTTP3-PENDING-PUSH requires an HTTP/3 client."
+     (type-of invalid)))
+  (let ((client (http3-transport-boundary-client)))
+    (unwind-protect
+         (progn
+           (ensure-true (http-kit/http3:http3-client-open-p client))
+           (ensure-true (http-kit/http3:close-http3-client client))
+           (http3-public-error-check
+            (http3-boundary-error
+             (lambda ()
+               (http-kit/http3:dequeue-http3-pending-push client)))
+            "The HTTP/3 client is already closed."
+            nil)
+           (ensure-false (http-kit/http3:http3-client-open-p client)))
+      (http-kit/http3:close-http3-client client))))
 (deftest http3-scheduler-data-frame-boundaries
   (let* ((payload (octets 1 2))
          (entry (http-kit/http3::%make-http3-request-stream))
@@ -3877,3 +3899,185 @@
            (run-case :fixed-no-trailers)
            (run-case :fixed-trailers)
            (run-case :producer-trailers)))
+(deftest http3-native-scheduler-unknown-length-producer-emits-final-empty-data
+  (let* ((producer-calls 0)
+         (writes nil)
+         (finished-streams (make-hash-table :test (function eq)))
+         (read-stages (make-hash-table :test (function eq)))
+         (response-wire (http3-test-native-response-wire))
+         (client
+          (http3-test-make-native-client
+           :write-stream
+           (lambda (stream bytes &key fin-p timeout deadline)
+             (declare (ignore timeout deadline))
+             (when (stringp (http3-test-stream-kind stream))
+               (push (list (http3-test-stream-kind stream) (copy-seq bytes) fin-p)
+                     writes)
+               (when fin-p
+                 (setf (gethash stream finished-streams) t))))
+           :try-read-stream
+           (lambda (stream &key timeout deadline)
+             (declare (ignore timeout deadline))
+             (if (not (gethash stream finished-streams))
+                 (values nil nil :would-block)
+                 (case (gethash stream read-stages 0)
+                   (0 (setf (gethash stream read-stages) 1)
+                      (values response-wire nil :data))
+                   (1 (setf (gethash stream read-stages) 2)
+                      (values nil t :fin))
+                   (otherwise
+                    (error "The native scheduler read past response FIN."))))))
+         (request
+          (make-http-request
+           :method "POST"
+           :uri "https://example.test/unknown-length-producer"
+           :body (octets)))
+         (response nil))
+    (unwind-protect
+        (progn
+          (setf response
+                (http-kit/http3:send-http3-request
+                 client request
+                 :request-body-function
+                 (lambda (maximum-size)
+                   (ensure-equal 16384 maximum-size)
+                   (incf producer-calls)
+                   (case producer-calls
+                     (1 (octets 7 8))
+                     (2 nil)
+                     (otherwise
+                      (error "The request body producer ran past EOF."))))))
+          (ensure-equal 200 (http-response-status response))
+          (ensure-equal 2 producer-calls)
+          (let* ((request-writes (nreverse writes))
+                 (frames
+                  (mapcar
+                   (lambda (event)
+                     (let ((decoded
+                            (http-kit/http3:decode-http3-frames (second event))))
+                       (ensure-equal 1 (length decoded))
+                       (first decoded)))
+                   request-writes)))
+            (ensure-equal 3 (length request-writes))
+            (ensure-equal
+             (list http-kit/http3:+http3-headers-type+
+                   http-kit/http3:+http3-data-type+
+                   http-kit/http3:+http3-data-type+)
+             (mapcar #'http-kit/http3:http3-frame-type frames))
+            (ensure-equal '(nil nil t) (mapcar #'third request-writes))
+            (ensure-equal
+             '(2 0)
+             (mapcar
+              (lambda (frame)
+                (length (http-kit/http3:http3-frame-payload frame)))
+              (rest frames)))
+            (ensure-octets-equal
+             (octets 7 8)
+             (http-kit/http3:http3-frame-payload (second frames)))
+            (ensure-equal
+             0
+             (length
+              (http-kit/http3:http3-frame-payload (third frames))))))
+      (when (http-kit/http3:http3-client-open-p client)
+        (http-kit/http3:close-http3-client client))))))
+(deftest http3-client-native-scheduler-expired-waiter-cancels-after-owner-release
+  (let* ((poll-started (sb-thread:make-semaphore :count 0))
+         (release-owner (sb-thread:make-semaphore :count 0))
+         (first-poll-p nil)
+         (cancellations nil)
+         (owner-response-sent-p nil)
+         (response-wire (http3-test-native-response-wire))
+         (client
+          (http3-test-make-native-client
+           :poll-function
+           (lambda ()
+             (unless first-poll-p
+               (setf first-poll-p t)
+               (sb-thread:signal-semaphore poll-started)
+               (sb-thread:wait-on-semaphore release-owner)))
+           :cancel-stream
+           (lambda (stream &key error-code timeout deadline)
+             (declare (ignore timeout deadline))
+             (push (list (http3-test-stream-kind stream) error-code)
+                   cancellations)
+             t)
+           :try-read-stream
+           (lambda (stream &key timeout deadline)
+             (declare (ignore timeout deadline))
+             (if (string= "/owner" (http3-test-stream-kind stream))
+                 (if (and cancellations (not owner-response-sent-p))
+                     (progn
+                       (setf owner-response-sent-p t)
+                       (values response-wire t :data))
+                     (values nil nil :would-block))
+                 (values nil nil :would-block)))))
+         (owner-thread nil)
+         (owner-finished nil)
+         (owner-result nil)
+         (waiter-thread nil)
+         (waiter-finished nil)
+         (waiter-result nil))
+    (unwind-protect
+         (progn
+           (multiple-value-setq (owner-thread owner-finished owner-result)
+             (http3-test-start-native-call
+              (lambda ()
+                (http-kit/http3:send-http3-request
+                 client
+                 (make-http-request
+                  :method "GET"
+                  :uri "https://example.test/owner")))))
+           (ensure-true
+            (sb-thread:wait-on-semaphore poll-started :timeout 3))
+           (multiple-value-setq (waiter-thread waiter-finished waiter-result)
+             (http3-test-start-native-call
+              (lambda ()
+                (http-kit/http3:send-http3-request
+                 client
+                 (make-http-request
+                  :method "GET"
+                  :uri "https://example.test/expired")
+                 :deadline 0))))
+           (ensure-true
+            (sb-thread:wait-on-semaphore waiter-finished :timeout 3))
+           (ensure-false
+            (sb-thread:wait-on-semaphore owner-finished :timeout 0))
+           (ensure-equal :error (first waiter-result))
+           (ensure-true (typep (second waiter-result) 'http-timeout))
+           (ensure-equal nil cancellations)
+           (let ((waiter-entry
+                  (sb-thread:with-mutex
+                      ((http-kit/http3::http3-client-scheduler-lock client))
+                    (find-if
+                     (lambda (entry)
+                       (string= "/expired"
+                                (http-kit:http-request-target
+                                 (http-kit/http3::%http3-request-stream-request
+                                  entry))))
+                     (http-kit/http3::http3-client-pending-request-streams client))))
+             (ensure-true waiter-entry)
+             (ensure-true
+              (http-kit/http3::%http3-request-stream-cancel-requested-p
+               waiter-entry)))
+           (sb-thread:signal-semaphore release-owner)
+           (ensure-true
+            (sb-thread:wait-on-semaphore owner-finished :timeout 3))
+           (ensure-equal :response (first owner-result))
+           (ensure-equal 200 (http-response-status (second owner-result)))
+           (ensure-equal
+            (list (list "/expired" #x10c))
+            (nreverse cancellations))
+           (sb-thread:with-mutex
+               ((http-kit/http3::http3-client-scheduler-lock client))
+             (ensure-equal
+              nil
+              (http-kit/http3::http3-client-pending-request-streams client))
+             (ensure-equal
+              0
+              (hash-table-count
+               (http-kit/http3::http3-client-request-streams client)))))
+      (sb-thread:signal-semaphore release-owner)
+      (when (http-kit/http3:http3-client-open-p client)
+        (http-kit/http3:close-http3-client client))
+      (http3-test-join-native-thread owner-thread owner-finished)
+      (http3-test-join-native-thread waiter-thread waiter-finished)))))

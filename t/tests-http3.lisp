@@ -3386,6 +3386,92 @@
         (http3-test-join-native-thread owner-thread owner-finished)
         (http3-test-join-native-thread peer-thread peer-finished))))
 
+(deftest http3-client-native-scheduler-cancel-callback-nonlocal-exit-falls-back-and-closes-state
+  (let* ((read-failure
+           (make-condition 'simple-error
+                           :format-control "The native response read failed."))
+         (read-failure-raised-p nil)
+         (cancel-count 0)
+         (cancelled-stream nil)
+         (request-stream nil)
+         (request-id nil)
+         (request-entry nil)
+         (client
+           (http3-test-make-native-client
+            :cancel-stream
+            (lambda (stream &key error-code timeout deadline)
+              (declare (ignore error-code timeout deadline))
+              (incf cancel-count)
+              (setf cancelled-stream stream)
+              (throw 'http3-test-native-cancel-cleanup-exit :unwound))
+            :try-read-stream
+            (lambda (stream &key timeout deadline)
+              (declare (ignore timeout deadline))
+              (if (and (stringp (http3-test-stream-kind stream))
+                       (string= "/cancel-cleanup"
+                                (http3-test-stream-kind stream))
+                       (not read-failure-raised-p))
+                  (progn
+                    (setf read-failure-raised-p t)
+                    (error read-failure))
+                  (values nil nil :would-block))))))
+    (unwind-protect
+         (let ((failure
+                 (catch 'http3-test-native-cancel-cleanup-exit
+                   (http3-boundary-error
+                    (lambda ()
+                      (http-kit/http3:send-http3-request
+                       client
+                       (make-http-request
+                        :method "GET"
+                        :uri "https://example.test/cancel-cleanup")
+                       :on-stream-open
+                       (lambda (stream stream-id cancel)
+                         (declare (ignore cancel))
+                         (setf request-stream stream
+                               request-id stream-id
+                               request-entry
+                               (http-kit/http3::%h3-scheduler-entry-for-stream
+                                client stream)))))))))
+           (ensure-true read-failure-raised-p)
+           (ensure-equal 1 cancel-count)
+           (ensure-true request-stream)
+           (ensure-true (eq request-stream cancelled-stream))
+           (ensure-equal 0 request-id)
+           (ensure-true (typep failure 'http-connection-error))
+           (when (typep failure 'http-connection-error)
+             (ensure-equal
+              "The HTTP/3 cancellation cleanup exited nonlocally."
+              (http-error-message failure))
+             (ensure-equal :http3-request (http-error-operation failure))
+             (ensure-true
+              (http-connection-error-request-sent-p failure)))
+           (ensure-true request-entry)
+           (ensure-true
+            (http-kit/http3::%http3-request-stream-done-p request-entry))
+           (ensure-true
+            (eq failure
+                (http-kit/http3::%http3-request-stream-failure request-entry)))
+           (ensure-false (http-kit/http3:http3-client-open-p client))
+           (ensure-equal :http3-closed
+                         (http-kit/http3::http3-client-scheduler-close-state client))
+           (ensure-equal 0
+                         (hash-table-count
+                          (http-kit/http3::http3-client-request-streams client)))
+           (ensure-equal nil
+                         (http-kit/http3::http3-client-pending-request-streams client))
+           (ensure-equal nil
+                         (http-kit/http3::http3-client-runnable-stream-ids client))
+           (ensure-equal 0
+                         (http-kit/http3::http3-client-request-stream-count client))
+           (ensure-equal nil
+                         (http-kit/http3::http3-client-scheduler-owner-thread client))
+           (ensure-false
+            (http-kit/http3::http3-client-scheduler-close-owner-active-p client)))
+      (when (http-kit/http3:http3-client-open-p client)
+        (http-kit/http3:close-http3-client client)))
+))
+
 (deftest http3-client-native-scheduler-discards-unknown-peer-stream-through-fin
   (let* ((response-wire (http3-test-native-response-wire))
          (extension-type (http-kit/http3:http3-varint-encode 64))
@@ -6534,6 +6620,77 @@
              (funcall cancel-function))))))
     (ensure-true cancel-attempted-p)
     (ensure-true (typep closed-condition 'error))))
+#+sbcl
+(deftest http3-client-native-scheduler-on-stream-open-cancel-closure-clears-entry
+  (let* ((cancel-calls nil)
+         (cancel-return-value nil)
+         (request-stream nil)
+         (request-id nil)
+         (request-entry nil)
+         (client
+          (http3-test-make-native-client
+           :cancel-stream
+           (lambda (stream &key error-code timeout deadline)
+             (declare (ignore timeout deadline))
+             (push (list stream error-code) cancel-calls))
+           :try-read-stream
+           (lambda (stream &key timeout deadline)
+             (declare (ignore stream timeout deadline))
+             (values nil nil :would-block)))))
+    (unwind-protect
+        (let ((failure
+               (http3-boundary-error
+                (lambda ()
+                  (http-kit/http3:send-http3-request
+                   client
+                   (make-http-request
+                    :method "GET"
+                    :uri "https://example.test/cancel-from-open")
+                   :on-stream-open
+                   (lambda (stream stream-id cancel)
+                     (setf request-stream stream
+                           request-id stream-id
+                           request-entry
+                           (http-kit/http3::%h3-scheduler-entry-for-stream
+                            client stream))
+                     (setf cancel-return-value (funcall cancel))))))))
+          (ensure-true request-stream)
+          (ensure-equal 0 request-id)
+          (ensure-equal t cancel-return-value)
+          (ensure-equal 1 (length cancel-calls))
+          (ensure-true (eq request-stream (first (first cancel-calls))))
+          (ensure-equal #x10c (second (first cancel-calls)))
+          (ensure-true (typep failure 'http-connection-error))
+          (when (typep failure 'http-connection-error)
+            (ensure-equal
+             "The HTTP/3 request stream was cancelled."
+             (http-error-message failure))
+            (ensure-equal :http3-request (http-error-operation failure))
+            (ensure-true
+             (http-connection-error-request-sent-p failure)))
+          (ensure-true request-entry)
+          (ensure-true
+           (http-kit/http3::%http3-request-stream-done-p request-entry))
+          (ensure-true
+           (eq failure
+               (http-kit/http3::%http3-request-stream-failure request-entry)))
+          (ensure-equal 0
+                        (hash-table-count
+                         (http-kit/http3::http3-client-request-streams client)))
+          (ensure-equal nil
+                        (http-kit/http3::http3-client-pending-request-streams client))
+          (ensure-equal nil
+                        (http-kit/http3::http3-client-runnable-stream-ids client))
+          (ensure-equal 0
+                        (http-kit/http3::http3-client-request-stream-count client))
+          (ensure-equal nil
+                        (http-kit/http3::http3-client-scheduler-owner-thread client))
+          (ensure-true (http-kit/http3:http3-client-open-p client))
+          (ensure-equal nil
+                        (http-kit/http3::http3-client-scheduler-close-state client)))
+      (when (http-kit/http3:http3-client-open-p client)
+        (http-kit/http3:close-http3-client client))
+      )))
 
 (deftest http3-control-role-is-required-for-role-sensitive-processing
   (let ((state (http-kit/http3:make-http3-control-state
