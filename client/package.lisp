@@ -82,18 +82,6 @@
    #:http-multipart-part-content-type
    #:make-http-multipart-body
    #:parse-http-multipart-body
-   ;; Server-sent events
-   #:http-sse-event
-   #:http-sse-event-p
-   #:make-http-sse-event
-   #:http-sse-event-event
-   #:http-sse-event-data
-   #:http-sse-event-id
-   #:http-sse-event-retry
-   #:http-sse-event-comments
-   #:parse-http-sse-events
-   #:read-http-sse-events
-   #:serialize-http-sse-event
    ;; Cookies
    #:http-cookie
    #:make-http-cookie
@@ -284,62 +272,3 @@
    #:http-client-request
    #:http-client-send))
 
-(defpackage #:http-kit/websocket
-  (:use #:cl)
-  (:import-from #:http-kit
-                #:http-error-operation
-                #:http-protocol-error
-                #:http-size-limit-exceeded
-                #:http-request
-                #:http-request-p
-                #:http-request-protocol-version
-                #:http-request-method
-                #:http-request-headers
-                #:http-response-p
-                #:http-response-protocol-version
-                #:http-response-status
-                #:http-response-headers
-                #:make-http-response
-                #:http-header-p
-                #:http-header-name
-                #:http-header-values
-                #:make-http-header
-                #:make-http-request
-                #:send-http-request-over-open-stream
-                #:%monotonic-time)
-  (:import-from #:http-kit/client
-                #:http-utf8-octets)
-  (:export
-   #:websocket-frame
-   #:websocket-frame-p
-   #:websocket-frame-fin-p
-   #:websocket-frame-rsv1-p
-   #:websocket-frame-opcode
-   #:websocket-frame-mask-p
-   #:websocket-frame-masking-key
-   #:websocket-frame-payload
-   #:make-websocket-frame
-   #:serialize-websocket-frame
-   #:parse-websocket-frame
-   #:read-websocket-frame
-   #:write-websocket-frame
-   #:read-websocket-message
-   #:write-websocket-message
-   #:websocket-ping
-   #:websocket-pong
-   #:websocket-close
-   #:serve-websocket-session
-   #:make-websocket-client-key
-   #:websocket-accept-key
-   #:websocket-extension
-   #:websocket-extension-p
-   #:websocket-extension-name
-   #:websocket-extension-parameters
-   #:parse-websocket-extensions
-   #:websocket-upgrade-request-p
-   #:websocket-upgrade-response
-   #:make-websocket-upgrade-request
-   #:websocket-client-handshake
-   #:websocket-valid-close-code-p
-   #:make-websocket-close-payload
-   #:parse-websocket-close-payload))

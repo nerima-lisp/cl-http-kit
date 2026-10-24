@@ -54,7 +54,7 @@ shell.
 | System | Purpose |
 | --- | --- |
 | cl-http-kit | HTTP message model, HTTP/1.1 wire format, HTTP/1.x server sessions, transport callbacks, deadlines, limits, conditions, and recording sessions |
-| cl-http-kit/client | URI, authentication, cookies, RFC 6797 HSTS, RFC 7838 Alt-Svc discovery, RFC 9111 cache with RFC 5861 `stale-if-error`, proxy, redirect, retry, gzip/deflate response decoding, HTTP/1.1 connection-pool, multipart body, Server-Sent Events, and WebSocket client/server-session policies |
+| cl-http-kit/client | URI, authentication, cookies, RFC 6797 HSTS, RFC 7838 Alt-Svc discovery, RFC 9111 cache with RFC 5861 `stale-if-error`, proxy, redirect, retry, gzip/deflate response decoding, HTTP/1.1 connection-pool, multipart body |
 | cl-http-kit/http2 | HTTP/2 client and injected-stream server-session boundaries |
 | cl-http-kit/http3 | HTTP/3 frames, SETTINGS, QPACK static/literal/Huffman codecs with caller-owned dynamic tables, and injected-QUIC client/request-stream server-session boundaries |
 | cl-http-kit/network | Optional SBCL TCP/DNS stream opener, IPv4/IPv6 listener, and HTTP/1 listener service |
@@ -123,16 +123,8 @@ cl-tls-kit integration has no server driver. To expose HTTPS for a server,
 terminate TLS in a reverse proxy or load balancer and forward plain HTTP to
 `cl-http-kit/network`; preserve the original host and scheme using the proxy's
 trusted forwarding policy. ALPN selection remains explicit in the current
-client path, and the
-optional client system also supplies
-a thread-safe HTTP/1.1 connection pool and RFC 6455 frame, message,
-close-payload, HTTP upgrade, client-side 101 handshake, and upgraded server
-session helpers. WebSocket extension grammar and RFC 7692 negotiation
-parameters are validated, with application-injected compression codecs for
-negotiated message processing. WebSocket key generation, dialing, TLS/ALPN,
-extension selection, codec state, and masking-key generation remain
-application-owned; the server session handles Ping/Pong and the close
-handshake it owns.
+client path, and the optional client system also supplies a thread-safe
+HTTP/1.1 connection pool.
 
 When a client supplies `:http3-transport-function`, an advertised
 Alt-Svc `h3` alternative is attempted before TCP. TCP fallback requires an
