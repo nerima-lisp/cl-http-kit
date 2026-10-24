@@ -746,7 +746,6 @@
                       :max-handshakes 1
                       :on-event
                       (lambda (event)
-                        (http-server-failure server)
                         (%https-listener-record-event context event))))
                (start-http-server server)
                (setf first-client (%https-listener-connect server))
@@ -820,7 +819,6 @@
                       :max-handshakes 1
                       :on-event
                       (lambda (event)
-                        (http-server-failure server)
                         (%https-listener-record-event context event))))
                (start-http-server server)
                (let ((client (%https-listener-connect server)))
@@ -855,11 +853,9 @@
                      (%https-listener-make-server
                       :on-event
                       (lambda (event)
-                        (http-server-failure server)
                         (%https-listener-record-event context event))
                       :on-error
                       (lambda (condition details)
-                        (http-server-failure server)
                         (%https-listener-record-error
                          context condition details))))
                (start-http-server server)
