@@ -11,7 +11,8 @@ historical release behavior, not the current API contract; see the
 - Remove the `http-kit/websocket` package and SSE exports from
   `http-kit/client`. Move WebSocket consumers to `websocket-kit` from
   `cl-websocket-kit` and SSE consumers to `sse-kit` from `cl-sse-kit`.
-  See the [WebSocket and SSE migration guide](migration.md#websocket-and-sse-api-migration).
+  See the
+  [WebSocket and SSE migration guide](migration.md#websocket-and-sse-api-migration).
 
 ## 0.4.1
 
@@ -74,9 +75,9 @@ The 0.4.0 release is a breaking integration release for the 0.x series:
   content coding, and pooling enabled by default;
 - retain `make-http-client` and `http-client-send` as compatibility entry
   points;
-- replace the direct `cl+ssl` TLS and `chipz` compression dependencies with
-  cl-tls-kit and cl-deflate-kit, using cl-crypto-kit for cryptographic
-  primitives and cl-quic-kit for QUIC;
+- replace the direct legacy TLS and compression dependencies with cl-tls-kit
+  and cl-deflate-kit, with the remaining crypto and QUIC boundaries supplied
+  by the four-kit stack;
 - support environment-based proxy selection (`HTTP_PROXY`, `HTTPS_PROXY`,
   and `NO_PROXY`, including lowercase names), proxy/origin authentication,
   and thread-safe pool and cookie state;
@@ -88,8 +89,16 @@ The 0.4.0 release is a breaking integration release for the 0.x series:
   Alt-Svc, fallback, and explicit HTTP/3 modes;
 - update the dependency pins for cl-crypto-kit, cl-deflate-kit, cl-tls-kit,
   and cl-quic-kit to their release integration branches;
-- The 0.4.0 test and lint gate ran on Ubuntu x86_64 with `nix flake check`.
+- verify the release gate on Ubuntu x86_64 with `nix flake check`, including
+  the test and lint checks defined by the flake; run the separate strict MkDocs
+  build for documentation when publishing the docs.
 
-The 0.4.0 HTTP/3 connection path was verified through the cl-quic-kit adapter;
-native QUIC sockets and server acceptance were outside that release boundary.
+The 0.4.0 runtime verification was limited to Ubuntu x86_64. Its HTTP/3
+connection path was verified through the cl-quic-kit adapter; native QUIC
+sockets and server acceptance were outside that release boundary.
 
+## Earlier 0.3.x source
+
+The 0.3.x source provided callback and stream APIs for HTTP/1.1, injected
+HTTP/2, injected HTTP/3 framing, client policy helpers, native TCP/DNS, and
+the cl-tls-kit TLS 1.3 client wrapper.

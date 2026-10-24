@@ -15,11 +15,9 @@ integrations.
 The checked-in ASDF systems are version 0.4.1. `make-http-client` creates a
 native TCP/TLS connection pool when no transport boundary is supplied, while
 `http-client-request` and `http-client-send` remain supported request paths.
-`http-client-send` also accepts a method and URI positionally, or a URI alone
-that defaults to GET. See the
-[changelog](docs/src/project/changelog.md) and
-[migration guide](docs/src/project/migration.md) for the 0.4.0 integration and
-planned API migrations.
+`http-client-send` also accepts a method and URL convenience form. See the
+[changelog](docs/src/project/changelog.md) and [migration guide](docs/src/project/migration.md)
+for the 0.4.0 compatibility boundary.
 
 The client uses cl-deflate-kit for compression and cl-tls-kit 0.1.2 or later
 for TLS 1.3.
@@ -27,8 +25,8 @@ TLS certificate-chain, hostname, and trust verification is required by
 default. `:verify :optional` has the same verification policy as `:required`;
 `:verify nil` skips those certificate-policy checks but still requires the
 peer's CertificateVerify signature. Use `nil` only for deliberately
-unauthenticated test connections. `cl-http-kit` does not support server-side
-TLS because cl-tls-kit has no server driver.
+unauthenticated test connections. Server TLS remains outside the current kit
+boundary.
 
 ## Quick Start
 
@@ -99,10 +97,41 @@ environment.
 The documentation build is described in
 [Project Development](https://nerima-lisp.github.io/cl-http-kit/project/development/).
 
-## HTTP/3 fallback
+## Scope
 
-See the [HTTP/3 compatibility notes](docs/src/reference/compatibility.md#http3)
-for Alt-Svc selection, fallback conditions, and explicit HTTP/3 requests.
+The library owns HTTP message validation, HTTP/1.1 framing, HTTP/1.x request
+and response sessions, bounded body handling, high-level request policies, and
+small composition boundaries. The optional client system adds cookie-jar
+partitioning and SameSite request context, content-coding adapter selection,
+cache request-directive handling with 304 metadata refresh, and ALPN protocol
+name helpers. The current client integration can supply native dialing, TLS,
+proxy selection, content coding, and a locked pool when its default boundary is
+used. The optional
+`cl-http-kit/http2` system supplies both a client and a
+server session over caller-provided binary I/O. The optional
+`cl-http-kit/http3` system supplies client and per-request server stream
+framing with static/literal/Huffman QPACK and caller-owned dynamic-table
+references over caller-provided QUIC streams. Its optional cl-quic-kit adapter
+can drive the client QUIC connection and stream lifecycle when explicitly
+supplied. QUIC packets, loss recovery, congestion control, TLS 1.3, ALPN,
+sockets, certificate policy, and native HTTP/3 server acceptance remain
+outside the framing boundary. The optional
+`cl-http-kit/network` system supplies native TCP, DNS, and an HTTP/1 listener
+service on SBCL; `cl-http-kit/tls` supplies the client TLS upgrade wrapper.
+Server-side TLS wrapping is unsupported because the current
+cl-tls-kit integration has no server driver. To expose HTTPS for a server,
+terminate TLS in a reverse proxy or load balancer and forward plain HTTP to
+`cl-http-kit/network`; preserve the original host and scheme using the proxy's
+trusted forwarding policy. ALPN selection remains explicit in the current
+client path, and the optional client system also supplies a thread-safe
+HTTP/1.1 connection pool.
+
+When a client supplies `:http3-transport-function`, an advertised
+Alt-Svc `h3` alternative is attempted before TCP. TCP fallback requires an
+`http-connection-error` whose `http-connection-error-request-sent-p` reader is
+false, and no request-body producer or response callback may have run.
+Other failures are propagated. An explicit HTTP/3 request is a hard
+requirement and does not fall back.
 
 ## Support
 

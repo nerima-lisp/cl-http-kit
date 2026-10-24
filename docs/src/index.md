@@ -5,13 +5,11 @@ separates HTTP message semantics and wire processing from the application-owned
 network boundary.
 
 The checked-in systems are version 0.4.1. The integration includes native
-default client wiring, dependency declarations for cl-crypto-kit,
-cl-deflate-kit, cl-tls-kit, and cl-quic-kit, and a URL-and-method client entry
-point. The optional cl-quic-kit adapter supports native
+default client wiring, the four-kit dependency declarations, and a URL-and-
+method client entry point. The optional cl-quic-kit adapter supports native
 IPv4 HTTP/3 client connections. Native QUIC server acceptance is not provided;
 HTTP/3 server sessions use injected streams. Read the
-[migration guide](project/migration.md) for the 0.4.0 integration and planned
-0.5.0 migrations, and the
+[migration guide](project/migration.md) for the compatibility boundary and the
 [changelog](project/changelog.md) for the release scope.
 
 ## Start here
@@ -31,7 +29,7 @@ The repository currently documents these ASDF systems:
 | System | Responsibility |
 | --- | --- |
 | cl-http-kit | HTTP messages, HTTP/1.1, HTTP/1.x server sessions, transport callbacks, limits, deadlines, conditions, and recording sessions |
-| cl-http-kit/client | URI, authentication, cookies, cache, content-coding selection, ALPN protocol helpers, proxy, redirect, retry, and HTTP/1.1 connection-pool |
+| cl-http-kit/client | URI, authentication, cookies, cache, content-coding selection, ALPN protocol helpers, proxy, redirect, retry, HTTP/1.1 connection-pool |
 | cl-http-kit/http2 | HTTP/2 client and injected-stream server-session boundaries |
 | cl-http-kit/http3 | HTTP/3 request-stream framing, static/literal/Huffman QPACK codecs with caller-owned dynamic tables, injected-QUIC client/server-session boundaries, and an optional cl-quic-kit client adapter |
 | cl-http-kit/network | Optional native SBCL TCP, DNS, and HTTP/1 listener service |
