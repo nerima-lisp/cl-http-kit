@@ -1171,6 +1171,8 @@
                 :on-body-chunk (lambda (state chunk)
                                  (declare (ignore state chunk))
                                  (incf body-calls))
+                :reserve-body-bytes #'identity
+                :release-body-bytes #'identity
                 :on-error (lambda (condition request)
                             (declare (ignore condition request))
                             (incf error-calls))
@@ -1285,6 +1287,9 @@
       (ensure-equal 7
                     (http-kit/http2::%h2-server-effective-deadline
                      7 9 deadlines))
+      (ensure-equal 7
+                    (http-kit/http2::%h2-server-effective-deadline
+                     7 nil deadlines))
       (setf (gethash :stream deadlines) 5)
       (ensure-equal 5
                     (http-kit/http2::%h2-server-effective-deadline
