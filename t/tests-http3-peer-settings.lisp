@@ -466,6 +466,69 @@
                 (http-kit/http3::http3-client-prefetched-stream-inputs client)))
           (when (http-kit/http3:http3-client-open-p client)
             (http-kit/http3:close-http3-client client)))))))
+#+sbcl
+(deftest http3-peer-push-registration-rejects-close-during-prefix-read
+  (cl-weave:expect-assertions 13)
+  (let* ((push-stream (make-http3-test-stream :kind :peer-push))
+         (push-prefix
+           (http3-test-concat-octets
+            (http-kit/http3:http3-varint-encode
+             http-kit/http3:+http3-push-stream-type+)
+            (http-kit/http3:http3-varint-encode 1)))
+         (client nil)
+         (read-count 0)
+         (callback-stream nil)
+         (close-result nil))
+    (setf client
+          (http-kit/http3:make-http3-client
+           :open-stream
+           (lambda (request &key stream-type timeout deadline)
+             (declare (ignore request timeout deadline))
+             (make-http3-test-stream :kind stream-type))
+           :write-stream
+           (lambda (stream octets &key fin-p timeout deadline)
+             (declare (ignore stream octets fin-p timeout deadline)))
+           :read-stream
+           (lambda (stream &key timeout deadline)
+             (declare (ignore timeout deadline))
+             (incf read-count)
+             (setf callback-stream stream)
+             (ensure-true (http-kit/http3:http3-client-open-p client))
+             (setf close-result
+                   (http-kit/http3:close-http3-client client))
+             (values push-prefix nil))
+           :close-stream
+           (lambda (stream &key condition)
+             (declare (ignore condition))
+             (setf (http3-test-stream-closed-p stream) t))
+           :max-push-id 2))
+    (unwind-protect
+         (let ((failure
+                 (http3-boundary-error
+                  (lambda ()
+                    (http-kit/http3:accept-http3-peer-unidirectional-stream
+                     client push-stream)))))
+           (http3-public-error-check
+            failure "The HTTP/3 client is already closed." nil)
+           (ensure-true close-result)
+           (ensure-false (http-kit/http3:http3-client-open-p client))
+           (ensure-equal 1 read-count)
+           (ensure-true (eq push-stream callback-stream))
+           (ensure-equal
+            nil
+            (http-kit/http3::http3-client-seen-peer-push-ids client))
+           (ensure-equal
+            nil
+            (http-kit/http3::http3-client-pending-push-streams client))
+           (ensure-equal
+            nil
+            (http-kit/http3::http3-client-prefetched-stream-inputs client))
+           (ensure-equal
+            1
+            (http-kit/http3::http3-client-peer-unidirectional-stream-count
+             client)))
+      (when (http-kit/http3:http3-client-open-p client)
+        (http-kit/http3:close-http3-client client)))))
 
 #+sbcl
 (progn

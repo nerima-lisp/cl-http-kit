@@ -13778,5 +13778,69 @@
               (ensure-equal 0 (http-kit/http3::http3-client-request-stream-count client)))
           (when (http-kit/http3:http3-client-open-p client)
             (http-kit/http3:close-http3-client client)))))))
+(deftest http3-client-close-callback-nonlocal-exit-synthesizes-failure
+         (let* ((close-count 0)
+                (client
+                 (http-kit/http3:make-http3-client
+                  :open-stream
+                  (lambda (request &key stream-type timeout deadline)
+                    (declare (ignore timeout deadline))
+                    (make-http3-test-stream
+                     :kind (if request
+                               (http-kit:http-request-target request)
+                             stream-type)))
+                  :write-stream
+                  (lambda (stream octets &key fin-p timeout deadline)
+                    (declare (ignore stream octets fin-p timeout deadline)))
+                  :read-stream
+                  (lambda (stream &key timeout deadline)
+                    (declare (ignore stream timeout deadline))
+                    (values nil t))
+                  :close-stream
+                  (lambda (stream &key condition)
+                    (declare (ignore stream condition))
+                    (incf close-count)
+                    (throw (quote http3-test-close-throw-exit) :unwound)))))
+           (let* ((exit
+                   (catch (quote http3-test-close-throw-exit)
+                     (http-kit/http3:close-http3-client client)
+                     :returned))
+                  (close-state
+                   (http-kit/http3::http3-client-scheduler-close-state client)))
+             (ensure-equal :unwound exit)
+             (ensure-equal 1 close-count)
+             (ensure-false (http-kit/http3:http3-client-open-p client))
+             (ensure-true (typep close-state (quote http-connection-error)))
+             (when (typep close-state (quote http-connection-error))
+               (ensure-equal
+                "Closing the HTTP/3 client did not complete."
+                (http-error-message close-state))
+               (ensure-equal :http3-close (http-error-operation close-state))))))
+(deftest http3-client-qpack-close-error-still-closes-streams
+         (let* ((closed-streams nil)
+                (client
+                 (http3-test-make-native-client
+                  :close-stream
+                  (lambda (stream &key condition)
+                    (declare (ignore condition))
+                    (push stream closed-streams)
+                    (setf (http3-test-stream-closed-p stream) t))))
+                (streams
+                 (list (http-kit/http3::http3-client-control-stream client)
+                       (http-kit/http3::http3-client-qpack-encoder-stream client)
+                       (http-kit/http3::http3-client-qpack-decoder-stream client))))
+           (setf (http-kit/http3::http3-client-qpack-http3-decoder-context client)
+                 :invalid)
+           (let ((failure
+                  (http3-boundary-error
+                   (lambda ()
+                     (http-kit/http3:close-http3-client client)))))
+             (ensure-true failure)
+             (ensure-true (typep failure (quote error)))
+             (ensure-false (http-kit/http3:http3-client-open-p client))
+             (ensure-equal 3 (length closed-streams))
+             (dolist (stream streams)
+               (ensure-true (member stream closed-streams :test (function eq)))
+               (ensure-true (http3-test-stream-closed-p stream))))))
 
 

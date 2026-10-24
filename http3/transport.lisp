@@ -2521,13 +2521,7 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
                                             (loop while (http3-client-scheduler-owner-thread client)
                                                   do (%h3-scheduler-condition-wait
                                                       client nil #'http-kit::%monotonic-time)))
-                                          (if (eq (http3-client-scheduler-close-state client) :closed)
-                                              (progn
-                                                (setf (http3-client-scheduler-close-owner-active-p client) nil
-                                                      (http3-client-scheduler-close-owner-thread client) nil
-                                                      result :closed)
-                                                (%h3-scheduler-broadcast client))
-                                            (setf result :proceed)))
+                                          (setf result :proceed))
                                          ((eq (http3-client-scheduler-owner-thread client) thread)
                                           (error
                                            (make-condition
@@ -2603,8 +2597,8 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
                 (%http3-request-stream-stream entry) opened-stream)
           (%h3-scheduler-register-entry client entry opened-stream stream-id)
           (let ((goaway-id
-                  (http3-control-state-goaway-id
-                   (http3-client-peer-control-state client))))
+                 (http3-control-state-goaway-id
+                  (http3-client-peer-control-state client))))
             (when goaway-id
               (unless (and (integerp stream-id)
                            (>= stream-id 0)
@@ -2616,28 +2610,18 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
           (when (%http3-request-stream-on-stream-open entry)
             (funcall (%http3-request-stream-on-stream-open entry)
                      stream stream-id
-                     (lambda (&key (error-code #x10c))
+                     (lambda (&key (error-code nil error-code-supplied-p))
                        (cancel-http3-stream
-                        client stream :error-code error-code
+                        client stream
+                        :error-code (if error-code-supplied-p error-code #x10c)
                         :timeout (%http3-request-stream-timeout entry)
                         :deadline (%http3-request-stream-deadline entry)))))
           entry)
       (error (condition)
-        (if stream
-            (progn
-              (%h3-scheduler-fail-entry client entry condition)
-              (unless
-                  (or (%http3-request-stream-done-p entry)
-                      (%h3-with-scheduler-lock (client)
-                        (loop for active-entry being the hash-values
-                                of (http3-client-request-streams client)
-                              thereis (eq entry active-entry))))
-                (%h3-with-scheduler-lock (client)
-                  (pushnew entry
-                           (http3-client-pending-request-streams client)
-                           :test (function eq)))))
-            (%h3-scheduler-complete-entry client entry :failure condition))
-        entry))))
+             (if stream
+                 (%h3-scheduler-fail-entry client entry condition)
+               (%h3-scheduler-complete-entry client entry :failure condition))
+             entry))))
 
 (defun %h3-scheduler-start-pending (client)
   (let ((entries
@@ -2798,19 +2782,15 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
      (trailers
       (%h3-scheduler-write-fields client entry trailers t)
       (setf (getf state :finished-p) t)
-      t)
-     (t
-      (%h3-scheduler-write-data client entry (http-kit::%empty-octets) t)
-      (setf (getf state :finished-p) t)
       t))))
 (progn
 (defun %h3-scheduler-process-push-promise (client entry payload)
   (multiple-value-bind (push-id field-position)
       (http3-varint-decode payload)
     (let ((max-push-id (let ((max-push-id nil))
-                             (%h3-with-scheduler-lock (client)
-                               (setf max-push-id (http3-client-max-push-id client)))
-                             max-push-id)))
+                         (%h3-with-scheduler-lock (client)
+                                                  (setf max-push-id (http3-client-max-push-id client)))
+                         max-push-id)))
       (unless (and max-push-id (<= push-id max-push-id))
         (%h3-transport-error
          "HTTP/3 PUSH_PROMISE exceeds the advertised MAX_PUSH_ID."
@@ -2827,14 +2807,14 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
            (let ((existing (assoc push-id (http3-client-push-promises client)
                                   :test #'=)))
              (cond
-               ((and existing
-                     (not (%h3-field-sections-equal-p (cdr existing) fields)))
-                (%h3-transport-error
-                 "Repeated HTTP/3 PUSH_PROMISE fields differ." :h3-id-error))
-               ((null existing)
-                (pushnew push-id (http3-client-promised-push-ids client) :test #'=)
-                (push (cons push-id fields)
-                      (http3-client-push-promises client)))))))
+              ((and existing
+                    (not (%h3-field-sections-equal-p (cdr existing) fields)))
+               (%h3-transport-error
+                "Repeated HTTP/3 PUSH_PROMISE fields differ." :h3-id-error))
+              ((null existing)
+               (pushnew push-id (http3-client-promised-push-ids client) :test #'=)
+               (push (cons push-id fields)
+                     (http3-client-push-promises client)))))))
         (when (%http3-request-stream-on-push-promise entry)
           (funcall (%http3-request-stream-on-push-promise entry)
                    push-id (%h3-copy-field-section fields)))
