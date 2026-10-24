@@ -424,6 +424,12 @@ CLOSE-HTTP2-CONNECTION-MANAGER also prevents future calls."
         (sb-thread:condition-broadcast
          (%h2-manager-opening-waitqueue opening))))
     opening)
+  #+sbcl
+  (defun %h2-manager-recover-wait-lock (lock)
+    (unless (sb-thread:holding-mutex-p lock)
+      (sb-sys:without-interrupts
+        (sb-sys:allow-with-interrupts
+          (sb-thread:grab-mutex lock)))))
 
   #-sbcl
   (defun %h2-manager-release-opening (manager key opening)
@@ -447,10 +453,7 @@ CLOSE-HTTP2-CONNECTION-MANAGER also prevents future calls."
                   :timeout (and deadline
                                 (max 0 (- deadline
                                          (funcall clock-function)))))
-                 (unless (sb-thread:holding-mutex-p lock)
-                   (sb-sys:without-interrupts
-                     (sb-sys:allow-with-interrupts
-                       (sb-thread:grab-mutex lock))))
+                 (%h2-manager-recover-wait-lock lock)
                  (http-kit::%check-deadline deadline clock-function :read))))
     opening)
 
