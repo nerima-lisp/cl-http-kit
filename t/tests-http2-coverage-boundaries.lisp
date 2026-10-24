@@ -1533,7 +1533,7 @@
                    (sb-thread:wait-on-semaphore wait-entered :timeout 5))
                   (funcall cancel)
                   (ensure-true
-                   (sb-thread:wait-on-semaphore waiter-finished :timeout 5)))
+                   (sb-thread:wait-on-semaphore waiter-finished :timeout 5))))
              (error (condition)
                (setf first-error condition)))
            (when waiter-thread
@@ -1567,7 +1567,7 @@
              (ensure-equal '((3 8) (5 8)) resets)
              (ensure-equal 0
                            (count 0 frames
-                                  :key #'http-kit/http2::%h2-frame-type))))
+                                  :key #'http-kit/http2::%h2-frame-type)))
       (setf (symbol-function wait-symbol) original-wait)
       (http-kit/http2::%h2-with-scheduler-lock (connection)
         (setf (http-kit/http2::%http2-connection-scheduler-reader-active-p
