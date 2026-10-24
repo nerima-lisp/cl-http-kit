@@ -144,7 +144,7 @@
                   (setf ciphertext-p t
                         pending (make-array 0 :element-type '(unsigned-byte 8)))
                   (return))
-              (error () nil))))))
+              (cl-tls-kit:tls13-decode-error () nil))))))
     (values ciphertext-p pending)))
 (defun %tls-transport (stream)
   (let ((ciphertext-p nil)
@@ -591,74 +591,76 @@ driver's transport callbacks."
       plaintext)))
 
   (defun %tls-server-handle-events (state events)
-    (let ((alert-p nil))
-      (dolist (event events)
-        (case (getf event :type)
-          (:cipher-suite
-           (setf (http-tls-server-state-suite state) (getf event :suite)))
-          (:secret
-           (let ((traffic-state
-                  (%tls-server-traffic-state state (getf event :secret))))
-             (case (getf event :direction)
-               (:read (setf (http-tls-server-state-read-state state) traffic-state))
-               (:write (setf (http-tls-server-state-write-state state) traffic-state))
-               (otherwise
-                (%tls-server-fail "TLS driver returned an invalid secret direction."
-                                  :invalid-driver-state)))
-             (when (eq (getf event :level) :handshake)
-               (setf (http-tls-server-state-phase state) :handshake))))
-          (:alpn
-           (setf (http-tls-server-state-selected-alpn state)
-                 (getf event :protocol)))
-          (:send
-           (let* ((level (getf event :level))
-                  (content-type (%tls-server-content-type (getf event :content-type)))
-                  (wire (getf event :wire)))
-             (when (and (eq level :initial)
-                        (= content-type cl-tls-kit:+tls-content-type-handshake+)
-                        (plusp (length wire))
-                        (= (aref wire 0) 2))
-               (handler-case
-                   (when (typep (cl-tls-kit:decode-handshake wire)
-                                'cl-tls-kit:tls13-hello-retry-request)
-                     (setf (http-tls-server-state-hello-retry-request-sent-p state)
-                           t))
-                 (error () nil)))
-             (%tls-server-send-plaintext state level content-type wire)
-             (when (= content-type cl-tls-kit:+tls-content-type-alert+)
-               (setf alert-p t))))
-          (:handshake-complete
-           (setf (http-tls-server-state-handshake-complete-p state) t
-                 (http-tls-server-state-phase state) :application))
-          ((:ticket-issued :alert :peer-quic-transport-parameters) nil)))
-      (when alert-p
-        (%tls-server-fail "TLS handshake failed." :handshake-failed))))
+  (let ((alert-p nil))
+    (dolist (event events)
+      (case (getf event :type)
+        (:cipher-suite
+         (setf (http-tls-server-state-suite state) (getf event :suite)))
+        (:secret
+         (let ((traffic-state
+                 (%tls-server-traffic-state state (getf event :secret))))
+           (case (getf event :direction)
+             (:read
+              (setf (http-tls-server-state-read-state state) traffic-state))
+             (:write
+              (setf (http-tls-server-state-write-state state) traffic-state))
+             (otherwise
+              (%tls-server-fail
+               "TLS driver returned an invalid secret direction."
+               :invalid-driver-state)))
+           (when (eq (getf event :level) :handshake)
+             (setf (http-tls-server-state-phase state) :handshake))))
+        (:alpn
+         (setf (http-tls-server-state-selected-alpn state)
+               (getf event :protocol)))
+        (:send
+         (let* ((level (getf event :level))
+                (content-type
+                  (%tls-server-content-type (getf event :content-type)))
+                (wire (getf event :wire)))
+           (when (and (eq level :initial)
+                      (= content-type cl-tls-kit:+tls-content-type-handshake+)
+                      (plusp (length wire))
+                      (= (aref wire 0) 2))
+             (let ((message (cl-tls-kit:decode-handshake wire)))
+               (when (typep message 'cl-tls-kit:tls13-hello-retry-request)
+                 (setf (http-tls-server-state-hello-retry-request-sent-p state)
+                       t))))
+           (%tls-server-send-plaintext state level content-type wire)
+           (when (= content-type cl-tls-kit:+tls-content-type-alert+)
+             (setf alert-p t))))
+        (:handshake-complete
+         (setf (http-tls-server-state-handshake-complete-p state) t
+               (http-tls-server-state-phase state) :application))
+        ((:ticket-issued :alert :peer-quic-transport-parameters) nil)))
+    (when alert-p
+      (%tls-server-fail "TLS handshake failed." :handshake-failed))))
 
   (defun %tls-server-step-handshake-message (state wire)
-    (when (and (eq (http-tls-server-state-phase state) :initial)
-               (not (http-tls-server-state-client-hello-received-p state))
-               (plusp (length wire))
-               (= (aref wire 0) 1))
-      (setf (http-tls-server-state-client-hello-received-p state) t)
-      (handler-case
-          (let* ((hello (cl-tls-kit:decode-handshake wire))
-                 (extensions (cl-tls-kit:tls13-client-hello-extensions hello)))
-            (setf (http-tls-server-state-early-data-offered-p state)
-                  (not (null
-                        (find 42 extensions
-                              :key #'cl-tls-kit:tls-extension-type)))))
-        (error () nil)))
+  (when (and (eq (http-tls-server-state-phase state) :initial)
+             (not (http-tls-server-state-client-hello-received-p state))
+             (plusp (length wire))
+             (= (aref wire 0) 1))
+    (setf (http-tls-server-state-client-hello-received-p state) t)
     (handler-case
-        (multiple-value-bind (driver events)
-            (cl-tls-kit:tls13-server-driver-step
-             (http-tls-server-state-driver state) wire
-             :level (http-tls-server-state-phase state))
-          (setf (http-tls-server-state-driver state) driver)
-          (%tls-server-handle-events state events))
-      (http-timeout (condition) (error condition))
-      (http-protocol-error (condition) (error condition))
-      (error ()
-             (%tls-server-fail "TLS handshake failed." :handshake-failed))))
+        (let* ((hello (cl-tls-kit:decode-handshake wire))
+               (extensions (cl-tls-kit:tls13-client-hello-extensions hello)))
+          (setf (http-tls-server-state-early-data-offered-p state)
+                (not (null
+                      (find 42 extensions
+                            :key #'cl-tls-kit:tls-extension-type)))))
+      (cl-tls-kit:tls13-decode-error () nil)))
+  (handler-case
+      (multiple-value-bind (driver events)
+          (cl-tls-kit:tls13-server-driver-step
+           (http-tls-server-state-driver state) wire
+           :level (http-tls-server-state-phase state))
+        (setf (http-tls-server-state-driver state) driver)
+        (%tls-server-handle-events state events))
+    (http-timeout (condition) (error condition))
+    (http-protocol-error (condition) (error condition))
+    (error ()
+      (%tls-server-fail "TLS handshake failed." :handshake-failed))))
 
   (defun %tls-server-feed-handshake (state fragment)
     (setf (http-tls-server-state-handshake-buffer state)
