@@ -1337,3 +1337,20 @@
         (ensure-equal :failed (http-kit::http-server-state server))
         (http-kit::%http-server-close-connection-stream server connection)
         (ensure-equal 1 (%https-listener-close-error-count stream))))))
+#+sbcl
+(deftest https-listener-waits-for-connections-to-deadline
+  (%with-https-listener-test-stubs (context)
+    (ensure-true context)
+    (let ((server (%https-listener-make-server))
+          (original-now (symbol-function 'http-kit::%http-server-now)))
+      (unwind-protect
+           (progn
+             (ensure-true
+              (http-kit::%http-server-wait-for-connections server 0))
+             (setf (http-kit::http-server-connection-count server) 1
+                   (fdefinition 'http-kit::%http-server-now)
+                   (let ((times '(0.0d0 1.0d0)))
+                     (lambda () (pop times))))
+             (ensure-false
+              (http-kit::%http-server-wait-for-connections server 0.01d0)))
+        (setf (fdefinition 'http-kit::%http-server-now) original-now)))))
