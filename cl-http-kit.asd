@@ -230,6 +230,7 @@
                (:file "tests-network-tls-contract-boundaries")
                (:file "tests-network-tls-server")
                (:file "tests-https-listener")
+               (:file "tests-https-listener-coverage")
                (:file "runner"))
   :perform (asdf:test-op (op c)
              (declare (ignore op c))

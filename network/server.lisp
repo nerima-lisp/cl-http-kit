@@ -91,13 +91,13 @@
 (defun %http-server-positive-real-p (value)
   (handler-case
       (and (realp value)
-           (plusp value)
            (or (not (floatp value))
                #+sbcl
                (and (not (sb-ext:float-nan-p value))
                     (not (sb-ext:float-infinity-p value)))
                #-sbcl
-               (= value value)))
+               (= value value))
+           (plusp value))
     (arithmetic-error () nil)))
 
 (defun %http-server-positive-integer-p (value)
