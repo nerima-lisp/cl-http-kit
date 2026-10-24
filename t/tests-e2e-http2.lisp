@@ -111,6 +111,235 @@
           (when process
             (ignore-errors (uiop:terminate-process process))
             (ignore-errors (uiop:wait-process process))))))))
+#+sbcl
+(deftest e2e-http2-connection-manager-cold-open-client-tcp-tls-session-and-stream-ids
+  (let* ((directory
+           (merge-pathnames
+            (format nil "cl-http-kit-http2-cold-open-e2e-~36R/"
+                    (random (expt 2 64)))
+            (uiop:temporary-directory)))
+         (certificate (namestring (merge-pathnames "server.crt" directory)))
+         (key (namestring (merge-pathnames "server.key" directory)))
+         (one (ascii "cold-open-first"))
+         (two (ascii "cold-open-second"))
+         (nghttpd (or (uiop:getenv "NGHTTPD") "nghttpd"))
+         (port (multiple-value-bind (listener selected-port)
+                   (%network-test-listener)
+                 (%network-test-close-socket listener)
+                 selected-port))
+         (process nil)
+         (client nil)
+         (counter-lock (sb-thread:make-mutex :name "HTTP/2 cold-open counters"))
+         (client-tcp-open-calls 0)
+         (tls-upgrades 0)
+         (manager-open-callbacks 0)
+         (constructed-entries 0)
+         (sessions nil)
+         (stream-ids nil)
+         (first-manager-open-entered (sb-thread:make-semaphore :count 0))
+         (release-first-manager-open (sb-thread:make-semaphore :count 0))
+         (second-manager-waiting (sb-thread:make-semaphore :count 0))
+         (first-response nil)
+         (second-response nil)
+         (first-error nil)
+         (second-error nil)
+         (first-thread nil)
+         (second-thread nil)
+         (runtime-symbol 'http-kit/client::%client-runtime-function)
+         (original-runtime (symbol-function runtime-symbol))
+         (open-symbol 'http-kit/http2::%h2-manager-open-connection)
+         (original-open (symbol-function open-symbol))
+         (wait-symbol 'http-kit/http2::%h2-manager-wait-for-opening)
+         (original-wait (symbol-function wait-symbol))
+         (new-entry-symbol 'http-kit/http2::%h2-manager-new-entry)
+         (original-new-entry (symbol-function new-entry-symbol))
+         (connection-symbol 'http-kit/http2:make-http2-connection)
+         (original-make-connection (symbol-function connection-symbol))
+         (scheduler-open-symbol 'http-kit/http2::%h2-scheduler-open-entry)
+         (original-scheduler-open (symbol-function scheduler-open-symbol)))
+    (unwind-protect
+         (progn
+           (ensure-directories-exist directory)
+           (%http2-e2e-write-file (merge-pathnames "one.txt" directory) one)
+           (%http2-e2e-write-file (merge-pathnames "two.txt" directory) two)
+           (uiop:run-program
+            (list "openssl" "req" "-x509" "-newkey" "rsa:2048" "-nodes"
+                  "-days" "1" "-subj" "/CN=127.0.0.1"
+                  "-addext" "subjectAltName=IP:127.0.0.1"
+                  "-keyout" key "-out" certificate)
+            :output :string :error-output :string)
+           (let ((trust-anchor
+                   (cl-tls-kit.x509:parse-certificate-der
+                    (cl-tls-kit:pem-block-der
+                     (first (cl-tls-kit:pem-decode
+                             (uiop:read-file-string certificate)))))))
+             (setf process
+                   (uiop:launch-program
+                    (list nghttpd "-a" "127.0.0.1"
+                          "-d" (namestring directory)
+                          "-m" "100"
+                          (princ-to-string port) key certificate)
+                    :output :stream
+                    :error-output :stream
+                    :wait nil))
+             (ensure-true (%e2e-wait-for-tcp "127.0.0.1" port :timeout 5))
+             (setf (symbol-function runtime-symbol)
+                   (lambda (package-name function-name)
+                     (cond
+                       ((and (string= package-name "HTTP-KIT/NETWORK")
+                             (string= function-name
+                                      "MAKE-HTTP-NETWORK-STREAM-OPENER"))
+                        (let ((factory
+                                (funcall original-runtime package-name
+                                         function-name)))
+                          (lambda (&rest factory-arguments)
+                            (let ((opener (apply factory factory-arguments)))
+                              (lambda (&rest open-arguments)
+                                (sb-thread:with-mutex (counter-lock)
+                                  (incf client-tcp-open-calls))
+                                (apply opener open-arguments))))))
+                       ((and (string= package-name "HTTP-KIT/TLS")
+                             (string= function-name "MAKE-HTTP-TLS-UPGRADER"))
+                        (lambda (&key alpn-protocols)
+                          (ensure-equal '("h2" "http/1.1") alpn-protocols)
+                          (let ((tls-upgrader
+                                  (make-http-tls-upgrader
+                                   :verify :required
+                                   :trust-anchors (list trust-anchor)
+                                   :alpn-protocols alpn-protocols)))
+                            (lambda (stream uri &key timeout deadline)
+                              (sb-thread:with-mutex (counter-lock)
+                                (incf tls-upgrades))
+                              (funcall tls-upgrader stream uri
+                                       :timeout timeout
+                                       :deadline deadline)))))
+                       (t
+                        (funcall original-runtime package-name function-name)))))
+             (setf (symbol-function open-symbol)
+                   (lambda (manager &rest arguments)
+                     (let ((first-open-p nil))
+                       (sb-thread:with-mutex (counter-lock)
+                         (incf manager-open-callbacks)
+                         (setf first-open-p (= manager-open-callbacks 1)))
+                       (when first-open-p
+                         (sb-thread:signal-semaphore
+                          first-manager-open-entered)
+                         (unless (sb-thread:wait-on-semaphore
+                                  release-first-manager-open :timeout 10)
+                           (error "Timed out waiting to release the first manager open")))
+                       (apply original-open manager arguments))))
+             (setf (symbol-function wait-symbol)
+                   (lambda (manager open-key opening deadline clock-function)
+                     (sb-thread:signal-semaphore second-manager-waiting)
+                     (funcall original-wait manager open-key opening
+                              deadline clock-function)))
+             (setf (symbol-function new-entry-symbol)
+                   (lambda (&rest arguments)
+                     (let ((entry (apply original-new-entry arguments)))
+                       (sb-thread:with-mutex (counter-lock)
+                         (incf constructed-entries))
+                       entry)))
+             (setf (symbol-function connection-symbol)
+                   (lambda (&rest arguments)
+                     (let ((connection
+                             (apply original-make-connection arguments)))
+                       (sb-thread:with-mutex (counter-lock)
+                         (push connection sessions))
+                       connection)))
+             (setf (symbol-function scheduler-open-symbol)
+                   (lambda (connection &rest arguments)
+                     (let ((entry
+                             (apply original-scheduler-open connection arguments)))
+                       (sb-thread:with-mutex (counter-lock)
+                         (push
+                          (http-kit/http2::%h2-batch-entry-stream-id entry)
+                          stream-ids))
+                       entry)))
+             (setf client (make-http-client :cache nil :default-timeout 15))
+             (ensure-equal 0 client-tcp-open-calls)
+             (ensure-equal 0 tls-upgrades)
+             (ensure-equal 0 (length sessions))
+             (setf first-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (handler-case
+                          (setf first-response
+                                (sb-ext:with-timeout 20
+                                  (http-client-send
+                                   client "GET"
+                                   (format nil "https://127.0.0.1:~D/one.txt"
+                                           port))))
+                        (error (condition)
+                          (setf first-error condition))))))
+             (ensure-true
+              (sb-thread:wait-on-semaphore first-manager-open-entered
+                                           :timeout 10))
+             (sb-thread:with-mutex (counter-lock)
+               (ensure-equal 1 client-tcp-open-calls)
+               (ensure-equal 1 tls-upgrades)
+               (ensure-equal 1 manager-open-callbacks)
+               (ensure-equal 0 constructed-entries)
+               (ensure-equal 0 (length sessions)))
+             (setf second-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (handler-case
+                          (setf second-response
+                                (sb-ext:with-timeout 20
+                                  (http-client-send
+                                   client "GET"
+                                   (format nil "https://127.0.0.1:~D/two.txt"
+                                           port))))
+                        (error (condition)
+                          (setf second-error condition))))))
+             (ensure-true
+              (sb-thread:wait-on-semaphore second-manager-waiting :timeout 10))
+             (sb-thread:with-mutex (counter-lock)
+               (ensure-equal 1 client-tcp-open-calls)
+               (ensure-equal 1 tls-upgrades)
+               (ensure-equal 1 manager-open-callbacks)
+               (ensure-equal 0 constructed-entries)
+               (ensure-equal 0 (length sessions)))
+             (sb-thread:signal-semaphore release-first-manager-open)
+             (sb-thread:join-thread first-thread)
+             (setf first-thread nil)
+             (sb-thread:join-thread second-thread)
+             (setf second-thread nil)
+             (ensure-true (null first-error))
+             (ensure-true (null second-error))
+             (ensure-equal 200 (http-response-status first-response))
+             (ensure-equal 200 (http-response-status second-response))
+             (ensure-equal "HTTP/2"
+                           (http-response-protocol-version first-response))
+             (ensure-equal "HTTP/2"
+                           (http-response-protocol-version second-response))
+             (ensure-octets-equal one (http-response-body first-response))
+             (ensure-octets-equal two (http-response-body second-response))
+             (sb-thread:with-mutex (counter-lock)
+               (ensure-equal 1 client-tcp-open-calls)
+               (ensure-equal 1 tls-upgrades)
+               (ensure-equal 1 manager-open-callbacks)
+               (ensure-equal 1 constructed-entries)
+               (ensure-equal 1 (length sessions))
+               (ensure-equal '(1 3) (sort (copy-list stream-ids) #'<)))
+             (http-client-clear-connections client)))
+      (sb-thread:signal-semaphore release-first-manager-open)
+      (when first-thread
+        (ignore-errors (sb-thread:join-thread first-thread)))
+      (when second-thread
+        (ignore-errors (sb-thread:join-thread second-thread)))
+      (when client
+        (ignore-errors (http-client-clear-connections client)))
+      (setf (symbol-function scheduler-open-symbol) original-scheduler-open)
+      (setf (symbol-function connection-symbol) original-make-connection)
+      (setf (symbol-function new-entry-symbol) original-new-entry)
+      (setf (symbol-function wait-symbol) original-wait)
+      (setf (symbol-function open-symbol) original-open)
+      (setf (symbol-function runtime-symbol) original-runtime)
+      (when process
+        (ignore-errors (uiop:terminate-process process))
+        (ignore-errors (uiop:wait-process process)))
+      (ignore-errors (uiop:delete-directory-tree directory :validate t)))))
 
 #+sbcl
 (deftest e2e-http2-nghttpd-native-default-client-reuses-clears-and-overlaps
