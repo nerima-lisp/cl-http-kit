@@ -408,7 +408,7 @@
                 -delete
               coverage_status=0
               coverage_command=(
-                perl -e 'alarm $ENV{CL_HTTP_KIT_COVERAGE_TIMEOUT_SECONDS}; exec @ARGV'
+                perl -e "alarm \$ENV{CL_HTTP_KIT_COVERAGE_TIMEOUT_SECONDS}; exec @ARGV"
                 sbcl --noinform --no-userinit --no-sysinit --non-interactive \
                 --load scripts/coverage.lisp \
                 -- run cl-http-kit/test \
