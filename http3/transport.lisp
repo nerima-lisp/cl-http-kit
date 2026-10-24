@@ -2600,7 +2600,7 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
                  (http3-control-state-goaway-id
                   (http3-client-peer-control-state client))))
             (when goaway-id
-              (unless (and (>= stream-id 0) (< stream-id goaway-id))
+              (unless (< stream-id goaway-id)
                 (%h3-transport-error
                  "The peer GOAWAY excludes this HTTP/3 request stream."
                  :h3-request-rejected))))
