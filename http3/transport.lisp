@@ -2009,9 +2009,6 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
             (return (finish-response))))))))
 
 (progn
-(progn
-(progn
-(progn
 (defun %h3-write-request-field-section
     (client stream fields encoder-context stream-id huffman-p
      &key fin-p timeout deadline)
@@ -2112,8 +2109,6 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
                       :body (http-kit::%empty-octets))))))))))
   t)
 
-)
-
 (defun %h3-scheduler-fields (client entry payload role)
   (if (%http3-request-stream-qpack-resume-fields-p entry)
       (prog1 (values (%http3-request-stream-qpack-resume-fields entry) t)
@@ -2157,8 +2152,6 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
    :body (if (%http3-request-stream-collect-body-p entry)
              (%http3-request-stream-response-body entry)
              nil)))
-
-)
 
 (defun %h3-scheduler-current-thread ()
   #+sbcl sb-thread:*current-thread*
@@ -2690,8 +2683,6 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
                  (%h3-scheduler-complete-response-if-finished client entry)))))))
 )
 )
-)
-
 )
 
 (defun send-http3-request
