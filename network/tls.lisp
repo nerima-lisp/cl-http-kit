@@ -391,7 +391,11 @@ driver's transport callbacks."
     (phase :initial)
     suite read-state write-state
     (selected-alpn nil)
-    (handshake-buffer (make-array 0 :element-type '(unsigned-byte 8)))
+    (handshake-buffer
+     (make-array 0
+                 :element-type '(unsigned-byte 8)
+                 :adjustable t
+                 :fill-pointer 0))
     (input-buffer (make-array 0 :element-type '(unsigned-byte 8)))
     (input-position 0)
     (handshake-complete-p nil)
@@ -615,25 +619,69 @@ driver's transport callbacks."
       (%tls-server-fail "TLS handshake failed." :handshake-failed))))
 
   (defun %tls-server-feed-handshake (state fragment)
-    (setf (http-tls-server-state-handshake-buffer state)
-          (concatenate '(vector (unsigned-byte 8))
-                       (http-tls-server-state-handshake-buffer state) fragment))
-    (loop
-      for buffer = (http-tls-server-state-handshake-buffer state)
-      do (when (< (length buffer) 4) (return))
-         (let* ((message-length (+ (ash (aref buffer 1) 16)
-                                   (ash (aref buffer 2) 8)
-                                   (aref buffer 3)))
-                (wire-length (+ 4 message-length)))
-           (when (> message-length (* 1024 1024))
-             (%tls-server-fail "TLS handshake message exceeds its size limit."
-                               :handshake-message-too-large))
-           (when (> wire-length (length buffer))
+  (let ((position 0))
+    (labels ((append-fragment (count)
+               (let* ((buffer
+                        (http-tls-server-state-handshake-buffer state))
+                      (current (fill-pointer buffer))
+                      (required (+ current count))
+                      (capacity (array-total-size buffer))
+                      (maximum (+ 4 (* 1024 1024))))
+                 (when (> required maximum)
+                   (%tls-server-fail
+                    "TLS handshake message exceeds its size limit."
+                    :handshake-message-too-large))
+                 (when (< capacity required)
+                   (let ((new-capacity
+                           (min maximum
+                                (max required
+                                     (if (zerop capacity)
+                                         16
+                                         (* 2 capacity))))))
+                     (setf buffer
+                           (adjust-array buffer new-capacity
+                                         :fill-pointer current)
+                           (http-tls-server-state-handshake-buffer state)
+                           buffer)))
+                 (setf (fill-pointer buffer) required)
+                 (replace buffer fragment
+                          :start1 current
+                          :start2 position
+                          :end2 (+ position count))
+                 (incf position count)))
+             (message-length (buffer)
+               (+ (ash (aref buffer 1) 16)
+                  (ash (aref buffer 2) 8)
+                  (aref buffer 3)))
+             (process-message (buffer)
+               (let ((wire (subseq buffer 0 (fill-pointer buffer))))
+                 (setf (http-tls-server-state-handshake-buffer state)
+                       (make-array 0
+                                   :element-type '(unsigned-byte 8)
+                                   :adjustable t
+                                   :fill-pointer 0))
+                 (%tls-server-step-handshake-message state wire))))
+      (loop
+        for buffer = (http-tls-server-state-handshake-buffer state)
+        do (when (>= (fill-pointer buffer) 4)
+             (let* ((body-length (message-length buffer))
+                    (wire-length (+ 4 body-length)))
+               (when (> body-length (* 1024 1024))
+                 (%tls-server-fail
+                  "TLS handshake message exceeds its size limit."
+                  :handshake-message-too-large))
+               (when (= wire-length (fill-pointer buffer))
+                 (process-message buffer))))
+           (when (= position (length fragment))
              (return))
-           (let ((wire (subseq buffer 0 wire-length)))
-             (setf (http-tls-server-state-handshake-buffer state)
-                   (subseq buffer wire-length))
-             (%tls-server-step-handshake-message state wire)))))
+           (let* ((buffer (http-tls-server-state-handshake-buffer state))
+                  (current (fill-pointer buffer))
+                  (remaining (- (length fragment) position))
+                  (needed (if (< current 4)
+                              (- 4 current)
+                              (- (+ 4 (message-length buffer)) current))))
+             (append-fragment (min remaining needed)))))))
+
 
   (defun %tls-server-dispatch-plaintext (state plaintext)
     (let ((content-type (cl-tls-kit:tls-plaintext-content-type plaintext))

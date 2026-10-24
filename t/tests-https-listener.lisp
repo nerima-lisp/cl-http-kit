@@ -1047,6 +1047,217 @@
                              (http-server-error-reason-code condition))))
         (setf (fdefinition 'http-kit/tls:make-http-tls-server-wrapper)
               wrapper-factory)))))
+#+sbcl
+(progn
+  (defclass %https-listener-client-stream
+      (sb-gray:fundamental-binary-input-stream
+       sb-gray:fundamental-binary-output-stream)
+    ((transport
+       :initarg :transport
+       :reader %https-listener-client-stream-transport)
+     (mode
+       :initarg :mode
+       :reader %https-listener-client-stream-mode)
+     (fragment-size
+       :initarg :fragment-size
+       :reader %https-listener-client-stream-fragment-size)
+     (client-hello-p
+       :initform t
+       :accessor %https-listener-client-stream-client-hello-p)
+     (record-count
+       :initform 0
+       :accessor %https-listener-client-stream-record-count)
+     (lock
+       :initform (sb-thread:make-mutex :name "HTTPS TLS client stream")
+       :reader %https-listener-client-stream-lock)
+     (waitqueue
+       :initform (sb-thread:make-waitqueue :name "HTTPS TLS client stream")
+       :reader %https-listener-client-stream-waitqueue)
+     (prefix-sent-p
+       :initform nil
+       :accessor %https-listener-client-stream-prefix-sent-p)
+     (release-p
+       :initform nil
+       :accessor %https-listener-client-stream-release-p)))
+
+  (defmethod sb-gray:stream-read-byte ((stream %https-listener-client-stream))
+    (read-byte (%https-listener-client-stream-transport stream) nil :eof))
+
+  (defmethod sb-gray:stream-read-sequence
+      ((stream %https-listener-client-stream) sequence &optional (start 0) end)
+    (read-sequence sequence
+                   (%https-listener-client-stream-transport stream)
+                   :start start
+                   :end end))
+
+  (defmethod sb-gray:stream-write-byte
+      ((stream %https-listener-client-stream) byte)
+    (write-byte byte (%https-listener-client-stream-transport stream)))
+
+  (defun %https-listener-client-hello-record-p (bytes)
+    (and (>= (length bytes) 9)
+         (= (aref bytes 0) cl-tls-kit:+tls-content-type-handshake+)
+         (= (aref bytes 5) 1)
+         (<= (+ 5 (ash (aref bytes 3) 8) (aref bytes 4))
+             (length bytes))))
+
+  (defun %https-listener-write-client-hello-fragments (stream bytes)
+    (let* ((transport (%https-listener-client-stream-transport stream))
+           (fragment-size (%https-listener-client-stream-fragment-size stream))
+           (record-end (+ 5 (ash (aref bytes 3) 8) (aref bytes 4)))
+           (position 5))
+      (loop while (< position record-end)
+            for end = (min record-end (+ position fragment-size))
+            for length = (- end position)
+            for header = (vector
+                          cl-tls-kit:+tls-content-type-handshake+
+                          (aref bytes 1)
+                          (aref bytes 2)
+                          (ldb (byte 8 8) length)
+                          (ldb (byte 8 0) length))
+            do (write-sequence header transport)
+               (write-sequence bytes transport :start position :end end)
+               (incf (%https-listener-client-stream-record-count stream))
+               (setf position end))
+      (when (< record-end (length bytes))
+        (write-sequence bytes transport
+                        :start record-end
+                        :end (length bytes)))))
+
+  (defun %https-listener-stream-write-client-hello-prefix (stream bytes)
+    (let* ((transport (%https-listener-client-stream-transport stream))
+           (prefix-end (min 8 (length bytes))))
+      (write-sequence bytes transport :end prefix-end)
+      (finish-output transport)
+      (sb-thread:with-mutex
+          ((%https-listener-client-stream-lock stream))
+        (setf (%https-listener-client-stream-prefix-sent-p stream) t)
+        (sb-thread:condition-broadcast
+         (%https-listener-client-stream-waitqueue stream))
+        (let ((deadline (+ (get-internal-real-time)
+                           (* 10 internal-time-units-per-second))))
+          (loop until (%https-listener-client-stream-release-p stream)
+                do (when (>= (get-internal-real-time) deadline)
+                     (error "Timed out waiting to release the TLS client stream."))
+                   (sb-thread:condition-wait
+                    (%https-listener-client-stream-waitqueue stream)
+                    (%https-listener-client-stream-lock stream)
+                    :timeout 0.1))))
+      (when (< prefix-end (length bytes))
+        (write-sequence bytes transport
+                        :start prefix-end
+                        :end (length bytes)))))
+
+  (defmethod sb-gray:stream-write-sequence
+      ((stream %https-listener-client-stream) sequence &optional (start 0) end)
+    (let* ((end (or end (length sequence)))
+           (bytes (subseq sequence start end))
+           (transport (%https-listener-client-stream-transport stream)))
+      (if (and (%https-listener-client-stream-client-hello-p stream)
+               (%https-listener-client-hello-record-p bytes))
+          (progn
+            (setf (%https-listener-client-stream-client-hello-p stream) nil)
+            (ecase (%https-listener-client-stream-mode stream)
+              (:fragment
+               (%https-listener-write-client-hello-fragments stream bytes))
+              (:stall
+               (%https-listener-stream-write-client-hello-prefix stream bytes))))
+          (write-sequence bytes transport))
+      (finish-output transport)
+      sequence))
+
+  (defmethod sb-gray:stream-finish-output
+      ((stream %https-listener-client-stream))
+    (finish-output (%https-listener-client-stream-transport stream)))
+
+  (defmethod open-stream-p ((stream %https-listener-client-stream))
+    (open-stream-p (%https-listener-client-stream-transport stream)))
+
+  (defmethod close ((stream %https-listener-client-stream) &key abort)
+    (close (%https-listener-client-stream-transport stream) :abort abort))
+
+  (defun %https-listener-open-real-tls-transport
+      (port &key (mode :fragment) (fragment-size 16))
+    (let* ((request
+             (make-http-request
+              :method "GET"
+              :uri (format nil "http://127.0.0.1:~D/" port)))
+           (transport (open-http-tcp-stream request :timeout 5)))
+      (values
+       (make-instance '%https-listener-client-stream
+                      :transport transport
+                      :mode mode
+                      :fragment-size fragment-size)
+       request)))
+
+  (defun %https-listener-real-tls-upgrader (material &optional alpn-protocols)
+    (make-http-tls-upgrader
+     :verify :required
+     :trust-anchors
+     (list
+      (cl-tls-kit.x509:parse-certificate-der
+       (first (getf material :certificate-chain))))
+     :alpn-protocols (or alpn-protocols '("http/1.1"))))
+
+  (defun %https-listener-wait-for-client-prefix (stream)
+    (%https-listener-wait
+     (lambda ()
+       (sb-thread:with-mutex
+           ((%https-listener-client-stream-lock stream))
+         (%https-listener-client-stream-prefix-sent-p stream)))
+     5))
+
+  (defun %https-listener-release-client-prefix (stream)
+    (sb-thread:with-mutex
+        ((%https-listener-client-stream-lock stream))
+      (setf (%https-listener-client-stream-release-p stream) t)
+      (sb-thread:condition-broadcast
+       (%https-listener-client-stream-waitqueue stream)))
+    nil)
+
+  (deftest https-listener-reassembles-fragmented-clienthello
+    (let* ((material (%tls-server-test-material))
+           (server
+             (make-http-server
+              :host "127.0.0.1"
+              :port 0
+              :handler (lambda (request)
+                         (declare (ignore request))
+                         (make-http-response :status 204))
+              :certificate-chain (getf material :certificate-chain)
+              :private-key (getf material :private-key)
+              :handshake-timeout 5
+              :request-timeout 5
+              :idle-timeout 5
+              :graceful-timeout 2))
+           (transport nil)
+           (tls-stream nil))
+      (unwind-protect
+           (progn
+             (start-http-server server)
+             (setf transport
+                   (nth-value
+                    0
+                    (%https-listener-open-real-tls-transport
+                     (http-server-port server)
+                     :fragment-size 8)))
+             (setf tls-stream
+                   (funcall
+                    (%https-listener-real-tls-upgrader material)
+                    transport
+                    (parse-http-uri
+                     (format nil "https://localhost:~D/" (http-server-port server)))
+                    :timeout 5))
+             (ensure-equal
+              "http/1.1"
+              (http-kit/tls:http-tls-selected-alpn-protocol tls-stream))
+             (ensure-true
+              (>= (%https-listener-client-stream-record-count transport) 10)))
+        (when (and tls-stream (open-stream-p tls-stream))
+          (close tls-stream :abort t))
+        (when (eq :running (http-kit::http-server-state server))
+          (stop-http-server server :graceful-timeout 2))
+        (%tls-server-test-remove-material material)))))
 
 
 #+sbcl
