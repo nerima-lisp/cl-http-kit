@@ -227,43 +227,21 @@
   (deftest https-listener-covers-shutdown-coordinator-paths
     (%with-https-listener-test-stubs (context)
       (ensure-true context)
-      (let* ((server (%https-listener-make-server))
-             (entered (sb-thread:make-semaphore :count 0))
-             (original-wait (fdefinition 'sb-thread:condition-wait))
-             (coordinator nil))
+      (let ((server (%https-listener-make-server))
+            (waited nil))
         (setf (http-kit::http-server-state server) :stopping
               (http-kit::http-server-listener-wake-in-progress-p server) t)
         (%https-listener-test-call-with-function-stubs
          (list
           (cons 'sb-thread:condition-wait
                 (lambda (&rest arguments)
-                  (sb-thread:signal-semaphore entered)
-                  (apply original-wait arguments))))
+                  (declare (ignore arguments))
+                  (setf waited t
+                        (http-kit::http-server-listener-wake-in-progress-p server)
+                        nil))))
          (lambda ()
-           (unwind-protect
-                (progn
-                  (setf coordinator
-                        (sb-thread:make-thread
-                         (lambda ()
-                           (http-kit::%http-server-shutdown-coordinator server))))
-                  (setf (http-kit::http-server-shutdown-coordinator server)
-                        coordinator)
-                  (ensure-true
-                   (sb-thread:wait-on-semaphore entered :timeout 10))
-                  (http-kit::%with-http-server-lock (server)
-                    (setf
-                     (http-kit::http-server-listener-wake-in-progress-p server)
-                     nil)
-                    (http-kit::%http-server-broadcast server))
-                  (sb-thread:join-thread coordinator)
-                  (setf coordinator nil))
-             (http-kit::%with-http-server-lock (server)
-               (setf
-                (http-kit::http-server-listener-wake-in-progress-p server)
-                nil)
-               (http-kit::%http-server-broadcast server))
-             (when coordinator
-               (sb-thread:join-thread coordinator)))))
+           (http-kit::%http-server-shutdown-coordinator server)))
+        (ensure-true waited)
         (ensure-equal :stopped (http-kit::http-server-state server))
         (ensure-false (http-kit::http-server-shutdown-coordinator server)))
       (let* ((server (%https-listener-make-server))
