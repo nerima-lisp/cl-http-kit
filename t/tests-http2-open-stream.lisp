@@ -1396,6 +1396,8 @@
                    ;; Apply a peer SETTINGS frame after the body loop has read
                    ;; its old frame limit but before the DATA writer takes the lock.
                    (when (and (eq window-connection connection)
+                              (= stream-id 3)
+                              (plusp producer-calls)
                               (not settings-applied-p))
                      (setf settings-applied-p t)
                      (http-kit/http2::%h2-scheduler-control-frame
