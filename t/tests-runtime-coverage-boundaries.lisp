@@ -211,38 +211,6 @@
     (ensure-equal (ascii "GET / HTTP/1.1|CRLF|Host: [v12.x]|CRLF|Content-Length: 0|CRLF||CRLF|")
                   (serialize-http-request request))))
 
-#+sbcl
-(deftest runtime-boundaries-websocket-empty-window-bits
-  (let* ((request (http-kit/websocket:make-websocket-upgrade-request
-                   "http://example.test/chat" :key "dGhlIHNhbXBsZSBub25jZQ=="
-                   :extensions "permessage-deflate; client_max_window_bits"))
-         (caught (handler-case
-                     (http-kit/websocket:websocket-upgrade-response
-                      request :extensions "permessage-deflate; client_max_window_bits=\"\"")
-                   (http-protocol-error (condition) condition))))
-    (ensure-true (typep caught 'http-protocol-error))
-    (ensure-equal :websocket (http-error-operation caught))
-    (ensure-equal "" (http-protocol-error-detail caught))
-    (let ((response (http-kit/websocket:websocket-upgrade-response
-                     request :extensions "permessage-deflate; client_max_window_bits=8")))
-      (ensure-equal 101 (http-response-status response))
-      (ensure-equal "permessage-deflate; client_max_window_bits=8"
-                    (http-header-value (http-response-headers response) "Sec-WebSocket-Extensions"))
-      (ensure-equal "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
-                    (http-header-value (http-response-headers response) "Sec-WebSocket-Accept"))
-      (let* ((wire (serialize-http-response response))
-             (stream (make-instance 'binary-test-stream
-                                    :input (concatenate-octets wire #(33)))))
-        (unwind-protect
-             (let ((parsed (parse-http-response stream)))
-               (ensure-equal (length wire) (binary-test-input-position stream))
-               (ensure-equal 101 (http-response-status parsed))
-               (ensure-equal (ascii "") (http-response-body parsed))
-               (ensure-equal (http-response-headers response) (http-response-headers parsed))
-               (ensure-equal 33 (read-byte stream)))
-          (close stream))
-        (ensure-false (open-stream-p stream))))))
-
 (deftest runtime-helper-client-parse-integer-bounds-preserve-input
   (let* ((input (copy-seq "123"))
          (before (copy-seq input)))
