@@ -423,6 +423,51 @@
       (when (http-kit/http3:http3-client-open-p client)
         (http-kit/http3:close-http3-client client)))))
 #+sbcl
+(deftest http3-peer-native-accept-reports-truncated-prefix-fin
+  (cl-weave:expect-assertions 14)
+  (dolist
+      (case
+       (list
+        (list
+         (octets #x40)
+         "A peer HTTP/3 unidirectional stream ended before its type prefix.")
+        (list
+         (http3-test-concat-octets
+          (http-kit/http3:http3-varint-encode
+           http-kit/http3:+http3-push-stream-type+)
+          (octets #x40))
+         "An HTTP/3 push stream ended with a truncated push ID.")))
+    (destructuring-bind (wire message) case
+      (let* ((stream
+               (make-http3-test-stream :reads (list (list wire t))))
+             (client (http3-transport-boundary-client))
+             (failure
+               (handler-case
+                   (progn
+                     (http-kit/http3:accept-http3-peer-unidirectional-stream
+                      client stream)
+                     nil)
+                 (http-protocol-error (condition) condition))))
+        (unwind-protect
+             (progn
+               (ensure-true (typep failure 'http-protocol-error))
+               (ensure-equal :http3-transport (http-error-operation failure))
+               (ensure-equal message (http-error-message failure))
+               (ensure-equal
+                :h3-stream-creation-error
+                (http-protocol-error-detail failure))
+               (ensure-equal
+                1
+                (http-kit/http3::http3-client-peer-unidirectional-stream-count
+                 client))
+               (ensure-equal nil (http3-test-stream-reads stream))
+               (ensure-equal
+                nil
+                (http-kit/http3::http3-client-prefetched-stream-inputs client)))
+          (when (http-kit/http3:http3-client-open-p client)
+            (http-kit/http3:close-http3-client client)))))))
+
+#+sbcl
 (progn
   (deftest http3-peer-native-scheduler-rejects-peer-stream-count-overflow
     (cl-weave:expect-assertions 9)

@@ -3025,6 +3025,11 @@
     (let* ((poll-started (sb-thread:make-semaphore :count 0))
            (release-poll (sb-thread:make-semaphore :count 0))
            (first-poll-p nil)
+           (close-condition
+             (make-condition
+              'http-connection-error
+              :message "The test supplied close condition."
+              :operation :http3-request))
            (client
              (http3-test-make-native-client
               :poll-function
@@ -3065,7 +3070,8 @@
                   (ensure-true (http3-test-await-native-pending client 3))
                   (http3-test-start-native-call
                    (lambda ()
-                     (http-kit/http3:close-http3-client client))))
+                     (http-kit/http3:close-http3-client
+                      client :condition close-condition))))
               (unwind-protect
                    (progn
                      (ensure-true
@@ -3085,8 +3091,17 @@
                      (ensure-equal :response (first close-result))
                      (ensure-true (typep (second a-result)
                                          'http-connection-error))
-                     (ensure-true (eq (second a-result) (second b-result)))
-                     (ensure-true (eq (second b-result) (second c-result)))
+                     (ensure-true (typep (second b-result)
+                                         'http-connection-error))
+                     (ensure-true (typep (second c-result)
+                                         'http-connection-error))
+                     (ensure-true (eq close-condition (second a-result)))
+                     (ensure-true (eq close-condition (second b-result)))
+                     (ensure-true (eq close-condition (second c-result)))
+                     (ensure-equal "The test supplied close condition."
+                                   (http-error-message (second a-result)))
+                     (ensure-equal :http3-request
+                                   (http-error-operation (second a-result)))
                      (ensure-equal
                       0 (http-kit/http3::http3-client-request-stream-count client)))
                 (sb-thread:signal-semaphore release-poll)
