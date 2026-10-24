@@ -565,7 +565,10 @@
               (%tls-server-test-condition
                (lambda ()
                  (setf (http-kit/tls::http-tls-server-state-handshake-buffer state)
-                       (octets))
+                       (make-array 0
+                                   :element-type '(unsigned-byte 8)
+                                   :adjustable t
+                                   :fill-pointer 0))
                  (http-kit/tls::%tls-server-feed-handshake
                   state (octets 1 16 0 1))))))
         (ensure-equal :handshake-message-too-large
