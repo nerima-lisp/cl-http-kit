@@ -1017,7 +1017,7 @@
                      :transport-stream server-stream)))
              (handler-case
                  (cl-tls-kit:tls13-client-driver-connect client-driver)
-               (error () nil))
+               (cl-tls-kit:tls13-client-driver-error () nil))
              (let ((client-wire (binary-test-output client-stream)))
                (ensure-true (> (length client-wire) 5))
                (ensure-equal cl-tls-kit:+tls-content-type-handshake+
