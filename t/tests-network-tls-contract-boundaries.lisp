@@ -1886,6 +1886,7 @@
       (ensure-equal nil (close-http-tcp-listener listener)))))
 
 #+sbcl
+(progn
 (deftest network-public-default-session-options-contract
   (let ((listener (open-http-tcp-listener :host "127.0.0.1"))
         (peer nil) (accepted nil) (events nil) (errors 0))
@@ -1943,3 +1944,50 @@
     (ensure-false (open-stream-p accepted))
     (ensure-false (open-stream-p peer))
     (ensure-equal nil (close-http-tcp-listener listener))))
+
+(deftest network-tls-contract-missing-default-trust-store
+  (%network-tls-contract-with-spy
+   'cl-tls-kit:default-trust-store-path
+   (lambda (original) (declare (ignore original)) (lambda () nil))
+   (lambda ()
+     (ensure-equal nil
+                   (http-kit/tls::%tls-load-trust-anchors :optional nil))
+     (let ((condition
+             (%network-tls-contract-condition
+              (lambda ()
+                (http-kit/tls::%tls-load-trust-anchors :required nil))
+              'http-unsupported-feature :tls)))
+       (ensure-equal :tls-trust-store
+                     (http-unsupported-feature-name condition))
+       (ensure-equal :not-found
+                     (http-protocol-error-detail condition))))))
+
+
+(deftest network-tls-contract-server-cipher-and-alert-boundaries
+  (dolist (mapping '((#x1301 :aes-128-gcm)
+                     (#x1302 :aes-256-gcm)
+                     (#x1303 :chacha20-poly1305)
+                     (#x1304 :aes-128-ccm)))
+    (ensure-equal (second mapping)
+                  (http-kit/tls::%tls-server-cipher-algorithm
+                   (first mapping))))
+  (let ((state
+          (http-kit/tls::%make-http-tls-server-state
+           :driver nil :provider nil :transport-stream nil))
+        (levels nil))
+    (%network-tls-contract-with-spy
+     'http-kit/tls::%tls-server-send-plaintext
+     (lambda (original)
+       (declare (ignore original))
+       (lambda (&rest arguments)
+         (push (second arguments) levels)))
+     (lambda ()
+       (setf (http-kit/tls::http-tls-server-state-handshake-complete-p state) t)
+       (http-kit/tls::%tls-server-fatal-alert state 20)
+       (setf (http-kit/tls::http-tls-server-state-handshake-complete-p state) nil
+             (http-kit/tls::http-tls-server-state-write-state state) :write-state)
+       (http-kit/tls::%tls-server-fatal-alert state 20)
+       (setf (http-kit/tls::http-tls-server-state-write-state state) nil)
+       (http-kit/tls::%tls-server-fatal-alert state 20)))
+    (ensure-equal '(:initial :handshake :application) levels)))
+)

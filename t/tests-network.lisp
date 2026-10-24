@@ -555,3 +555,82 @@
       (close-http-tcp-listener listener))
     (loop for seam in seams for original in originals
           do (ensure-true (eq original (fdefinition seam))))))
+#+sbcl
+(deftest native-network-listener-wakeup
+  (signals http-protocol-error
+    (wake-http-tcp-listener :not-listener))
+  (dolist (case
+           (list (list (list :host "127.0.0.1") :ipv4 "127.0.0.1")
+                 (list (list :host nil) :ipv4 "127.0.0.1")
+                 (list (list :host nil :ipv6-p t)
+                       :ipv6 "0000:0000:0000:0000:0000:0000:0000:0001")))
+    (destructuring-bind (options family expected-peer-address) case
+      (let ((listener (apply (function open-http-tcp-listener) options))
+            (accepted nil))
+        (unwind-protect
+             (progn
+               (ensure-equal nil (wake-http-tcp-listener listener))
+               (multiple-value-bind (stream address port)
+                   (accept-http-tcp-stream listener :timeout 2)
+                 (setf accepted stream)
+                 (ensure-equal
+                  family (http-network-listener-address-family listener))
+                 (ensure-equal expected-peer-address address)
+                 (ensure-true (plusp port))
+                 (ensure-equal nil (sb-ext:with-timeout 2 (read-byte stream nil nil)))))
+          (%network-test-close-stream accepted)
+          (close-http-tcp-listener listener)))))
+  (let ((listener (open-http-tcp-listener :host "127.0.0.1")))
+    (unwind-protect
+         (progn
+           (close-http-tcp-listener listener)
+           (ensure-equal nil (wake-http-tcp-listener listener)))
+      (close-http-tcp-listener listener))))
+#+sbcl
+(deftest native-network-listener-accept-timeout-condition
+  (let ((listener (open-http-tcp-listener :host "127.0.0.1")))
+    (unwind-protect
+         (let ((condition
+                 (handler-case
+                     (progn
+                       (accept-http-tcp-stream listener :timeout 0.01)
+                       nil)
+                   (http-timeout (condition) condition))))
+           (ensure-true (typep condition (quote http-timeout)))
+           (ensure-equal :accept (http-error-operation condition))
+           (ensure-equal :accept (http-timeout-kind condition)))
+      (close-http-tcp-listener listener))))
+#+sbcl
+(deftest native-network-listener-wakeup-connect-failure
+  (let* ((listener (open-http-tcp-listener :host "127.0.0.1"))
+         (connect-name (quote sb-bsd-sockets:socket-connect))
+         (close-name (quote sb-bsd-sockets:socket-close))
+         (original-connect (fdefinition connect-name))
+         (original-close (fdefinition close-name))
+         (wake-socket nil)
+         (close-count 0)
+         (failure (make-condition
+                   (quote http-protocol-error)
+                   :message "Expected wake socket connection failure."
+                   :operation :test-wake)))
+    (unwind-protect
+         (progn
+           (setf (fdefinition connect-name)
+                 (lambda (socket &rest arguments)
+                   (declare (ignore arguments))
+                   (setf wake-socket socket)
+                   (error failure))
+                 (fdefinition close-name)
+                 (lambda (socket)
+                   (when (eq socket wake-socket)
+                     (incf close-count))
+                   (funcall original-close socket)))
+           (ensure-true
+            (eq failure
+                (handler-case (wake-http-tcp-listener listener)
+                  (error (condition) condition))))
+           (ensure-true wake-socket)
+           (ensure-equal 1 close-count))
+      (setf (fdefinition connect-name) original-connect
+            (fdefinition close-name) original-close)
+      (close-http-tcp-listener listener))))
