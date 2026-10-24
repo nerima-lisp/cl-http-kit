@@ -2572,7 +2572,7 @@
                                    connection
                                    (make-http-request
                                     :method "GET"
-                                    :uri "https://example.com/nested")))))
+                                    :uri "https://example.com/nested"))))))
                        nil)
                    (http-protocol-error (condition) condition)))
            (ensure-true (typep outer-error 'http-protocol-error))
@@ -2598,6 +2598,6 @@
               8
               (http-kit/http2::%h2-u32
                (http-kit/http2::%h2-frame-payload reset-frame) 0))))
-      (http-kit/http2:close-http2-connection connection)))))
+      (http-kit/http2:close-http2-connection connection))))
 
 
