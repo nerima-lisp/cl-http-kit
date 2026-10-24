@@ -75,7 +75,7 @@
     };
 
     cl-quic-kit = {
-      url = "github:nerima-lisp/cl-quic-kit/8ac08dbb764e7d50e6c387f1d245a6ce1510dff4";
+      url = "github:nerima-lisp/cl-quic-kit/8e85e63bf601ff5b004f15fe36818fba125663eb";
       flake = false;
     };
 
