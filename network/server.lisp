@@ -21,6 +21,8 @@
   certificate-chain
   private-key
   ticket-key-store
+  ticket-key-store-owned-p
+  ticket-key-rotation-deadline
   tls-wrapper
   max-connections
   max-handshakes
@@ -129,6 +131,48 @@
       (error condition))
     (error ()
       (%http-server-configuration-error :invalid-tls-credentials))))
+(progn
+  (defconstant +http-server-ticket-key-rotation-interval+ (* 12 60 60))
+
+  (defun %http-server-rotate-ticket-key-store-if-due (server)
+    (%with-http-server-lock (server)
+      (let ((store (http-server-ticket-key-store server))
+            (deadline (http-server-ticket-key-rotation-deadline server)))
+        (when (and (http-server-ticket-key-store-owned-p server)
+                   store
+                   (or (null deadline)
+                       (>= (%http-server-now) deadline)))
+          (cl-tls-kit:rotate-tls13-server-ticket-key-store store)
+          (setf (http-server-ticket-key-rotation-deadline server)
+                (+ (%http-server-now)
+                   +http-server-ticket-key-rotation-interval+))
+          t))))
+
+  (defun %http-server-ensure-owned-ticket-key-store (server)
+    (%with-http-server-lock (server)
+      (when (and (http-server-ticket-key-store-owned-p server)
+                 (null (http-server-ticket-key-store server)))
+        (let* ((store (%http-server-new-ticket-key-store))
+               (wrapper
+                 (%http-server-make-tls-wrapper
+                  (http-server-certificate-chain server)
+                  (http-server-private-key server)
+                  store)))
+          (setf (http-server-ticket-key-store server) store
+                (http-server-tls-wrapper server) wrapper
+                (http-server-ticket-key-rotation-deadline server)
+                (+ (%http-server-now)
+                   +http-server-ticket-key-rotation-interval+)))))
+    server)
+
+  (defun %http-server-release-owned-ticket-key-store (server)
+    ;; cl-tls-kit exposes no server-store destruction API, so this only drops references.
+    (%with-http-server-lock (server)
+      (when (http-server-ticket-key-store-owned-p server)
+        (setf (http-server-ticket-key-store server) nil
+              (http-server-tls-wrapper server) nil
+              (http-server-ticket-key-rotation-deadline server) nil)))
+    server))
 
 (defun make-http-server
     (&key (transport :https)
@@ -180,7 +224,8 @@
              (not (cl-tls-kit:tls13-server-ticket-key-store-p
                    ticket-key-store)))
     (%http-server-configuration-error :invalid-ticket-key-store))
-  (let* ((store (or ticket-key-store (%http-server-new-ticket-key-store)))
+  (let* ((owned-p (null ticket-key-store))
+         (store (or ticket-key-store (%http-server-new-ticket-key-store)))
          (wrapper (%http-server-make-tls-wrapper
                    certificate-chain private-key store)))
     (%make-http-server
@@ -190,6 +235,9 @@
      :certificate-chain certificate-chain
      :private-key private-key
      :ticket-key-store store
+     :ticket-key-store-owned-p owned-p
+     :ticket-key-rotation-deadline
+     (+ (%http-server-now) +http-server-ticket-key-rotation-interval+)
      :tls-wrapper wrapper
      :max-connections max-connections
      :max-handshakes max-handshakes
@@ -513,6 +561,7 @@
     (unwind-protect
          (handler-case
              (progn
+               (%http-server-rotate-ticket-key-store-if-due server)
                (setf tls-stream
                      (funcall (http-server-tls-wrapper server)
                               raw-stream
@@ -738,47 +787,48 @@
 
 (progn
   #+sbcl
-  (defun %http-server-shutdown-coordinator (server)
-    (let ((coordinator sb-thread:*current-thread*)
-          (supervisor nil)
-          (listener nil))
-      (unwind-protect
-           (progn
-             (%with-http-server-lock (server)
-               (setf supervisor (http-server-supervisor server)))
-             (when (and supervisor (not (eq supervisor coordinator)))
-               (sb-thread:join-thread supervisor))
-             (%with-http-server-lock (server)
-               (loop while (http-server-listener-wake-in-progress-p server)
-                     do (%http-server-wait-for-listener-wakeup server))
-               (setf listener (http-server-listener server)))
-             (%http-server-close-listener-object listener)
-             (%with-http-server-lock (server)
-               (when (eq listener (http-server-listener server))
-                 (setf (http-server-listener server) nil
-                       (http-server-listener-wakeup-p server) nil)))
-             (let ((deadline (or (%http-server-stop-deadline server)
-                                 (+ (%http-server-now)
-                                    (http-server-graceful-timeout server)))))
-               (unless (%http-server-wait-for-connections server deadline)
-                 (%http-server-force-close-connections server)))
-             (%http-server-emit-event-once
-              server :stopped (list :type :listener-stopped :phase :shutdown))
-             (%with-http-server-lock (server)
-               (when (eq supervisor (http-server-supervisor server))
-                 (setf (http-server-supervisor server) nil))
-               (setf (http-server-start-token server) nil
-                     (http-server-listener-wake-in-progress-p server) nil)
-               (unless (eq (http-server-state server) :failed)
-                 (setf (http-server-state server) :stopped))
-               (when (eq coordinator (http-server-shutdown-coordinator server))
-                 (setf (http-server-shutdown-coordinator server) nil))
-               (%http-server-broadcast server)))
-        (%with-http-server-lock (server)
-          (when (eq coordinator (http-server-shutdown-coordinator server))
-            (setf (http-server-shutdown-coordinator server) nil))
-          (%http-server-broadcast server)))
-      server))
+(defun %http-server-shutdown-coordinator (server)
+  (let ((coordinator sb-thread:*current-thread*)
+        (supervisor nil)
+        (listener nil))
+    (unwind-protect
+         (progn
+           (%with-http-server-lock (server)
+             (setf supervisor (http-server-supervisor server)))
+           (when (and supervisor (not (eq supervisor coordinator)))
+             (sb-thread:join-thread supervisor))
+           (%with-http-server-lock (server)
+             (loop while (http-server-listener-wake-in-progress-p server)
+                   do (%http-server-wait-for-listener-wakeup server))
+             (setf listener (http-server-listener server)))
+           (%http-server-close-listener-object listener)
+           (%with-http-server-lock (server)
+             (when (eq listener (http-server-listener server))
+               (setf (http-server-listener server) nil
+                     (http-server-listener-wakeup-p server) nil)))
+           (let ((deadline (or (%http-server-stop-deadline server)
+                               (+ (%http-server-now)
+                                  (http-server-graceful-timeout server)))))
+             (unless (%http-server-wait-for-connections server deadline)
+               (%http-server-force-close-connections server)))
+           (%http-server-release-owned-ticket-key-store server)
+           (%http-server-emit-event-once
+            server :stopped (list :type :listener-stopped :phase :shutdown))
+           (%with-http-server-lock (server)
+             (when (eq supervisor (http-server-supervisor server))
+               (setf (http-server-supervisor server) nil))
+             (setf (http-server-start-token server) nil
+                   (http-server-listener-wake-in-progress-p server) nil)
+             (unless (eq (http-server-state server) :failed)
+               (setf (http-server-state server) :stopped))
+             (when (eq coordinator (http-server-shutdown-coordinator server))
+               (setf (http-server-shutdown-coordinator server) nil))
+             (%http-server-broadcast server)))
+      (%with-http-server-lock (server)
+        (when (eq coordinator (http-server-shutdown-coordinator server))
+          (setf (http-server-shutdown-coordinator server) nil))
+        (%http-server-broadcast server)))
+    server))
   #-sbcl
   (defun %http-server-shutdown-coordinator (server)
     (declare (ignore server))
@@ -816,6 +866,7 @@
     (%http-server-supervisor-exited server)))
 
 (defun %http-server-start-listener (server)
+  (%http-server-ensure-owned-ticket-key-store server)
   (handler-case
       (http-kit/network:open-http-tcp-listener
        :host (http-server-host server)

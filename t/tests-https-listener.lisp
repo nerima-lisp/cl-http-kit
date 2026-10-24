@@ -1565,3 +1565,70 @@
              (ensure-false
               (http-kit::%http-server-wait-for-connections server 0.01d0)))
         (setf (fdefinition 'http-kit::%http-server-now) original-now)))))
+#+sbcl
+(deftest https-listener-rotates-owned-ticket-stores-and-preserves-external-ones
+  (%with-https-listener-test-stubs (context)
+    (let* ((owned-server (%https-listener-make-server))
+           (original-store
+             (http-kit::http-server-ticket-key-store owned-server))
+           (external-store (cl-tls-kit:make-tls13-server-ticket-key-store))
+           (external-server
+             (%https-listener-make-server :ticket-key-store external-store))
+           (original-rotate
+             (fdefinition 'cl-tls-kit:rotate-tls13-server-ticket-key-store))
+           (rotation-count 0))
+      (unwind-protect
+           (progn
+             (ensure-true
+              (http-kit::http-server-ticket-key-store-owned-p owned-server))
+             (ensure-false
+              (http-kit::http-server-ticket-key-store-owned-p external-server))
+             (setf (http-kit::http-server-ticket-key-rotation-deadline
+                    owned-server)
+                   0.0d0
+                   (http-kit::http-server-ticket-key-rotation-deadline
+                    external-server)
+                   0.0d0
+                   (fdefinition
+                    'cl-tls-kit:rotate-tls13-server-ticket-key-store)
+                   (lambda (store &key clock)
+                     (declare (ignore clock))
+                     (ensure-true (eq original-store store))
+                     (incf rotation-count)
+                     store))
+             (ensure-true
+              (http-kit::%http-server-rotate-ticket-key-store-if-due
+               owned-server))
+             (ensure-false
+              (http-kit::%http-server-rotate-ticket-key-store-if-due
+               external-server))
+             (ensure-equal 1 rotation-count)
+             (ensure-true
+              (> (http-kit::http-server-ticket-key-rotation-deadline
+                  owned-server)
+                 (http-kit::%http-server-now)))
+             (stop-http-server owned-server :graceful-timeout 1)
+             (ensure-false (http-kit::http-server-ticket-key-store owned-server))
+             (ensure-false (http-kit::http-server-tls-wrapper owned-server))
+             (ensure-true
+              (eq external-store
+                  (http-kit::http-server-ticket-key-store external-server)))
+             (stop-http-server external-server :graceful-timeout 1)
+             (ensure-true
+              (eq external-store
+                  (http-kit::http-server-ticket-key-store external-server)))
+             (start-http-server owned-server)
+             (ensure-false
+              (eq original-store
+                  (http-kit::http-server-ticket-key-store owned-server)))
+             (ensure-true
+              (functionp (http-kit::http-server-tls-wrapper owned-server)))
+             (stop-http-server owned-server :graceful-timeout 1))
+        (setf (fdefinition
+               'cl-tls-kit:rotate-tls13-server-ticket-key-store)
+              original-rotate)
+        (dolist (server (list owned-server external-server))
+          (unless (eq :stopped (http-kit::http-server-state server))
+            (handler-case
+                (stop-http-server server :graceful-timeout 1)
+              (error () nil))))))))
