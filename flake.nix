@@ -676,7 +676,6 @@
                 ]
                 ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
                   pkgs.iproute2
-                  pkgs.strace
                 ]
                 ++ sbclDependencies;
               }
@@ -705,40 +704,7 @@
                   --bail true
                   --fail-with-no-tests
                 )
-                ${pkgs.lib.optionalString pkgs.stdenv.isLinux ''
-                  trace_output="$TMPDIR/cl-http-kit-fd-trace.log"
-                  set +e
-                  strace -f -ttt -yy \
-                    -e trace=execve,close,accept,accept4,shutdown \
-                    -o "$trace_output" \
-                    "''${test_command[@]}"
-                  trace_status=$?
-                  set -e
-                  if [ "$trace_status" -ne 0 ]; then
-                    sbcl_pid=""
-                    if [ -f "$trace_output" ]; then
-                      # -f with -o prefixes trace lines with the traced process ID.
-                      sbcl_pid="$(awk '/execve\(.*sbcl/ { print $1; exit }' "$trace_output")"
-                    fi
-                    if [ -z "$sbcl_pid" ]; then
-                      echo "strace did not observe SBCL startup; trace status: $trace_status" >&2
-                    elif grep -Eq "^$sbcl_pid .*[+][+][+] (exited with|killed by)" "$trace_output"; then
-                      echo "strace observed SBCL termination; trace status: $trace_status" >&2
-                    else
-                      echo "strace observed SBCL startup but no termination; trace status: $trace_status" >&2
-                    fi
-                    echo "Linux test process and fd syscall trace (last 1200 events):" >&2
-                    if [ -f "$trace_output" ]; then
-                      tail -n 1200 "$trace_output"
-                    else
-                      echo "strace did not create an output file." >&2
-                    fi
-                    exit "$trace_status"
-                  fi
-                ''}
-                ${pkgs.lib.optionalString (!pkgs.stdenv.isLinux) ''
-                  "''${test_command[@]}"
-                ''}
+                "''${test_command[@]}"
                 read -r caddy_port receiver_port < <(
                   sbcl --no-userinit --no-sysinit --non-interactive \
                     --eval '(require :sb-bsd-sockets)' \
