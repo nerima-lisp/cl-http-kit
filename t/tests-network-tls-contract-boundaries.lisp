@@ -1991,3 +1991,120 @@
        (http-kit/tls::%tls-server-fatal-alert state 20)))
     (ensure-equal '(:initial :handshake :application) levels)))
 )
+#+sbcl
+(progn
+  (deftest network-tls-contract-server-event-output-boundaries
+    (let* ((provider (cl-tls-kit:make-cl-crypto-kit-provider))
+           (secret (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
+           (raw (make-instance 'network-tls-contract-stream :input (octets)))
+           (state (http-kit/tls::%make-http-tls-server-state
+                   :driver nil :provider provider :transport-stream raw)))
+      (ensure-true (search "TLS server state" (princ-to-string state)))
+      (ensure-equal cl-tls-kit:+tls-content-type-application-data+
+                    (http-kit/tls::%tls-server-content-type :application-data))
+      (%network-tls-contract-protocol
+       (lambda () (http-kit/tls::%tls-server-content-type :unsupported))
+       :tls :unsupported-record-type)
+      (%network-tls-contract-protocol
+       (lambda () (http-kit/tls::%tls-server-cipher-algorithm #xffff))
+       :tls :unsupported-cipher-suite)
+      (%network-tls-contract-protocol
+       (lambda () (http-kit/tls::%tls-server-traffic-state state secret))
+       :tls :invalid-driver-state)
+      (%network-tls-contract-protocol
+       (lambda ()
+         (http-kit/tls::%tls-server-send-plaintext
+          state :renegotiation cl-tls-kit:+tls-content-type-application-data+ (octets 41)))
+       :tls :invalid-driver-state)
+      (setf (http-kit/tls::http-tls-server-state-write-state state) :not-a-traffic-state)
+      (%network-tls-contract-protocol
+       (lambda ()
+         (http-kit/tls::%tls-server-send-plaintext
+          state :application cl-tls-kit:+tls-content-type-application-data+ (octets 41)))
+       :tls :record-protection-failed)
+      (ensure-equal 0 (length (binary-test-output raw)))
+      (setf (http-kit/tls::http-tls-server-state-write-state state) nil)
+      (%network-tls-contract-protocol
+       (lambda ()
+         (http-kit/tls::%tls-server-handle-events
+          state
+          (list (list :type :cipher-suite :suite #x1301)
+                (list :type :secret :direction :sideways :level :handshake
+                      :secret secret))))
+       :tls :invalid-driver-state)
+      (ensure-equal #x1301 (http-kit/tls::http-tls-server-state-suite state))
+      (ensure-equal :initial (http-kit/tls::http-tls-server-state-phase state))
+      (ensure-false (http-kit/tls::http-tls-server-state-read-state state))
+      (ensure-false (http-kit/tls::http-tls-server-state-write-state state))
+      (ensure-equal 0 (length (binary-test-output raw)))
+      (close raw :abort t)))
+
+  (deftest network-tls-contract-server-record-stream-boundaries
+    (let* ((raw (make-instance 'network-tls-contract-stream :input (octets)))
+           (state (http-kit/tls::%make-http-tls-server-state
+                   :driver nil :provider nil :transport-stream raw))
+           (legacy-handshake (octets 22 3 1 0 0)))
+      (ensure-equal nil (http-kit/tls::%tls-server-process-record state legacy-handshake))
+      (ensure-false (http-kit/tls::http-tls-server-state-client-hello-received-p state))
+      (setf (http-kit/tls::http-tls-server-state-client-hello-received-p state) t)
+      (%network-tls-contract-protocol
+       (lambda () (http-kit/tls::%tls-server-process-record state legacy-handshake))
+       :tls :invalid-record-version)
+      (setf (http-kit/tls::http-tls-server-state-client-hello-received-p state) nil
+            (http-kit/tls::http-tls-server-state-early-data-offered-p state) t)
+      (%network-tls-contract-protocol
+       (lambda ()
+         (http-kit/tls::%tls-server-process-record state (octets 23 3 3 0 1 41)))
+       :tls :early-data-rejected)
+      (ensure-octets-equal #(21 3 3 0 2 2 10) (binary-test-output raw))
+      (setf (fill-pointer (binary-test-output raw)) 0
+            (http-kit/tls::http-tls-server-state-early-data-offered-p state) nil
+            (http-kit/tls::http-tls-server-state-read-state state) :read-keys)
+      (%network-tls-contract-protocol
+       (lambda () (http-kit/tls::%tls-server-process-record state (octets 22 3 3 0 0)))
+       :tls :unexpected-record)
+      (setf (http-kit/tls::http-tls-server-state-read-state state) nil)
+      (%network-tls-contract-protocol
+       (lambda ()
+         (http-kit/tls::%tls-server-dispatch-plaintext
+          state (cl-tls-kit:make-tls-plaintext cl-tls-kit:+tls-content-type-alert+
+                                               (octets 1 0))))
+       :tls :handshake-failed)
+      (close raw :abort t))
+    (let* ((raw (make-instance 'network-tls-contract-stream :input (octets)))
+           (state (http-kit/tls::%make-http-tls-server-state
+                   :driver nil :provider nil :transport-stream raw)))
+      (%network-tls-contract-protocol
+       (lambda () (http-kit/tls::%tls-server-handshake state))
+       :tls :handshake-failed)
+      (close raw :abort t))
+    (let* ((raw (make-instance 'network-tls-contract-stream :input (octets)))
+           (state (http-kit/tls::%make-http-tls-server-state
+                   :driver nil :provider nil :transport-stream raw))
+           (stream (http-kit/tls::%make-http-tls-stream state raw)))
+      (%network-tls-contract-protocol
+       (lambda () (read-byte stream))
+       :tls :missing-close-notify)
+      (ensure-true (open-stream-p stream))
+      (ensure-true (open-stream-p raw))
+      (ensure-equal 0 (length (binary-test-output raw)))
+      (close stream :abort t))
+    (let* ((raw (make-instance 'network-tls-contract-stream :input (octets)))
+           (state (http-kit/tls::%make-http-tls-server-state
+                   :driver nil :provider nil :transport-stream raw)))
+      (ensure-true (http-kit/tls::%tls-server-send-close-notify state))
+      (ensure-false (http-kit/tls::http-tls-server-state-close-sent-p state))
+      (ensure-equal 0 (length (binary-test-output raw)))
+      (close raw :abort t))
+    (let* ((raw (make-instance 'network-tls-contract-stream :input (octets)))
+           (state (http-kit/tls::%make-http-tls-server-state
+                   :driver nil :provider nil :transport-stream raw))
+           (stream (http-kit/tls::%make-http-tls-stream state raw)))
+      (%network-tls-contract-protocol
+       (lambda () (write-byte 42 stream))
+       :tls :record-encryption-failed)
+      (ensure-true (open-stream-p stream))
+      (ensure-true (open-stream-p raw))
+      (ensure-equal 0 (length (binary-test-output raw)))
+      (close stream :abort t))))
+
