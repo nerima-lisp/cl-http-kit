@@ -487,6 +487,68 @@
       (ensure-false (open-stream-p stream)))))
 
 #+sbcl
+(deftest http2-public-single-blocked-upload-no-error-reset-keeps-response
+  (dolist (producer-p '(nil t))
+    (let* ((body (make-array 65536 :element-type '(unsigned-byte 8)))
+           (early-response
+             (concatenate-octets
+              (h2-frame 1 4 1 (h2-header-block (cons ":status" "200")
+                                              (cons "content-length" "2")))
+              (h2-frame 0 0 1 (octets 0))
+              (h2-frame 0 1 1 (octets 255))))
+           (reset-input (concatenate-octets
+                         (h2-frame 4 0 0 (octets)) early-response
+                         (h2-frame 3 0 1 (octets 0 0 0 0))))
+           (input (concatenate-octets
+                   reset-input (h2-frame 8 0 0 (octets 0 0 0 1))))
+           (stream (make-instance 'binary-session-stream :input input))
+           (closes 0)
+           (connection
+             (http-kit/http2:make-http2-connection
+              :stream stream
+              :close-stream (lambda (actual)
+                              (ensure-true (eq stream actual))
+                              (incf closes)
+                              (close actual)))))
+      (dotimes (index (length body))
+        (setf (aref body index) (mod index 256)))
+      (unwind-protect
+           (multiple-value-bind (producer position calls)
+               (make-octet-body-producer body)
+             (declare (ignore position calls))
+             (let ((response
+                     (http-kit/http2:send-http2-request-over-connection
+                      connection
+                      (make-http-request :method "POST" :uri "https://example.test/upload"
+                                         :body (unless producer-p body))
+                      :request-body-function (when producer-p producer)
+                      :request-body-length (when producer-p (length body)))))
+               (ensure-equal 200 (http-response-status response))
+               (ensure-equal (octets 0 255) (http-response-body response))
+               (ensure-true (>= (binary-session-input-position stream)
+                                (length reset-input)))
+               (multiple-value-bind (sent count ack) (h2-output-data-summary stream)
+                 (ensure-equal 65535 (length sent))
+                 (ensure-true (equalp sent (subseq body 0 65535)))
+                 (ensure-equal 4 count)
+                 (ensure-equal 1 ack))
+               (let ((data (remove-if-not
+                            (lambda (frame) (= 0 (http-kit/http2::%h2-frame-type frame)))
+                            (h2-output-frames stream))))
+                 (ensure-equal '(16384 16384 16384 16383)
+                               (mapcar (lambda (frame)
+                                         (length (http-kit/http2::%h2-frame-payload frame))) data))
+                 (ensure-equal '(0 0 0 0)
+                               (mapcar #'http-kit/http2::%h2-frame-flags data))
+                 (ensure-true (every (lambda (frame)
+                                      (= 1 (http-kit/http2::%h2-frame-stream-id frame))) data)))
+               (ensure-equal 0 closes)
+               (ensure-true (http-kit/http2:http2-connection-open-p connection))))
+        (http-kit/http2:close-http2-connection connection))
+      (ensure-equal 1 closes)
+      (ensure-false (open-stream-p stream)))))
+
+#+sbcl
 (deftest http2-public-connection-peer-hpack-setting-boundaries
   (dolist (case (list (list 0 (octets #x20 #x88) nil)
                      (list 0 (octets #x21 #x88) '(1 0))

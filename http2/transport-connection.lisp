@@ -485,6 +485,9 @@ are rejected after this function marks the connection draining."
                (when scheduler-entry
                  (when (%h2-batch-entry-error scheduler-entry)
                    (error (%h2-batch-entry-error scheduler-entry)))
+                 (when (%h2-batch-entry-request-body-abandoned-p
+                        scheduler-entry)
+                   (return-from %h2-connection-send-request-body nil))
                  (unless (member scheduler-entry
                                  (%http2-connection-scheduler-entries connection)
                                  :test #'eq)
@@ -498,8 +501,10 @@ are rejected after this function marks the connection draining."
                    (check-scheduler-entry-under-lock))))
              (read-while-blocked ()
                (if flow-wait-function
-                   (funcall flow-wait-function connection stream-id
-                            deadline clock-function)
+                   (progn
+                     (funcall flow-wait-function connection stream-id
+                              deadline clock-function)
+                     (check-scheduler-entry))
                    (let ((frame (%h2-read-frame
                                  reader
                                  (%http2-connection-max-frame-size connection)
@@ -1149,6 +1154,7 @@ concurrent streams should use SEND-HTTP2-REQUESTS-OVER-CONNECTION."
   deadline
   clock-function
   body-sent-p
+  request-body-abandoned-p
   error
   local-retired-p
   callback-events
@@ -1606,14 +1612,19 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                   :detail stream-id))
          (let ((entry (%h2-scheduler-entry-for-stream connection stream-id)))
            (when entry
-             (unless (%h2-batch-entry-error entry)
+            (cond
+              ((and (null (%h2-batch-entry-error entry))
+                    (= (%h2-u32 payload 0) +http2-no-error+)
+                    (%h2-batch-entry-response entry))
+               (setf (%h2-batch-entry-request-body-abandoned-p entry) t))
+              ((null (%h2-batch-entry-error entry))
                (setf (%h2-batch-entry-error entry)
                      (make-condition
                       'http-kit:http-connection-error
                       :message "The HTTP/2 peer reset the response stream."
                       :operation :http2-control
                       :cause (list :rst-stream stream-id
-                                   (%h2-u32 payload 0)))))
+                                   (%h2-u32 payload 0))))))
              (when (%h2-batch-entry-local-retired-p entry)
                (%h2-scheduler-remove-entry connection entry)))))
         (t
@@ -1968,6 +1979,7 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                      (%h2-scheduler-entry-for-stream connection stream-id)))
                (or (null active-entry)
                    (%h2-batch-entry-error active-entry)
+                   (%h2-batch-entry-request-body-abandoned-p active-entry)
                    (%h2-batch-entry-callback-events active-entry)
                    (%h2-scheduler-window-available-p connection stream-id))))
            reader writer deadline clock-function entry)
@@ -1979,6 +1991,9 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                     (%h2-scheduler-entry-for-stream connection stream-id)))
               (when (and active-entry (%h2-batch-entry-error active-entry))
                 (error (%h2-batch-entry-error active-entry)))
+              (when (and active-entry
+                         (%h2-batch-entry-request-body-abandoned-p active-entry))
+                (return-from %h2-scheduler-wait-for-window nil))
               (when (or (%http2-connection-closed-p connection)
                         (null active-entry))
                 (error 'http-kit:http-connection-error
