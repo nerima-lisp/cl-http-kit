@@ -56,8 +56,7 @@
   (let* ((connection (cl-quic-kit:quic-client-connection quic-client))
          (frame (cl-quic-kit:connection-close-frame connection))
          (kind (cl-quic-kit:connection-close-kind connection))
-         (reason (and kind
-                      (cl-quic-kit:quic-connection-closed-reason connection)))
+         (reason (and kind (cl-quic-kit:quic-connection-closed-reason connection)))
          (detail (list :state (cl-quic-kit:connection-state connection)
                        :client-closed-p
                        (cl-quic-kit:quic-client-closed-p quic-client))))
@@ -218,24 +217,44 @@
                 prefix-buffers)
                (%h3-check-state-bytes http3-client))
              (classify-peer-stream (stream input fin-p)
-               (let ((original-reader (http3-client-read-stream http3-client))
-                     (replayed-p nil))
-                 (unwind-protect
-                      (progn
-                        (setf (http3-client-read-stream http3-client)
-                              (lambda (read-stream &key timeout deadline)
-                                (if (and (eq read-stream stream)
-                                         (not replayed-p))
-                                    (progn
-                                      (setf replayed-p t)
-                                      (values input fin-p))
-                                    (funcall original-reader read-stream
-                                             :timeout timeout
-                                             :deadline deadline))))
-                        (accept-http3-peer-unidirectional-stream
-                         http3-client stream :deadline end))
-                   (setf (http3-client-read-stream http3-client)
-                         original-reader)))))
+               (let* ((original-reader (http3-client-read-stream http3-client))
+                      (replayed-p nil)
+                      (kind
+                        (unwind-protect
+                             (progn
+                               (setf (http3-client-read-stream http3-client)
+                                     (lambda (read-stream &key timeout deadline)
+                                       (if (and (eq read-stream stream)
+                                                (not replayed-p))
+                                           (progn
+                                             (setf replayed-p t)
+                                             (values input fin-p))
+                                           (funcall original-reader read-stream
+                                                    :timeout timeout
+                                                    :deadline deadline))))
+                               (accept-http3-peer-unidirectional-stream
+                                http3-client stream :deadline end))
+                          (setf (http3-client-read-stream http3-client)
+                                original-reader))))
+                 (when (eq kind :push)
+                   (%h3-with-scheduler-lock (http3-client)
+                     (let ((push-entry
+                             (find stream
+                                  (http3-client-seen-peer-push-ids http3-client)
+                                  :key (function cdr) :test (function eq))))
+                       (unless push-entry
+                         (%h3-transport-error
+                          "An HTTP/3 push stream was not registered during initialization."
+                          stream))
+                       (unless (member stream
+                                       (http3-client-pending-push-streams
+                                        http3-client)
+                                       :key #'cdr :test #'eq)
+                         (setf (http3-client-pending-push-streams http3-client)
+                               (append
+                                (http3-client-pending-push-streams http3-client)
+                                (list (cons (car push-entry) stream))))))))
+                 kind)))
       (cl-quic-kit:client-flush quic-client)
       (loop repeat 3000
           for state = (cl-quic-kit:connection-state
@@ -421,12 +440,13 @@ to be selected without exposing QUIC implementation details."
                                                                     (setf (gethash stream stream-prefix-sent) t)
                                                                     (subseq octets (length prefix)))
                                                                   octets)))
-                                                       (cl-quic-kit:client-write-stream
-                                                        quic-client stream payload
-                                                        :fin-p fin-p :timeout timeout :deadline deadline)
-                                                       (%http3-quic-adapter-await-stream-write
-                                                        quic-client stream
-                                                        :timeout timeout :deadline deadline)))
+                                                       (prog1
+                                                         (cl-quic-kit:client-write-stream
+                                                          quic-client stream payload
+                                                          :fin-p fin-p :timeout timeout :deadline deadline)
+                                                         (%http3-quic-adapter-await-stream-write
+                                                          quic-client stream
+                                                          :timeout timeout :deadline deadline))))
                                                    :read-stream
                                                    (lambda (stream &key timeout deadline)
                                                      (%http3-quic-adapter-read
@@ -479,7 +499,21 @@ to be selected without exposing QUIC implementation details."
                                                           :timeout timeout
                                                           :deadline deadline)
                                                          (cl-quic-kit:client-flush
-                                                          quic-client)))
+                                                          quic-client))
+                                                       :accept-peer-unidirectional-stream
+                                                       (lambda ()
+                                                         (let ((pending
+                                                                 (http3-quic-adapter-pending-peer-unidirectional-streams
+                                                                  adapter)))
+                                                           (if pending
+                                                               (prog1 (car pending)
+                                                                 (setf
+                                                                  (http3-quic-adapter-pending-peer-unidirectional-streams
+                                                                   adapter)
+                                                                  (cdr pending)))
+                                                               (cl-quic-kit:client-accept-peer-stream
+                                                                quic-client
+                                                                :type :unidirectional)))))
                                                      http3-options)))
                                       (%http3-quic-adapter-await-peer-settings
                                        quic-client (http3-quic-adapter-http3-client adapter)

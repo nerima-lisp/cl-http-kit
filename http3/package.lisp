@@ -127,6 +127,7 @@
    #:send-http3-request/cps
    #:send-http3-push
    #:receive-http3-push
+   #:dequeue-http3-pending-push
    #:serve-http3-request-stream
    #:http3-quic-adapter
    #:http3-quic-adapter-p

@@ -33,11 +33,17 @@
 (defun %h3-non-negative-limit-p (value)
   (and (integerp value) (>= value 0)))
 
-(defun %h3-check-state-bytes (client)
-  (let ((observed (+ (length (http3-client-peer-control-buffer client))
+(defun %h3-check-state-bytes (client &optional (additional-bytes 0))
+  (let ((observed (+ additional-bytes
+                     (length (http3-client-peer-control-buffer client))
                      (length (http3-client-peer-qpack-encoder-buffer client))
                      (length (http3-client-peer-qpack-decoder-buffer client))
                      (reduce #'+ (http3-client-prefetched-stream-inputs client)
+                             :key (lambda (entry)
+                                    (length (or (first (cdr entry)) #())))
+                             :initial-value 0)
+                     (reduce #'+
+                             (http3-client-peer-unidirectional-prefix-buffers client)
                              :key (lambda (entry)
                                     (length (or (first (cdr entry)) #())))
                              :initial-value 0))))
@@ -72,7 +78,13 @@
     poll-function
     try-read-stream
     stream-write-pending-p
+    accept-peer-unidirectional-stream
     (prefetched-stream-inputs (quote ()))
+    (pending-peer-unidirectional-streams (quote ()))
+    (peer-unidirectional-prefix-buffers (quote ()))
+    (pending-push-streams (quote ()))
+    (seen-peer-push-ids (quote ()))
+    (discard-peer-unidirectional-streams (quote ()))
     close-stream
     cancel-stream
     control-stream
@@ -184,7 +196,7 @@
            +http3-default-qpack-max-instruction-bytes+)
           (qpack-max-buffer-bytes +http3-default-qpack-max-buffer-bytes+)
           (qpack-settings (quote ())) max-push-id peer-control-stream timeout deadline
-          on-control-stream-ready)
+          on-control-stream-ready accept-peer-unidirectional-stream)
   "Open an HTTP/3 client over caller-supplied QUIC stream callbacks.
 
 OPEN-STREAM is called as (REQUEST &KEY STREAM-TYPE TIMEOUT DEADLINE) and
@@ -204,6 +216,13 @@ returns true while a previously submitted write remains queued. The scheduler
 does not resubmit those octets and polls until the write completes before its
 next write on that stream. When these callbacks are absent, READ-STREAM keeps
 its blocking behavior.
+
+ACCEPT-PEER-UNIDIRECTIONAL-STREAM, when supplied, takes no arguments and
+returns one newly accepted peer-created unidirectional stream, or NIL when
+none is available. It must return without blocking. The native scheduler drains
+this callback after each poll and buffers an incomplete stream-type prefix
+until it can classify the stream. When omitted, the native scheduler does not
+discover peer-created unidirectional streams.
 
 TRY-WRITE-STREAM, when supplied, is called like WRITE-STREAM and returns after
 submitting its octets. The native scheduler uses it for request frames and
@@ -228,7 +247,12 @@ system supplies the HTTP/3 stream and codec layer."
                              (type-of callback))))
     (unless (or (null try-write-stream) (functionp try-write-stream))
       (%h3-transport-error "HTTP/3 try-write-stream must be a function or NIL."
-                           (type-of try-write-stream))))
+                           (type-of try-write-stream)))
+    (unless (or (null accept-peer-unidirectional-stream)
+                (functionp accept-peer-unidirectional-stream))
+      (%h3-transport-error
+       "HTTP/3 accept-peer-unidirectional-stream must be a function or NIL."
+       (type-of accept-peer-unidirectional-stream))))
   (unless (or (null close-stream) (functionp close-stream))
     (%h3-transport-error "HTTP/3 close-stream must be a function or NIL."
                          (type-of close-stream)))
@@ -373,6 +397,8 @@ system supplies the HTTP/3 stream and codec layer."
              :poll-function poll-function
              :try-read-stream try-read-stream
              :stream-write-pending-p stream-write-pending-p
+             :accept-peer-unidirectional-stream
+             accept-peer-unidirectional-stream
              :open-stream open-stream
              :write-stream write-stream
              :try-write-stream try-write-stream
@@ -550,16 +576,119 @@ system supplies the HTTP/3 stream and codec layer."
      (push (cons stream (list chunk fin-p))
            (http3-client-prefetched-stream-inputs client)))))
 
+(defun %h3-register-peer-push-stream (client stream push-id)
+  (let ((failure nil))
+    (%h3-with-scheduler-lock (client)
+      (cond
+        ((not (http3-client-open-p client))
+         (setf failure :closed))
+        ((not (and (http3-client-max-push-id client)
+                   (<= push-id (http3-client-max-push-id client))))
+         (setf failure :max-push-id))
+        (t
+         (let ((entry (assoc push-id (http3-client-seen-peer-push-ids client)
+                             :test (function =))))
+           (cond
+             ((null entry)
+              (push (cons push-id stream)
+                    (http3-client-seen-peer-push-ids client)))
+             ((not (eq (cdr entry) stream))
+              (setf failure :duplicate)))))))
+    (case failure
+      (:closed
+       (%h3-transport-error "The HTTP/3 client is already closed."))
+      (:max-push-id
+       (%h3-transport-error
+        "The peer HTTP/3 push ID exceeds MAX_PUSH_ID."
+        :h3-id-error))
+      (:duplicate
+       (%h3-transport-error
+        "The peer used an HTTP/3 push ID more than once."
+        :h3-id-error)))
+    push-id))
+
+(defun %h3-forget-peer-push-stream (client stream)
+  (%h3-with-scheduler-lock (client)
+    (dolist (entry (http3-client-seen-peer-push-ids client))
+      (when (eq (cdr entry) stream)
+        (setf (cdr entry) nil))))
+  stream)
+
+(defun dequeue-http3-pending-push (client)
+  "Return the next peer push stream and its push ID. During polling, the native
+scheduler enqueues discovered push streams. Return two NIL values when empty.
+This function does not poll QUIC. Pass only the stream to
+RECEIVE-HTTP3-PUSH."
+  (unless (http3-client-p client)
+    (%h3-transport-error "DEQUEUE-HTTP3-PENDING-PUSH requires an HTTP/3 client."
+                         (type-of client)))
+  (let ((entry nil)
+        (open-p nil))
+    (%h3-with-scheduler-lock (client)
+      (setf open-p (http3-client-open-p client))
+      (when open-p
+        (setf entry (pop (http3-client-pending-push-streams client)))))
+    (unless open-p
+      (%h3-transport-error "The HTTP/3 client is already closed."))
+    (if entry
+        (values (cdr entry) (car entry))
+        (values nil nil))))
+(defun %h3-retain-unknown-peer-stream (client stream fin-p)
+  (let ((entry nil)
+        (cancel (http3-client-cancel-stream client))
+        (cancel-p nil)
+        (drain-capable-p (%h3-native-scheduler-p client)))
+    (%h3-with-scheduler-lock (client)
+      (let ((entries (http3-client-discard-peer-unidirectional-streams client)))
+        (setf entry (assoc stream entries :test #'eq))
+        (unless entry
+          (setf (http3-client-discard-peer-unidirectional-streams client)
+                (acons stream
+                       (cond
+                         (cancel :cancel-pending)
+                         (fin-p :finished)
+                         (t :drain))
+                       entries))
+          (setf entry
+                (assoc stream
+                       (http3-client-discard-peer-unidirectional-streams client)
+                       :test #'eq)))
+        (setf cancel-p (and cancel (eq (cdr entry) :cancel-pending)))))
+    (when cancel-p
+      (let ((cancel-returned-p nil)
+            (cancel-condition nil))
+        (unwind-protect
+             (handler-case
+                 (progn
+                   (funcall cancel stream :error-code #x103 :timeout nil :deadline nil)
+                   (setf cancel-returned-p t))
+               (error (condition)
+                 (setf cancel-condition condition)))
+          (unless cancel-returned-p
+            (%h3-with-scheduler-lock (client)
+              (setf (cdr entry)
+                    (if drain-capable-p :drain :cancel-pending)))
+            (unless drain-capable-p
+              (handler-case
+                  (close-http3-client client :condition cancel-condition)
+                (error (close-condition)
+                  (declare (ignore close-condition)))))))
+        (cond
+          (cancel-returned-p
+           (%h3-with-scheduler-lock (client)
+             (setf (cdr entry) :cancelled)))
+          (drain-capable-p nil)
+          (t
+           (error cancel-condition)))))
+    stream))
 (defun accept-http3-peer-unidirectional-stream
     (client stream &key timeout deadline)
   "Classify and attach one peer-created HTTP/3 unidirectional STREAM.
 
-The stream-type prefix may be fragmented across reads.  The consumed prefix
-is replayed to the existing control, QPACK, or push reader, so callers can
-continue with READ-HTTP3-CONTROL-STREAM, the corresponding QPACK reader, or
-RECEIVE-HTTP3-PUSH without losing bytes.  Returns :CONTROL, :QPACK-ENCODER,
-:QPACK-DECODER, :PUSH, or :UNKNOWN.  Unknown stream types are not errors; the
-surrounding QUIC transport remains responsible for discarding their contents."
+The stream-type prefix may be fragmented across reads. Push streams are
+classified only after their complete push ID is available. Consumed prefix
+bytes are replayed to the corresponding reader. Returns :CONTROL,
+:QPACK-ENCODER, :QPACK-DECODER, :PUSH, or :UNKNOWN."
   (unless (and (http3-client-p client) (http3-client-open-p client))
     (%h3-transport-error "A live HTTP/3 client is required."))
   (unless stream
@@ -572,76 +701,93 @@ surrounding QUIC transport remains responsible for discarding their contents."
      :h3-excessive-load))
   (incf (http3-client-peer-unidirectional-stream-count client))
   (let* ((prefetched
-           (%call-http3-serialized
-            client
-            (lambda ()
-              (let ((entry
-                      (assoc stream
-                             (http3-client-prefetched-stream-inputs client))))
-                (when entry
-                  (setf (http3-client-prefetched-stream-inputs client)
-                        (remove stream
-                                (http3-client-prefetched-stream-inputs client)
-                                :key #'car :test #'eql :count 1))
-                  (cdr entry))))))
+          (%call-http3-serialized
+           client
+           (lambda ()
+             (let ((entry
+                    (assoc stream
+                           (http3-client-prefetched-stream-inputs client))))
+               (when entry
+                 (setf (http3-client-prefetched-stream-inputs client)
+                       (remove stream
+                               (http3-client-prefetched-stream-inputs client)
+                               :key #'car :test #'eq :count 1))
+                 (cdr entry))))))
          (buffer (if prefetched
                      (first prefetched)
-                     (make-array 0 :element-type '(unsigned-byte 8))))
+                   (make-array 0 :element-type '(unsigned-byte 8))))
          (prefetched-fin-p (and prefetched (second prefetched))))
     (loop
-      (multiple-value-bind (stream-type position)
-          (http3-varint-decode buffer :allow-incomplete-p t)
-        (declare (ignore position))
-        (when stream-type
-          (let ((kind
-                  (cond
-                    ((= stream-type +http3-control-stream-type+)
-                     (attach-http3-peer-control-stream client stream)
-                     :control)
-                    ((= stream-type +http3-push-stream-type+) :push)
-                    ((= stream-type +http3-qpack-encoder-stream-type+)
-                     (attach-http3-peer-qpack-encoder-stream client stream)
-                     :qpack-encoder)
-                    ((= stream-type +http3-qpack-decoder-stream-type+)
-                     (attach-http3-peer-qpack-decoder-stream client stream)
-                     :qpack-decoder)
-                    (t :unknown))))
-            (unless (eq kind :unknown)
-              (%h3-prefetch-stream-input client stream buffer prefetched-fin-p))
-            (return kind))))
-      (when prefetched-fin-p
-        (%h3-transport-error
-         "A peer HTTP/3 unidirectional stream ended before its type prefix."
-         :h3-stream-creation-error))
-      (multiple-value-bind (chunk fin-p)
-          (funcall (http3-client-read-stream client)
-                   stream :timeout timeout :deadline deadline)
-        (when chunk
-          (unless (%http3-octet-vector-p chunk)
-            (%h3-transport-error
-             "HTTP/3 read-stream must return an octet vector or NIL."
-             (type-of chunk)))
-          (setf buffer (%http3-concatenate-octets buffer chunk))
-          (%h3-check-state-bytes client))
-        (setf prefetched-fin-p fin-p)
-        (when (or fin-p (null chunk))
-          (multiple-value-bind (stream-type position)
-              (http3-varint-decode buffer :allow-incomplete-p t)
-            (declare (ignore position))
-            (unless stream-type
-              (%h3-transport-error
-               "A peer HTTP/3 unidirectional stream ended before its type prefix."
-               :h3-stream-creation-error))))))))
+     (multiple-value-bind (stream-type type-end)
+         (http3-varint-decode buffer :allow-incomplete-p t)
+       (when stream-type
+         (let ((kind
+                (cond
+                 ((= stream-type +http3-control-stream-type+)
+                  (attach-http3-peer-control-stream client stream)
+                  :control)
+                 ((= stream-type +http3-push-stream-type+) :push)
+                 ((= stream-type +http3-qpack-encoder-stream-type+)
+                  (attach-http3-peer-qpack-encoder-stream client stream)
+                  :qpack-encoder)
+                 ((= stream-type +http3-qpack-decoder-stream-type+)
+                  (attach-http3-peer-qpack-decoder-stream client stream)
+                  :qpack-decoder)
+                 (t :unknown))))
+           (if (eq kind :push)
+               (multiple-value-bind (push-id push-end)
+                   (http3-varint-decode
+                    buffer :position type-end :allow-incomplete-p t)
+                 (declare (ignore push-end))
+                 (when push-id
+                   (%h3-register-peer-push-stream client stream push-id)
+                   (%h3-prefetch-stream-input
+                    client stream buffer prefetched-fin-p)
+                   (return :push))
+                 (when prefetched-fin-p
+                   (%h3-transport-error
+                    "An HTTP/3 push stream ended with a truncated push ID."
+                    :h3-stream-creation-error)))
+             (progn
+               (if (eq kind :unknown)
+                   (%h3-retain-unknown-peer-stream client stream prefetched-fin-p)
+                 (%h3-prefetch-stream-input client stream buffer prefetched-fin-p))
+               (return kind)))))
+       (when prefetched-fin-p
+         (%h3-transport-error
+          "A peer HTTP/3 unidirectional stream ended before its type prefix."
+          :h3-stream-creation-error))
+       (multiple-value-bind (chunk fin-p)
+           (funcall (http3-client-read-stream client)
+                    stream :timeout timeout :deadline deadline)
+         (when chunk
+           (unless (%http3-octet-vector-p chunk)
+             (%h3-transport-error
+              "HTTP/3 read-stream must return an octet vector or NIL."
+              (type-of chunk)))
+           (progn
+             (%h3-check-state-bytes client (+ (length buffer) (length chunk)))
+             (setf buffer (%http3-concatenate-octets buffer chunk))))
+         (setf prefetched-fin-p (or fin-p (null chunk)))
+         (when prefetched-fin-p
+           (multiple-value-bind (stream-type position)
+               (http3-varint-decode buffer :allow-incomplete-p t)
+             (declare (ignore position))
+             (unless stream-type
+               (%h3-transport-error
+                "A peer HTTP/3 unidirectional stream ended before its type prefix."
+                :h3-stream-creation-error)))))))))
 
 (defun process-http3-peer-unidirectional-stream
     (client stream &key timeout deadline)
   "Classify STREAM and apply its first control or QPACK input to CLIENT.
 
 Returns the stream kind, a list of effects, and whether the processed input
-ended.  :PUSH and :UNKNOWN streams are classified but not consumed further;
-the caller must pass push streams to RECEIVE-HTTP3-PUSH and discard unknown
-extension streams.  Call the corresponding READ-HTTP3-* function when a
-critical stream becomes readable again."
+ended. :PUSH streams must be passed to RECEIVE-HTTP3-PUSH. The native
+scheduler cancels unknown streams with H3_STREAM_CREATION_ERROR when a
+cancellation callback is available; otherwise, it discards their data through
+FIN. Call the corresponding READ-HTTP3-* function when a critical stream
+becomes readable again."
   (let ((kind
           (accept-http3-peer-unidirectional-stream
            client stream :timeout timeout :deadline deadline)))
@@ -818,7 +964,10 @@ critical stream becomes readable again."
   (%call-http3-serialized
    client
    (lambda ()
-     (let ((previous (http3-client-max-push-id client)))
+     (let ((previous (let ((max-push-id nil))
+                       (%h3-with-scheduler-lock (client)
+                         (setf max-push-id (http3-client-max-push-id client)))
+                       max-push-id)))
        (when (and previous (<= max-push-id previous))
          (%h3-transport-error
           "MAX_PUSH_ID must increase the previously advertised push ID."
@@ -830,7 +979,8 @@ critical stream becomes readable again."
                          :fin-p nil
                          :timeout timeout
                          :deadline deadline)
-       (setf (http3-client-max-push-id client) max-push-id))))
+       (%h3-with-scheduler-lock (client)
+         (setf (http3-client-max-push-id client) max-push-id)))))
   client)
 
 (defun cancel-http3-push (client push-id &key timeout deadline)
@@ -866,37 +1016,115 @@ critical stream becomes readable again."
 
 (progn
   (defun %close-http3-client-serialized (client condition)
-    (when (http3-client-open-p client)
-      (let ((decoder (http3-client-qpack-http3-decoder-context client)))
-        (when decoder
-          (http-message-kit:qpack-close-http3-decoder-context decoder)))
-      (setf (http3-client-open-p client) nil
-            (http3-client-qpack-encoder-context client) nil
-            (http3-client-qpack-decoder-context client) nil
-            (http3-client-qpack-http3-decoder-context client) nil
-            (http3-client-close-pending-streams client)
-            (remove-duplicates
-             (remove nil
-                     (list (http3-client-control-stream client)
-                           (http3-client-qpack-encoder-stream client)
-                           (http3-client-qpack-decoder-stream client)
-                           (http3-client-peer-control-stream client)
-                           (http3-client-peer-qpack-encoder-stream client)
-                           (http3-client-peer-qpack-decoder-stream client)))
-             :test (function eq))))
-    (loop while (http3-client-close-pending-streams client)
-          for stream = (pop (http3-client-close-pending-streams client))
-          do (let ((closed-p nil))
-               (unwind-protect
-                    (progn
-                      (funcall (http3-client-close-stream client)
-                               stream
-                               :condition condition)
-                      (setf closed-p t))
-                 (unless closed-p
-                   (push stream
-                         (http3-client-close-pending-streams client))))))
-    t)
+    (let ((snapshot nil)
+          (first-failure nil))
+      (%h3-with-scheduler-lock (client)
+        (let* ((open-p (http3-client-open-p client))
+               (pending-pushes
+                 (copy-list (http3-client-pending-push-streams client)))
+               (seen-push-streams
+                 (remove nil
+                         (mapcar #'cdr
+                                 (http3-client-seen-peer-push-ids client))))
+               (pending-peer-streams
+                 (remove-duplicates
+                  (append
+                   (copy-list
+                    (http3-client-pending-peer-unidirectional-streams client))
+                   (mapcar #'car
+                           (http3-client-peer-unidirectional-prefix-buffers
+                            client)))
+                  :test #'eq))
+               (discard-entries
+                 (copy-list
+                  (http3-client-discard-peer-unidirectional-streams client)))
+               (discard-streams (mapcar #'car discard-entries))
+               (push-streams
+                 (remove-duplicates
+                  (append (mapcar #'cdr pending-pushes) seen-push-streams)
+                  :test #'eq))
+               (cancel-pairs
+                 (when open-p
+                   (remove-duplicates
+                    (append
+                     (mapcar (lambda (stream) (cons stream #x10c)) push-streams)
+                     (mapcar (lambda (stream) (cons stream #x103))
+                             pending-peer-streams)
+                     (loop for entry in discard-entries
+                           when (or (eq (cdr entry) :drain)
+                                    (eq (cdr entry) :cancel-pending))
+                             collect (cons (car entry) #x103)))
+                    :key #'car :test #'eq)))
+               (streams
+                 (if open-p
+                     (remove-duplicates
+                      (append
+                       (http3-client-close-pending-streams client)
+                       (remove nil
+                               (list
+                                (http3-client-control-stream client)
+                                (http3-client-qpack-encoder-stream client)
+                                (http3-client-qpack-decoder-stream client)
+                                (http3-client-peer-control-stream client)
+                                (http3-client-peer-qpack-encoder-stream client)
+                                (http3-client-peer-qpack-decoder-stream client)))
+                       pending-peer-streams discard-streams push-streams)
+                      :test #'eq)
+                   (copy-list (http3-client-close-pending-streams client))))
+               (decoder
+                 (and open-p
+                      (http3-client-qpack-http3-decoder-context client))))
+          (setf snapshot (list cancel-pairs streams decoder))
+          (when open-p
+            (setf (http3-client-open-p client) nil
+                  (http3-client-qpack-encoder-context client) nil
+                  (http3-client-qpack-decoder-context client) nil
+                  (http3-client-qpack-http3-decoder-context client) nil
+                  (http3-client-close-pending-streams client) streams
+                  (http3-client-pending-push-streams client) nil
+                  (http3-client-seen-peer-push-ids client) nil
+                  (http3-client-pending-peer-unidirectional-streams client) nil
+                  (http3-client-peer-unidirectional-prefix-buffers client) nil
+                  (http3-client-discard-peer-unidirectional-streams client) nil
+                  (http3-client-prefetched-stream-inputs client) nil))))
+      (destructuring-bind (cancel-pairs streams decoder) snapshot
+        (labels ((remember-failure (caught-condition)
+                   (unless first-failure
+                     (setf first-failure caught-condition)))
+                 (try-cancel (entry)
+                   (let ((cancel (http3-client-cancel-stream client)))
+                     (when cancel
+                       (handler-case
+                           (funcall cancel (car entry)
+                                    :error-code (cdr entry)
+                                    :timeout nil :deadline nil)
+                         (error (caught-condition)
+                           (remember-failure caught-condition))))))
+                 (try-close (stream failed-streams)
+                   (handler-case
+                       (progn
+                         (funcall (http3-client-close-stream client)
+                                  stream :condition condition)
+                         failed-streams)
+                     (error (caught-condition)
+                       (remember-failure caught-condition)
+                       (cons stream failed-streams)))))
+          (when decoder
+            (handler-case
+                (http-message-kit:qpack-close-http3-decoder-context decoder)
+              (error (caught-condition)
+                (remember-failure caught-condition))))
+          (dolist (entry cancel-pairs)
+            (try-cancel entry))
+          (let ((failed-streams nil))
+            (dolist (stream streams)
+              (setf failed-streams (try-close stream failed-streams)))
+            (%h3-with-scheduler-lock (client)
+              (setf (http3-client-close-pending-streams client)
+                    (nreverse failed-streams))))
+          (when first-failure
+            (error first-failure))
+          t))))
   (defun close-http3-client (client &key condition)
     (unless (http3-client-p client)
       (%h3-transport-error "CLOSE-HTTP3-CLIENT requires an HTTP/3 client."
@@ -922,10 +1150,11 @@ critical stream becomes readable again."
              (unless close-succeeded-p
                (or close-failure
                    (make-condition
-                    'http-kit:http-connection-error
+                    (quote http-kit:http-connection-error)
                     :message "Closing the HTTP/3 client did not complete."
                     :operation :http3-close)))
-             :http3-only-p t))))
+             :http3-only-p t
+             :scheduler-condition condition))))
       (not (null close-status)))))
 
 (defun %h3-consume-control-prefix (buffer prefix-seen-p)
@@ -1919,7 +2148,10 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
                ((= type +http3-push-promise-type+)
                 (multiple-value-bind (push-id field-position)
                     (http3-varint-decode payload)
-                  (let ((max-push-id (http3-client-max-push-id client)))
+                  (let ((max-push-id (let ((max-push-id nil))
+                             (%h3-with-scheduler-lock (client)
+                               (setf max-push-id (http3-client-max-push-id client)))
+                             max-push-id)))
                     (unless (and max-push-id (<= push-id max-push-id))
                       (%h3-transport-error
                        "HTTP/3 PUSH_PROMISE exceeds the advertised MAX_PUSH_ID."
@@ -2111,7 +2343,8 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
 
 (defun %h3-scheduler-fields (client entry payload role)
   (if (%http3-request-stream-qpack-resume-fields-p entry)
-      (prog1 (values (%http3-request-stream-qpack-resume-fields entry) t)
+      (multiple-value-prog1
+          (values (%http3-request-stream-qpack-resume-fields entry) t)
         (setf (%http3-request-stream-qpack-resume-fields entry) nil
               (%http3-request-stream-qpack-resume-fields-p entry) nil))
       (multiple-value-bind (fields token)
@@ -2314,7 +2547,7 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
       result))
 
   (defun %h3-scheduler-finish-connection-close
-      (client &optional condition &key http3-only-p)
+      (client &optional condition &key http3-only-p scheduler-condition)
     (%h3-with-scheduler-lock (client)
                              (cond
                               (condition
@@ -2327,17 +2560,19 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
                                  (setf (http3-client-scheduler-close-state client) :http3-closed)
                                  (%h3-scheduler-fail-closed-state-locked
                                   client
-                                  (make-condition
-                                   'http-kit:http-connection-error
-                                   :message "The HTTP/3 client was closed."
-                                   :operation :http3-request))))
+                                  (or scheduler-condition
+                                      (make-condition
+                                       (quote http-kit:http-connection-error)
+                                       :message "The HTTP/3 client was closed."
+                                       :operation :http3-request)))))
                               (t
                                (setf (http3-client-scheduler-close-state client) :closed)
                                (%h3-scheduler-clear-closed-state-locked client)))
                              (when (and (http3-client-scheduler-close-owner-active-p client)
                                         (eq (http3-client-scheduler-close-owner-thread client)
                                             (%h3-scheduler-current-thread)))
-                               (setf (http3-client-scheduler-close-owner-active-p client) nil (http3-client-scheduler-close-owner-thread client) nil))
+                               (setf (http3-client-scheduler-close-owner-active-p client) nil
+                                     (http3-client-scheduler-close-owner-thread client) nil))
                              (%h3-scheduler-broadcast client))
     client))
 
@@ -2505,7 +2740,8 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
 (defun %h3-scheduler-write-entry-step (client entry)
   (when (or (not (%http3-request-stream-started-p entry))
             (%http3-request-stream-done-p entry)
-            (%h3-scheduler-close-started-p client))
+            (%h3-scheduler-close-started-p client)
+            (getf (%http3-request-stream-request-write-state entry) :finished-p))
     (return-from %h3-scheduler-write-entry-step nil))
   (let* ((stream (%http3-request-stream-stream entry))
          (state (%http3-request-stream-request-write-state entry))
@@ -2513,67 +2749,74 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
     (when (funcall (http3-client-stream-write-pending-p client) stream)
       (return-from %h3-scheduler-write-entry-step nil))
     (cond
-      ((not (getf state :headers-sent-p))
-       (%h3-scheduler-write-fields
-        client entry (%http3-request-stream-request-fields entry) nil)
-       (setf (getf state :headers-sent-p) t)
-       t)
-      ((%http3-request-stream-request-body-function entry)
-       (let* ((chunk
-                (funcall (%http3-request-stream-request-body-function entry)
-                         (http3-client-max-frame-size client)))
-              (sent (getf state :sent-length 0))
-              (expected (%http3-request-stream-request-body-length entry)))
-         (when (or (%http3-request-stream-done-p entry)
-                   (%http3-request-stream-failure entry)
-                   (%h3-scheduler-close-started-p client))
-           (return-from %h3-scheduler-write-entry-step nil))
-         (if chunk
-             (progn
-               (%h3-validate-request-body-chunk
-                chunk (http3-client-max-frame-size client))
-               (when (and expected (> (+ sent (length chunk)) expected))
-                 (%h3-transport-error
-                  "The HTTP/3 request body producer exceeded its declared length."
-                  (list (+ sent (length chunk)) expected)))
-               (%h3-scheduler-write-data client entry chunk nil)
-               (setf (getf state :sent-length) (+ sent (length chunk))))
-             (progn
-               (when (and expected (/= sent expected))
-                 (%h3-transport-error
-                  "The HTTP/3 request body producer ended before its declared length."
-                  (list sent expected)))
-               (if trailers
-                   (%h3-scheduler-write-fields client entry trailers t)
-                   (%h3-scheduler-write-data
-                    client entry (http-kit::%empty-octets) t))
-               (setf (getf state :finished-p) t)))
+     ((not (getf state :headers-sent-p))
+       (let ((finish-p (and (null (%http3-request-stream-request-body-function entry))
+                            (zerop (length (%http3-request-stream-request-body entry)))
+                            (null (%http3-request-stream-trailer-fields entry)))))
+         (%h3-scheduler-write-fields
+          client entry (%http3-request-stream-request-fields entry) finish-p)
+         (setf (getf state :headers-sent-p) t)
+         (when finish-p (setf (getf state :finished-p) t))
          t))
-      ((< (getf state :body-offset 0)
-          (length (%http3-request-stream-request-body entry)))
-       (let* ((body (%http3-request-stream-request-body entry))
-              (position (getf state :body-offset 0))
-              (end (min (length body)
-                        (+ position (http3-client-max-frame-size client))))
-              (chunk (subseq body position end))
-              (fin-p (and (= end (length body)) (null trailers))))
-         (%h3-scheduler-write-data client entry chunk fin-p)
-         (setf (getf state :body-offset) end)
-         (when fin-p (setf (getf state :finished-p) t))
-         t))
-      (trailers
-       (%h3-scheduler-write-fields client entry trailers t)
-       (setf (getf state :finished-p) t)
-       t)
-      (t
-       (%h3-scheduler-write-data client entry (http-kit::%empty-octets) t)
-       (setf (getf state :finished-p) t)
-       t))))
+     ((%http3-request-stream-request-body-function entry)
+      (let* ((chunk
+              (funcall (%http3-request-stream-request-body-function entry)
+                       (http3-client-max-frame-size client)))
+             (sent (getf state :sent-length 0))
+             (expected (%http3-request-stream-request-body-length entry)))
+        (when (or (%http3-request-stream-done-p entry)
+                  (%http3-request-stream-failure entry)
+                  (%h3-scheduler-close-started-p client))
+          (return-from %h3-scheduler-write-entry-step nil))
+        (if chunk
+            (progn
+              (%h3-validate-request-body-chunk
+               chunk (http3-client-max-frame-size client))
+              (when (and expected (> (+ sent (length chunk)) expected))
+                (%h3-transport-error
+                 "The HTTP/3 request body producer exceeded its declared length."
+                 (list (+ sent (length chunk)) expected)))
+              (%h3-scheduler-write-data client entry chunk nil)
+              (setf (getf state :sent-length) (+ sent (length chunk))))
+          (progn
+            (when (and expected (/= sent expected))
+              (%h3-transport-error
+               "The HTTP/3 request body producer ended before its declared length."
+               (list sent expected)))
+            (if trailers
+                (%h3-scheduler-write-fields client entry trailers t)
+              (%h3-scheduler-write-data
+               client entry (http-kit::%empty-octets) t))
+            (setf (getf state :finished-p) t)))
+        t))
+     ((< (getf state :body-offset 0)
+         (length (%http3-request-stream-request-body entry)))
+      (let* ((body (%http3-request-stream-request-body entry))
+             (position (getf state :body-offset 0))
+             (end (min (length body)
+                       (+ position (http3-client-max-frame-size client))))
+             (chunk (subseq body position end))
+             (fin-p (and (= end (length body)) (null trailers))))
+        (%h3-scheduler-write-data client entry chunk fin-p)
+        (setf (getf state :body-offset) end)
+        (when fin-p (setf (getf state :finished-p) t))
+        t))
+     (trailers
+      (%h3-scheduler-write-fields client entry trailers t)
+      (setf (getf state :finished-p) t)
+      t)
+     (t
+      (%h3-scheduler-write-data client entry (http-kit::%empty-octets) t)
+      (setf (getf state :finished-p) t)
+      t))))
 (progn
 (defun %h3-scheduler-process-push-promise (client entry payload)
   (multiple-value-bind (push-id field-position)
       (http3-varint-decode payload)
-    (let ((max-push-id (http3-client-max-push-id client)))
+    (let ((max-push-id (let ((max-push-id nil))
+                             (%h3-with-scheduler-lock (client)
+                               (setf max-push-id (http3-client-max-push-id client)))
+                             max-push-id)))
       (unless (and max-push-id (<= push-id max-push-id))
         (%h3-transport-error
          "HTTP/3 PUSH_PROMISE exceeds the advertised MAX_PUSH_ID."
@@ -2641,14 +2884,20 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
   (when (and (%http3-request-stream-response-fin-p entry)
              (null (%http3-request-stream-qpack-token entry))
              (null (%http3-request-stream-response-frames entry)))
-    (when (plusp (length (%http3-request-stream-response-buffer entry)))
-      (%h3-transport-error
-       "The HTTP/3 stream ended with a truncated frame."))
-    (let ((response (%h3-scheduler-finish-response entry)))
-      (funcall (http3-client-close-stream client)
-               (%http3-request-stream-stream entry) :condition nil)
-      (%h3-scheduler-complete-entry client entry :response response)
-      t)))
+    (unless (%h3-scheduler-close-started-p client)
+      (%h3-scheduler-poll-critical-streams client))
+    (when (and (not (%h3-scheduler-close-started-p client))
+               (%http3-request-stream-response-fin-p entry)
+               (null (%http3-request-stream-qpack-token entry))
+               (null (%http3-request-stream-response-frames entry)))
+      (when (plusp (length (%http3-request-stream-response-buffer entry)))
+        (%h3-transport-error
+         "The HTTP/3 stream ended with a truncated frame."))
+      (let ((response (%h3-scheduler-finish-response entry)))
+        (funcall (http3-client-close-stream client)
+                 (%http3-request-stream-stream entry) :condition nil)
+        (%h3-scheduler-complete-entry client entry :response response)
+        t))))
 
 (defun %h3-scheduler-read-entry-step (client entry)
   (multiple-value-bind (chunk fin-p status)
@@ -2678,9 +2927,10 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
              (not (null (%http3-request-stream-response-frames entry)))))
         (unless (%h3-scheduler-close-started-p client)
           (%h3-scheduler-drain-response-frames client entry))
-        (or read-progress-p frames-p
-            (and (not (%h3-scheduler-close-started-p client))
-                 (%h3-scheduler-complete-response-if-finished client entry)))))))
+        (or (and (not (%h3-scheduler-close-started-p client))
+                 (%h3-scheduler-complete-response-if-finished client entry))
+            read-progress-p
+            frames-p)))))
 )
 )
 )
@@ -2949,7 +3199,8 @@ validated informational response in wire order."
       (unwind-protect
            (funcall (http3-client-close-stream client)
                     stream :condition failure)
-        (decf (http3-client-request-stream-count client))))))
+        (when (plusp (http3-client-request-stream-count client))
+          (decf (http3-client-request-stream-count client)))))))
 (progn
 (defun %h3-scheduler-resume-ready-token (client token)
   (let ((entry (%h3-scheduler-entry-for-token client token)))
@@ -2993,28 +3244,170 @@ validated informational response in wire order."
           (declare (ignore ended-p))
           (values t events))))))
 
-(defun %h3-scheduler-poll-critical-streams (client)
-  (let ((progress-p nil))
-    (multiple-value-bind (read-p events)
-        (%h3-scheduler-read-critical-stream
-         client (http3-client-peer-control-stream client)
-         #'read-http3-control-stream)
-      (declare (ignore events))
-      (when read-p (setf progress-p t)))
-    (multiple-value-bind (read-p events)
-        (%h3-scheduler-read-critical-stream
-         client (http3-client-peer-qpack-encoder-stream client)
-         #'read-http3-qpack-encoder-stream)
-      (when read-p
-        (setf progress-p t)
-        (%h3-scheduler-resume-ready-tokens client events)))
-    (multiple-value-bind (read-p events)
-        (%h3-scheduler-read-critical-stream
-         client (http3-client-peer-qpack-decoder-stream client)
-         #'read-http3-qpack-decoder-stream)
-      (declare (ignore events))
-      (when read-p (setf progress-p t)))
-    progress-p))
+(progn
+  (defun %h3-scheduler-drain-discard-streams (client)
+    (let ((progress-p nil))
+      (dolist (entry (http3-client-discard-peer-unidirectional-streams client))
+        (when (eq (cdr entry) :drain)
+          (loop
+           (multiple-value-bind (chunk fin-p status)
+               (%h3-try-read-client-stream client (car entry) nil nil)
+             (declare (ignore chunk))
+             (when (eq status :would-block)
+               (return))
+             (setf progress-p t)
+             (when (or fin-p (eq status :fin))
+               (setf (cdr entry) :finished)
+               (return))))))
+      progress-p))
+  (defun %h3-scheduler-discover-peer-unidirectional-streams (client)
+    (let ((accept (http3-client-accept-peer-unidirectional-stream client))
+          (pending (http3-client-pending-peer-unidirectional-streams client))
+          (progress-p nil)
+          (empty (make-array 0 :element-type '(unsigned-byte 8))))
+      (when accept
+        (loop for stream = (funcall accept)
+              while stream
+              do (unless (member stream pending :test #'eq)
+                   (when (>= (http3-client-peer-unidirectional-stream-count client)
+                             (http3-client-max-peer-unidirectional-streams client))
+                     (%h3-transport-error
+                      "The HTTP/3 peer unidirectional-stream limit was exceeded."
+                      :h3-excessive-load))
+                   (incf (http3-client-peer-unidirectional-stream-count client))
+                   (setf pending (append pending (list stream))
+                         progress-p t))))
+      (setf (http3-client-pending-peer-unidirectional-streams client) pending)
+      (dolist (stream (copy-list pending))
+        (multiple-value-bind (chunk fin-p status)
+            (%h3-try-read-client-stream client stream nil nil)
+          (unless (eq status :would-block) (progn (%h3-check-state-bytes client (length (or chunk empty))) (let* ((entry (assoc stream
+                                 (http3-client-peer-unidirectional-prefix-buffers
+                                  client)
+                                 :test #'eq))
+                   (buffer (%http3-concatenate-octets
+                            (if entry (first (cdr entry)) empty)
+                            (or chunk empty))))
+              (multiple-value-bind (stream-type position)
+                  (http3-varint-decode buffer :allow-incomplete-p t)
+                (cond
+                 ((and stream-type
+                       (= stream-type +http3-push-stream-type+))
+                  (multiple-value-bind (push-id push-position)
+                      (http3-varint-decode
+                       buffer :position position :allow-incomplete-p t)
+                    (declare (ignore push-position))
+                    (if push-id
+                        (progn
+                          (%h3-register-peer-push-stream client stream push-id)
+                          (setf pending
+                                (remove stream pending :test #'eq))
+                          (setf (http3-client-pending-peer-unidirectional-streams
+                                 client)
+                                (remove stream
+                                        (http3-client-pending-peer-unidirectional-streams
+                                         client)
+                                        :test #'eq)
+                                (http3-client-peer-unidirectional-prefix-buffers client)
+                                (remove stream
+                                        (http3-client-peer-unidirectional-prefix-buffers
+                                         client)
+                                        :key #'car :test #'eq))
+                          (%h3-prefetch-stream-input client stream buffer fin-p)
+                          (%h3-with-scheduler-lock (client)
+                            (when (http3-client-open-p client)
+                              (setf (http3-client-pending-push-streams client)
+                                    (append
+                                     (http3-client-pending-push-streams client)
+                                     (list (cons push-id stream))))))
+                          (%h3-check-state-bytes client)
+                          (setf progress-p t))
+                      (if fin-p
+                          (%h3-transport-error
+                           "An HTTP/3 push stream ended with a truncated push ID."
+                           :h3-stream-creation-error)
+                        (progn
+                          (setf (http3-client-peer-unidirectional-prefix-buffers
+                                 client)
+                                (acons
+                                 stream (list buffer nil)
+                                 (remove
+                                  stream
+                                  (http3-client-peer-unidirectional-prefix-buffers
+                                   client)
+                                  :key #'car :test #'eq)))
+                          (%h3-check-state-bytes client))))))
+                 (stream-type
+                  (let ((kind
+                         (cond
+                          ((= stream-type +http3-control-stream-type+)
+                           (attach-http3-peer-control-stream client stream)
+                           :control)
+                          ((= stream-type +http3-qpack-encoder-stream-type+)
+                           (attach-http3-peer-qpack-encoder-stream client stream)
+                           :qpack-encoder)
+                          ((= stream-type +http3-qpack-decoder-stream-type+)
+                           (attach-http3-peer-qpack-decoder-stream client stream)
+                           :qpack-decoder)
+                          (t :unknown))))
+                    (if (eq kind :unknown)
+                        (%h3-retain-unknown-peer-stream client stream fin-p)
+                      (progn
+                        (%h3-prefetch-stream-input client stream buffer fin-p)
+                        (%h3-check-state-bytes client)))
+                    (setf pending (remove stream pending :test #'eq))
+                    (setf (http3-client-pending-peer-unidirectional-streams
+                           client)
+                          (remove stream
+                                  (http3-client-pending-peer-unidirectional-streams
+                                   client)
+                                  :test #'eq)
+                          (http3-client-peer-unidirectional-prefix-buffers client)
+                          (remove stream
+                                  (http3-client-peer-unidirectional-prefix-buffers
+                                   client)
+                                  :key #'car :test #'eq))
+                    (setf progress-p t)))
+                 (fin-p
+                  (%h3-transport-error
+                   "A peer HTTP/3 unidirectional stream ended before its type prefix."
+                   :h3-stream-creation-error))
+                 (t
+                  (setf (http3-client-peer-unidirectional-prefix-buffers client)
+                        (acons
+                         stream (list buffer nil)
+                         (remove
+                          stream
+                          (http3-client-peer-unidirectional-prefix-buffers client)
+                          :key #'car :test #'eq)))
+                  (%h3-check-state-bytes client))))))))
+        (when (%h3-scheduler-drain-discard-streams client)
+          (setf progress-p t))
+        progress-p)))
+
+  (defun %h3-scheduler-poll-critical-streams (client)
+    (let ((progress-p
+            (%h3-scheduler-discover-peer-unidirectional-streams client)))
+      (multiple-value-bind (read-p events)
+          (%h3-scheduler-read-critical-stream
+           client (http3-client-peer-control-stream client)
+           #'read-http3-control-stream)
+        (declare (ignore events))
+        (when read-p (setf progress-p t)))
+      (multiple-value-bind (read-p events)
+          (%h3-scheduler-read-critical-stream
+           client (http3-client-peer-qpack-encoder-stream client)
+           #'read-http3-qpack-encoder-stream)
+        (when read-p
+          (setf progress-p t)
+          (%h3-scheduler-resume-ready-tokens client events)))
+      (multiple-value-bind (read-p events)
+          (%h3-scheduler-read-critical-stream
+           client (http3-client-peer-qpack-decoder-stream client)
+           #'read-http3-qpack-decoder-stream)
+        (declare (ignore events))
+        (when read-p (setf progress-p t)))
+      progress-p)))
 
 (defun %h3-scheduler-fail-entry (client entry condition)
   (unless (or (%http3-request-stream-done-p entry)
@@ -3087,58 +3480,74 @@ validated informational response in wire order."
         t))))
 
 (defun %h3-scheduler-owner-loop (client owner-entry)
-  (unwind-protect
-       (loop
-         (unless
-             (%h3-with-scheduler-lock (client)
-               (and (null (http3-client-scheduler-close-state client))
-                    (not (and (or (%http3-request-stream-done-p owner-entry)
-                                  (%http3-request-stream-failure owner-entry))
-                              (null (http3-client-pending-request-streams client))
-                              (zerop (hash-table-count
-                                      (http3-client-request-streams client)))))))
-           (return))
-         (let ((progress-p nil))
-           (handler-case
-               (progn
-                 (funcall (http3-client-poll-function client))
-                 (when (%h3-scheduler-poll-critical-streams client)
-                   (setf progress-p t))
-                 (unless (%h3-scheduler-close-started-p client)
-                   (%h3-scheduler-start-pending client)
+  (let ((normal-exit-p nil))
+    (unwind-protect
+         (progn
+           (loop
+             (unless
+                 (%h3-with-scheduler-lock (client)
+                   (and (null (http3-client-scheduler-close-state client))
+                        (not (or (%http3-request-stream-done-p owner-entry)
+                                 (%http3-request-stream-failure owner-entry)))))
+               (return))
+             (let ((progress-p nil))
+               (handler-case
+                   (progn
+                     (funcall (http3-client-poll-function client))
+                     (when (%h3-scheduler-poll-critical-streams client)
+                       (setf progress-p t))
+                     (unless (%h3-scheduler-close-started-p client)
+                       (%h3-scheduler-start-pending client)
+                       (unless (%h3-scheduler-close-started-p client)
+                         (let* ((stream-id (%h3-scheduler-next-runnable-id client))
+                                (entry (and stream-id
+                                            (gethash stream-id
+                                                     (http3-client-request-streams
+                                                      client)))))
+                           (when (and entry
+                                      (%h3-scheduler-progress-entry client entry))
+                             (setf progress-p t))))))
+                 (error (condition)
                    (unless (%h3-scheduler-close-started-p client)
-                     (let* ((stream-id (%h3-scheduler-next-runnable-id client))
-                            (entry (and stream-id
-                                        (gethash stream-id
-                                                 (http3-client-request-streams
-                                                  client)))))
-                       (when (and entry
-                                  (%h3-scheduler-progress-entry client entry))
-                         (setf progress-p t))))))
-             (error (condition)
-               (unless (%h3-scheduler-close-started-p client)
-                 (%h3-scheduler-fail-active client condition))))
-           (unless progress-p
-             (sleep 0.001))))
-    (%h3-with-scheduler-lock (client)
-      (let ((close-state (http3-client-scheduler-close-state client)))
-        (cond
-          ((eq close-state :closed)
-           (%h3-scheduler-clear-closed-state-locked client))
-          ((eq close-state :http3-closed)
-           (%h3-scheduler-fail-closed-state-locked
-            client
-            (make-condition
-             'http-kit:http-connection-error
-             :message "The HTTP/3 client was closed."
-             :operation :http3-request)))
-          ((and close-state (not (eq close-state :closing)))
-           (%h3-scheduler-fail-closed-state-locked client close-state))))
-      (when (eq (http3-client-scheduler-owner-thread client)
-                (%h3-scheduler-current-thread))
-        (setf (http3-client-scheduler-owner-thread client) nil))
-      (%h3-scheduler-broadcast client)))
-  client)
+                     (%h3-scheduler-fail-active client condition))))
+               (unless progress-p
+                 (sleep 0.001))))
+           (setf normal-exit-p t))
+      (unwind-protect
+           (unwind-protect
+                (unless (or normal-exit-p
+                            (%h3-with-scheduler-lock (client)
+                              (or (http3-client-scheduler-close-state client)
+                                  (%http3-request-stream-done-p owner-entry)
+                                  (%http3-request-stream-failure owner-entry))))
+                  (%h3-scheduler-fail-entry
+                   client owner-entry
+                   (make-condition
+                    'http-kit:http-connection-error
+                    :message "The HTTP/3 scheduler owner exited before its request completed."
+                    :operation :http3-request
+                    :request-sent-p (%http3-request-stream-started-p owner-entry))))
+             (%h3-with-scheduler-lock (client)
+               (let ((close-state (http3-client-scheduler-close-state client)))
+                 (cond
+                   ((eq close-state :closed)
+                    (%h3-scheduler-clear-closed-state-locked client))
+                   ((eq close-state :http3-closed)
+                    (%h3-scheduler-fail-closed-state-locked
+                     client
+                     (make-condition
+                      'http-kit:http-connection-error
+                      :message "The HTTP/3 client was closed."
+                      :operation :http3-request)))
+                   ((and close-state (not (eq close-state :closing)))
+                    (%h3-scheduler-fail-closed-state-locked
+                     client close-state)))))
+        (%h3-with-scheduler-lock (client)
+          (when (eq (http3-client-scheduler-owner-thread client)
+                    (%h3-scheduler-current-thread))
+            (setf (http3-client-scheduler-owner-thread client) nil))
+          (%h3-scheduler-broadcast client)))))
+  client))
 
 (defun %h3-scheduler-wait-entry (client entry)
   (handler-case
@@ -3154,7 +3563,7 @@ validated informational response in wire order."
                                (http3-client-scheduler-owner-thread client))
                            (%h3-scheduler-condition-wait
                             client (%http3-request-stream-deadline entry)
-                            #'http-kit::%monotonic-time)
+                            (function http-kit::%monotonic-time))
                            (setf (http3-client-scheduler-owner-thread client)
                                  (%h3-scheduler-current-thread)
                                  owner-p t))))
@@ -3196,9 +3605,9 @@ validated informational response in wire order."
               (%h3-scheduler-current-thread)
               owner-p t))
       (%h3-scheduler-broadcast client))
-    (if owner-p
-        (%h3-scheduler-owner-loop client entry)
-        (%h3-scheduler-wait-entry client entry))
+    (when owner-p
+      (%h3-scheduler-owner-loop client entry))
+    (%h3-scheduler-wait-entry client entry)
     (when (%http3-request-stream-failure entry)
       (error (%http3-request-stream-failure entry)))
     (%http3-request-stream-response entry)))
@@ -3498,6 +3907,7 @@ can be consumed only once."
                  (%h3-transport-error
                   "A server push stream must use the HTTP/3 push stream type."
                   :h3-stream-creation-error))
+               (%h3-register-peer-push-stream client stream push-id)
                (labels ((claim-promise ()
                           (%call-http3-serialized
                            client
@@ -3576,8 +3986,10 @@ can be consumed only once."
            (error (condition)
              (setf failure condition)
              (error condition)))
-      (funcall (http3-client-close-stream client)
-               stream :condition failure))))
+      (unwind-protect
+          (funcall (http3-client-close-stream client)
+                   stream :condition failure)
+        (%h3-forget-peer-push-stream client stream)))))
 
 (defun %h3-server-parse-trailer-fields (fields)
   (let ((headers '()))
