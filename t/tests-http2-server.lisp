@@ -1216,6 +1216,111 @@
         (when (open-stream-p stream)
           (close stream)))
       (ensure-false (open-stream-p stream)))))
+(progn
+  (deftest http2-server-preflight-rejects-invalid-server-options
+    (dolist (case '((:request-timeout -1)
+                    (:idle-timeout :invalid)
+                    (:shutdown-p :invalid)
+                    (:max-body-bytes :invalid)))
+      (destructuring-bind (option invalid) case
+        (let ((stream (make-instance 'binary-session-stream :input (octets)))
+              (observed nil))
+          (unwind-protect
+               (progn
+                 (handler-case
+                     (apply #'http-kit/http2:serve-http2-session
+                            stream #'identity
+                            (list :close-stream nil option invalid))
+                   (http-protocol-error (condition)
+                     (setf observed condition)))
+                 (ensure-true (typep observed 'http-protocol-error))
+                 (ensure-equal :http2-server
+                               (http-kit:http-error-operation observed))
+                 (ensure-equal
+                  (case option
+                    (:request-timeout (cons option invalid))
+                    (:idle-timeout (cons option invalid))
+                    (otherwise invalid))
+                  (http-kit:http-protocol-error-detail observed))
+                 (ensure-equal 0 (binary-session-input-position stream))
+                 (ensure-true (open-stream-p stream)))
+            (when (open-stream-p stream)
+              (close stream)))
+          (ensure-false (open-stream-p stream))))))
+  (deftest http2-server-preflight-rejects-unpaired-body-buffer-callbacks
+    (let ((stream (make-instance 'binary-session-stream :input (octets)))
+          (observed nil))
+      (unwind-protect
+           (progn
+             (handler-case
+                 (http-kit/http2:serve-http2-session
+                  stream #'identity :close-stream nil
+                  :reserve-body-bytes #'identity)
+               (http-protocol-error (condition)
+                 (setf observed condition)))
+             (ensure-true (typep observed 'http-protocol-error))
+             (ensure-equal :http2-server
+                           (http-kit:http-error-operation observed))
+             (ensure-equal nil
+                           (first (http-kit:http-protocol-error-detail observed)))
+             (ensure-true
+              (functionp
+               (second (http-kit:http-protocol-error-detail observed))))
+             (ensure-equal nil
+                           (third (http-kit:http-protocol-error-detail observed)))
+             (ensure-equal 0 (binary-session-input-position stream))
+             (ensure-true (open-stream-p stream)))
+        (when (open-stream-p stream)
+          (close stream)))
+      (ensure-false (open-stream-p stream))))
+  (deftest http2-server-internal-deadline-and-stream-guards
+    (let ((deadlines (make-hash-table :test #'eq))
+          (streams (make-hash-table)))
+      (ensure-equal nil
+                    (http-kit/http2::%h2-server-effective-deadline
+                     nil nil deadlines))
+      (ensure-equal 4
+                    (http-kit/http2::%h2-server-effective-deadline
+                     7 4 deadlines))
+      (ensure-equal 7
+                    (http-kit/http2::%h2-server-effective-deadline
+                     7 9 deadlines))
+      (setf (gethash :stream deadlines) 5)
+      (ensure-equal 5
+                    (http-kit/http2::%h2-server-effective-deadline
+                     nil nil deadlines))
+      (ensure-equal 5
+                    (http-kit/http2::%h2-server-effective-deadline
+                     7 9 deadlines))
+      (setf (gethash :stream deadlines) 10)
+      (ensure-equal 7
+                    (http-kit/http2::%h2-server-effective-deadline
+                     7 9 deadlines))
+      (ensure-true
+       (http-kit/http2::%h2-server-new-client-stream-p 3 1 streams))
+      (ensure-false
+       (http-kit/http2::%h2-server-new-client-stream-p 1 1 streams))
+      (setf (gethash 3 streams) :existing)
+      (ensure-false
+       (http-kit/http2::%h2-server-new-client-stream-p 3 1 streams))
+      (ensure-equal
+       4
+       (http-kit/http2::%h2-server-request-deadline 2 4 10 (lambda () 0)))
+      (ensure-equal
+       7
+       (http-kit/http2::%h2-server-request-deadline 2 nil 10 (lambda () 5)))
+      (ensure-equal
+       nil
+       (http-kit/http2::%h2-server-check-body-release 3 3 :stream))
+      (let ((observed nil))
+        (handler-case
+            (http-kit/http2::%h2-server-check-body-release 3 2 :stream)
+          (http-protocol-error (condition)
+            (setf observed condition)))
+        (ensure-true (typep observed 'http-protocol-error))
+        (ensure-equal :http2-server (http-kit:http-error-operation observed))
+        (ensure-equal :stream
+                      (http-kit:http-protocol-error-detail observed))))))
 
 #+sbcl
 (progn
