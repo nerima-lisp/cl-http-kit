@@ -2396,4 +2396,72 @@
       (http-kit/http2::%h2-manager-finish-entry manager entry)
       (http-kit/http2:close-http2-connection-manager manager)
       (http-kit/http2:close-http2-connection connection))))
+#+sbcl
+(deftest http2-coverage-scheduler-bounds-informational-callback-queue
+  (let* ((information-block
+           (h2-header-block (cons ":status" "103")))
+         (information-frame (h2-frame 1 4 1 information-block))
+         (frames
+           (append
+            (list (h2-frame 4 0 0 (octets)) information-frame)
+            (make-list 17 :initial-element information-frame)
+            (list
+             (h2-frame 1 5 3
+                       (h2-header-block (cons ":status" "200")
+                                        (cons "content-length" "0"))))))
+         (stream
+           (make-instance 'binary-session-stream
+                          :input (apply #'concatenate-octets frames)))
+         (connection
+           (http-kit/http2:make-http2-connection :stream stream))
+         (information-calls 0)
+         (nested-response nil)
+         (outer-error nil))
+    (unwind-protect
+         (progn
+           (setf outer-error
+                 (handler-case
+                     (progn
+                       (http-kit/http2:send-http2-request-over-connection
+                        connection
+                        (make-http-request :method "GET"
+                                           :uri "https://example.com/outer")
+                        :on-information
+                        (lambda (response)
+                          (ensure-equal 103 (http-response-status response))
+                          (incf information-calls)
+                          (when (= information-calls 1)
+                            (setf nested-response
+                                  (http-kit/http2:send-http2-request-over-connection
+                                   connection
+                                   (make-http-request
+                                    :method "GET"
+                                    :uri "https://example.com/nested")))))
+                       nil)
+                   (http-protocol-error (condition) condition)))
+           (ensure-true (typep outer-error 'http-protocol-error))
+           (ensure-equal :http2-read (http-error-operation outer-error))
+           (ensure-equal
+            (list :information-callback-queue 1 16)
+            (http-protocol-error-detail outer-error))
+           (ensure-equal 200 (http-response-status nested-response))
+           (ensure-equal 1 information-calls)
+           (ensure-true
+            (null
+             (http-kit/http2::%http2-connection-scheduler-entries connection)))
+           (let ((reset-frame
+                   (find-if
+                    (lambda (frame)
+                      (and
+                       (= http-kit/http2::+http2-rst-stream-type+
+                          (http-kit/http2::%h2-frame-type frame))
+                       (= 1 (http-kit/http2::%h2-frame-stream-id frame))))
+                    (h2-output-frames stream))))
+             (ensure-true reset-frame)
+             (ensure-equal
+              8
+              (http-kit/http2::%h2-u32
+               (http-kit/http2::%h2-frame-payload reset-frame) 0))))
+      (http-kit/http2:close-http2-connection connection)))))
+
 

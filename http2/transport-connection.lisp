@@ -1295,18 +1295,41 @@ CONTINUATION frames must still be consumed contiguously from that queue."
       (%h2-send-window-update writer 0 increment)))
 
   (defun %h2-scheduler-queue-callback (connection entry event)
-    (let ((queued-p nil))
+    (let ((queued-p nil)
+          (overflow-condition nil)
+          (max-pending-information-events 16))
       (%h2-with-scheduler-lock (connection)
         (unless (or (%h2-batch-entry-local-retired-p entry)
                     (%h2-batch-entry-error entry))
-          (let ((cell (list event))
-                (tail (%h2-batch-entry-callback-events-tail entry)))
-            (if tail
-                (setf (cdr tail) cell)
-                (setf (%h2-batch-entry-callback-events entry) cell))
-            (setf (%h2-batch-entry-callback-events-tail entry) cell
-                  queued-p t))
+          (if (and (eq (first event) :information)
+                   (>= (count :information
+                              (%h2-batch-entry-callback-events entry)
+                              :key (function first)
+                              :test (function eq))
+                       max-pending-information-events))
+              (setf overflow-condition
+                    (make-condition
+                     (quote http-kit:http-protocol-error)
+                     :message
+                     "The peer exceeded the pending informational response callback limit."
+                     :operation :http2-read
+                     :detail
+                     (list :information-callback-queue
+                           (%h2-batch-entry-stream-id entry)
+                           max-pending-information-events))
+                    (%h2-batch-entry-error entry) overflow-condition)
+              (let ((cell (list event))
+                    (tail (%h2-batch-entry-callback-events-tail entry)))
+                (if tail
+                    (setf (cdr tail) cell)
+                    (setf (%h2-batch-entry-callback-events entry) cell))
+                (setf (%h2-batch-entry-callback-events-tail entry) cell
+                      queued-p t)))
           (%h2-scheduler-broadcast connection)))
+      (when overflow-condition
+        (%h2-scheduler-retire-entry
+         connection entry overflow-condition
+         (%http2-connection-clock-function connection)))
       queued-p))
 
   (defun %h2-scheduler-pop-callback (connection entry)
