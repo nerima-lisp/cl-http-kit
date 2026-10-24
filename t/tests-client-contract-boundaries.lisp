@@ -3451,3 +3451,146 @@
 (deftest client-clear-connections-rejects-non-client
   (signals http-protocol-error
     (http-client-clear-connections nil)))
+(deftest client-contract-pool-public-argument-validation
+  (signals http-protocol-error
+    (make-http-connection-pool :open-stream nil))
+  (signals http-protocol-error
+    (make-http-connection-pool
+     :open-stream (lambda (&rest arguments)
+                    (declare (ignore arguments))
+                    nil)
+     :resolve-host-style :unsupported))
+  (signals http-protocol-error
+    (make-http-proxy-stream-opener #'identity #'close
+                                   :resolve-host-style :unsupported))
+  (signals http-protocol-error
+    (http-connection-pool-max-idle nil))
+  (signals http-protocol-error
+    (http-connection-pool-clear nil)))
+(deftest client-contract-http-client-clear-connections-clears-idle-streams
+  (let* ((reply (ascii "HTTP/1.1 204 No Content|CRLF||CRLF|"))
+         (streams (list (make-instance 'binary-test-stream :input reply)
+                        (make-instance 'binary-test-stream :input reply)))
+         (opened 0)
+         (closed nil)
+         (clock (lambda () 10))
+         (tls-upgrade #'identity)
+         (resolver #'identity)
+         (pool (make-http-connection-pool
+                :open-stream
+                (lambda (request &key &allow-other-keys)
+                  (ensure-true (http-request-p request))
+                  (incf opened)
+                  (pop streams))
+                :close-stream
+                (lambda (stream)
+                  (push stream closed)
+                  (when (open-stream-p stream)
+                    (close stream :abort t)))
+                :max-idle 4
+                :idle-timeout nil
+                :max-connection-age nil
+                :clock-function clock
+                :tls-upgrade tls-upgrade
+                :resolve-host resolver
+                :resolve-host-style :host-only))
+         (client (make-http-client :cache nil :connection-pool pool)))
+    (ensure-equal 4 (http-connection-pool-max-idle pool))
+    (ensure-false (http-connection-pool-idle-timeout pool))
+    (ensure-false (http-connection-pool-max-connection-age pool))
+    (ensure-true (eq clock (http-connection-pool-clock-function pool)))
+    (ensure-true (eq tls-upgrade (http-connection-pool-tls-upgrade pool)))
+    (ensure-true (eq resolver (http-connection-pool-resolve-host pool)))
+    (unwind-protect
+         (progn
+           (ensure-equal 204
+                         (http-response-status
+                          (http-client-send client "GET" "http://one.test/")))
+           (ensure-equal 204
+                         (http-response-status
+                          (http-client-send client "GET" "http://two.test/")))
+           (ensure-equal 2 opened)
+           (ensure-equal 2 (getf (http-connection-pool-stats pool) :idle-count))
+           (ensure-equal 2 (http-client-clear-connections client))
+           (ensure-equal 0 (getf (http-connection-pool-stats pool) :idle-count)))
+      (http-client-clear-connections client))
+    (ensure-equal 2 (length closed))
+    (ensure-false (some #'open-stream-p closed))))
+(deftest client-contract-pool-send-closes-after-clock-callback-error
+  (let* ((original (make-condition 'simple-error
+                                   :format-control "The pool clock failed."))
+         (reply (ascii "HTTP/1.1 204 No Content|CRLF||CRLF|"))
+         (stream (make-instance 'binary-test-stream :input reply))
+         (opened 0)
+         (closed 0)
+         (bad-p t)
+         (pool (make-http-connection-pool
+                :idle-timeout nil
+                :max-connection-age nil
+                :clock-function
+                (lambda ()
+                  (if (and bad-p
+                           (plusp (http-kit/test-core::binary-test-input-position stream)))
+                      (error original)
+                      10))
+                :open-stream
+                (lambda (request &key &allow-other-keys)
+                  (ensure-true (http-request-p request))
+                  (incf opened)
+                  stream)
+                :close-stream
+                (lambda (owned)
+                  (ensure-true (eq stream owned))
+                  (incf closed)
+                  (when (open-stream-p owned)
+                    (close owned :abort t))))))
+    (unwind-protect
+         (let ((caught (handler-case
+                           (http-connection-pool-send
+                            pool (make-http-request
+                                  :method "GET" :uri "http://clock-error.test/"))
+                         (http-connection-error (condition) condition))))
+           (ensure-true (typep caught 'http-connection-error))
+           (ensure-true (eq original (http-connection-error-cause caught)))
+           (ensure-equal :transport (http-error-operation caught))
+           (ensure-equal 1 opened)
+           (ensure-equal 1 closed)
+           (ensure-equal (length reply)
+                         (http-kit/test-core::binary-test-input-position stream))
+           (ensure-false (open-stream-p stream))
+           (ensure-equal 0 (getf (http-connection-pool-stats pool) :idle-count)))
+      (setf bad-p nil)
+      (http-connection-pool-clear pool)
+      (when (open-stream-p stream)
+        (close stream :abort t)))))
+(deftest client-contract-proxy-default-clock-enforces-expired-deadline
+  (let* ((request (make-http-request :method "GET" :uri "http://target.test/"))
+         (proxy (make-http-proxy :scheme :socks5h :host "proxy.test" :port 1080))
+         (plan (http-proxy-plan proxy (http-request-uri request)))
+         (stream (make-instance 'binary-test-stream))
+         (opened 0)
+         (closed 0)
+         (opener (make-http-proxy-stream-opener
+                  (lambda (&rest arguments)
+                    (declare (ignore arguments))
+                    (incf opened)
+                    stream)
+                  (lambda (owned)
+                    (ensure-true (eq stream owned))
+                    (incf closed)
+                    (when (open-stream-p owned)
+                      (close owned :abort t))))))
+    (unwind-protect
+         (let ((caught (handler-case
+                           (funcall opener request :deadline 0 :proxy-plan plan)
+                         (http-timeout (condition) condition))))
+           (ensure-true (typep caught 'http-timeout))
+           (ensure-equal :write (http-timeout-kind caught))
+           (ensure-equal :write (http-error-operation caught))
+           (ensure-equal 1 opened)
+           (ensure-equal 1 closed)
+           (ensure-equal 0 (length (binary-test-output stream)))
+           (ensure-equal 0 (http-kit/test-core::binary-test-input-position stream))
+           (ensure-false (open-stream-p stream)))
+      (when (open-stream-p stream)
+        (close stream :abort t)))))

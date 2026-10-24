@@ -247,11 +247,15 @@
   (let* ((input (copy-seq "123"))
          (before (copy-seq input)))
     (ensure-equal 123 (http-kit/client::%client-parse-integer input))
+    (ensure-equal 23
+                  (http-kit/client::%client-parse-integer input :start 1))
     (ensure-equal before input)
-    (dolist (bounds '((-1 2) (2 1) (0 4) (1 1)))
+    (dolist (bounds (list (list -1 2) (list 2 1) (list 0 4) (list 1 1)))
       (destructuring-bind (start end) bounds
-        (ensure-equal nil
-                      (http-kit/client::%client-parse-integer input :start start :end end))
+        (ensure-equal
+         nil
+         (http-kit/client::%client-parse-integer
+          input :start start :end end))
         (ensure-equal before input))))
   (let* ((input (copy-seq "x12y"))
          (before (copy-seq input)))
