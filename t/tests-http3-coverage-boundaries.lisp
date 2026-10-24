@@ -4306,3 +4306,371 @@
         (http-kit/http3:close-http3-client client))
       (http3-test-join-native-thread owner-thread owner-finished)
       (http3-test-join-native-thread waiter-thread waiter-finished)))))
+(deftest http3-native-scheduler-cancel-qpack-rejects-missing-context
+  (let* ((client
+          (http3-test-make-native-client
+           :try-read-stream
+           (lambda (stream &key timeout deadline)
+             (declare (ignore stream timeout deadline))
+             (values nil nil :would-block))))
+         (entry
+          (http-kit/http3::%make-http3-request-stream
+           :qpack-token :blocked)))
+    (unwind-protect
+         (progn
+           (setf (http-kit/http3::http3-client-qpack-http3-decoder-context
+                  client)
+                 nil)
+           (let ((failure
+                   (http3-boundary-error
+                    (lambda ()
+                      (http-kit/http3::%h3-scheduler-cancel-qpack
+                       client entry nil nil)))))
+             (ensure-true failure)
+             (ensure-equal
+              "A blocked HTTP/3 request must retain its QPACK context and stream ID."
+              (http-error-message failure))
+             (ensure-equal
+              nil
+              (http-kit/http3::%http3-request-stream-stream-id entry))))
+      (when (http-kit/http3:http3-client-open-p client)
+        (http-kit/http3:close-http3-client client)))))
+(deftest http3-native-scheduler-write-fields-requires-stream-id-for-dynamic-qpack
+  (let* ((client
+          (http3-test-make-native-client
+           :try-read-stream
+           (lambda (stream &key timeout deadline)
+             (declare (ignore stream timeout deadline))
+             (values nil nil :would-block))))
+         (encoder-context
+          (http-message-kit:make-qpack-context
+           :max-table-capacity 64 :table-capacity 64 :huffman nil))
+         (entry
+          (http-kit/http3::%make-http3-request-stream
+           :encoder-context encoder-context)))
+    (unwind-protect
+         (progn
+           (http-message-kit:qpack-encode-insert-with-literal-name
+            encoder-context "x-dynamic" "value" :huffman nil)
+           (let ((failure
+                   (http3-boundary-error
+                    (lambda ()
+                      (http-kit/http3::%h3-scheduler-write-fields
+                       client entry (list (cons ":method" "GET")) nil)))))
+             (ensure-true failure)
+             (ensure-equal
+              "Dynamic QPACK field encoding requires a numeric stream ID."
+              (http-error-message failure))))
+      (when (http-kit/http3:http3-client-open-p client)
+        (http-kit/http3:close-http3-client client)))))
+(deftest http3-native-scheduler-restores-failed-pending-entries-without-duplicates
+  (let* ((client
+          (http3-test-make-native-client
+           :try-read-stream
+           (lambda (stream &key timeout deadline)
+             (declare (ignore stream timeout deadline))
+             (values nil nil :would-block))))
+         (failure
+          (make-condition
+           (quote http-kit:http-connection-error)
+           :message "retained request failure"
+           :operation :http3-request))
+         (active-entry
+          (http-kit/http3::%make-http3-request-stream :failure failure))
+         (pending-entry
+          (http-kit/http3::%make-http3-request-stream :failure failure)))
+    (unwind-protect
+         (progn
+           (setf (gethash 0
+                          (http-kit/http3::http3-client-request-streams client))
+                 active-entry
+                 (http-kit/http3::http3-client-request-stream-count client)
+                 1
+                 (http-kit/http3::http3-client-pending-request-streams client)
+                 (list pending-entry active-entry pending-entry))
+           (http-kit/http3::%h3-scheduler-start-pending client)
+           (ensure-equal
+            (list pending-entry)
+            (http-kit/http3::http3-client-pending-request-streams client))
+           (ensure-true
+            (eq active-entry
+                (gethash 0
+                         (http-kit/http3::http3-client-request-streams client))))
+           (ensure-true
+            (eq failure
+                (http-kit/http3::%http3-request-stream-failure active-entry)))
+           (ensure-true
+            (eq failure
+                (http-kit/http3::%http3-request-stream-failure pending-entry))))
+      (setf (http-kit/http3::http3-client-pending-request-streams client) nil)
+      (clrhash (http-kit/http3::http3-client-request-streams client))
+      (setf (http-kit/http3::http3-client-request-stream-count client) 0)
+      (when (http-kit/http3:http3-client-open-p client)
+        (http-kit/http3:close-http3-client client)))))
+(deftest http3-native-scheduler-retains-queued-entry-when-close-starts
+  (let* ((client
+          (http3-test-make-native-client
+           :try-read-stream
+           (lambda (stream &key timeout deadline)
+             (declare (ignore stream timeout deadline))
+             (values nil nil :would-block))))
+         (current-entry
+          (http-kit/http3::%make-http3-request-stream
+           :request
+           (make-http-request
+            :method "GET" :uri "https://example.test/current")
+           :on-stream-open
+           (lambda (stream stream-id cancel)
+             (declare (ignore stream stream-id cancel))
+             (setf (http-kit/http3::http3-client-scheduler-close-state client)
+                   :closing))))
+         (queued-entry
+          (http-kit/http3::%make-http3-request-stream
+           :request
+           (make-http-request
+            :method "GET" :uri "https://example.test/queued"))))
+    (unwind-protect
+         (progn
+           (setf (http-kit/http3::http3-client-pending-request-streams client)
+                 (list queued-entry current-entry))
+           (http-kit/http3::%h3-scheduler-start-pending client)
+           (ensure-equal :closing
+                         (http-kit/http3::http3-client-scheduler-close-state
+                          client))
+           (ensure-equal
+            1
+            (hash-table-count
+             (http-kit/http3::http3-client-request-streams client)))
+           (ensure-equal
+            (list queued-entry)
+            (http-kit/http3::http3-client-pending-request-streams client))
+           (ensure-true
+            (http-kit/http3::%http3-request-stream-started-p current-entry))
+           (ensure-false
+            (http-kit/http3::%http3-request-stream-started-p queued-entry)))
+      (setf (http-kit/http3::http3-client-scheduler-close-state client) nil)
+      (when (http-kit/http3:http3-client-open-p client)
+        (http-kit/http3:close-http3-client client)))))
+(deftest http3-native-scheduler-restores-current-and-queued-entries-after-closed-unwind
+  (let* ((client
+          (http3-test-make-native-client
+           :try-read-stream
+           (lambda (stream &key timeout deadline)
+             (declare (ignore stream timeout deadline))
+             (values nil nil :would-block))))
+         (current-entry
+          (http-kit/http3::%make-http3-request-stream
+           :request
+           (make-http-request
+            :method "GET" :uri "https://example.test/current")))
+         (queued-entry
+          (http-kit/http3::%make-http3-request-stream
+           :request
+           (make-http-request
+            :method "GET" :uri "https://example.test/queued"))))
+    (unwind-protect
+         (progn
+           (setf (http-kit/http3::http3-client-open-stream client)
+                 (lambda (request &key stream-type timeout deadline)
+                   (declare (ignore request stream-type timeout deadline))
+                   (setf (http-kit/http3::http3-client-scheduler-close-state
+                          client)
+                         :closed)
+                   (throw (quote http3-native-scheduler-start-pending-exit)
+                          :unwound))
+                 (http-kit/http3::http3-client-pending-request-streams client)
+                 (list queued-entry current-entry))
+           (ensure-equal
+            :unwound
+            (catch (quote http3-native-scheduler-start-pending-exit)
+              (http-kit/http3::%h3-scheduler-start-pending client)
+              :returned))
+           (ensure-equal nil
+                         (http-kit/http3::http3-client-pending-request-streams
+                          client))
+           (dolist (entry (list current-entry queued-entry))
+             (ensure-true
+              (http-kit/http3::%http3-request-stream-done-p entry))
+             (let ((failure
+                     (http-kit/http3::%http3-request-stream-failure entry)))
+               (ensure-true
+                (typep failure (quote http-kit:http-connection-error)))
+               (when (typep failure (quote http-kit:http-connection-error))
+                 (ensure-equal
+                  "The HTTP/3 QUIC connection was closed."
+                  (http-error-message failure))))))
+      (setf (http-kit/http3::http3-client-scheduler-close-state client) nil)
+      (when (http-kit/http3:http3-client-open-p client)
+        (http-kit/http3:close-http3-client client)))))
+(deftest http3-native-scheduler-owner-loop-clears-closed-client-state
+  (let* ((client
+          (http3-test-make-native-client
+           :try-read-stream
+           (lambda (stream &key timeout deadline)
+             (declare (ignore stream timeout deadline))
+             (values nil nil :would-block))))
+         (prior-failure
+          (make-condition
+           (quote http-kit:http-connection-error)
+           :message "first request failure"
+           :operation :http3-request))
+         (active-entry
+          (http-kit/http3::%make-http3-request-stream))
+         (pending-entry
+          (http-kit/http3::%make-http3-request-stream
+           :failure prior-failure)))
+    (unwind-protect
+         (progn
+           (setf (gethash 0
+                          (http-kit/http3::http3-client-request-streams client))
+                 active-entry
+                 (http-kit/http3::http3-client-request-stream-count client)
+                 1
+                 (http-kit/http3::http3-client-pending-request-streams client)
+                 (list pending-entry)
+                 (http-kit/http3::http3-client-scheduler-close-state client)
+                 :closed)
+           (http-kit/http3::%h3-scheduler-owner-loop client active-entry)
+           (ensure-true
+            (http-kit/http3::%http3-request-stream-done-p active-entry))
+           (ensure-true
+            (typep
+             (http-kit/http3::%http3-request-stream-failure active-entry)
+             (quote http-kit:http-connection-error)))
+           (ensure-equal
+            "The HTTP/3 QUIC connection was closed."
+            (http-error-message
+             (http-kit/http3::%http3-request-stream-failure active-entry)))
+           (ensure-true
+            (http-kit/http3::%http3-request-stream-done-p pending-entry))
+           (ensure-true
+            (eq prior-failure
+                (http-kit/http3::%http3-request-stream-failure pending-entry)))
+           (ensure-equal
+            0
+            (hash-table-count
+             (http-kit/http3::http3-client-request-streams client)))
+           (ensure-equal nil
+                         (http-kit/http3::http3-client-pending-request-streams
+                          client))
+           (ensure-equal
+            0
+            (http-kit/http3::http3-client-request-stream-count client)))
+      (setf (http-kit/http3::http3-client-scheduler-close-state client) nil)
+      (when (http-kit/http3:http3-client-open-p client)
+        (http-kit/http3:close-http3-client client)))))
+(deftest http3-native-scheduler-close-waits-for-existing-close-owner
+  (let* ((client
+          (http3-test-make-native-client
+           :try-read-stream
+           (lambda (stream &key timeout deadline)
+             (declare (ignore stream timeout deadline))
+             (values nil nil :would-block))))
+         (wait-entered (sb-thread:make-semaphore :count 0))
+         (original-wait
+          (symbol-function
+           (quote http-kit/http3::%h3-scheduler-condition-wait)))
+         (waiter-thread nil)
+         (waiter-finished nil)
+         (waiter-result nil))
+    (unwind-protect
+         (progn
+           (setf (http-kit/http3::http3-client-scheduler-close-state client)
+                 :closing
+                 (http-kit/http3::http3-client-scheduler-close-owner-active-p
+                  client)
+                 t
+                 (http-kit/http3::http3-client-scheduler-close-owner-thread client)
+                 nil)
+           (setf (symbol-function
+                  (quote http-kit/http3::%h3-scheduler-condition-wait))
+                 (lambda (wait-client deadline clock-function)
+                   (sb-thread:signal-semaphore wait-entered)
+                   (funcall original-wait wait-client deadline clock-function)))
+           (multiple-value-setq
+               (waiter-thread waiter-finished waiter-result)
+             (http3-test-start-native-call
+              (lambda ()
+                (http-kit/http3::%h3-scheduler-begin-connection-close client))))
+           (ensure-true
+            (sb-thread:wait-on-semaphore wait-entered :timeout 3))
+           (http-kit/http3::%h3-scheduler-finish-connection-close client)
+           (ensure-true
+            (sb-thread:wait-on-semaphore waiter-finished :timeout 3))
+           (ensure-equal :response (first waiter-result))
+           (ensure-equal :closed (second waiter-result))
+           (ensure-equal
+            :closed
+            (http-kit/http3::%h3-scheduler-begin-connection-close client))
+           (setf (http-kit/http3::http3-client-scheduler-close-state client)
+                 :closing
+                 (http-kit/http3::http3-client-scheduler-close-owner-active-p
+                  client)
+                 t
+                 (http-kit/http3::http3-client-scheduler-close-owner-thread client)
+                 nil
+                 (http-kit/http3::http3-client-scheduler-owner-thread client)
+                 (http-kit/http3::%h3-scheduler-current-thread))
+           (let ((failure
+                   (http3-boundary-error
+                    (lambda ()
+                      (http-kit/http3::%h3-scheduler-begin-connection-close
+                       client)))))
+             (ensure-true
+              (typep failure (quote http-kit:http-connection-error)))
+             (ensure-equal
+              "A scheduler owner cannot join a concurrent close."
+              (http-error-message failure))
+             (ensure-equal :http3-close (http-error-operation failure))
+             (ensure-true
+              (http-kit:http-connection-error-request-sent-p failure))))
+      (setf (symbol-function
+             (quote http-kit/http3::%h3-scheduler-condition-wait))
+            original-wait)
+      (http-kit/http3::%h3-scheduler-finish-connection-close client)
+      (http3-test-join-native-thread waiter-thread waiter-finished)
+      (setf (http-kit/http3::http3-client-scheduler-close-state client) nil
+            (http-kit/http3::http3-client-scheduler-close-owner-active-p client)
+            nil
+            (http-kit/http3::http3-client-scheduler-close-owner-thread client) nil
+            (http-kit/http3::http3-client-scheduler-owner-thread client) nil)
+      (when (http-kit/http3:http3-client-open-p client)
+        (http-kit/http3:close-http3-client client)))))
+(deftest http3-native-scheduler-open-cancel-uses-default-error-code
+  (let* ((cancel-calls nil)
+         (client
+          (http3-test-make-native-client
+           :try-read-stream
+           (lambda (stream &key timeout deadline)
+             (declare (ignore stream timeout deadline))
+             (values nil nil :would-block))
+           :cancel-stream
+           (lambda (stream &key error-code timeout deadline)
+             (declare (ignore timeout deadline))
+             (push (list stream error-code) cancel-calls)
+             t)))
+         (entry
+          (http-kit/http3::%make-http3-request-stream
+           :request
+           (make-http-request
+            :method "GET" :uri "https://example.test/cancel")
+           :on-stream-open
+           (lambda (stream stream-id cancel)
+             (declare (ignore stream stream-id))
+             (funcall cancel)))))
+    (unwind-protect
+         (progn
+           (http-kit/http3::%h3-scheduler-start-entry client entry)
+           (ensure-equal 1 (length cancel-calls))
+           (ensure-equal #x10c (second (first cancel-calls)))
+           (ensure-true
+            (eq (http-kit/http3::%http3-request-stream-stream entry)
+                (first (first cancel-calls))))
+           (ensure-true
+            (http-kit/http3::%http3-request-stream-done-p entry))
+           (ensure-equal
+            0
+            (hash-table-count
+             (http-kit/http3::http3-client-request-streams client))))
+      (when (http-kit/http3:http3-client-open-p client)
+        (http-kit/http3:close-http3-client client)))))
