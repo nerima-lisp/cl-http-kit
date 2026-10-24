@@ -313,6 +313,56 @@
              (ensure-false (open-stream-p stream)))
         (when (open-stream-p stream)
           (close stream :abort t)))))
+(deftest tls-server-wrapper-constructor-validation-boundaries
+  (dolist (alpn (list 1 '("h2" "h2") (list (string (code-char 128)))))
+    (let ((condition
+            (%tls-server-test-condition
+             (lambda ()
+               (make-http-tls-server-wrapper
+                :certificate-chain (list t) :private-key t
+                :alpn-protocols alpn)))))
+      (ensure-equal :invalid-alpn
+                    (http-protocol-error-detail condition))))
+  (let ((condition
+          (%tls-server-test-condition
+           (lambda ()
+             (make-http-tls-server-wrapper
+              :certificate-chain (list t) :private-key t
+              :ticket-key-store :not-a-ticket-key-store)))))
+    (ensure-equal :invalid-ticket-key-store
+                  (http-protocol-error-detail condition)))
+  (%tls-server-test-with-spy
+   'cl-tls-kit:make-tls13-server-ticket-key-store
+   (lambda (&rest arguments)
+     (declare (ignore arguments))
+     (error "Injected ticket key store construction failure."))
+   (lambda ()
+     (let ((condition
+             (%tls-server-test-condition
+              (lambda ()
+                (make-http-tls-server-wrapper
+                 :certificate-chain (list t) :private-key t)))))
+       (ensure-equal :invalid-ticket-key-store
+                     (http-protocol-error-detail condition)))))
+  (let* ((wrapper (make-http-tls-server-wrapper
+                   :certificate-chain (list t) :private-key t))
+         (condition
+           (%tls-server-test-condition
+            (lambda () (funcall wrapper :not-a-stream)))))
+    (ensure-equal :invalid-stream
+                  (http-protocol-error-detail condition)))
+  (let* ((stream (make-instance '%tls-server-test-stream :input (octets)))
+         (wrapper
+           (make-http-tls-server-wrapper
+            :certificate-chain (list t) :private-key t
+            :clock-function (lambda () 1)))
+         (condition
+           (handler-case
+               (progn (funcall wrapper stream :deadline 0) nil)
+             (http-timeout (condition) condition))))
+    (ensure-true condition)
+    (ensure-equal :tls (http-timeout-kind condition))
+    (ensure-false (open-stream-p stream))))
 
   (defclass %tls-server-failure-test-stream (%tls-server-test-stream)
     ((fail-on :initarg :fail-on :reader %tls-server-failure-test-stream-fail-on)))
@@ -392,6 +442,44 @@
                      (ensure-equal :would-block
                                    (http-protocol-error-detail condition)))))))
           (close stream :abort t)))))
+  (deftest tls-client-driver-error-boundaries
+  (let* ((raw (make-instance '%tls-server-test-stream :input (octets)))
+         (stream (http-kit/tls::%make-http-tls-stream :client raw)))
+    (unwind-protect
+         (%tls-server-test-with-spy
+          'cl-tls-kit:tls13-client-driver-read-application-data
+          (lambda (driver)
+            (declare (ignore driver))
+            (values :invalid nil))
+          (lambda ()
+            (let ((condition
+                    (%tls-server-test-condition
+                     (lambda () (read-byte stream nil :eof)))))
+              (ensure-equal :invalid-read-status
+                            (http-protocol-error-detail condition)))))
+      (close stream :abort t)))
+  (dolist (case (list (list :eof :missing-close-notify)
+                      (list (list :peer-alert 40) (list :peer-alert 40))
+                      (list :unexpected :handshake-failed)))
+    (destructuring-bind (reason expected) case
+      (let* ((raw (make-instance '%tls-server-test-stream :input (octets)))
+             (stream (http-kit/tls::%make-http-tls-stream :client raw))
+             (driver-error
+               (make-condition 'cl-tls-kit:tls13-client-driver-error
+                               :reason reason)))
+        (unwind-protect
+             (%tls-server-test-with-spy
+              'cl-tls-kit:tls13-client-driver-read-application-data
+              (lambda (driver)
+                (declare (ignore driver))
+                (error driver-error))
+              (lambda ()
+                (let ((condition
+                        (%tls-server-test-condition
+                         (lambda () (read-byte stream nil :eof)))))
+                  (ensure-equal expected
+                                (http-protocol-error-detail condition)))))
+          (close stream :abort t))))))
 
   (deftest tls-client-server-hello-framing-boundaries
     (multiple-value-bind (ciphertext-p pending)
@@ -738,5 +826,4 @@
                   (http-kit/tls::%tls-server-process-record state (apply #'octets wire))))))
         (ensure-true condition)
         (close raw :abort t))))
-
-)
+  )
