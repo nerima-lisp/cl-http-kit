@@ -19,14 +19,13 @@ native TCP/TLS connection pool when no transport boundary is supplied, while
 [changelog](docs/src/project/changelog.md) and [migration guide](docs/src/project/migration.md)
 for the 0.4.0 compatibility boundary.
 
-The client uses cl-deflate-kit for compression and cl-tls-kit 0.1.2 or later
-for TLS 1.3.
+The client uses cl-deflate-kit for compression, and the client and HTTPS
+listener use cl-tls-kit 0.1.0 or later for TLS 1.3.
 TLS certificate-chain, hostname, and trust verification is required by
 default. `:verify :optional` has the same verification policy as `:required`;
-`:verify nil` skips those certificate-policy checks but still requires the
-peer's CertificateVerify signature. Use `nil` only for deliberately
-unauthenticated test connections. Server TLS remains outside the current kit
-boundary.
+`:verify nil` is rejected because the pinned cl-tls-kit client driver does not
+provide a supported certificate-verification bypass. Use a trusted test
+certificate when exercising HTTPS clients.
 
 ## Quick Start
 
@@ -58,7 +57,7 @@ shell.
 | cl-http-kit/http2 | HTTP/2 client and injected-stream server-session boundaries |
 | cl-http-kit/http3 | HTTP/3 frames, SETTINGS, QPACK static/literal/Huffman codecs with caller-owned dynamic tables, and injected-QUIC client/request-stream server-session boundaries |
 | cl-http-kit/network | Optional SBCL TCP/DNS stream opener, IPv4/IPv6 listener, and HTTP/1 listener service |
-| cl-http-kit/tls | Native TLS 1.3 client stream wrapper backed by cl-tls-kit; server wrapping remains an explicit unsupported boundary until the kit exposes a server driver |
+| cl-http-kit/tls | Native TLS 1.3 client wrapper and HTTPS HTTP/1.1/HTTP/2 server backed by cl-tls-kit |
 | cl-http-kit/observability | Request and error counters backed by cl-observability-kit |
 | cl-http-kit/test-core | Internal core-only test runner without optional subsystems |
 | cl-http-kit/test | Internal test runner for the core and optional systems |
@@ -117,15 +116,18 @@ supplied. QUIC packets, loss recovery, congestion control, TLS 1.3, ALPN,
 sockets, certificate policy, and native HTTP/3 server acceptance remain
 outside the framing boundary. The optional
 `cl-http-kit/network` system supplies native TCP, DNS, and an HTTP/1 listener
-service on SBCL; `cl-http-kit/tls` supplies the client TLS upgrade wrapper.
-Server-side TLS wrapping is unsupported because the current
-cl-tls-kit integration has no server driver. To expose HTTPS for a server,
-terminate TLS in a reverse proxy or load balancer and forward plain HTTP to
-`cl-http-kit/network`; preserve the original host and scheme using the proxy's
-trusted forwarding policy. ALPN selection remains explicit in the current
-client path, and the
-optional client system also supplies
-a thread-safe HTTP/1.1 connection pool and RFC 6455 frame, message,
+service on SBCL. The optional `cl-http-kit/tls` system adds an HTTPS listener
+that negotiates HTTP/2 or HTTP/1.1 with ALPN and uses the shared handler
+contract `(request) -> (values response informational-responses)`. It bounds
+concurrent connections and handshakes, HTTP/2 streams, request sizes, aggregate
+buffered request bodies, and the time spent in handshakes, requests, idle waits,
+and shutdown.
+Applications can pass the same ticket-key store to multiple server instances
+to share TLS resumption keys. The listener supports HTTPS only; HTTP/3 server
+acceptance remains outside this boundary. The default origin client offers
+`h2` and `http/1.1` through ALPN. TLS to an HTTPS proxy offers only
+`http/1.1`; custom transports supply their own ALPN policy. The optional
+client system also supplies a thread-safe HTTP/1.1 connection pool and RFC 6455 frame, message,
 close-payload, HTTP upgrade, client-side 101 handshake, and upgraded server
 session helpers. WebSocket extension grammar and RFC 7692 negotiation
 parameters are validated, with application-injected compression codecs for

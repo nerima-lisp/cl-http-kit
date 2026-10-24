@@ -44,7 +44,10 @@
   (list :compiler (lisp-implementation-version) :machine (machine-type)
         :runtime (namestring (truename sb-ext:*runtime-pathname*))
         :core (namestring (truename sb-ext:*core-pathname*))
-        :features (sort (copy-list *features*) #'string< :key #'symbol-name)
+        :features (sort (intersection *features*
+                                      (list :sbcl :64-bit :arm64 :x86-64
+                                            :darwin :linux :unix))
+                        (function string<) :key (function symbol-name))
         :policy (sb-c::policy sb-c::*policy* sb-cover:store-coverage-data)))
 
 (defun load-identity (component)

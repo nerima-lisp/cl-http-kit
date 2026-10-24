@@ -68,14 +68,14 @@
     };
 
     cl-tls-kit = {
-      url = "github:nerima-lisp/cl-tls-kit/v0.1.2";
+      url = "github:nerima-lisp/cl-tls-kit/d6cf61a9ac2c0af16c7a29db3de1075962ba08f9";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.cl-weave.follows = "cl-weave";
       inputs.cl-crypto-kit.follows = "cl-crypto-kit";
     };
 
     cl-quic-kit = {
-      url = "github:nerima-lisp/cl-quic-kit/v0.1.1";
+      url = "github:nerima-lisp/cl-quic-kit/8e85e63bf601ff5b004f15fe36818fba125663eb";
       flake = false;
     };
 
@@ -162,6 +162,13 @@
           codec = cl-codec-kit.packages.${system}.default;
           deflate = cl-deflate-kit.packages.${system}.default;
           tls = cl-tls-kit.packages.${system}.default;
+          sbclDependencies = with pkgs.sbclPackages; [
+            alexandria
+            bordeaux-threads
+            global-vars
+            trivial-features
+            trivial-garbage
+          ];
           crypto = cl-crypto-kit;
           quic = cl-quic-kit;
           paredit = patchedParedit system;
@@ -191,24 +198,28 @@
               pkgs.python3Packages.mkdocs
               pkgs.python3Packages.mkdocs-material
               pkgs.python3Packages.pymdown-extensions
-            ];
+            ]
+            ++ sbclDependencies;
             shellHook = ''
               export HTTP_QUIC_PEER="${quicPeer pkgs}/bin/quic-peer"
               export CL_SOURCE_REGISTRY="''${CL_SOURCE_REGISTRY:-$PWD//:${
-                pkgs.lib.concatStringsSep ":" [
-                  "${clWeave}/share/common-lisp/source//"
-                  "${clHttpMessageKit}/share/common-lisp/source//"
-                  "${observability}//"
-                  "${concurrent}//"
-                  "${boundary}//"
-                  "${date}//"
-                  "${host}//"
-                  "${codec}//"
-                  "${deflate}//"
-                  "${tls}//"
-                  "${crypto}//"
-                  "${quic}//"
-                ]
+                pkgs.lib.concatStringsSep ":" (
+                  [
+                    "${clWeave}/share/common-lisp/source//"
+                    "${clHttpMessageKit}/share/common-lisp/source//"
+                    "${observability}//"
+                    "${concurrent}//"
+                    "${boundary}//"
+                    "${date}//"
+                    "${host}//"
+                    "${codec}//"
+                    "${deflate}//"
+                    "${tls}//"
+                    "${crypto}//"
+                    "${quic}//"
+                  ]
+                  ++ map (dependency: "${dependency}//") sbclDependencies
+                )
               }}"
             '';
           };
@@ -228,23 +239,33 @@
           codec = cl-codec-kit.packages.${system}.default;
           deflate = cl-deflate-kit.packages.${system}.default;
           tls = cl-tls-kit.packages.${system}.default;
+          sbclDependencies = with pkgs.sbclPackages; [
+            alexandria
+            bordeaux-threads
+            global-vars
+            trivial-features
+            trivial-garbage
+          ];
           crypto = cl-crypto-kit;
           quic = cl-quic-kit;
           paredit = patchedParedit system;
-          sourceRegistry = pkgs.lib.concatStringsSep ":" [
-            "${clWeave}/share/common-lisp/source//"
-            "${clHttpMessageKit}/share/common-lisp/source//"
-            "${observability}//"
-            "${concurrent}//"
-            "${boundary}//"
-            "${date}//"
-            "${host}//"
-            "${codec}//"
-            "${deflate}//"
-            "${tls}//"
-            "${crypto}//"
-            "${quic}//"
-          ];
+          sourceRegistry = pkgs.lib.concatStringsSep ":" (
+            [
+              "${clWeave}/share/common-lisp/source//"
+              "${clHttpMessageKit}/share/common-lisp/source//"
+              "${observability}//"
+              "${concurrent}//"
+              "${boundary}//"
+              "${date}//"
+              "${host}//"
+              "${codec}//"
+              "${deflate}//"
+              "${tls}//"
+              "${crypto}//"
+              "${quic}//"
+            ]
+            ++ map (dependency: "${dependency}//") sbclDependencies
+          );
           appMeta = {
             description = "Common Lisp HTTP client quality gate";
           };
@@ -297,10 +318,16 @@
               tls
               pkgs.nghttp2
               pkgs.caddy
+              pkgs.curl
               pkgs.openssl
               (quicPeer pkgs)
-            ];
+            ]
+            ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.iproute2 ]
+            ++ sbclDependencies;
             text = ''
+              ${pkgs.lib.optionalString pkgs.stdenv.isLinux ''
+                export PATH="${pkgs.iproute2}/sbin:$PATH"
+              ''}
               test_cache="$(mktemp -d "''${TMPDIR:-/tmp}/cl-http-kit-test.XXXXXXXX")"
               export HTTP_QUIC_PEER="${quicPeer pkgs}/bin/quic-peer"
               export XDG_CACHE_HOME="$test_cache"
@@ -338,10 +365,18 @@
               pkgs.perl
               pkgs.nghttp2
               pkgs.openssl
+              pkgs.curl
               pkgs.caddy
               (quicPeer pkgs)
-            ];
+            ]
+            ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+              pkgs.iproute2
+            ]
+            ++ sbclDependencies;
             text = ''
+              ${pkgs.lib.optionalString pkgs.stdenv.isLinux ''
+                export PATH="${pkgs.iproute2}/sbin:$PATH"
+              ''}
               coverage_cache="$(mktemp -d "''${TMPDIR:-/tmp}/cl-http-kit-coverage.XXXXXXXX")"
               export HTTP_QUIC_PEER="${quicPeer pkgs}/bin/quic-peer"
               export XDG_CACHE_HOME="$coverage_cache"
@@ -371,9 +406,10 @@
                 -name '*.html' \
                 -delete
               coverage_status=0
-              CL_HTTP_KIT_COVERAGE_TIMEOUT_SECONDS="$coverage_timeout_seconds" \
-                perl -e 'alarm $ENV{CL_HTTP_KIT_COVERAGE_TIMEOUT_SECONDS}; exec @ARGV' \
-                sbcl --noinform --no-userinit --no-sysinit --non-interactive \
+              coverage_command=(
+                perl -e "alarm \$ENV{CL_HTTP_KIT_COVERAGE_TIMEOUT_SECONDS}; exec @ARGV"
+                sbcl --dynamic-space-size 4096 \
+                --noinform --no-userinit --no-sysinit --non-interactive \
                 --load scripts/coverage.lisp \
                 -- run cl-http-kit/test \
                 --coverage \
@@ -409,7 +445,10 @@
                 --max-workers "$max_workers" \
                 --bail true \
                 --coverage-report-directory "$coverage_report_directory/" \
-                --fail-with-no-tests "$@" || coverage_status=$?
+                --fail-with-no-tests "$@"
+              )
+              CL_HTTP_KIT_COVERAGE_TIMEOUT_SECONDS="$coverage_timeout_seconds" \
+                "''${coverage_command[@]}" || coverage_status=$?
               if [ "$coverage_status" -ne 0 ]; then
                 if [ -s "''${coverage_report_directory}/cover-index.html" ]; then
                   perl scripts/check-coverage.pl "$coverage_report_directory" || true
@@ -480,24 +519,34 @@
           codec = cl-codec-kit.packages.${system}.default;
           deflate = cl-deflate-kit.packages.${system}.default;
           tls = cl-tls-kit.packages.${system}.default;
+          sbclDependencies = with pkgs.sbclPackages; [
+            alexandria
+            bordeaux-threads
+            global-vars
+            trivial-features
+            trivial-garbage
+          ];
           crypto = cl-crypto-kit;
           quic = cl-quic-kit;
           paredit = patchedParedit system;
           source = pkgs.lib.cleanSource ./.;
-          sourceRegistry = pkgs.lib.concatStringsSep ":" [
-            "${clWeave}/share/common-lisp/source//"
-            "${clHttpMessageKit}/share/common-lisp/source//"
-            "${observability}//"
-            "${concurrent}//"
-            "${boundary}//"
-            "${date}//"
-            "${host}//"
-            "${codec}//"
-            "${deflate}//"
-            "${tls}//"
-            "${crypto}//"
-            "${quic}//"
-          ];
+          sourceRegistry = pkgs.lib.concatStringsSep ":" (
+            [
+              "${clWeave}/share/common-lisp/source//"
+              "${clHttpMessageKit}/share/common-lisp/source//"
+              "${observability}//"
+              "${concurrent}//"
+              "${boundary}//"
+              "${date}//"
+              "${host}//"
+              "${codec}//"
+              "${deflate}//"
+              "${tls}//"
+              "${crypto}//"
+              "${quic}//"
+            ]
+            ++ map (dependency: "${dependency}//") sbclDependencies
+          );
         in
         {
           test-core =
@@ -563,7 +612,10 @@
           coverage-tools-asdf =
             pkgs.runCommand "cl-http-kit-coverage-tools-asdf"
               {
-                nativeBuildInputs = [ pkgs.sbcl clHttpMessageKit ];
+                nativeBuildInputs = [
+                  pkgs.sbcl
+                  clHttpMessageKit
+                ];
               }
               ''
                 export XDG_CACHE_HOME="$TMPDIR/cache"
@@ -595,13 +647,21 @@
                   host
                   deflate
                   tls
+                  pkgs.curl
                   pkgs.openssl
                   pkgs.nghttp2
                   pkgs.caddy
                   (quicPeer pkgs)
-                ];
+                ]
+                ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+                  pkgs.iproute2
+                ]
+                ++ sbclDependencies;
               }
               ''
+                ${pkgs.lib.optionalString pkgs.stdenv.isLinux ''
+                  export PATH="${pkgs.iproute2}/sbin:$PATH"
+                ''}
                 export HTTP_QUIC_PEER="${quicPeer pkgs}/bin/quic-peer"
                 export XDG_CACHE_HOME="$TMPDIR/cache"
                 mkdir -p "$XDG_CACHE_HOME"
@@ -612,15 +672,18 @@
                 cd "$work"
                 export SBCL_HOME="${pkgs.sbcl}/lib/sbcl"
                 export CL_SOURCE_REGISTRY="$PWD//:${sourceRegistry}"
-                sbcl --noinform --no-userinit --no-sysinit --non-interactive \
-                  --eval '(require :asdf)' \
-                  --eval '(asdf:load-system "cl-weave")' \
-                  --eval '(cl-weave/cli:main)' \
-                  -- run cl-http-kit/test \
-                  --test-timeout-ms "''${CL_WEAVE_TEST_TIMEOUT_MS:-30000}" \
-                  --max-workers "''${CL_WEAVE_MAX_WORKERS:-1}" \
-                  --bail true \
+                test_command=(
+                  sbcl --noinform --no-userinit --no-sysinit --non-interactive
+                  --eval '(require :asdf)'
+                  --eval '(asdf:load-system "cl-weave")'
+                  --eval '(cl-weave/cli:main)'
+                  -- run cl-http-kit/test
+                  --test-timeout-ms "''${CL_WEAVE_TEST_TIMEOUT_MS:-30000}"
+                  --max-workers "''${CL_WEAVE_MAX_WORKERS:-1}"
+                  --bail true
                   --fail-with-no-tests
+                )
+                "''${test_command[@]}"
                 read -r caddy_port receiver_port < <(
                   sbcl --no-userinit --no-sysinit --non-interactive \
                     --eval '(require :sb-bsd-sockets)' \

@@ -1,9 +1,104 @@
 (in-package #:http-kit/test-core)
+(deftest http1-session-bounds-retained-request-body
+  (let ((charged 0)
+        (events nil))
+    (ensure-http1-session-run
+     (ascii "POST /budget HTTP/1.1|CRLF|Host: example.test|CRLF|Content-Length: 3|CRLF||CRLF|abc")
+     (lambda (request)
+       (ensure-equal "abc" (octets-as-string (http-request-body request)))
+       (ensure-equal 3 charged)
+       (make-http-response :status 204))
+     1 :eof
+     :reserve-body-bytes
+     (lambda (amount)
+       (incf charged amount)
+       (push (list :reserve amount) events))
+     :release-body-bytes
+     (lambda (amount)
+       (decf charged amount)
+       (push (list :release amount) events))
+     :close-stream nil)
+    (ensure-equal 0 charged)
+    (ensure-true
+     (equal (reverse events)
+            (list (list :reserve 3)
+                  (list :reserve 3)
+                  (list :release 3)
+                  (list :release 3)))))
+  (let ((charged 0)
+        (events nil)
+        (handled 0))
+    (signals http-protocol-error
+      (ensure-http1-session-run
+       (ascii "POST /truncated HTTP/1.1|CRLF|Host: example.test|CRLF|Content-Length: 4|CRLF||CRLF|ab")
+       (lambda (request)
+         (declare (ignore request))
+         (incf handled)
+         (make-http-response :status 204))
+       0 :eof
+       :reserve-body-bytes
+       (lambda (amount)
+         (incf charged amount)
+         (push (list :reserve amount) events))
+       :release-body-bytes
+       (lambda (amount)
+         (decf charged amount)
+         (push (list :release amount) events))
+       :close-stream nil))
+    (ensure-equal 0 handled)
+    (ensure-equal 0 charged)
+    (ensure-true
+     (equal (reverse events)
+            (list (list :reserve 4) (list :release 4))))))
+(deftest http1-session-rejects-body-over-release
+  (let* ((parse-symbol (find-symbol "PARSE-HTTP-REQUEST" "HTTP-KIT"))
+         (original-parse (symbol-function parse-symbol))
+         (reserve-calls 0)
+         (release-calls 0)
+         (stream (make-string-input-stream "")))
+    (unwind-protect
+         (progn
+           (setf (symbol-function parse-symbol)
+                 (lambda (input &rest arguments &key release-body-bytes
+                          &allow-other-keys)
+                   (declare (ignore input arguments))
+                   (funcall release-body-bytes 1)
+                   nil))
+           (let ((condition
+                   (handler-case
+                       (progn
+                         (serve-http1-session
+                          stream
+                          (lambda (request)
+                            (declare (ignore request))
+                            (make-http-response :status 204))
+                          :reserve-body-bytes
+                          (lambda (amount)
+                            (incf reserve-calls amount))
+                          :release-body-bytes
+                          (lambda (amount)
+                            (incf release-calls amount))
+                          :close-stream nil)
+                         nil)
+                     (http-protocol-error (condition) condition))))
+             (ensure-true
+              (typep condition
+                     (find-symbol "HTTP-PROTOCOL-ERROR" "HTTP-KIT")))
+             (ensure-equal :session (http-error-operation condition))
+             (ensure-equal 1 (http-protocol-error-detail condition))
+             (ensure-equal 0 reserve-calls)
+             (ensure-equal 0 release-calls)))
+      (setf (symbol-function parse-symbol) original-parse)
+      (close stream))))
 
 (deftest core-coverage-http1-session-argument-errors
   (dolist (case '((:stream 7) (:handler 7) (:max-requests -1)
                   (:max-requests "1") (:on-error 7) (:on-upgrade 7)
-                  (:on-expect-continue 7) (:close-stream 7)))
+                  (:on-expect-continue 7) (:close-stream 7)
+                  (:request-timeout -1) (:request-timeout "soon")
+                  (:idle-timeout -1) (:idle-timeout "soon")
+                  (:shutdown-p 7) (:reserve-body-bytes 7)
+                  (:release-body-bytes 7)))
     (destructuring-bind (option value) case
       (let* ((output (make-string-output-stream))
              (stream (make-two-way-stream (make-string-input-stream "") output))
@@ -23,12 +118,41 @@
                        (http-protocol-error (condition) condition))))
                (ensure-true (typep condition 'http-protocol-error))
                (ensure-equal :session (http-error-operation condition))
-               (ensure-equal (if (eq option :max-requests) value (type-of value))
-                             (http-protocol-error-detail condition))
+               (ensure-equal
+                (cond
+                  ((eq option :max-requests) value)
+                  ((member option '(:request-timeout :idle-timeout))
+                   (cons option value))
+                  ((eq option :shutdown-p) (list value nil nil))
+                  ((eq option :reserve-body-bytes) (list nil value nil))
+                  ((eq option :release-body-bytes) (list nil nil value))
+                  (t (type-of value)))
+                (http-protocol-error-detail condition))
                (ensure-equal 0 handler-calls)
                (ensure-true (open-stream-p stream))
                (ensure-equal "" (get-output-stream-string output)))
-          (close stream))))))
+          (close stream)))))
+  (let* ((output (make-string-output-stream))
+         (stream (make-two-way-stream (make-string-input-stream "") output))
+         (condition
+           (handler-case
+               (serve-http1-session
+                stream
+                (lambda (request)
+                  (declare (ignore request))
+                  (make-http-response :status 204))
+                :reserve-body-bytes #'identity
+                :release-body-bytes 7)
+             (http-protocol-error (condition) condition))))
+    (unwind-protect
+         (progn
+           (ensure-true (typep condition 'http-protocol-error))
+           (ensure-equal :session (http-error-operation condition))
+           (ensure-equal (list nil #'identity 7)
+                         (http-protocol-error-detail condition))
+           (ensure-true (open-stream-p stream))
+           (ensure-equal "" (get-output-stream-string output)))
+      (close stream))))
 
 (deftest core-coverage-http1-session-connect-outcomes
   (dolist (stream-response-p '(nil t))
@@ -698,4 +822,196 @@
                (ascii "HTTP/1.0 200 OK|CRLF|Connection: keep-alive|CRLF|Content-Length: 4|CRLF||CRLF|/oneHTTP/1.0 200 OK|CRLF|Connection: keep-alive|CRLF|Content-Length: 4|CRLF||CRLF|/two")
                (ascii "HTTP/1.0 200 OK|CRLF|Content-Length: 4|CRLF||CRLF|/one"))
            wire))))))
+#+sbcl
+(progn
+  (defclass http1-deadline-session-stream
+      (sb-gray:fundamental-binary-input-stream
+       sb-gray:fundamental-binary-output-stream)
+    ((input :initarg :input :reader http1-deadline-session-input)
+     (position :initform 0 :accessor http1-deadline-session-position)
+     (block-at :initarg :block-at :initform nil
+               :reader http1-deadline-session-block-at)
+     (block-writes-p :initarg :block-writes-p :initform nil
+                     :reader http1-deadline-session-block-writes-p)
+     (output :initform (make-array 0
+                                  :element-type '(unsigned-byte 8)
+                                  :adjustable t
+                                  :fill-pointer 0)
+             :reader http1-deadline-session-output)))
+
+  (defmethod sb-gray:stream-read-byte
+      ((stream http1-deadline-session-stream))
+    (let ((position (http1-deadline-session-position stream)))
+      (when (and (http1-deadline-session-block-at stream)
+                 (>= position (http1-deadline-session-block-at stream)))
+        (sleep 10))
+      (let ((input (http1-deadline-session-input stream)))
+        (if (< position (length input))
+            (prog1 (aref input position)
+              (incf (http1-deadline-session-position stream)))
+            :eof))))
+
+  (defmethod sb-gray:stream-write-sequence
+      ((stream http1-deadline-session-stream) sequence
+       &optional (start 0) end)
+    (when (http1-deadline-session-block-writes-p stream)
+      (sleep 10))
+    (let ((end (or end (length sequence)))
+          (output (http1-deadline-session-output stream)))
+      (loop for index from start below end
+            do (vector-push-extend (aref sequence index) output)))
+    sequence)
+
+  (defmethod sb-gray:stream-finish-output
+      ((stream http1-deadline-session-stream))
+    (declare (ignore stream))
+    nil)
+
+  (deftest http1-session-request-timeout-blocks-stream-read
+    (let ((stream (make-instance 'http1-deadline-session-stream
+                                 :input (ascii "G")
+                                 :block-at 1))
+          (handler-calls 0)
+          (observed nil))
+      (handler-case
+          (sb-ext:with-timeout 1
+            (serve-http1-session
+             stream
+             (lambda (request)
+               (declare (ignore request))
+               (incf handler-calls)
+               (make-http-response :status 204))
+             :request-timeout 0.05d0
+             :clock-function (lambda () 0)
+             :close-stream nil))
+        (http-timeout (condition)
+          (setf observed condition)))
+      (ensure-true (typep observed 'http-timeout))
+      (ensure-equal 0 handler-calls)
+      (ensure-equal 0 (length (http1-deadline-session-output stream)))))
+
+  (deftest http1-session-request-timeout-late-handler-writes-no-response
+    (let* ((now 0)
+           (handler-calls 0)
+           (observed nil)
+           (stream
+             (make-instance
+              'http1-deadline-session-stream
+              :input (ascii "GET /late HTTP/1.1|CRLF|Host: example.test|CRLF||CRLF|"))))
+      (handler-case
+          (serve-http1-session
+           stream
+           (lambda (request)
+             (declare (ignore request))
+             (incf handler-calls)
+             (setf now 2)
+             (values (make-http-response :status 200)
+                     (list (make-http-response :status 103))))
+           :request-timeout 1
+           :clock-function (lambda () now)
+           :close-stream nil)
+        (http-timeout (condition)
+          (setf observed condition)))
+      (ensure-true (typep observed 'http-timeout))
+      (ensure-equal 1 handler-calls)
+      (ensure-equal 0 (length (http1-deadline-session-output stream)))))
+
+  (deftest http1-session-request-timeout-interrupts-response-write
+    (let ((stream
+            (make-instance
+             'http1-deadline-session-stream
+             :input (ascii "GET /write HTTP/1.1|CRLF|Host: example.test|CRLF||CRLF|")
+             :block-writes-p t))
+          (handler-calls 0)
+          (observed nil))
+      (handler-case
+          (sb-ext:with-timeout 1
+            (serve-http1-session
+             stream
+             (lambda (request)
+               (declare (ignore request))
+               (incf handler-calls)
+               (make-http-response :status 200))
+             :request-timeout 0.05d0
+             :clock-function (lambda () 0)
+             :close-stream nil))
+        (http-timeout (condition)
+          (setf observed condition)))
+      (ensure-true (typep observed 'http-timeout))
+      (ensure-equal 1 handler-calls)
+      (ensure-equal 0 (length (http1-deadline-session-output stream)))))
+
+  (deftest http1-session-idle-timeout-blocks-next-request-read
+    (let* ((request-wire
+             (ascii "GET /idle HTTP/1.1|CRLF|Host: example.test|CRLF||CRLF|"))
+           (now 0)
+           (handler-calls 0)
+           (observed nil)
+           (stream
+             (make-instance
+              'http1-deadline-session-stream
+              :input request-wire
+              :block-at (length request-wire))))
+      (handler-case
+          (sb-ext:with-timeout 1
+            (serve-http1-session
+             stream
+             (lambda (request)
+               (declare (ignore request))
+               (incf handler-calls)
+               (make-http-response :status 204))
+             :idle-timeout 0.05d0
+             :clock-function (lambda () now)
+             :close-stream nil))
+        (http-timeout (condition)
+          (setf observed condition)))
+      (ensure-true (typep observed 'http-timeout))
+      (ensure-equal 1 handler-calls)
+      (ensure-true
+       (search "HTTP/1.1 204 No Content"
+               (octets-as-string
+                (http1-deadline-session-output stream))))))
+
+  (deftest http1-session-idle-timeout-bounds-initial-request-read
+    (let ((stream (make-instance 'http1-deadline-session-stream
+                                 :input (ascii "")
+                                 :block-at 0))
+          (handler-calls 0)
+          (observed nil))
+      (handler-case
+          (sb-ext:with-timeout 1
+            (serve-http1-session
+             stream
+             (lambda (request)
+               (declare (ignore request))
+               (incf handler-calls)
+               (make-http-response :status 204))
+             :idle-timeout 0.05d0
+             :clock-function (lambda () 0)
+             :close-stream nil))
+        (http-timeout (condition)
+          (setf observed condition)))
+      (ensure-true (typep observed 'http-timeout))
+      (ensure-equal :read (http-timeout-kind observed))
+      (ensure-equal 0 handler-calls)
+      (ensure-equal 0 (length (http1-deadline-session-output stream)))))
+
+  (deftest http1-session-shutdown-closes-after-current-response
+    (let ((handler-calls 0)
+          (request-wire
+            (ascii "GET /one HTTP/1.1|CRLF|Host: example.test|CRLF||CRLF|GET /two HTTP/1.1|CRLF|Host: example.test|CRLF||CRLF|")))
+      (let ((wire
+              (ensure-http1-session-run
+               request-wire
+               (lambda (request)
+                 (declare (ignore request))
+                 (incf handler-calls)
+                 (make-http-response :status 204))
+               1 :close
+               :shutdown-p (lambda () (= handler-calls 1))
+               :close-stream nil)))
+        (ensure-equal 1 handler-calls)
+        (ensure-octets-equal
+         (ascii "HTTP/1.1 204 No Content|CRLF||CRLF|")
+         wire)))))
 

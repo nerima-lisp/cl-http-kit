@@ -12,6 +12,8 @@
   (signals http-protocol-error
     (parse-http-response "HTTP/1.1 200 OK"))
   (signals http-protocol-error
+    (parse-http-response (vector :bad)))
+  (signals http-protocol-error
     (parse-http-response (make-array '(1 1)
                                      :element-type '(unsigned-byte 8)
                                      :initial-element 0)))

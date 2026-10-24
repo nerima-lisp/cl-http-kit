@@ -419,6 +419,24 @@
       (ensure-equal 1 (length seen))
       (let ((wire-string (octets-as-string wire)))
         (ensure-true (search "/one" wire-string))
+        (ensure-true (null (search "/two" wire-string))))))
+  (let ((seen '()))
+    (multiple-value-bind (count reason wire)
+        (%run-http1-session-from-file
+         (ascii "GET /one HTTP/1.1|CRLF|Host: example.com|CRLF||CRLF|GET /two HTTP/1.1|CRLF|Host: example.com|CRLF||CRLF|")
+         (lambda (request)
+           (push (http-request-target request) seen)
+           (make-http-response
+            :status 200
+            :headers (list (make-http-header "Connection" "close"))
+            :body (ascii (http-request-target request))))
+         :close-stream nil)
+      (ensure-equal 1 count)
+      (ensure-equal :close reason)
+      (ensure-equal '("/one") (nreverse seen))
+      (let ((wire-string (octets-as-string wire)))
+        (ensure-true (search "Connection: close" wire-string))
+        (ensure-true (search "/one" wire-string))
         (ensure-true (null (search "/two" wire-string)))))))
 
 (deftest http1-session-http10-keep-alive

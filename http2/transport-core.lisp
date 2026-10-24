@@ -32,13 +32,14 @@
              :detail (%h2-frame-type frame)))))
   nil)
 
-(defun %h2-validate-limit (name value &key allow-zero)
+(defun %h2-validate-limit (name value &key allow-zero
+                                                (operation :http2-client))
   (unless (and (integerp value)
                (if allow-zero (>= value 0) (plusp value)))
     (error 'http-kit:http-protocol-error
            :message (format nil "The HTTP/2 ~A must be a ~A integer."
                             name (if allow-zero "non-negative" "positive"))
-           :operation :http2-client
+           :operation operation
            :detail value))
   value)
 

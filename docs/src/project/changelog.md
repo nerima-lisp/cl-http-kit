@@ -4,6 +4,12 @@ Unreleased entries describe pending changes. Versioned sections record
 historical release behavior, not the current API contract; see the
 [API reference](../reference/api.md) for that contract.
 
+## Unreleased
+
+- cap buffered request-body bytes across active HTTPS listener sessions;
+- reject `:verify nil` because the pinned cl-tls-kit client driver does not
+  expose a supported way to disable certificate verification;
+
 ## 0.4.1
 
 - require certificate-chain, hostname, and trust verification by default on

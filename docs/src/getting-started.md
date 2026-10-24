@@ -97,7 +97,7 @@ The same optional system exposes a native listening boundary for servers:
 ```
 
 Passing `:port 0` asks the operating system for an ephemeral port; read it
-with `http-network-listener-port`. `serve-http1-listener` owns accept and
+with `http-kit/network:http-network-listener-port`. `serve-http1-listener` owns accept and
 HTTP/1 session dispatch for the requested number of connections; applications
 that need HTTP/2 or protocol selection can keep using
 `accept-http-tcp-stream` and dispatch to `serve-http2-session` themselves.
@@ -106,12 +106,12 @@ The socket boundary itself does not negotiate TLS, ALPN, or proxies. Load
 `cl-http-kit/tls` and compose `http-kit/tls:make-http-tls-upgrader` with the
 client opener. The wrapper defaults to `:verify :required`, passes the request
 host as TLS SNI, loads the platform trust store, and accepts an ALPN offer
-list. Server TLS wrapping signals an explicit unsupported-feature condition
-because cl-tls-kit does not expose a server driver. For an HTTPS server,
-terminate TLS in a reverse proxy or load balancer and forward HTTP to the
-listener above. Configure that proxy to preserve the original host and scheme
-according to the application's trusted-forwarding policy; cl-http-kit does not
-validate proxy headers automatically.
+list. The `cl-http-kit/tls` system also provides the native HTTPS server API:
+`make-http-server` terminates TLS 1.3 and dispatches `h2` and `http/1.1` by
+ALPN. A TLS-terminating proxy can instead forward cleartext HTTP/1.1 to the
+listener above. Configure forwarded host and scheme according to the
+application's trusted-forwarding policy; cl-http-kit does not validate proxy
+headers automatically.
 
 The high-level client creates this native TCP/TLS path automatically when no
 custom transport is supplied.

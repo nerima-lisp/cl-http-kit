@@ -55,7 +55,7 @@
              (sb-thread:make-thread
               (lambda ()
                 (handler-case
-                    (loop repeat 11
+                    (loop repeat 10
                           for request = (%https-e2e-read-headers output)
                           for request-text = (octets-as-string request)
                           for path = (second (uiop:split-string
@@ -177,24 +177,6 @@
                    (ensure-equal 200 (http-response-status response))
                    (ensure-equal "cookie-ok"
                                  (octets-as-string (http-response-body response))))
-                 (let ((unverified-client
-                         (make-http-client
-                          :open-stream (make-http-network-stream-opener)
-                          :close-stream #'close-http-tcp-stream
-                          :tls-upgrade (make-http-tls-upgrader
-                                        :verify nil
-                                        :alpn-protocols '("http/1.1"))
-                          :strict-transport-store nil
-                          :alternative-service-store nil)))
-                   (multiple-value-bind (response ignored)
-                       (http-client-send
-                        unverified-client "GET"
-                        (format nil "https://localhost:~D/ok" port)
-                        :timeout 5)
-                     (declare (ignore ignored))
-                     (ensure-equal 200 (http-response-status response))
-                     (ensure-equal "https-ok"
-                                   (octets-as-string (http-response-body response)))))
                  (dolist (verify '(:optional :required))
                    (let* ((verified-client
                             (make-http-client

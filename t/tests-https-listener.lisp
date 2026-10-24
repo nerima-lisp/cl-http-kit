@@ -1,0 +1,1339 @@
+(in-package #:http-kit/test)
+#+sbcl
+(deftest https-listener-shares-body-budget-across-protocols
+  (let* ((context
+           (funcall (symbol-function '%make-https-listener-test-context)))
+         (originals
+           (mapcar #'fdefinition
+                   (funcall
+                    (symbol-function '%https-listener-test-symbols))))
+         (server nil))
+    (unwind-protect
+         (progn
+           (funcall
+            (symbol-function '%https-listener-test-install-stubs) context)
+           (let ((default-server
+                   (funcall
+                    (symbol-function '%https-listener-make-server))))
+             (ensure-equal
+              (* 64 1024 1024)
+              (http-kit::http-server-max-buffered-body-bytes
+               default-server)))
+           (let ((derived-server
+                   (funcall
+                    (symbol-function '%https-listener-make-server)
+                    :max-body-bytes 67108865)))
+             (ensure-equal
+              134217730
+              (http-kit::http-server-max-buffered-body-bytes
+               derived-server)))
+           (signals http-server-error
+             (funcall
+              (symbol-function '%https-listener-make-server)
+              :max-buffered-body-bytes nil))
+           (setf server
+                 (funcall
+                  (symbol-function '%https-listener-make-server)
+                  :max-buffered-body-bytes 5))
+           (start-http-server server)
+           (let ((client
+                   (funcall
+                    (symbol-function '%https-listener-connect) server)))
+             (close-http-tcp-stream client))
+           (funcall
+            (symbol-function '%https-listener-wait)
+            (lambda ()
+              (= 1
+                 (funcall
+                  (symbol-function '%https-listener-session-count) context))))
+           (funcall
+            (fdefinition
+             '(setf %https-listener-test-context-alpn))
+            "h2" context)
+           (let ((client
+                   (funcall
+                    (symbol-function '%https-listener-connect) server)))
+             (close-http-tcp-stream client))
+           (funcall
+            (symbol-function '%https-listener-wait)
+            (lambda ()
+              (and
+               (= 2
+                  (funcall
+                   (symbol-function '%https-listener-session-count)
+                   context))
+               (zerop
+                (funcall
+                 (symbol-function '%https-listener-connection-count) server)))))
+           (let* ((calls
+                    (sb-thread:with-mutex
+                        ((funcall
+                          (symbol-function '%https-listener-test-context-lock)
+                          context))
+                      (reverse
+                       (funcall
+                        (symbol-function
+                         '%https-listener-test-context-session-calls)
+                        context))))
+                  (first-call (first calls))
+                  (second-call (second calls))
+                  (first-options (third first-call))
+                  (second-options (third second-call))
+                  (reserve-first (getf first-options :reserve-body-bytes))
+                  (release-first (getf first-options :release-body-bytes))
+                  (reserve-second (getf second-options :reserve-body-bytes))
+                  (release-second (getf second-options :release-body-bytes)))
+             (ensure-equal 2 (length calls))
+             (ensure-equal :http1 (first first-call))
+             (ensure-equal :http2 (first second-call))
+             (funcall reserve-first 3)
+             (let ((observed
+                     (handler-case
+                         (progn
+                           (funcall reserve-second 3)
+                           nil)
+                       (http-size-limit-exceeded (condition) condition))))
+               (ensure-true
+                (typep observed 'http-size-limit-exceeded))
+               (ensure-equal
+                5 (http-size-limit-exceeded-limit observed))
+               (ensure-equal
+                6 (http-size-limit-exceeded-observed observed)))
+             (ensure-equal
+              3 (http-kit::http-server-buffered-body-bytes server))
+             (funcall release-first 3)
+             (ensure-equal
+              0 (http-kit::http-server-buffered-body-bytes server))
+             (funcall reserve-second 2)
+             (funcall release-second 2)
+             (ensure-equal
+              0 (http-kit::http-server-buffered-body-bytes server)))
+           (stop-http-server server :graceful-timeout 1)
+           (setf server nil))
+      (when server
+        (stop-http-server server :graceful-timeout 1))
+      (funcall
+       (symbol-function '%https-listener-test-restore-stubs)
+       originals))))
+#+sbcl
+(deftest https-listener-restarts-without-stale-acceptors
+  (let* ((context (funcall (symbol-function '%make-https-listener-test-context)))
+         (originals
+           (mapcar #'fdefinition
+                   (funcall
+                    (symbol-function '%https-listener-test-symbols))))
+         (server nil))
+    (unwind-protect
+         (progn
+           (funcall
+            (symbol-function '%https-listener-test-install-stubs)
+            context)
+           (setf server
+                 (funcall
+                  (symbol-function '%https-listener-make-server)
+                  :on-event
+                  (lambda (event)
+                    (funcall
+                     (symbol-function '%https-listener-record-event)
+                     context event))))
+           (labels ((event-count (type)
+                      (count type
+                             (funcall
+                              (symbol-function '%https-listener-events)
+                              context)
+                             :key (lambda (event) (getf event :type))
+                             :test #'eq)))
+             (loop for iteration from 1 to 32
+                   do (setf (http-kit::http-server-port server) 0)
+                      (start-http-server server)
+                      (let* ((supervisor
+                               (http-kit::http-server-supervisor server))
+                             (client
+                               (funcall
+                                (symbol-function '%https-listener-connect)
+                                server)))
+                        (close-http-tcp-stream client)
+                        (funcall
+                         (symbol-function '%https-listener-wait)
+                         (lambda ()
+                           (>= (event-count :connection-accepted)
+                               iteration)))
+                        (funcall
+                         (symbol-function '%https-listener-wait)
+                         (lambda ()
+                           (>= (event-count :connection-closed)
+                               iteration)))
+                        (stop-http-server server :graceful-timeout 1)
+                        (ensure-false
+                         (sb-thread:thread-alive-p supervisor))
+                        (ensure-equal
+                         iteration
+                         (event-count :connection-accepted))
+                        (ensure-equal :stopped
+                                      (http-kit::http-server-state server))))))
+      (when (and server
+                 (not (eq :stopped
+                          (http-kit::http-server-state server))))
+        (stop-http-server server :graceful-timeout 1))
+      (funcall
+       (symbol-function '%https-listener-test-restore-stubs)
+       originals))))
+
+#+sbcl
+(progn
+  (defstruct (%https-listener-test-context
+               (:constructor %make-https-listener-test-context))
+    (lock (sb-thread:make-mutex :name "https listener test"))
+    (waitqueue (sb-thread:make-waitqueue :name "https listener test"))
+    (alpn "http/1.1")
+    (handshake-action
+      (lambda (stream timeout deadline)
+        (declare (ignore timeout deadline))
+        stream))
+    (session-action
+      (lambda (protocol stream handler options)
+        (declare (ignore protocol stream handler options))))
+    wrapper-options
+    wrapper-call-options
+    (wrapper-calls 0)
+    (session-calls nil)
+    (events nil)
+    (errors nil)
+    (handshakes-entered 0)
+    (release-handshakes-p nil)
+    (shutdown-observed-p nil))
+
+  (defun %https-listener-test-symbols ()
+    (list 'http-kit/tls:make-http-tls-server-wrapper
+          'http-kit/tls:http-tls-selected-alpn-protocol
+          'http-kit:serve-http1-session
+          'http-kit/http2:serve-http2-session))
+
+  (defun %https-listener-test-install-stubs (context)
+    (setf (fdefinition 'http-kit/tls:make-http-tls-server-wrapper)
+          (lambda (&key certificate-chain private-key ticket-key-store
+                         alpn-protocols clock-function)
+            (sb-thread:with-mutex
+                ((%https-listener-test-context-lock context))
+              (setf (%https-listener-test-context-wrapper-options context)
+                    (list :certificate-chain certificate-chain
+                          :private-key private-key
+                          :ticket-key-store ticket-key-store
+                          :alpn-protocols alpn-protocols
+                          :clock-function clock-function)))
+            (lambda (stream &key timeout deadline &allow-other-keys)
+              (let ((action nil))
+                (sb-thread:with-mutex
+                    ((%https-listener-test-context-lock context))
+                  (incf (%https-listener-test-context-wrapper-calls context))
+                  (setf (%https-listener-test-context-wrapper-call-options
+                         context)
+                        (list :timeout timeout :deadline deadline)
+                        action
+                        (%https-listener-test-context-handshake-action
+                         context)))
+                (funcall action stream timeout deadline))))
+          (fdefinition 'http-kit/tls:http-tls-selected-alpn-protocol)
+          (lambda (stream)
+            (declare (ignore stream))
+            (sb-thread:with-mutex
+                ((%https-listener-test-context-lock context))
+              (%https-listener-test-context-alpn context)))
+          (fdefinition 'http-kit:serve-http1-session)
+          (lambda (stream handler &rest options)
+            (%https-listener-test-dispatch-session
+             context :http1 stream handler options))
+          (fdefinition 'http-kit/http2:serve-http2-session)
+          (lambda (stream handler &rest options)
+            (%https-listener-test-dispatch-session
+             context :http2 stream handler options)))
+    context)
+
+  (defun %https-listener-test-dispatch-session
+      (context protocol stream handler options)
+    (let ((action nil))
+      (sb-thread:with-mutex
+          ((%https-listener-test-context-lock context))
+        (push (list protocol handler options)
+              (%https-listener-test-context-session-calls context))
+        (setf action (%https-listener-test-context-session-action context)))
+      (funcall action protocol stream handler options)))
+
+  (defun %https-listener-test-restore-stubs (originals)
+    (loop for symbol in (%https-listener-test-symbols)
+          for original in originals
+          do (setf (fdefinition symbol) original))
+    nil)
+
+  (defmacro %with-https-listener-test-stubs ((context) &body body)
+    (let ((originals (gensym "ORIGINALS")))
+      `(let* ((,context (%make-https-listener-test-context))
+              (,originals
+                (mapcar #'fdefinition (%https-listener-test-symbols))))
+         (unwind-protect
+              (progn
+                (%https-listener-test-install-stubs ,context)
+                ,@body)
+           (%https-listener-test-restore-stubs ,originals)))))
+
+  (defun %https-listener-make-server (&rest overrides)
+    (let ((options
+            (list :transport :https
+                  :host "127.0.0.1"
+                  :port 0
+                  :handler (lambda (request)
+                             (declare (ignore request))
+                             (make-http-response :status 204))
+                  :certificate-chain '(:test-certificate)
+                  :private-key "https-listener-private-key-marker")))
+      (loop for (key value) on overrides by #'cddr
+            do (setf (getf options key) value))
+      (apply #'make-http-server options)))
+
+  (defun %https-listener-connect (server)
+    (open-http-tcp-stream
+     (make-http-request
+      :method "GET"
+      :uri (format nil "http://127.0.0.1:~D/" (http-server-port server)))
+     :timeout 2))
+
+  (defun %https-listener-wait (predicate &optional (timeout 5))
+    (let ((deadline
+            (+ (get-internal-real-time)
+               (* timeout internal-time-units-per-second))))
+      (loop
+        (when (funcall predicate)
+          (return t))
+        (when (>= (get-internal-real-time) deadline)
+          (error "Timed out waiting for HTTPS listener test state."))
+        (sleep 0.005))))
+
+  (defun %https-listener-record-event (context event)
+    (sb-thread:with-mutex
+        ((%https-listener-test-context-lock context))
+      (push event (%https-listener-test-context-events context))
+      (sb-thread:condition-broadcast
+       (%https-listener-test-context-waitqueue context)))
+    event)
+
+  (defun %https-listener-record-error (context condition details)
+    (sb-thread:with-mutex
+        ((%https-listener-test-context-lock context))
+      (push (list condition details)
+            (%https-listener-test-context-errors context))
+      (sb-thread:condition-broadcast
+       (%https-listener-test-context-waitqueue context)))
+    nil)
+
+  (defun %https-listener-session-count (context)
+    (sb-thread:with-mutex
+        ((%https-listener-test-context-lock context))
+      (length (%https-listener-test-context-session-calls context))))
+
+  (defun %https-listener-events (context)
+    (sb-thread:with-mutex
+        ((%https-listener-test-context-lock context))
+      (copy-list (%https-listener-test-context-events context))))
+
+  (defun %https-listener-errors (context)
+    (sb-thread:with-mutex
+        ((%https-listener-test-context-lock context))
+      (copy-list (%https-listener-test-context-errors context))))
+
+  (defun %https-listener-connection-count (server)
+    (http-kit::%with-http-server-lock (server)
+      (http-kit::http-server-connection-count server)))
+
+  (defun %https-listener-handshake-count (server)
+    (http-kit::%with-http-server-lock (server)
+      (http-kit::http-server-handshake-count server)))
+
+  (defun %https-listener-event-present-p (context type reason-code)
+    (some (lambda (event)
+            (and (eq (getf event :type) type)
+                 (or (null reason-code)
+                     (eq (getf event :reason-code) reason-code))))
+          (%https-listener-events context)))
+
+  (defun %https-listener-socket-options (server)
+    (let* ((listener (http-kit::http-server-listener server))
+           (socket
+             (and listener
+                  (http-kit/network::http-network-listener-socket listener))))
+      (list :so-reuseaddr
+            (and socket (sb-bsd-sockets:sockopt-reuse-address socket))
+            :so-reuseport :not-configured-by-http-listener)))
+
+  (defun %https-listener-ss-snapshot (port)
+    (handler-case
+        (multiple-value-bind (output errors status)
+            (uiop:run-program
+             (list "ss" "-ltnp" (format nil "sport = :~D" port))
+             :output :string
+             :error-output :string
+             :ignore-error-status t)
+          (list :status status
+                :listening-socket-count
+                (with-input-from-string (stream output)
+                  (loop for line = (read-line stream nil nil)
+                        while line
+                        count (and (>= (length line) 6)
+                                   (string= line "LISTEN"
+                                            :end1 6
+                                            :end2 6))))
+                :output output
+                :errors errors))
+      (error (condition)
+        (list :status :unavailable
+              :error (princ-to-string condition)))))
+
+  (defun %https-listener-network-diagnostics (server)
+    (let* ((listener (http-kit::http-server-listener server))
+           (port (http-kit::http-server-port server)))
+      (list :address
+            (and listener
+                 (http-kit/network:http-network-listener-address listener))
+            :port port
+            :socket-options (%https-listener-socket-options server)
+            :same-port-sockets (%https-listener-ss-snapshot port))))
+
+  (deftest https-listener-validates-finite-configuration
+    (%with-https-listener-test-stubs (context)
+      (let* ((server (%https-listener-make-server))
+             (store (http-kit::http-server-ticket-key-store server)))
+        (ensure-true (http-server-p server))
+        (ensure-equal 0 (http-server-port server))
+        (ensure-equal 128 (http-kit::http-server-max-connections server))
+        (ensure-equal 32 (http-kit::http-server-max-handshakes server))
+        (ensure-equal 100
+                      (http-kit::http-server-max-concurrent-streams server))
+        (ensure-equal 10 (http-kit::http-server-handshake-timeout server))
+        (ensure-equal 30 (http-kit::http-server-request-timeout server))
+        (ensure-equal 60 (http-kit::http-server-idle-timeout server))
+        (ensure-equal 30 (http-kit::http-server-graceful-timeout server))
+        (ensure-equal 65536 (http-kit::http-server-max-header-bytes server))
+        (ensure-equal 100 (http-kit::http-server-max-fields server))
+        (ensure-equal 16777216 (http-kit::http-server-max-body-bytes server))
+        (ensure-true (cl-tls-kit:tls13-server-ticket-key-store-p store))
+        (ensure-equal nil (http-server-failure server))
+        (ensure-equal store
+                      (getf (%https-listener-test-context-wrapper-options
+                             context)
+                            :ticket-key-store)))
+      (dolist (overrides
+                '((:transport :http)
+                  (:host "")
+                  (:port -1)
+                  (:port 65536)
+                  (:handler nil)
+                  (:certificate-chain nil)
+                  (:private-key nil)
+                  (:max-connections nil)
+                  (:max-connections 0)
+                  (:max-handshakes nil)
+                  (:max-concurrent-streams nil)
+                  (:max-header-bytes nil)
+                  (:max-fields nil)
+                  (:max-body-bytes nil)
+                  (:handshake-timeout nil)
+                  (:handshake-timeout 0)
+                  (:request-timeout nil)
+                  (:idle-timeout nil)
+                  (:graceful-timeout nil)
+                  (:max-handshakes 2 :max-connections 1)))
+        (signals http-server-error
+          (apply #'%https-listener-make-server overrides)))))
+
+  (deftest https-listener-interoperates-with-curl-and-openssl
+    (let* ((material (%tls-server-test-material))
+           (observation-lock
+             (sb-thread:make-mutex :name "HTTPS listener observations"))
+           (server-events nil)
+           (server-errors nil)
+           (server
+             (make-http-server
+              :host "127.0.0.1"
+              :port 0
+              :handler (lambda (request)
+                         (declare (ignore request))
+                         (make-http-response :status 200
+                                             :body (ascii "listener-ok")))
+              :certificate-chain (getf material :certificate-chain)
+              :private-key (getf material :private-key)
+              :handshake-timeout 5
+              :request-timeout 5
+              :idle-timeout 5
+              :graceful-timeout 2
+              :on-event
+              (lambda (event)
+                (sb-thread:with-mutex (observation-lock)
+                  (push (copy-list event) server-events)))
+              :on-error
+              (lambda (condition context)
+                (sb-thread:with-mutex (observation-lock)
+                  (push (list (http-server-error-reason-code condition)
+                              (http-server-error-phase condition)
+                              context)
+                        server-errors)))))
+           (port nil)
+           (url nil))
+      (unwind-protect
+           (progn
+             (start-http-server server)
+             (setf port (http-server-port server)
+                   url (format nil "https://localhost:~D/" port))
+             (dolist (protocol '("http/1.1" "h2"))
+               (multiple-value-bind (output errors status)
+                   (uiop:run-program
+                    (list "curl" "--insecure" "--show-error" "--verbose"
+                          "--trace" "/dev/stderr"
+                          "--fail" "--max-time" "10" "--noproxy" "*"
+                          "--resolve"
+                          (format nil "localhost:~D:127.0.0.1" port)
+                          (if (string= protocol "h2") "--http2" "--http1.1")
+                          "--output" "-"
+                          "--write-out" (format nil "~%%{http_version}")
+                          url)
+                    :output :string
+                    :error-output :string
+                    :ignore-error-status t)
+                 (unless (zerop status)
+                   (let ((state-before-cleanup
+                           (http-kit::http-server-state server))
+                         (failure-time (get-universal-time))
+                         (connection-count-before-cleanup
+                           (%https-listener-connection-count server))
+                         (handshake-count-before-cleanup
+                           (%https-listener-handshake-count server))
+                         (network-diagnostics-before-cleanup
+                           (%https-listener-network-diagnostics server))
+                         (events-before-cleanup nil)
+                         (listener-errors-before-cleanup nil))
+                     (sb-thread:with-mutex (observation-lock)
+                       (setf events-before-cleanup
+                             (reverse (copy-list server-events))
+                             listener-errors-before-cleanup
+                             (reverse (copy-list server-errors))))
+                     (unless (eq :stopped state-before-cleanup)
+                       (stop-http-server
+                        server :graceful-timeout 2))
+                     (let ((wait-error
+                             (handler-case
+                                 (progn
+                                   (%https-listener-wait
+                                    (lambda ()
+                                      (zerop
+                                       (%https-listener-connection-count
+                                        server))))
+                                   nil)
+                               (error (condition) condition))))
+                       (let ((connection-count-after-cleanup
+                               (%https-listener-connection-count server))
+                             (handshake-count-after-cleanup
+                               (%https-listener-handshake-count server))
+                             (events-after-cleanup nil)
+                             (listener-errors-after-cleanup nil))
+                         (sb-thread:with-mutex (observation-lock)
+                           (setf events-after-cleanup
+                                 (reverse (copy-list server-events))
+                                 listener-errors-after-cleanup
+                                 (reverse (copy-list server-errors))))
+                         (multiple-value-bind (curl-version-output
+                                               curl-version-errors
+                                               curl-version-status)
+                             (uiop:run-program
+                              (list "curl" "--version")
+                              :output :string
+                              :error-output :string
+                              :ignore-error-status t)
+                           (error
+                            "curl ~A request failed (~D): ~A~%curl version (~D): stdout=~S stderr=~S~%failure time (UTC universal seconds): ~D~%listener config: handshake-timeout=~D max-connections=~D max-handshakes=~D~%listener state before cleanup: ~S~%listener counts before cleanup: connections=~D handshakes=~D~%listener events before cleanup: ~S~%listener errors before cleanup: ~S~%listener state after cleanup: ~S~%listener counts after cleanup: connections=~D handshakes=~D~%listener events after cleanup: ~S~%listener errors after cleanup: ~S~%listener wait error: ~S~%listener network diagnostics at failure: ~S"
+                            protocol status errors curl-version-status
+                            curl-version-output curl-version-errors
+                            failure-time
+                            (http-kit::http-server-handshake-timeout server)
+                            (http-kit::http-server-max-connections server)
+                            (http-kit::http-server-max-handshakes server)
+                            state-before-cleanup
+                            connection-count-before-cleanup
+                            handshake-count-before-cleanup
+                            events-before-cleanup listener-errors-before-cleanup
+                            (http-kit::http-server-state server)
+                            connection-count-after-cleanup
+                            handshake-count-after-cleanup
+                            events-after-cleanup listener-errors-after-cleanup
+                            wait-error
+                            network-diagnostics-before-cleanup))))))
+                 (ensure-equal 0 status)
+                 (ensure-true (search "listener-ok" output))
+                 (let ((version-start
+                         (position #\Newline output :from-end t)))
+                   (ensure-true version-start)
+                   (ensure-true
+                    (member
+                     (subseq output (1+ version-start))
+                     (if (string= protocol "h2")
+                         '("2" "2.0")
+                         '("1.1"))
+                     :test #'string=)))))
+             (dolist (protocol '("http/1.1" "h2"))
+               (multiple-value-bind (output errors status)
+                   (uiop:run-program
+                    (list "openssl" "s_client" "-trace"
+                          "-groups"
+                          "X25519MLKEM768:X25519:secp256r1:X448:secp384r1:secp521r1:ffdhe2048:ffdhe3072"
+                          "-ign_eof"
+                          "-ignore_unexpected_eof"
+                          "-connect" (format nil "127.0.0.1:~D" port)
+                          "-servername" "localhost"
+                          "-alpn" protocol)
+                    :input #P"/dev/null"
+                    :output :string
+                    :error-output :string
+                    :ignore-error-status t)
+                 (unless (zerop status)
+                   (let ((state-before-cleanup
+                           (http-kit::http-server-state server))
+                         (failure-time (get-universal-time))
+                         (connection-count-before-cleanup
+                           (%https-listener-connection-count server))
+                         (network-diagnostics-before-cleanup
+                           (%https-listener-network-diagnostics server))
+                         (events-before-cleanup nil)
+                         (listener-errors-before-cleanup nil))
+                     (sb-thread:with-mutex (observation-lock)
+                       (setf events-before-cleanup
+                             (reverse (copy-list server-events))
+                             listener-errors-before-cleanup
+                             (reverse (copy-list server-errors))))
+                     (multiple-value-bind (version-output version-errors
+                                           version-status)
+                         (uiop:run-program
+                          (list "openssl" "version")
+                          :output :string
+                          :error-output :string
+                          :ignore-error-status t)
+                       (error
+                        "openssl s_client for ALPN ~A failed (~D); OpenSSL version (~D): stdout=~S stderr=~S~%s_client stdout=~S stderr=~S~%failure time (UTC universal seconds): ~D~%listener config: handshake-timeout=~D max-connections=~D max-handshakes=~D~%listener state before cleanup: ~S~%listener connection count before cleanup: ~D~%listener events before cleanup: ~S~%listener errors before cleanup: ~S~%listener network diagnostics at failure: ~S"
+                        protocol status version-status version-output
+                        version-errors output errors failure-time
+                        (http-kit::http-server-handshake-timeout server)
+                        (http-kit::http-server-max-connections server)
+                        (http-kit::http-server-max-handshakes server)
+                        state-before-cleanup
+                        connection-count-before-cleanup events-before-cleanup
+                        listener-errors-before-cleanup
+                        network-diagnostics-before-cleanup))))
+                 (ensure-equal 0 status)
+                 (unless
+                     (or (search (format nil "ALPN protocol: ~A" protocol)
+                                 output)
+                         (search (format nil "ALPN protocol: ~A" protocol)
+                                 errors))
+                   (let ((state-before-cleanup
+                           (http-kit::http-server-state server))
+                         (failure-time (get-universal-time))
+                         (connection-count-before-cleanup
+                           (%https-listener-connection-count server))
+                         (network-diagnostics-before-cleanup
+                           (%https-listener-network-diagnostics server))
+                         (events-before-cleanup nil)
+                         (listener-errors-before-cleanup nil))
+                     (sb-thread:with-mutex (observation-lock)
+                       (setf events-before-cleanup
+                             (reverse (copy-list server-events))
+                             listener-errors-before-cleanup
+                             (reverse (copy-list server-errors))))
+                     (multiple-value-bind (version-output version-errors
+                                           version-status)
+                         (uiop:run-program
+                          (list "openssl" "version")
+                          :output :string
+                          :error-output :string
+                          :ignore-error-status t)
+                       (error
+                        "openssl s_client did not report ALPN ~A; OpenSSL version (~D): stdout=~S stderr=~S~%s_client stdout=~S stderr=~S~%failure time (UTC universal seconds): ~D~%listener config: handshake-timeout=~D max-connections=~D max-handshakes=~D~%listener state before cleanup: ~S~%listener connection count before cleanup: ~D~%listener events before cleanup: ~S~%listener errors before cleanup: ~S~%listener network diagnostics at failure: ~S"
+                        protocol version-status version-output version-errors
+                        output errors failure-time
+                        (http-kit::http-server-handshake-timeout server)
+                        (http-kit::http-server-max-connections server)
+                        (http-kit::http-server-max-handshakes server)
+                        state-before-cleanup
+                        connection-count-before-cleanup events-before-cleanup
+                        listener-errors-before-cleanup
+                        network-diagnostics-before-cleanup))))))
+             (ensure-equal :stopped
+                           (http-kit::http-server-state
+                            (stop-http-server server :graceful-timeout 2))))
+        (when (eq :running (http-kit::http-server-state server))
+          (stop-http-server server :graceful-timeout 2))
+        (%tls-server-test-remove-material material))))
+
+  (deftest https-listener-routes-negotiated-alpn
+    (%with-https-listener-test-stubs (context)
+      (let ((server (%https-listener-make-server)))
+        (unwind-protect
+             (progn
+               (start-http-server server)
+               (ensure-true (plusp (http-server-port server)))
+               (dolist (case '(("h2" :http2) ("http/1.1" :http1)))
+                 (destructuring-bind (alpn expected-protocol) case
+                   (sb-thread:with-mutex
+                       ((%https-listener-test-context-lock context))
+                     (setf (%https-listener-test-context-alpn context) alpn))
+                   (let ((client (%https-listener-connect server)))
+                     (close-http-tcp-stream client))
+                   (%https-listener-wait
+                    (lambda ()
+                      (>= (%https-listener-session-count context)
+                          (if (eq expected-protocol :http2) 1 2))))
+                   (%https-listener-wait
+                    (lambda ()
+                      (zerop (%https-listener-connection-count server))))))
+               (let ((routes
+                       (sb-thread:with-mutex
+                           ((%https-listener-test-context-lock context))
+                         (mapcar #'first
+                                 (reverse
+                                  (%https-listener-test-context-session-calls
+                                   context))))))
+                 (ensure-equal '(:http2 :http1) routes))
+               (let ((wrapper-options
+                       (%https-listener-test-context-wrapper-options context))
+                     (wrapper-call-options
+                       (%https-listener-test-context-wrapper-call-options
+                        context)))
+                 (ensure-equal '("h2" "http/1.1")
+                               (getf wrapper-options :alpn-protocols))
+                 (ensure-equal "https-listener-private-key-marker"
+                               (getf wrapper-options :private-key))
+                 (ensure-true
+                  (eq (getf wrapper-options :ticket-key-store)
+                      (http-kit::http-server-ticket-key-store server)))
+                 (ensure-equal 10 (getf wrapper-call-options :timeout))
+                 (ensure-true (numberp (getf wrapper-call-options :deadline)))
+                 (ensure-equal 2
+                               (%https-listener-test-context-wrapper-calls
+                                context))))
+          (stop-http-server server :graceful-timeout 1)))))
+
+  (deftest https-listener-enforces-handshake-cap-and-recovers
+    (%with-https-listener-test-stubs (context)
+      (let ((server nil)
+            (first-client nil)
+            (second-client nil))
+        (setf (%https-listener-test-context-handshake-action context)
+              (lambda (stream timeout deadline)
+                (declare (ignore timeout deadline))
+                (sb-thread:with-mutex
+                    ((%https-listener-test-context-lock context))
+                  (incf (%https-listener-test-context-handshakes-entered
+                         context))
+                  (sb-thread:condition-broadcast
+                   (%https-listener-test-context-waitqueue context))
+                  (loop until (%https-listener-test-context-release-handshakes-p
+                               context)
+                        do (sb-thread:condition-wait
+                            (%https-listener-test-context-waitqueue context)
+                            (%https-listener-test-context-lock context)
+                            :timeout 0.1)))
+                stream))
+        (unwind-protect
+             (progn
+               (setf server
+                     (%https-listener-make-server
+                      :max-connections 2
+                      :max-handshakes 1
+                      :on-event
+                      (lambda (event)
+                        (http-server-failure server)
+                        (%https-listener-record-event context event))))
+               (start-http-server server)
+               (setf first-client (%https-listener-connect server))
+               (close-http-tcp-stream first-client)
+               (%https-listener-wait
+                (lambda ()
+                  (sb-thread:with-mutex
+                      ((%https-listener-test-context-lock context))
+                    (= 1
+                       (%https-listener-test-context-handshakes-entered
+                        context)))))
+               (setf second-client (%https-listener-connect server))
+               (close-http-tcp-stream second-client)
+               (%https-listener-wait
+                (lambda ()
+                  (%https-listener-event-present-p
+                   context :connection-rejected :max-handshakes)))
+               (ensure-equal 1 (%https-listener-handshake-count server))
+               (ensure-equal 1 (%https-listener-connection-count server))
+               (ensure-equal 1
+                             (%https-listener-test-context-wrapper-calls
+                              context))
+               (sb-thread:with-mutex
+                   ((%https-listener-test-context-lock context))
+                 (setf (%https-listener-test-context-release-handshakes-p
+                        context)
+                       t)
+                 (sb-thread:condition-broadcast
+                  (%https-listener-test-context-waitqueue context)))
+               (%https-listener-wait
+                (lambda ()
+                  (and (zerop (%https-listener-handshake-count server))
+                       (zerop (%https-listener-connection-count server)))))
+               (let ((client (%https-listener-connect server)))
+                 (close-http-tcp-stream client))
+               (%https-listener-wait
+                (lambda ()
+                  (and (= 2 (%https-listener-test-context-wrapper-calls
+                             context))
+                       (= 2 (%https-listener-session-count context)))))
+               (ensure-equal 0 (%https-listener-handshake-count server))
+               (ensure-equal 0 (%https-listener-connection-count server)))
+          (when server
+            (sb-thread:with-mutex
+                ((%https-listener-test-context-lock context))
+              (setf (%https-listener-test-context-release-handshakes-p context)
+                    t)
+              (sb-thread:condition-broadcast
+               (%https-listener-test-context-waitqueue context)))
+            (stop-http-server server :graceful-timeout 1))))))
+
+  (deftest https-listener-enforces-connection-cap-and-graceful-stop
+    (%with-https-listener-test-stubs (context)
+      (let ((server nil))
+        (setf (%https-listener-test-context-session-action context)
+              (lambda (protocol stream handler options)
+                (declare (ignore protocol stream handler))
+                (let ((shutdown-p (getf options :shutdown-p)))
+                  (loop repeat 1000
+                        when (funcall shutdown-p)
+                          do (setf (%https-listener-test-context-shutdown-observed-p
+                                    context)
+                                   t)
+                             (return)
+                        do (sleep 0.005)))))
+        (unwind-protect
+             (progn
+               (setf server
+                     (%https-listener-make-server
+                      :max-connections 1
+                      :max-handshakes 1
+                      :on-event
+                      (lambda (event)
+                        (http-server-failure server)
+                        (%https-listener-record-event context event))))
+               (start-http-server server)
+               (let ((client (%https-listener-connect server)))
+                 (close-http-tcp-stream client))
+               (%https-listener-wait
+                (lambda () (= 1 (%https-listener-session-count context))))
+               (let ((client (%https-listener-connect server)))
+                 (close-http-tcp-stream client))
+               (%https-listener-wait
+                (lambda ()
+                  (%https-listener-event-present-p
+                   context :connection-rejected :max-connections)))
+               (ensure-equal 1 (%https-listener-connection-count server))
+               (stop-http-server server :graceful-timeout 2)
+               (stop-http-server server :graceful-timeout 2)
+               (ensure-equal 0 (%https-listener-connection-count server))
+               (ensure-true
+                (%https-listener-test-context-shutdown-observed-p context))
+               (ensure-true
+                (%https-listener-event-present-p context :listener-stopped nil))
+               (ensure-true
+                (eq :stopped (http-kit::http-server-state server))))
+          (when server
+            (stop-http-server server :graceful-timeout 1))))))
+
+  (deftest https-listener-rejects-missing-and-unknown-alpn-safely
+    (%with-https-listener-test-stubs (context)
+      (let ((server nil))
+        (unwind-protect
+             (progn
+               (setf server
+                     (%https-listener-make-server
+                      :on-event
+                      (lambda (event)
+                        (http-server-failure server)
+                        (%https-listener-record-event context event))
+                      :on-error
+                      (lambda (condition details)
+                        (http-server-failure server)
+                        (%https-listener-record-error
+                         context condition details))))
+               (start-http-server server)
+               (dolist (alpn '(nil "h3"))
+                 (sb-thread:with-mutex
+                     ((%https-listener-test-context-lock context))
+                   (setf (%https-listener-test-context-alpn context) alpn))
+                 (let ((client (%https-listener-connect server)))
+                   (close-http-tcp-stream client))
+                 (%https-listener-wait
+                  (lambda ()
+                    (>= (length (%https-listener-errors context))
+                        (if alpn 2 1))))
+                 (%https-listener-wait
+                  (lambda ()
+                    (zerop (%https-listener-connection-count server)))))
+               (ensure-equal nil (%https-listener-test-context-session-calls
+                                  context))
+               (dolist (entry (%https-listener-errors context))
+                 (ensure-equal :unsupported-alpn
+                               (http-server-error-reason-code (first entry)))
+                 (ensure-false
+                  (search "https-listener-private-key-marker"
+                          (princ-to-string entry))))
+               (dolist (event (%https-listener-events context))
+                 (ensure-false
+                  (search "https-listener-private-key-marker"
+                          (princ-to-string event))))
+               (ensure-false
+                (search "https-listener-private-key-marker"
+                        (princ-to-string server))))
+          (when server
+            (stop-http-server server :graceful-timeout 1))))))
+
+  (deftest https-listener-event-callback-failure-releases-connection
+    (%with-https-listener-test-stubs (context)
+      (let ((server nil))
+        (unwind-protect
+             (progn
+               (setf server
+                     (%https-listener-make-server
+                      :on-event
+                      (lambda (event)
+                        (when (eq (getf event :type) :connection-accepted)
+                          (error "event callback marker failure")))))
+               (start-http-server server)
+               (let ((client (%https-listener-connect server)))
+                 (close-http-tcp-stream client))
+               (%https-listener-wait
+                (lambda () (http-server-failure server)))
+               (%https-listener-wait
+                (lambda ()
+                  (and (zerop (%https-listener-connection-count server))
+                       (zerop (%https-listener-handshake-count server)))))
+               (let ((condition (http-server-failure server)))
+                 (ensure-true (typep condition 'http-server-callback-error))
+                 (ensure-equal :on-event
+                               (http-server-callback-error-callback condition))
+                 (ensure-equal :event-callback-failed
+                               (http-server-error-reason-code condition)))
+               (ensure-equal 0 (%https-listener-connection-count server)))
+          (when server
+            (stop-http-server server :graceful-timeout 1))))))
+
+  (deftest https-listener-callback-failure-is-fatal-and-redacted
+    (%with-https-listener-test-stubs (context)
+      (let ((server nil))
+        (unwind-protect
+             (progn
+               (setf server
+                     (%https-listener-make-server
+                      :on-event
+                      (lambda (event)
+                        (%https-listener-record-event context event))
+                      :on-error
+                      (lambda (condition details)
+                        (declare (ignore condition details))
+                        (error "callback private marker failure"))))
+               (sb-thread:with-mutex
+                   ((%https-listener-test-context-lock context))
+                 (setf (%https-listener-test-context-alpn context) nil))
+               (start-http-server server)
+               (let ((client (%https-listener-connect server)))
+                 (close-http-tcp-stream client))
+               (%https-listener-wait
+                (lambda () (http-server-failure server)))
+               (let ((condition (http-server-failure server)))
+                 (ensure-true (typep condition 'http-server-callback-error))
+                 (ensure-equal :on-error
+                               (http-server-callback-error-callback condition))
+                 (ensure-equal :error-callback-failed
+                               (http-server-error-reason-code condition))
+                 (ensure-false
+                  (search "callback private marker failure"
+                          (princ-to-string condition)))
+                 (ensure-false
+                  (search "https-listener-private-key-marker"
+                          (princ-to-string condition))))
+               (ensure-false
+                (%https-listener-event-present-p context :alpn-selected nil)))
+          (when server
+            (stop-http-server server :graceful-timeout 1)))))))
+
+#+sbcl
+(deftest https-listener-covers-configuration-failure-paths
+  (%with-https-listener-test-stubs (context)
+    (ensure-true (%https-listener-test-context-p context))
+    (dolist (overrides
+              '((:on-event :invalid-callback)
+                (:on-error :invalid-callback)
+                (:ticket-key-store :invalid-store)))
+      (let ((condition
+              (handler-case
+                  (progn
+                    (apply #'%https-listener-make-server overrides)
+                    nil)
+                (http-server-error (condition) condition))))
+        (ensure-true condition)
+        (ensure-equal
+         (if (eq (getf overrides :ticket-key-store) :invalid-store)
+             :invalid-ticket-key-store
+             (if (eq (getf overrides :on-event) :invalid-callback)
+                 :invalid-event-callback
+                 :invalid-error-callback))
+         (http-server-error-reason-code condition))))
+    (let ((nan (sb-kernel:make-single-float #x7fc00000))
+          (infinity (sb-kernel:make-single-float #x7f800000)))
+      (ensure-true (http-kit::%http-server-positive-real-p 1.5))
+      (ensure-false (http-kit::%http-server-positive-real-p nan))
+      (ensure-false (http-kit::%http-server-positive-real-p infinity)))
+    (let ((factory (fdefinition 'cl-tls-kit:make-tls13-server-ticket-key-store)))
+      (unwind-protect
+           (progn
+             (setf (fdefinition 'cl-tls-kit:make-tls13-server-ticket-key-store)
+                   (lambda (&rest arguments)
+                     (declare (ignore arguments))
+                     (error "ticket store factory failure")))
+             (let ((condition
+                     (handler-case
+                         (progn (%https-listener-make-server) nil)
+                       (http-server-error (condition) condition))))
+               (ensure-true condition)
+               (ensure-equal :ticket-key-store-unavailable
+                             (http-server-error-reason-code condition))))
+        (setf (fdefinition 'cl-tls-kit:make-tls13-server-ticket-key-store)
+              factory)))
+    (let ((wrapper-factory
+            (fdefinition 'http-kit/tls:make-http-tls-server-wrapper)))
+      (unwind-protect
+           (progn
+             (setf (fdefinition 'http-kit/tls:make-http-tls-server-wrapper)
+                   (lambda (&rest arguments)
+                     (declare (ignore arguments))
+                     :not-a-wrapper))
+             (let ((condition
+                     (handler-case
+                         (progn (%https-listener-make-server) nil)
+                       (http-server-error (condition) condition))))
+               (ensure-true condition)
+               (ensure-equal :invalid-tls-wrapper
+                             (http-server-error-reason-code condition)))
+             (setf (fdefinition 'http-kit/tls:make-http-tls-server-wrapper)
+                   (lambda (&rest arguments)
+                     (declare (ignore arguments))
+                     (error "TLS wrapper factory failure")))
+             (let ((condition
+                     (handler-case
+                         (progn (%https-listener-make-server) nil)
+                       (http-server-error (condition) condition))))
+               (ensure-true condition)
+               (ensure-equal :invalid-tls-credentials
+                             (http-server-error-reason-code condition)))
+             (setf (fdefinition 'http-kit/tls:make-http-tls-server-wrapper)
+                   (lambda (&rest arguments)
+                     (declare (ignore arguments))
+                     (error 'http-server-error
+                            :reason-code :wrapper-originated
+                            :phase :wrapper)))
+             (let ((condition
+                     (handler-case
+                         (progn (%https-listener-make-server) nil)
+                       (http-server-error (condition) condition))))
+               (ensure-true condition)
+               (ensure-equal :wrapper-originated
+                             (http-server-error-reason-code condition))))
+        (setf (fdefinition 'http-kit/tls:make-http-tls-server-wrapper)
+              wrapper-factory)))))
+
+
+#+sbcl
+(deftest https-listener-covers-server-error-and-state-helpers
+  (%with-https-listener-test-stubs (context)
+    (let* ((reported nil)
+           (events nil)
+           (server
+             (%https-listener-make-server
+              :on-event (lambda (event) (push event events))
+              :on-error
+              (lambda (condition details)
+                (push (list condition details) reported))))
+           (timeout-condition
+             (make-condition 'http-timeout :message "request timed out"))
+           (protocol-condition
+             (make-condition 'http-protocol-error :message "bad request")))
+      (signals http-server-error (http-server-failure nil))
+      (ensure-equal :timeout
+                    (http-server-error-reason-code
+                     (http-kit::%http-server-safe-error
+                      timeout-condition :test)))
+      (ensure-equal :protocol-error
+                    (http-server-error-reason-code
+                     (http-kit::%http-server-safe-error
+                      protocol-condition :test)))
+      (ensure-equal :connection-error
+                    (http-server-error-reason-code
+                     (http-kit::%http-server-safe-error
+                      (make-condition 'error) :test)))
+      (let ((safe
+              (http-kit::%http-server-report-error
+               server protocol-condition :session
+               :protocol :http1 :peer-address "127.0.0.1" :peer-port 443)))
+        (ensure-equal :protocol-error
+                      (http-server-error-reason-code safe))
+        (ensure-equal :session (getf (second (first reported)) :phase))
+        (ensure-equal :http1 (getf (second (first reported)) :protocol))
+        (ensure-equal "127.0.0.1"
+                      (getf (second (first reported)) :peer-address))
+        (ensure-equal 443 (getf (second (first reported)) :peer-port)))
+      (http-kit::%http-server-emit-event-once
+       server :started '(:type :listener-started))
+      (http-kit::%http-server-emit-event-once
+       server :started '(:type :listener-started))
+      (http-kit::%http-server-emit-event-once
+       server :stopping '(:type :listener-stopping))
+      (http-kit::%http-server-emit-event-once
+       server :stopping '(:type :listener-stopping))
+      (http-kit::%http-server-emit-event-once
+       server :stopped '(:type :listener-stopped))
+      (http-kit::%http-server-emit-event-once
+       server :stopped '(:type :listener-stopped))
+      (ensure-equal 3 (length events))
+      (ensure-false (http-kit::%http-server-running-p server))
+      (ensure-true (http-kit::%http-server-shutdown-p server))
+      (ensure-equal
+       (http-kit::http-server-graceful-timeout server)
+       (http-kit::%http-server-positive-stop-timeout server nil nil))
+      (signals http-server-error
+        (http-kit::%http-server-positive-stop-timeout server t 0)))
+    (let* ((server (%https-listener-make-server))
+           (failure (http-kit::%http-server-callback-condition :on-event :test)))
+      (setf (http-kit::http-server-on-error server)
+            (lambda (condition details)
+              (declare (ignore condition details))
+              (error "error callback test failure")))
+      (let ((observed
+              (handler-case
+                  (progn
+                    (http-kit::%http-server-report-callback-error
+                     server failure)
+                    nil)
+                (http-server-callback-error (condition) condition))))
+        (ensure-true observed)
+        (ensure-equal :error-callback-failed
+                      (http-server-error-reason-code observed))
+        (ensure-equal observed (http-server-failure server))))
+    (let* ((server (%https-listener-make-server))
+           (callback
+             (http-kit::%http-server-session-error-callback
+              server
+              (http-kit::%make-http-server-connection
+               :peer-address "192.0.2.4" :peer-port 1234)
+              :http2
+              (list nil)))
+           (observed nil))
+      (setf (http-kit::http-server-on-error server)
+            (lambda (condition details)
+              (push (list condition details) observed)))
+      (funcall callback
+               (make-condition 'http-protocol-error :message "session error")
+               nil)
+      (ensure-equal :session
+                    (getf (second (first observed)) :phase))
+      (ensure-equal :http2
+                    (getf (second (first observed)) :protocol))
+      (ensure-equal "192.0.2.4"
+                    (getf (second (first observed)) :peer-address))
+      (ensure-equal 1234
+                    (getf (second (first observed)) :peer-port))))
+  (%with-https-listener-test-stubs (context)
+    (let* ((listener (gensym "LISTENER"))
+           (server (%https-listener-make-server))
+           (raw-stream (make-string-input-stream "raw"))
+           (tls-stream (make-string-input-stream "tls"))
+           (connection nil)
+           (accounting-error nil))
+      (setf (http-kit::http-server-state server) :running
+            (http-kit::http-server-listener server) listener)
+      (multiple-value-bind (rejected rejection)
+          (http-kit::%http-server-reserve-connection
+           server (gensym "OTHER-LISTENER") raw-stream nil nil)
+        (declare (ignore rejected))
+        (ensure-equal :server-stopping rejection))
+      (multiple-value-bind (reserved rejection)
+          (http-kit::%http-server-reserve-connection
+           server listener raw-stream "127.0.0.1" 4444)
+        (ensure-false rejection)
+        (setf connection reserved))
+      (ensure-equal 1 (http-kit::http-server-connection-count server))
+      (ensure-equal 1 (http-kit::http-server-handshake-count server))
+      (ensure-equal tls-stream
+                    (http-kit::%http-server-set-tls-stream
+                     server connection tls-stream))
+      (http-kit::%http-server-release-handshake server connection)
+      (http-kit::%http-server-release-handshake server connection)
+      (ensure-equal 0 (http-kit::http-server-handshake-count server))
+      (http-kit::%http-server-close-connection-stream server connection)
+      (http-kit::%http-server-close-connection-stream server connection)
+      (ensure-false (open-stream-p tls-stream))
+      (ensure-true (open-stream-p raw-stream))
+      (http-kit::%http-server-release-connection server connection)
+      (http-kit::%http-server-release-connection server connection)
+      (ensure-equal 0 (http-kit::http-server-connection-count server))
+      (close raw-stream)
+      (setf (%https-listener-test-context-session-action context)
+            (lambda (protocol stream handler options)
+              (declare (ignore protocol stream handler))
+              (setf accounting-error
+                    (handler-case
+                        (progn
+                          (funcall (getf options :release-body-bytes) -1)
+                          nil)
+                      (http-server-error (condition) condition)))))
+      (http-kit::%http-server-serve-session
+       server connection (make-string-input-stream "session") :http1 (list nil))
+      (ensure-true accounting-error)
+      (ensure-equal :body-buffer-accounting
+                    (http-server-error-reason-code accounting-error)))))
+
+#+sbcl
+(deftest https-listener-covers-startup-and-worker-failures
+  (%with-https-listener-test-stubs (context)
+    (let* ((opener 'http-kit/network:open-http-tcp-listener)
+           (original (fdefinition opener))
+           (server (%https-listener-make-server)))
+      (unwind-protect
+           (progn
+             (setf (fdefinition opener)
+                   (lambda (&rest arguments)
+                     (declare (ignore arguments))
+                     (error "listener opener failure")))
+             (let ((condition
+                     (handler-case
+                         (progn (start-http-server server) nil)
+                       (http-server-error (condition) condition))))
+               (ensure-true condition)
+               (ensure-equal :listener-open-failed
+                             (http-server-error-reason-code condition))
+               (ensure-equal :failed (http-kit::http-server-state server))))
+        (setf (fdefinition opener) original)))
+    (let* ((thread-maker 'sb-thread:make-thread)
+           (original (fdefinition thread-maker))
+           (server (%https-listener-make-server)))
+      (unwind-protect
+           (progn
+             (sb-ext:without-package-locks
+               (setf (fdefinition thread-maker)
+                     (lambda (&rest arguments)
+                       (declare (ignore arguments))
+                       (error "supervisor thread creation failure"))))
+             (start-http-server server)
+             (ensure-equal :failed (http-kit::http-server-state server))
+             (ensure-equal :supervisor-start-failed
+                           (http-server-error-reason-code
+                            (http-server-failure server)))
+             (ensure-false (http-kit::http-server-listener server)))
+        (sb-ext:without-package-locks
+          (setf (fdefinition thread-maker) original))))
+    (let* ((thread-maker 'sb-thread:make-thread)
+           (original (fdefinition thread-maker))
+           (server (%https-listener-make-server))
+           (listener (gensym "LISTENER"))
+           (raw-stream (make-string-input-stream "worker"))
+           (connection nil))
+      (setf (http-kit::http-server-state server) :running
+            (http-kit::http-server-listener server) listener)
+      (multiple-value-bind (reserved rejection)
+          (http-kit::%http-server-reserve-connection
+           server listener raw-stream nil nil)
+        (ensure-false rejection)
+        (setf connection reserved))
+      (ensure-equal 1 (http-kit::http-server-connection-count server))
+      (ensure-equal 1 (http-kit::http-server-handshake-count server))
+      (unwind-protect
+           (progn
+             (sb-ext:without-package-locks
+               (setf (fdefinition thread-maker)
+                     (lambda (&rest arguments)
+                       (declare (ignore arguments))
+                       (error "worker thread creation failure"))))
+             (http-kit::%http-server-start-connection-worker server connection)
+             (ensure-equal :worker-start-failed
+                           (http-server-error-reason-code
+                            (http-server-failure server)))
+             (ensure-false (open-stream-p raw-stream))
+             (ensure-equal 0 (http-kit::http-server-connection-count server))
+             (ensure-equal 0 (http-kit::http-server-handshake-count server)))
+        (sb-ext:without-package-locks
+          (setf (fdefinition thread-maker) original))))
+    (setf (%https-listener-test-context-handshake-action context)
+          (lambda (stream timeout deadline)
+            (declare (ignore stream timeout deadline))
+            :not-a-stream))
+    (let* ((errors nil)
+           (server (%https-listener-make-server
+                    :on-error
+                    (lambda (condition details)
+                      (push (list condition details) errors))))
+           (raw-stream (make-string-input-stream "invalid TLS result"))
+           (connection
+             (http-kit::%make-http-server-connection :raw-stream raw-stream)))
+      (http-kit::%http-server-run-connection server connection)
+      (ensure-equal :invalid-tls-stream
+                    (http-server-error-reason-code
+                     (first (first errors))))
+      (ensure-equal :handshake
+                    (http-server-error-phase (first (first errors))))
+      (ensure-false (open-stream-p raw-stream)))
+    (setf (%https-listener-test-context-handshake-action context)
+          (lambda (stream timeout deadline)
+            (declare (ignore timeout deadline))
+            stream))
+    (let* ((server
+             (%https-listener-make-server
+              :on-event
+              (lambda (event)
+                (when (eq (getf event :type) :alpn-selected)
+                  (error "ALPN callback failure")))))
+           (raw-stream (make-string-input-stream "TLS stream"))
+           (connection
+             (http-kit::%make-http-server-connection :raw-stream raw-stream)))
+      (http-kit::%http-server-run-connection server connection)
+      (ensure-true (typep (http-server-failure server)
+                          'http-server-callback-error))
+      (ensure-equal :event-callback-failed
+                    (http-server-error-reason-code
+                     (http-server-failure server))))))
+
+#+sbcl
+(progn
+  (defclass %https-listener-close-error-stream (binary-test-stream)
+    ((close-count :initform 0
+                  :accessor %https-listener-close-error-count)))
+
+  (defmethod close ((stream %https-listener-close-error-stream) &key abort)
+    (declare (ignore abort))
+    (incf (%https-listener-close-error-count stream))
+    (error "Intentional HTTPS listener close failure."))
+
+  (deftest https-listener-covers-connection-close-failure
+    (%with-https-listener-test-stubs (context)
+      (ensure-true context)
+      (let* ((server (%https-listener-make-server))
+             (stream
+               (make-instance
+                (quote %https-listener-close-error-stream)
+                :input (make-array 0
+                                   :element-type (quote (unsigned-byte 8)))))
+             (connection
+               (http-kit::%make-http-server-connection
+                :raw-stream stream)))
+        (http-kit::%http-server-close-connection-stream server connection)
+        (ensure-equal
+         :connection-close-failed
+         (http-server-error-reason-code (http-server-failure server)))
+        (ensure-equal :failed (http-kit::http-server-state server))
+        (http-kit::%http-server-close-connection-stream server connection)
+        (ensure-equal 1 (%https-listener-close-error-count stream))))))

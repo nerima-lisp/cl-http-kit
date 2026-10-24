@@ -5,11 +5,24 @@
 
 (defvar *coverage-code-roots* nil)
 (defvar *coverage-pending-proofs* nil)
+(defvar *coverage-source-paths* nil)
+
+(defun coverage-source-paths (options)
+  (let ((paths (make-hash-table :test (function equal))))
+    (dolist (system (cl-weave/cli::cli-options-coverage-systems options))
+      (cl-weave/cli::ensure-requested-system-visible system options)
+      (dolist (pathname (cl-weave::asdf-system-files system))
+        (setf (gethash (namestring (truename pathname)) paths) t)))
+    paths))
+
+(defun coverage-source-p (pathname)
+  (gethash (namestring (truename pathname)) *coverage-source-paths*))
 
 (let ((options (cl-weave/cli::parse-cli-arguments
                 (uiop:command-line-arguments)))
       (*coverage-code-roots* nil)
       (*coverage-pending-proofs* (make-hash-table :test 'equal))
+      (*coverage-source-paths* nil)
       (http-coverage-child-merge:*collector*
         (when (http-coverage-child-merge:supported-runtime-p)
           (http-coverage-child-merge:make-collector)))
@@ -19,6 +32,7 @@
     (error "Coverage requires a non-watch test run with --coverage."))
   (cl-weave/cli::ensure-valid-reporter-for-command options)
   (cl-weave/cli::prepare-coverage-compilation options)
+  (setf *coverage-source-paths* (coverage-source-paths options))
   (unless http-coverage-child-merge:*collector*
     (format *error-output* "Child coverage merge: unsupported runtime; native raw coverage retained.~%"))
   ;; Reset before loading: load-time forms must remain part of the measurement.
@@ -36,7 +50,8 @@
              '(defmethod asdf:perform :around
                   ((operation asdf:compile-op) (component asdf:cl-source-file))
                 (let* ((pathname (asdf:component-pathname component))
-                       (proof (http-coverage-normalization:capture-source pathname)))
+                       (proof (when (coverage-source-p pathname)
+                                (http-coverage-normalization:capture-source pathname))))
                   (multiple-value-prog1 (call-next-method)
                     (when proof
                       (setf (gethash (namestring (truename pathname))
@@ -61,7 +76,7 @@
                       (http-coverage-child-merge:record-load load-record *coverage-code-roots*)
                       (let ((proof (gethash (namestring (truename pathname))
                                             *coverage-pending-proofs*)))
-                        (when proof
+                        (when (and proof (coverage-source-p pathname))
                           (http-coverage-normalization:seal-source pathname proof))))))))
             methods)
            (cl-weave/cli::load-requested-inputs options))
