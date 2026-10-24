@@ -2266,11 +2266,12 @@
            (wait-failure nil))
       (unwind-protect
            (progn
-             (setf (fdefinition wait-symbol)
-                   (lambda (waitqueue lock &key timeout)
-                     (sb-thread:signal-semaphore wait-entered)
-                     (funcall original-wait waitqueue lock :timeout timeout)
-                     (sb-thread:release-mutex lock)))
+             (sb-ext:without-package-locks
+               (setf (fdefinition wait-symbol)
+                     (lambda (waitqueue lock &key timeout)
+                       (sb-thread:signal-semaphore wait-entered)
+                       (funcall original-wait waitqueue lock :timeout timeout)
+                       (sb-thread:release-mutex lock))))
              (setf wait-thread
                    (sb-thread:make-thread
                     (lambda ()
@@ -2307,7 +2308,8 @@
                      (when (sb-thread:thread-alive-p wait-thread)
                        (sb-thread:terminate-thread wait-thread))))
                  (sb-thread:join-thread wait-thread)))
-          (setf (fdefinition wait-symbol) original-wait)
+          (sb-ext:without-package-locks
+            (setf (fdefinition wait-symbol) original-wait))
           (ensure-true (eq original-wait (fdefinition wait-symbol)))))))
 
   (deftest http2-coverage-manager-open-entry-reuses-existing
