@@ -514,7 +514,18 @@ to be selected without exposing QUIC implementation details."
                                                                (cl-quic-kit:client-accept-peer-stream
                                                                 quic-client
                                                                 :type :unidirectional)))))
-                                                     http3-options)))
+                                                     http3-options
+                                                     (list :close-connection
+                                                       (lambda (&key error-code reason)
+                                                         (prog1
+                                                             (cl-quic-kit:client-close
+                                                              quic-client
+                                                              :error-code error-code
+                                                              :reason reason)
+                                                           (setf
+                                                            (http3-quic-adapter-closed-p
+                                                             adapter)
+                                                            t)))))))
                                       (%http3-quic-adapter-await-peer-settings
                                        quic-client (http3-quic-adapter-http3-client adapter)
                                        :timeout timeout :deadline deadline :adapter adapter)

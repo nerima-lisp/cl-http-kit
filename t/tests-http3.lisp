@@ -14476,6 +14476,167 @@
         (lambda (&rest arguments)
           (declare (ignore arguments))
           fallback))))))
+(deftest http3-native-scheduler-closes-connection-on-duplicate-control-stream
+  (call-with-http3-coverage-adapter-fixture
+   (lambda (adapter)
+     (let* ((quic (http-kit/http3::http3-quic-adapter-quic-client adapter))
+            (client (http-kit/http3:http3-quic-adapter-http3-client adapter))
+            (poll-started (sb-thread:make-semaphore :count 0))
+            (release-poll (sb-thread:make-semaphore :count 0))
+            (first-poll-p nil)
+            (original-poll
+              (symbol-function (quote cl-quic-kit:client-poll)))
+            (owner-thread nil)
+            (owner-finished nil)
+            (owner-result nil)
+            (waiter-thread nil)
+            (waiter-finished nil)
+            (waiter-result nil))
+       (let ((original-close-connection
+              (http-kit/http3::http3-client-close-connection client)))
+         (setf (http-kit/http3::http3-client-close-connection client)
+               (lambda (&key error-code reason)
+                 (funcall original-close-connection
+                          :error-code error-code :reason reason)
+                 (error "Injected QUIC close callback failure.")))
+         (cl-quic-kit:client-receive-frame
+          quic
+          (cl-quic-kit:make-frame
+           :stream :stream-id 7 :offset 0
+           :data (octets 0) :len-present t)
+          :level :1-rtt))
+       (unwind-protect
+            (call-with-http3-quic-lifecycle-spies
+             (lambda (calls)
+               (multiple-value-setq
+                   (owner-thread owner-finished owner-result)
+                 (http3-test-start-native-call
+                  (lambda ()
+                    (http-kit/http3:send-http3-request
+                     client
+                     (make-http-request
+                      :method "GET"
+                      :uri "https://example.test/owner")))))
+               (ensure-true
+                (sb-thread:wait-on-semaphore poll-started :timeout 3))
+               (multiple-value-setq
+                   (waiter-thread waiter-finished waiter-result)
+                 (http3-test-start-native-call
+                  (lambda ()
+                    (http-kit/http3:send-http3-request
+                     client
+                     (make-http-request
+                      :method "GET"
+                      :uri "https://example.test/waiter")))))
+               (ensure-true (http3-test-await-native-pending client 1))
+               (ensure-equal
+                1
+                (hash-table-count
+                 (http-kit/http3::http3-client-request-streams client)))
+               (ensure-equal
+                1
+                (length
+                 (http-kit/http3::http3-client-pending-request-streams client)))
+               (sb-thread:signal-semaphore release-poll)
+               (ensure-true
+                (sb-thread:wait-on-semaphore owner-finished :timeout 3))
+               (ensure-true
+                (sb-thread:wait-on-semaphore waiter-finished :timeout 3))
+               (dolist (result (list owner-result waiter-result))
+                 (ensure-equal :error (first result))
+                 (ensure-true
+                  (typep
+                   (second result)
+                   (quote http-kit/http3::http3-connection-protocol-error)))
+                 (ensure-equal
+                  :h3-stream-creation-error
+                  (http-protocol-error-detail (second result)))
+                 (ensure-equal
+                  #x103
+                  (http-kit/http3::http3-connection-protocol-error-quic-error-code
+                   (second result)))
+                 (progn
+                   (ensure-equal
+                    :http3-transport
+                    (http-kit:http-error-operation (second result)))
+                   (ensure-equal
+                    "An HTTP/3 client can have only one peer control stream."
+                    (http-kit:http-error-message (second result)))))
+               (let ((close-calls (gethash (quote cl-quic-kit:client-close)
+                                           calls)))
+                 (ensure-equal 1 (length close-calls))
+                 (ensure-true (eq quic (first (first close-calls))))
+                 (ensure-equal
+                  #x103
+                  (getf (rest (first close-calls)) :error-code))
+                 (ensure-equal
+                  "An HTTP/3 client can have only one peer control stream."
+                  (getf (rest (first close-calls)) :reason)))
+               (progn
+                 (ensure-true (eq (second owner-result)
+                                  (second waiter-result)))
+                 (ensure-false
+                  (http-kit/http3:http3-client-open-p client)))
+               (ensure-true
+                (http-kit/http3::http3-quic-adapter-closed-p adapter))
+               (ensure-true (cl-quic-kit:quic-client-closed-p quic))
+               (let ((detail
+                       (http-kit/http3::%http3-quic-adapter-close-detail quic)))
+                 (ensure-equal :application (getf detail :closed-kind))
+                 (ensure-equal #x103 (getf detail :closed-error))
+                 (ensure-true (getf detail :client-closed-p))))
+             :client-poll
+             (lambda (actual &optional at)
+               (when (and (eq actual quic) (not first-poll-p))
+                 (setf first-poll-p t)
+                 (sb-thread:signal-semaphore poll-started)
+                 (sb-thread:wait-on-semaphore release-poll))
+               (funcall original-poll actual at))
+         )
+         (sb-thread:signal-semaphore release-poll)
+         (http3-test-join-native-thread owner-thread owner-finished)
+         (http3-test-join-native-thread waiter-thread waiter-finished))))))
+(deftest http3-native-scheduler-stream-error-does-not-close-connection
+  (let* ((response-wire
+           (http-kit/http3:encode-http3-frame
+            (http-kit/http3:make-http3-frame
+             :type http-kit/http3:+http3-settings-type+
+             :payload (octets))))
+         (response-sent-p nil)
+         (close-calls nil)
+         (client
+           (http3-test-make-native-client
+            :try-read-stream
+            (lambda (stream &key timeout deadline)
+              (declare (ignore timeout deadline))
+              (if (and (stringp (http3-test-stream-kind stream))
+                       (string= "/stream-error"
+                                (http3-test-stream-kind stream))
+                       (not response-sent-p))
+                  (progn
+                    (setf response-sent-p t)
+                    (values response-wire t :data))
+                  (values nil nil :would-block))))))
+    (setf (http-kit/http3::http3-client-close-connection client)
+          (lambda (&key error-code reason)
+            (push (list error-code reason) close-calls)))
+    (unwind-protect
+         (let ((failure
+                 (http3-boundary-error
+                  (lambda ()
+                    (http-kit/http3:send-http3-request
+                     client
+                     (make-http-request
+                      :method "GET"
+                      :uri "https://example.test/stream-error"))))))
+           (http3-public-error-check
+            failure
+            "HTTP/3 control frames are not valid on a request stream."
+            http-kit/http3:+http3-settings-type+)
+           (ensure-equal nil close-calls)
+           (ensure-true (http-kit/http3:http3-client-open-p client)))
+      (when (http-kit/http3:http3-client-open-p client)
+        (http-kit/http3:close-http3-client client)))))
 
 
 

@@ -6,11 +6,23 @@
 (defparameter +http3-default-max-peer-unidirectional-streams+ 16)
 (defparameter +http3-default-max-state-bytes+ (* 4 1024 1024))
 
-(defun %h3-transport-error (message &optional detail)
-  (error 'http-protocol-error
-         :message message
-         :operation :http3-transport
-         :detail detail))
+(progn
+  (define-condition http3-connection-protocol-error (http-protocol-error)
+    ((quic-error-code :initarg :quic-error-code
+                     :reader http3-connection-protocol-error-quic-error-code)))
+
+  (defun %h3-connection-transport-error (message detail quic-error-code)
+    (error 'http3-connection-protocol-error
+           :message message
+           :operation :http3-transport
+           :detail detail
+           :quic-error-code quic-error-code))
+
+  (defun %h3-transport-error (message &optional detail)
+    (error 'http-protocol-error
+           :message message
+           :operation :http3-transport
+           :detail detail)))
 
 (defun %h3-invalid-header (name reason)
   (error 'http-invalid-header
@@ -86,6 +98,7 @@
     seen-peer-push-ids
     discard-peer-unidirectional-streams
     close-stream
+    close-connection
     cancel-stream
     control-stream
     qpack-encoder-stream
@@ -185,7 +198,7 @@
     (started-p nil :type boolean)))
 
 (defun make-http3-client
-    (&key open-stream write-stream try-write-stream read-stream poll-function try-read-stream stream-write-pending-p close-stream cancel-stream
+    (&key open-stream write-stream try-write-stream read-stream poll-function try-read-stream stream-write-pending-p close-stream close-connection cancel-stream
           (serialize (lambda (thunk) (funcall thunk)))
           (max-frame-size #x4000) (max-header-bytes 65536) (max-fields 256)
           (max-request-streams +http3-default-max-request-streams+)
@@ -204,8 +217,10 @@ returns a stream object plus, for request streams, an optional numeric QUIC
 stream ID. WRITE-STREAM is called as (STREAM OCTETS &KEY FIN-P TIMEOUT
 DEADLINE). READ-STREAM is called as (STREAM &KEY TIMEOUT DEADLINE) and returns
 an octet vector, or NIL at QUIC stream FIN. CLOSE-STREAM is called as (STREAM
-&KEY CONDITION), and optional CANCEL-STREAM as (STREAM &KEY ERROR-CODE TIMEOUT
-DEADLINE).
+&KEY CONDITION), optional CANCEL-STREAM as (STREAM &KEY ERROR-CODE TIMEOUT
+DEADLINE), and optional CLOSE-CONNECTION as (CLOSE-CONNECTION &KEY ERROR-CODE
+REASON). CLOSE-CONNECTION receives the QUIC application error code and reason
+when a connection-scoped HTTP/3 protocol error is detected.
 
 For native scheduler operation, supply POLL-FUNCTION, TRY-READ-STREAM, and
 STREAM-WRITE-PENDING-P together. POLL-FUNCTION takes no arguments and performs
@@ -256,6 +271,9 @@ system supplies the HTTP/3 stream and codec layer."
   (unless (or (null close-stream) (functionp close-stream))
     (%h3-transport-error "HTTP/3 close-stream must be a function or NIL."
                          (type-of close-stream)))
+  (unless (or (null close-connection) (functionp close-connection))
+    (%h3-transport-error "HTTP/3 close-connection must be a function or NIL."
+                         (type-of close-connection)))
   (unless (or (null cancel-stream) (functionp cancel-stream))
     (%h3-transport-error "HTTP/3 cancel-stream must be a function or NIL."
                          (type-of cancel-stream)))
@@ -404,6 +422,7 @@ system supplies the HTTP/3 stream and codec layer."
              :try-write-stream try-write-stream
              :read-stream read-stream
              :close-stream closer
+             :close-connection close-connection
              :cancel-stream cancel-stream
              :control-stream control-stream
              :qpack-encoder-stream qpack-encoder-stream
@@ -1198,8 +1217,9 @@ attach a stream; its single attachment is retained after closing."
     (%h3-transport-error
      "ATTACH-HTTP3-PEER-CONTROL-STREAM requires a stream."))
   (when (http3-client-peer-control-stream client)
-    (%h3-transport-error
-     "An HTTP/3 client can have only one peer control stream."))
+    (%h3-connection-transport-error
+     "An HTTP/3 client can have only one peer control stream."
+     :h3-stream-creation-error #x103))
   (unless (http3-client-open-p client)
     (%h3-transport-error
      "Cannot attach an HTTP/3 control stream after client close."))
@@ -1374,9 +1394,9 @@ HTTP3-CLIENT-PEER-CONTROL-STATE."
      "ATTACH-HTTP3-PEER-QPACK-ENCODER-STREAM requires a client and stream."))
   (when (or (http3-client-peer-qpack-encoder-stream client)
             (http3-client-peer-qpack-encoder-prefix-seen-p client))
-    (%h3-transport-error
+    (%h3-connection-transport-error
      "An HTTP/3 connection can have only one peer QPACK encoder stream."
-     :h3-stream-creation-error))
+     :h3-stream-creation-error #x103))
   (setf (http3-client-peer-qpack-encoder-stream client) stream)
   client)
 
@@ -1387,9 +1407,9 @@ HTTP3-CLIENT-PEER-CONTROL-STATE."
      "ATTACH-HTTP3-PEER-QPACK-DECODER-STREAM requires a client and stream."))
   (when (or (http3-client-peer-qpack-decoder-stream client)
             (http3-client-peer-qpack-decoder-prefix-seen-p client))
-    (%h3-transport-error
+    (%h3-connection-transport-error
      "An HTTP/3 connection can have only one peer QPACK decoder stream."
-     :h3-stream-creation-error))
+     :h3-stream-creation-error #x103))
   (setf (http3-client-peer-qpack-decoder-stream client) stream)
   client)
 
@@ -3429,6 +3449,27 @@ validated informational response in wire order."
     (dolist (entry entries)
       (%h3-scheduler-fail-entry client entry condition)))
   client)
+(defun %h3-scheduler-fail-connection (client condition)
+  (let ((close-failure
+          (handler-case
+              (close-http3-client client :condition condition)
+            (error (caught-condition)
+              caught-condition))))
+    (let ((close-connection (http3-client-close-connection client)))
+      (when close-connection
+        (handler-case
+            (funcall
+             close-connection
+             :error-code
+             (http3-connection-protocol-error-quic-error-code condition)
+             :reason (http-kit:http-error-message condition))
+          (error (caught-condition)
+            (unless close-failure
+              (setf close-failure caught-condition))))))
+    (when close-failure
+      (warn "Closing the HTTP/3 QUIC connection also failed after HTTP/3 connection error (~A): ~A"
+            condition close-failure))
+    client))
 
 (defun %h3-scheduler-progress-entry (client entry)
   (unless (or (%http3-request-stream-done-p entry)
@@ -3489,7 +3530,9 @@ validated informational response in wire order."
                              (setf progress-p t))))))
                  (error (condition)
                    (unless (%h3-scheduler-close-started-p client)
-                     (%h3-scheduler-fail-active client condition))))
+                     (if (typep condition 'http3-connection-protocol-error)
+                         (%h3-scheduler-fail-connection client condition)
+                         (%h3-scheduler-fail-active client condition)))))
                (unless progress-p
                  (sleep 0.001))))
            (setf normal-exit-p t))
