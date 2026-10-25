@@ -1114,8 +1114,7 @@
              (setf (fdefinition 'cl-tls-kit:tls13-server-driver-step)
                    (lambda (&rest arguments)
                      (declare (ignore arguments))
-                     (sb-ext:with-timeout 0.001
-                       (sleep 0.01))))
+                     (error 'sb-ext:timeout)))
              (setf condition
                    (handler-case
                        (progn
