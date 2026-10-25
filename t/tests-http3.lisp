@@ -4028,7 +4028,7 @@
                      (declare (ignore stream-id cancel-request))
                      (setf request-entry
                            (http-kit/http3::%h3-scheduler-entry-for-stream
-                            client stream)))))
+                            client stream))))))
              (unwind-protect
                   (progn
                     (ensure-true
@@ -4105,7 +4105,7 @@
                (sb-thread:signal-semaphore release-resume-poll)
                (http3-test-join-native-thread request-thread request-finished)))
         (when (http-kit/http3:http3-client-open-p client)
-          (http-kit/http3:close-http3-client client)))))))
+          (http-kit/http3:close-http3-client client))))))
 )
 
 (deftest http3-server-blocked-request-pauses-same-chunk
