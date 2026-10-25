@@ -2297,7 +2297,7 @@
                 (t (values response-wire t :data))))
             :stream-write-pending-p
             (lambda (stream)
-              (%http3-quic-adapter-stream-write-pending-p quic stream))))
+              (http-kit/http3::%http3-quic-adapter-stream-write-pending-p quic stream))))
          (adapter
            (http-kit/http3::%make-http3-quic-adapter
             :quic-client quic :http3-client client)))
