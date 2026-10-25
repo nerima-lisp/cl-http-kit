@@ -1609,14 +1609,7 @@
                   (/ (get-internal-real-time)
                      internal-time-units-per-second))))
            (owned-key-generation-count 0)
-           (owned-key-materials nil)
-           (owned-random
-             (lambda (size)
-               (let ((seed (incf owned-key-generation-count)))
-                 (push seed owned-key-materials)
-                 (make-array size
-                             :element-type (quote (unsigned-byte 8))
-                             :initial-element seed))))
+           (owned-stores nil)
            (external-key-generation-count 0)
            (external-store
              (funcall
@@ -1625,10 +1618,12 @@
               (lambda (size)
                 (incf external-key-generation-count)
                 (make-array size
-                            :element-type (quote (unsigned-byte 8))
+                            :element-type '(unsigned-byte 8)
                             :initial-element 201))))
            (owned-server nil)
            (external-server nil)
+           (initial-owned-store nil)
+           (current-owned-store nil)
            (owned-client nil)
            (external-client nil))
       (unwind-protect
@@ -1637,39 +1632,66 @@
                    (fdefinition
                     'cl-tls-kit:make-tls13-server-ticket-key-store)
                    (lambda (&rest arguments)
-                     (apply original-store-maker :random owned-random
-                            arguments)))
+                     (let ((store
+                             (apply original-store-maker
+                                    :random
+                                    (lambda (size)
+                                      (incf owned-key-generation-count)
+                                      (make-array
+                                       size
+                                       :element-type '(unsigned-byte 8)
+                                       :initial-element
+                                       owned-key-generation-count))
+                                    arguments)))
+                       (push store owned-stores)
+                       store)))
              (setf owned-server (%https-listener-make-server)
+                   initial-owned-store (first owned-stores)
                    external-server
                    (%https-listener-make-server
                     :ticket-key-store external-store))
-             (setf (fdefinition
-                    'cl-tls-kit:make-tls13-server-ticket-key-store)
-                   original-store-maker)
              (ensure-equal 1 owned-key-generation-count)
-             (ensure-equal 1 external-key-generation-count)
-             (setf clock-offset (* 13 60 60))
              (start-http-server owned-server)
-             (setf owned-client (%https-listener-connect owned-server))
+             (setf clock-offset (* 13 60 60)
+                   owned-client (%https-listener-connect owned-server))
              (close-http-tcp-stream owned-client)
              (setf owned-client nil)
              (%https-listener-wait
-              (lambda () (= 1 (%https-listener-session-count context))))
+              (lambda ()
+                (and (= 1 (%https-listener-session-count context))
+                     (zerop
+                      (%https-listener-connection-count owned-server)))))
              (ensure-equal 2 owned-key-generation-count)
-             (ensure-false
-              (= (first owned-key-materials)
-                 (second owned-key-materials)))
+             (setf current-owned-store (first owned-stores))
+             (ensure-false (eq initial-owned-store current-owned-store))
+             (signals error
+               (cl-tls-kit:rotate-tls13-server-ticket-key-store
+                initial-owned-store))
+             (ensure-true current-owned-store)
+             (setf clock-offset (* 26 60 60))
              (start-http-server external-server)
              (setf external-client (%https-listener-connect external-server))
              (close-http-tcp-stream external-client)
              (setf external-client nil)
              (%https-listener-wait
-              (lambda () (= 2 (%https-listener-session-count context))))
+              (lambda ()
+                (and (= 2 (%https-listener-session-count context))
+                     (zerop
+                      (%https-listener-connection-count external-server)))))
+             (ensure-equal 2 owned-key-generation-count)
              (ensure-equal 1 external-key-generation-count)
              (ensure-true
               (cl-tls-kit:tls13-server-ticket-key-store-p external-store))
              (stop-http-server owned-server :graceful-timeout 1)
-             (stop-http-server external-server :graceful-timeout 1))
+             (signals error
+               (cl-tls-kit:rotate-tls13-server-ticket-key-store
+                current-owned-store))
+             (stop-http-server external-server :graceful-timeout 1)
+             (ensure-true
+              (cl-tls-kit:tls13-server-ticket-key-store-p external-store))
+             (ensure-equal
+              external-store
+              (cl-tls-kit:rotate-tls13-server-ticket-key-store external-store)))
         (when (and owned-client (open-stream-p owned-client))
           (close-http-tcp-stream owned-client))
         (when (and external-client (open-stream-p external-client))
@@ -1682,7 +1704,98 @@
         (setf http-kit::*http-server-clock-function* original-clock
               (fdefinition
                'cl-tls-kit:make-tls13-server-ticket-key-store)
-              original-store-maker)))))
+              original-store-maker)
+        (dolist (store owned-stores)
+          (http-kit::%with-http-cleanup
+            (cl-tls-kit:destroy-tls13-server-ticket-key-store store)))
+        (http-kit::%with-http-cleanup
+          (cl-tls-kit:destroy-tls13-server-ticket-key-store external-store))))))
+#+sbcl
+(deftest https-listener-defers-retired-ticket-store-destruction-for-active-connections
+  (%with-https-listener-test-stubs (context)
+    (let* ((original-clock http-kit::*http-server-clock-function*)
+           (original-store-maker
+             (fdefinition 'cl-tls-kit:make-tls13-server-ticket-key-store))
+           (clock-offset 0.0d0)
+           (clock
+             (lambda ()
+               (+ clock-offset
+                  (/ (get-internal-real-time)
+                     internal-time-units-per-second))))
+           (stores nil)
+           (session-number 0)
+           (session-entered (sb-thread:make-semaphore :count 0))
+           (release-session (sb-thread:make-semaphore :count 0))
+           (server nil)
+           (old-client nil)
+           (rotation-client nil)
+           (old-store nil)
+           (current-store nil))
+      (unwind-protect
+           (progn
+             (setf http-kit::*http-server-clock-function* clock
+                   (%https-listener-test-context-session-action context)
+                   (lambda (protocol stream handler options)
+                     (declare (ignore protocol stream handler options))
+                     (let ((session-index
+                             (sb-thread:with-mutex
+                                 ((%https-listener-test-context-lock context))
+                               (incf session-number))))
+                       (when (= session-index 1)
+                         (sb-thread:signal-semaphore session-entered)
+                         (sb-thread:wait-on-semaphore release-session))))
+                   (fdefinition
+                    'cl-tls-kit:make-tls13-server-ticket-key-store)
+                   (lambda (&rest arguments)
+                     (let ((store (apply original-store-maker arguments)))
+                       (push store stores)
+                       store)))
+             (setf server (%https-listener-make-server)
+                   old-store (first stores))
+             (start-http-server server)
+             (setf old-client (%https-listener-connect server))
+             (ensure-true
+              (sb-thread:wait-on-semaphore session-entered :timeout 5))
+             (setf clock-offset (* 13 60 60)
+                   rotation-client (%https-listener-connect server))
+             (close-http-tcp-stream rotation-client)
+             (setf rotation-client nil)
+             (%https-listener-wait
+              (lambda ()
+                (and (= 2 (%https-listener-session-count context))
+                     (= 1 (%https-listener-connection-count server)))))
+             (ensure-equal 2 (length stores))
+             (setf current-store (first stores))
+             (ensure-false (eq old-store current-store))
+             (ensure-equal
+              old-store
+              (cl-tls-kit:rotate-tls13-server-ticket-key-store old-store))
+             (close-http-tcp-stream old-client)
+             (setf old-client nil)
+             (sb-thread:signal-semaphore release-session)
+             (%https-listener-wait
+              (lambda () (zerop (%https-listener-connection-count server))))
+             (signals error
+               (cl-tls-kit:rotate-tls13-server-ticket-key-store old-store))
+             (stop-http-server server :graceful-timeout 1)
+             (signals error
+               (cl-tls-kit:rotate-tls13-server-ticket-key-store current-store)))
+        (sb-thread:signal-semaphore release-session)
+        (when (and old-client (open-stream-p old-client))
+          (close-http-tcp-stream old-client))
+        (when (and rotation-client (open-stream-p rotation-client))
+          (close-http-tcp-stream rotation-client))
+        (when (and server
+                   (not (eq :stopped
+                            (http-kit::http-server-state server))))
+          (stop-http-server server :graceful-timeout 1))
+        (setf http-kit::*http-server-clock-function* original-clock
+              (fdefinition
+               'cl-tls-kit:make-tls13-server-ticket-key-store)
+              original-store-maker)
+        (dolist (store stores)
+          (http-kit::%with-http-cleanup
+            (cl-tls-kit:destroy-tls13-server-ticket-key-store store)))))))
 #+sbcl
 (deftest https-listener-does-not-report-stopped-while-handler-worker-runs
   (%with-https-listener-test-stubs (context)
@@ -1755,7 +1868,244 @@
              (ensure-true
               (eq store
                   (cl-tls-kit:rotate-tls13-server-ticket-key-store store))))
-        (stop-http-server server :graceful-timeout 1)))))
+        (stop-http-server server :graceful-timeout 1)
+        (http-kit::%with-http-cleanup
+          (cl-tls-kit:destroy-tls13-server-ticket-key-store store))))))
+#+sbcl
+(deftest https-listener-destroys-owned-ticket-store-through-public-stop
+  (%with-https-listener-test-stubs (context)
+    (ensure-true context)
+    (let* ((original-store-maker
+             (fdefinition 'cl-tls-kit:make-tls13-server-ticket-key-store))
+           (store nil)
+           (server nil))
+      (unwind-protect
+           (progn
+             (setf (fdefinition
+                    'cl-tls-kit:make-tls13-server-ticket-key-store)
+                   (lambda (&rest arguments)
+                     (setf store (apply original-store-maker arguments))))
+             (setf server (%https-listener-make-server))
+             (ensure-true store)
+             (start-http-server server)
+             (ensure-equal
+              server
+              (stop-http-server server :graceful-timeout 1))
+             (signals error
+               (cl-tls-kit:rotate-tls13-server-ticket-key-store store)))
+        (when (and server
+                   (not (eq :stopped
+                            (http-kit::http-server-state server))))
+          (stop-http-server server :graceful-timeout 1))
+        (setf (fdefinition
+               'cl-tls-kit:make-tls13-server-ticket-key-store)
+              original-store-maker)
+        (when store
+          (http-kit::%with-http-cleanup
+            (cl-tls-kit:destroy-tls13-server-ticket-key-store store)))))))
+#+sbcl
+(deftest https-listener-preserves-stop-error-when-ticket-store-destroy-fails
+  (%with-https-listener-test-stubs (context)
+    (ensure-true context)
+    (let* ((original-store-maker
+             (fdefinition 'cl-tls-kit:make-tls13-server-ticket-key-store))
+           (original-store-destroyer
+             (fdefinition 'cl-tls-kit:destroy-tls13-server-ticket-key-store))
+           (store nil)
+           (server nil)
+           (fail-stop-callback-p t)
+           (stop-error nil))
+      (unwind-protect
+           (progn
+             (setf (fdefinition
+                    'cl-tls-kit:make-tls13-server-ticket-key-store)
+                   (lambda (&rest arguments)
+                     (setf store (apply original-store-maker arguments)))
+                   (fdefinition
+                    'cl-tls-kit:destroy-tls13-server-ticket-key-store)
+                   (lambda (ignored-store)
+                     (declare (ignore ignored-store))
+                     (error "injected ticket store destruction failure")))
+             (setf server
+                   (%https-listener-make-server
+                    :on-event
+                    (lambda (event)
+                      (when (and fail-stop-callback-p
+                                 (eq :listener-stopping
+                                     (getf event :type)))
+                        (setf fail-stop-callback-p nil)
+                        (error "injected listener stop callback failure")))))
+             (start-http-server server)
+             (setf stop-error
+                   (handler-case
+                       (progn
+                         (stop-http-server server :graceful-timeout 1)
+                         nil)
+                     (error (condition) condition)))
+             (ensure-true (typep stop-error 'http-server-callback-error))
+             (ensure-equal :event-callback-failed
+                           (http-server-error-reason-code stop-error))
+             (ensure-true store))
+        (setf fail-stop-callback-p nil
+              (fdefinition 'cl-tls-kit:make-tls13-server-ticket-key-store)
+              original-store-maker
+              (fdefinition
+               'cl-tls-kit:destroy-tls13-server-ticket-key-store)
+              original-store-destroyer)
+        (when (and server
+                   (not (eq :stopped
+                            (http-kit::http-server-state server))))
+          (stop-http-server server :graceful-timeout 1))
+        (when store
+          (http-kit::%with-http-cleanup
+            (cl-tls-kit:destroy-tls13-server-ticket-key-store store)))))))
+#+sbcl
+(deftest https-listener-destroys-owned-ticket-store-if-wrapper-construction-fails
+  (%with-https-listener-test-stubs (context)
+    (ensure-true context)
+    (let* ((original-store-maker
+             (fdefinition 'cl-tls-kit:make-tls13-server-ticket-key-store))
+           (original-wrapper-maker
+             (fdefinition 'http-kit/tls:make-http-tls-server-wrapper))
+           (store nil))
+      (unwind-protect
+           (progn
+             (setf (fdefinition
+                    'cl-tls-kit:make-tls13-server-ticket-key-store)
+                   (lambda (&rest arguments)
+                     (setf store (apply original-store-maker arguments)))
+                   (fdefinition 'http-kit/tls:make-http-tls-server-wrapper)
+                   (lambda (&rest arguments)
+                     (declare (ignore arguments))
+                     (error "injected TLS wrapper construction failure")))
+             (signals http-server-error
+               (%https-listener-make-server))
+             (ensure-true store)
+             (signals error
+               (cl-tls-kit:rotate-tls13-server-ticket-key-store store)))
+        (setf (fdefinition 'cl-tls-kit:make-tls13-server-ticket-key-store)
+              original-store-maker
+              (fdefinition 'http-kit/tls:make-http-tls-server-wrapper)
+              original-wrapper-maker)
+        (when store
+          (http-kit::%with-http-cleanup
+            (cl-tls-kit:destroy-tls13-server-ticket-key-store store)))))))
+#+sbcl
+(deftest https-listener-destroys-uninstalled-restart-ticket-store
+  (%with-https-listener-test-stubs (context)
+    (ensure-true context)
+    (let* ((original-store-maker
+             (fdefinition 'cl-tls-kit:make-tls13-server-ticket-key-store))
+           (original-wrapper-maker
+             (fdefinition 'http-kit/tls:make-http-tls-server-wrapper))
+           (stores nil)
+           (server nil))
+      (unwind-protect
+           (progn
+             (setf (fdefinition
+                    'cl-tls-kit:make-tls13-server-ticket-key-store)
+                   (lambda (&rest arguments)
+                     (let ((store (apply original-store-maker arguments)))
+                       (push store stores)
+                       store)))
+             (setf server (%https-listener-make-server))
+             (ensure-equal 1 (length stores))
+             (start-http-server server)
+             (ensure-equal
+              server
+              (stop-http-server server :graceful-timeout 1))
+             (signals error
+               (cl-tls-kit:rotate-tls13-server-ticket-key-store
+                (first stores)))
+             (setf (fdefinition 'http-kit/tls:make-http-tls-server-wrapper)
+                   (lambda (&rest arguments)
+                     (declare (ignore arguments))
+                     (error "injected restart TLS wrapper construction failure")))
+             (signals http-server-error
+               (start-http-server server))
+             (ensure-equal 2 (length stores))
+             (signals error
+               (cl-tls-kit:rotate-tls13-server-ticket-key-store
+                (second stores))))
+        (setf (fdefinition 'cl-tls-kit:make-tls13-server-ticket-key-store)
+              original-store-maker
+              (fdefinition 'http-kit/tls:make-http-tls-server-wrapper)
+              original-wrapper-maker)
+        (when (and server
+                   (not (eq :stopped
+                            (http-kit::http-server-state server))))
+          (stop-http-server server :graceful-timeout 1))
+        (dolist (store stores)
+          (http-kit::%with-http-cleanup
+            (cl-tls-kit:destroy-tls13-server-ticket-key-store store)))))))
+#+sbcl
+(deftest https-listener-destroys-uninstalled-rotation-ticket-store
+  (%with-https-listener-test-stubs (context)
+    (ensure-true context)
+    (let* ((original-clock http-kit::*http-server-clock-function*)
+           (original-store-maker
+             (fdefinition 'cl-tls-kit:make-tls13-server-ticket-key-store))
+           (original-wrapper-maker
+             (fdefinition 'http-kit/tls:make-http-tls-server-wrapper))
+           (clock-offset 0.0d0)
+           (clock
+             (lambda ()
+               (+ clock-offset
+                  (/ (get-internal-real-time)
+                     internal-time-units-per-second))))
+           (stores nil)
+           (server nil)
+           (client nil))
+      (unwind-protect
+           (progn
+             (setf http-kit::*http-server-clock-function* clock
+                   (fdefinition
+                    'cl-tls-kit:make-tls13-server-ticket-key-store)
+                   (lambda (&rest arguments)
+                     (let ((store (apply original-store-maker arguments)))
+                       (push store stores)
+                       store)))
+             (setf server (%https-listener-make-server))
+             (ensure-equal 1 (length stores))
+             (start-http-server server)
+             (setf clock-offset (* 13 60 60)
+                   (fdefinition 'http-kit/tls:make-http-tls-server-wrapper)
+                   (lambda (&rest arguments)
+                     (declare (ignore arguments))
+                     (error "injected rotation wrapper construction failure"))
+                   client (%https-listener-connect server))
+             (close-http-tcp-stream client)
+             (setf client nil)
+             (%https-listener-wait
+              (lambda () (zerop (%https-listener-connection-count server))))
+             (ensure-equal 2 (length stores))
+             (let ((replacement-store (first stores))
+                   (initial-store (second stores)))
+               (ensure-equal
+                initial-store
+                (cl-tls-kit:rotate-tls13-server-ticket-key-store initial-store))
+               (signals error
+                 (cl-tls-kit:rotate-tls13-server-ticket-key-store
+                  replacement-store))
+               (stop-http-server server :graceful-timeout 1)
+               (signals error
+                 (cl-tls-kit:rotate-tls13-server-ticket-key-store
+                  initial-store))))
+        (when (and client (open-stream-p client))
+          (close-http-tcp-stream client))
+        (setf http-kit::*http-server-clock-function* original-clock
+              (fdefinition
+               'cl-tls-kit:make-tls13-server-ticket-key-store)
+              original-store-maker
+              (fdefinition 'http-kit/tls:make-http-tls-server-wrapper)
+              original-wrapper-maker)
+        (when (and server
+                   (not (eq :stopped
+                            (http-kit::http-server-state server))))
+          (stop-http-server server :graceful-timeout 1))
+        (dolist (store stores)
+          (http-kit::%with-http-cleanup
+            (cl-tls-kit:destroy-tls13-server-ticket-key-store store)))))))
 #+sbcl
 (deftest https-listener-stop-joins-aborted-shutdown-coordinator
   (%with-https-listener-test-stubs (context)

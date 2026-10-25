@@ -25,6 +25,8 @@
   ticket-key-store
   ticket-key-store-owned-p
   ticket-key-rotation-deadline
+  (retired-ticket-key-stores nil)
+  (ticket-key-store-users (make-hash-table :test (function eq)))
   tls-wrapper
   max-connections
   max-handshakes
@@ -64,6 +66,7 @@
              (:constructor %make-http-server-connection))
   raw-stream
   tls-stream
+  ticket-key-store
   (handshake-p t)
   (closed-p nil)
   peer-address
@@ -137,44 +140,113 @@
 (progn
   (defconstant +http-server-ticket-key-rotation-interval+ (* 12 60 60))
 
-  (defun %http-server-rotate-ticket-key-store-if-due (server)
-    (%with-http-server-lock (server)
-      (let ((store (http-server-ticket-key-store server))
-            (deadline (http-server-ticket-key-rotation-deadline server)))
-        (when (and (http-server-ticket-key-store-owned-p server)
-                   store
-                   (or (null deadline)
-                       (>= (%http-server-now) deadline)))
-          (cl-tls-kit:rotate-tls13-server-ticket-key-store store)
-          (setf (http-server-ticket-key-rotation-deadline server)
-                (+ (%http-server-now)
-                   +http-server-ticket-key-rotation-interval+))
-          t))))
+  (defun %http-server-destroy-ticket-key-stores (stores)
+    (dolist (store stores)
+      (%with-http-cleanup
+        (cl-tls-kit:destroy-tls13-server-ticket-key-store store)))
+    nil)
+
+  (defun %http-server-take-retired-ticket-key-store (server store)
+    (when (and (zerop
+                (gethash store (http-server-ticket-key-store-users server) 0))
+               (member store (http-server-retired-ticket-key-stores server)
+                       :test #'eq))
+      (remhash store (http-server-ticket-key-store-users server))
+      (setf (http-server-retired-ticket-key-stores server)
+            (delete store (http-server-retired-ticket-key-stores server)
+                    :test #'eq))
+      store))
+
+  (defun %http-server-rotate-ticket-key-store-if-due (server connection)
+    (let ((stores-to-destroy nil)
+          (wrapper nil))
+      (%with-http-server-lock (server)
+        (let* ((store (http-server-ticket-key-store server))
+               (deadline (http-server-ticket-key-rotation-deadline server))
+               (now (%http-server-now)))
+          (when (and (http-server-ticket-key-store-owned-p server)
+                     store
+                     (or (null deadline) (>= now deadline)))
+            (let ((replacement-store (%http-server-new-ticket-key-store))
+                  (replacement-wrapper nil)
+                  (installed-p nil))
+              (unwind-protect
+                   (progn
+                     (setf replacement-wrapper
+                           (%http-server-make-tls-wrapper
+                            (http-server-certificate-chain server)
+                            (http-server-private-key server)
+                            replacement-store))
+                     (push store
+                           (http-server-retired-ticket-key-stores server))
+                     (setf (http-server-ticket-key-store server)
+                           replacement-store
+                           (http-server-tls-wrapper server)
+                           replacement-wrapper
+                           (http-server-ticket-key-rotation-deadline server)
+                           (+ now
+                              +http-server-ticket-key-rotation-interval+))
+                     (when (zerop
+                            (gethash store
+                                     (http-server-ticket-key-store-users server)
+                                     0))
+                       (setf stores-to-destroy
+                             (list
+                              (%http-server-take-retired-ticket-key-store
+                               server store))))
+                     (setf installed-p t))
+                (unless installed-p
+                  (%with-http-cleanup
+                    (cl-tls-kit:destroy-tls13-server-ticket-key-store
+                     replacement-store))))))
+          (setf wrapper (http-server-tls-wrapper server))
+          (when (http-server-ticket-key-store-owned-p server)
+            (setf (%http-server-connection-ticket-key-store connection)
+                  (http-server-ticket-key-store server))
+            (incf
+             (gethash (http-server-ticket-key-store server)
+                      (http-server-ticket-key-store-users server)
+                      0)))))
+      (%http-server-destroy-ticket-key-stores stores-to-destroy)
+      wrapper))
 
   (defun %http-server-ensure-owned-ticket-key-store (server)
     (%with-http-server-lock (server)
       (when (and (http-server-ticket-key-store-owned-p server)
                  (null (http-server-ticket-key-store server)))
-        (let* ((store (%http-server-new-ticket-key-store))
-               (wrapper
-                 (%http-server-make-tls-wrapper
-                  (http-server-certificate-chain server)
-                  (http-server-private-key server)
-                  store)))
-          (setf (http-server-ticket-key-store server) store
-                (http-server-tls-wrapper server) wrapper
-                (http-server-ticket-key-rotation-deadline server)
-                (+ (%http-server-now)
-                   +http-server-ticket-key-rotation-interval+)))))
+        (let ((store (%http-server-new-ticket-key-store))
+              (installed-p nil))
+          (unwind-protect
+               (let ((wrapper
+                       (%http-server-make-tls-wrapper
+                        (http-server-certificate-chain server)
+                        (http-server-private-key server)
+                        store)))
+                 (setf (http-server-ticket-key-store server) store
+                       (http-server-tls-wrapper server) wrapper
+                       (http-server-ticket-key-rotation-deadline server)
+                       (+ (%http-server-now)
+                          +http-server-ticket-key-rotation-interval+))
+                 (setf installed-p t))
+            (unless installed-p
+              (%with-http-cleanup
+                (cl-tls-kit:destroy-tls13-server-ticket-key-store store)))))))
     server)
 
   (defun %http-server-release-owned-ticket-key-store (server)
-    ;; cl-tls-kit exposes no server-store destruction API, so this only drops references.
-    (%with-http-server-lock (server)
-      (when (http-server-ticket-key-store-owned-p server)
-        (setf (http-server-ticket-key-store server) nil
-              (http-server-tls-wrapper server) nil
-              (http-server-ticket-key-rotation-deadline server) nil)))
+    (let ((stores nil))
+      (%with-http-server-lock (server)
+        (when (http-server-ticket-key-store-owned-p server)
+          (setf stores
+                (remove nil
+                        (cons (http-server-ticket-key-store server)
+                              (http-server-retired-ticket-key-stores server)))
+                (http-server-ticket-key-store server) nil
+                (http-server-retired-ticket-key-stores server) nil
+                (http-server-tls-wrapper server) nil
+                (http-server-ticket-key-rotation-deadline server) nil)
+          (clrhash (http-server-ticket-key-store-users server))))
+      (%http-server-destroy-ticket-key-stores stores))
     server))
 
 (defun make-http-server
@@ -229,32 +301,43 @@
     (%http-server-configuration-error :invalid-ticket-key-store))
   (let* ((owned-p (null ticket-key-store))
          (store (or ticket-key-store (%http-server-new-ticket-key-store)))
-         (wrapper (%http-server-make-tls-wrapper
-                   certificate-chain private-key store)))
-    (%make-http-server
-     :host host
-     :port port
-     :handler handler
-     :certificate-chain certificate-chain
-     :private-key private-key
-     :ticket-key-store store
-     :ticket-key-store-owned-p owned-p
-     :ticket-key-rotation-deadline
-     (+ (%http-server-now) +http-server-ticket-key-rotation-interval+)
-     :tls-wrapper wrapper
-     :max-connections max-connections
-     :max-handshakes max-handshakes
-     :max-concurrent-streams max-concurrent-streams
-     :handshake-timeout handshake-timeout
-     :request-timeout request-timeout
-     :idle-timeout idle-timeout
-     :graceful-timeout graceful-timeout
-     :max-header-bytes max-header-bytes
-     :max-fields max-fields
-     :max-body-bytes max-body-bytes
-     :max-buffered-body-bytes max-buffered-body-bytes
-     :on-event on-event
-     :on-error on-error)))
+         (wrapper nil)
+         (server nil))
+    (unwind-protect
+         (progn
+           (setf wrapper
+                 (%http-server-make-tls-wrapper
+                  certificate-chain private-key store))
+           (setf server
+                 (%make-http-server
+                  :host host
+                  :port port
+                  :handler handler
+                  :certificate-chain certificate-chain
+                  :private-key private-key
+                  :ticket-key-store store
+                  :ticket-key-store-owned-p owned-p
+                  :ticket-key-rotation-deadline
+                  (+ (%http-server-now)
+                     +http-server-ticket-key-rotation-interval+)
+                  :tls-wrapper wrapper
+                  :max-connections max-connections
+                  :max-handshakes max-handshakes
+                  :max-concurrent-streams max-concurrent-streams
+                  :handshake-timeout handshake-timeout
+                  :request-timeout request-timeout
+                  :idle-timeout idle-timeout
+                  :graceful-timeout graceful-timeout
+                  :max-header-bytes max-header-bytes
+                  :max-fields max-fields
+                  :max-body-bytes max-body-bytes
+                  :max-buffered-body-bytes max-buffered-body-bytes
+                  :on-event on-event
+                  :on-error on-error))
+           server)
+      (when (and owned-p (null server))
+        (%with-http-cleanup
+          (cl-tls-kit:destroy-tls13-server-ticket-key-store store))))))
 
 (defun %http-server-callback-condition (callback phase)
   (make-condition 'http-server-callback-error
@@ -427,14 +510,24 @@
   nil)
 
 (defun %http-server-release-connection (server connection)
-  (%with-http-server-lock (server)
-    (when (gethash connection (http-server-connections server))
-      (remhash connection (http-server-connections server))
-      (when (%http-server-connection-handshake-p connection)
-        (setf (%http-server-connection-handshake-p connection) nil)
-        (decf (http-server-handshake-count server)))
-      (decf (http-server-connection-count server))
-      (%http-server-broadcast server)))
+  (let ((store-to-destroy nil))
+    (%with-http-server-lock (server)
+      (when (gethash connection (http-server-connections server))
+        (remhash connection (http-server-connections server))
+        (when (%http-server-connection-handshake-p connection)
+          (setf (%http-server-connection-handshake-p connection) nil)
+          (decf (http-server-handshake-count server)))
+        (let ((store (%http-server-connection-ticket-key-store connection)))
+          (when store
+            (setf (%http-server-connection-ticket-key-store connection) nil)
+            (decf (gethash store
+                           (http-server-ticket-key-store-users server)))
+            (setf store-to-destroy
+                  (%http-server-take-retired-ticket-key-store server store))))
+        (decf (http-server-connection-count server))
+        (%http-server-broadcast server)))
+    (%http-server-destroy-ticket-key-stores
+     (and store-to-destroy (list store-to-destroy))))
   nil)
 
 (defun %http-server-reserve-connection
@@ -563,9 +656,9 @@
     (unwind-protect
          (handler-case
              (progn
-               (%http-server-rotate-ticket-key-store-if-due server)
                (setf tls-stream
-                     (funcall (http-server-tls-wrapper server)
+                     (funcall (%http-server-rotate-ticket-key-store-if-due
+                               server connection)
                               raw-stream
                               :timeout (http-server-handshake-timeout server)
                               :deadline

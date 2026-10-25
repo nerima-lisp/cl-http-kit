@@ -997,14 +997,20 @@ and `http-server-error-phase` expose safe error metadata, while
 `http-server-callback-error-callback` identifies whether `:on-event` or
 `:on-error` failed.
 
-Each server creates its own ticket-key store by default. Pass a store created
-with `cl-tls-kit:make-tls13-server-ticket-key-store` to multiple server
-instances to share their TLS 1.3 session-ticket keys. Each instance still
-enforces its own connection and handshake limits. A server automatically
-rotates only a store it created, on the first TLS connection after each
-12-hour interval. The caller that supplies a store is responsible for rotating
-it with `cl-tls-kit:rotate-tls13-server-ticket-key-store` and coordinating
-that rotation across every server that shares the store.
+Each server creates and owns a ticket-key store by default. On the first TLS
+connection after each 12-hour interval, the server replaces its owned store
+and, after all connections using it finish, zeroizes the previous store's keys
+and destroys the store. TLS session tickets encrypted with the previous store
+cannot resume after rotation. The server also zeroizes its owned store's keys
+and destroys the store when it stops.
+
+Pass a store created with `cl-tls-kit:make-tls13-server-ticket-key-store` to
+multiple server instances to share their TLS 1.3 session-ticket keys. Each
+instance still enforces its own connection and handshake limits. A server does
+not rotate or destroy a supplied store. The caller must rotate it with
+`cl-tls-kit:rotate-tls13-server-ticket-key-store`, coordinate that rotation
+across every server that shares the store, and stop those servers before
+destroying the store.
 
 ## TLS package
 
