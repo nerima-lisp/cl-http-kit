@@ -1728,6 +1728,7 @@
            (release-session (sb-thread:make-semaphore :count 0))
            (server nil)
            (old-client nil)
+           (second-old-client nil)
            (rotation-client nil)
            (old-store nil)
            (current-store nil))
@@ -1741,7 +1742,7 @@
                              (sb-thread:with-mutex
                                  ((%https-listener-test-context-lock context))
                                (incf session-number))))
-                       (when (= session-index 1)
+                       (when (<= session-index 2)
                          (sb-thread:signal-semaphore session-entered)
                          (sb-thread:wait-on-semaphore release-session))))
                    (fdefinition
@@ -1756,22 +1757,30 @@
              (setf old-client (%https-listener-connect server))
              (ensure-true
               (sb-thread:wait-on-semaphore session-entered :timeout 5))
+             (setf second-old-client (%https-listener-connect server))
+             (ensure-true
+              (sb-thread:wait-on-semaphore session-entered :timeout 5))
              (setf clock-offset (* 13 60 60)
                    rotation-client (%https-listener-connect server))
              (close-http-tcp-stream rotation-client)
              (setf rotation-client nil)
              (%https-listener-wait
               (lambda ()
-                (and (= 2 (%https-listener-session-count context))
-                     (= 1 (%https-listener-connection-count server)))))
+                (and (= 3 (%https-listener-session-count context))
+                     (= 2 (%https-listener-connection-count server)))))
              (ensure-equal 2 (length stores))
              (setf current-store (first stores))
              (ensure-false (eq old-store current-store))
+             (close-http-tcp-stream old-client)
+             (setf old-client nil)
+             (sb-thread:signal-semaphore release-session)
+             (%https-listener-wait
+              (lambda () (= 1 (%https-listener-connection-count server))))
              (ensure-equal
               old-store
               (cl-tls-kit:rotate-tls13-server-ticket-key-store old-store))
-             (close-http-tcp-stream old-client)
-             (setf old-client nil)
+             (close-http-tcp-stream second-old-client)
+             (setf second-old-client nil)
              (sb-thread:signal-semaphore release-session)
              (%https-listener-wait
               (lambda () (zerop (%https-listener-connection-count server))))
@@ -1781,8 +1790,11 @@
              (signals error
                (cl-tls-kit:rotate-tls13-server-ticket-key-store current-store)))
         (sb-thread:signal-semaphore release-session)
+        (sb-thread:signal-semaphore release-session)
         (when (and old-client (open-stream-p old-client))
           (close-http-tcp-stream old-client))
+        (when (and second-old-client (open-stream-p second-old-client))
+          (close-http-tcp-stream second-old-client))
         (when (and rotation-client (open-stream-p rotation-client))
           (close-http-tcp-stream rotation-client))
         (when (and server
