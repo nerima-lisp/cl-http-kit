@@ -1479,21 +1479,30 @@
         (sb-ext:without-package-locks
           (setf (fdefinition thread-maker) original))))
     (let* ((thread-maker 'sb-thread:make-thread)
-           (original (fdefinition thread-maker))
+           (original-thread-maker (fdefinition thread-maker))
+           (acceptor 'http-kit/network:accept-http-tcp-stream)
+           (original-acceptor (fdefinition acceptor))
            (worker-start-failed-p nil)
+           (accepted-stream nil)
            (server (%https-listener-make-server))
            (client nil))
       (unwind-protect
            (progn
              (sb-ext:without-package-locks
-               (setf (fdefinition thread-maker)
+               (setf (fdefinition acceptor)
+                     (lambda (listener)
+                       (multiple-value-bind (stream peer-address peer-port)
+                           (funcall original-acceptor listener)
+                         (setf accepted-stream stream)
+                         (values stream peer-address peer-port)))
+                     (fdefinition thread-maker)
                      (lambda (&rest arguments)
                        (if (equal (getf (cdr arguments) :name)
                                   "http server connection")
                            (progn
                              (setf worker-start-failed-p t)
                              (error "worker thread creation failure"))
-                           (apply original arguments)))))
+                           (apply original-thread-maker arguments)))))
              (start-http-server server)
              (setf client (%https-listener-connect server))
              (close-http-tcp-stream client)
@@ -1502,12 +1511,18 @@
              (ensure-true worker-start-failed-p)
              (ensure-equal :worker-start-failed
                            (http-server-error-reason-code
-                            (http-server-failure server))))
+                            (http-server-failure server)))
+             (ensure-true accepted-stream)
+             (ensure-false (open-stream-p accepted-stream))
+             (ensure-equal 0 (%https-listener-connection-count server))
+             (ensure-equal 0 (%https-listener-handshake-count server)))
         (sb-ext:without-package-locks
-          (setf (fdefinition thread-maker) original))
+          (setf (fdefinition thread-maker) original-thread-maker
+                (fdefinition acceptor) original-acceptor))
         (when client
           (close-http-tcp-stream client))
         (stop-http-server server :graceful-timeout 1)))))
+
 #+sbcl
 (deftest https-listener-stop-sets-deadline-during-startup-error-callback
   (%with-https-listener-test-stubs (context)
