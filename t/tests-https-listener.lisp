@@ -1925,6 +1925,8 @@
              (fdefinition 'cl-tls-kit:destroy-tls13-server-ticket-key-store))
            (store nil)
            (server nil)
+           (destroy-attempts 0)
+           (cleanup-error-reported-p nil)
            (fail-stop-callback-p t)
            (stop-error nil))
       (unwind-protect
@@ -1935,10 +1937,12 @@
                      (setf store (apply original-store-maker arguments)))
                    (fdefinition
                     'cl-tls-kit:destroy-tls13-server-ticket-key-store)
-                   (lambda (ignored-store)
-                     (declare (ignore ignored-store))
-                     (error "injected ticket store destruction failure")))
-             (setf server
+                   (lambda (candidate)
+                     (incf destroy-attempts)
+                     (if (= destroy-attempts 1)
+                         (error "injected ticket store destruction failure")
+                         (funcall original-store-destroyer candidate)))
+                   server
                    (%https-listener-make-server
                     :on-event
                     (lambda (event)
@@ -1946,7 +1950,13 @@
                                  (eq :listener-stopping
                                      (getf event :type)))
                         (setf fail-stop-callback-p nil)
-                        (error "injected listener stop callback failure")))))
+                        (error "injected listener stop callback failure")))
+                    :on-error
+                    (lambda (condition details)
+                      (declare (ignore details))
+                      (when (eq :ticket-key-store-destroy-failed
+                                (http-server-error-reason-code condition))
+                        (setf cleanup-error-reported-p t)))))
              (start-http-server server)
              (setf stop-error
                    (handler-case
@@ -1957,7 +1967,22 @@
              (ensure-true (typep stop-error 'http-server-callback-error))
              (ensure-equal :event-callback-failed
                            (http-server-error-reason-code stop-error))
-             (ensure-true store))
+             (ensure-true cleanup-error-reported-p)
+             (ensure-equal 1 destroy-attempts)
+             (ensure-equal
+              store
+              (http-kit::http-server-ticket-key-store server))
+             (ensure-equal
+              :ticket-key-store-destroy-failed
+              (http-server-error-reason-code
+               (http-kit::http-server-ticket-key-store-cleanup-error server)))
+             (ensure-equal server
+                           (stop-http-server server :graceful-timeout 1))
+             (ensure-equal 2 destroy-attempts)
+             (ensure-false
+              (http-kit::http-server-ticket-key-store server))
+             (ensure-false
+              (http-kit::http-server-ticket-key-store-cleanup-error server)))
         (setf fail-stop-callback-p nil
               (fdefinition 'cl-tls-kit:make-tls13-server-ticket-key-store)
               original-store-maker
@@ -1968,7 +1993,8 @@
                    (not (eq :stopped
                             (http-kit::http-server-state server))))
           (stop-http-server server :graceful-timeout 1))
-        (when store
+        (when (and store
+                   (cl-tls-kit:tls13-server-ticket-key-store-p store))
           (http-kit::%with-http-cleanup
             (cl-tls-kit:destroy-tls13-server-ticket-key-store store)))))))
 #+sbcl
@@ -2422,4 +2448,222 @@
       (unless (eq :stopped (http-kit::http-server-state server))
         (stop-http-server server :graceful-timeout 2))
       (%tls-server-test-remove-material material))))
+#+sbcl
+(deftest https-listener-does-not-create-ticket-store-after-start-is-stopped
+  (%with-https-listener-test-stubs (context)
+    (ensure-true context)
+    (let* ((original-store-maker
+             (fdefinition 'cl-tls-kit:make-tls13-server-ticket-key-store))
+           (original-start-listener
+             (fdefinition 'http-kit::%http-server-start-listener))
+           (stores nil)
+           (start-entered (sb-thread:make-semaphore :count 0))
+           (release-start (sb-thread:make-semaphore :count 0))
+           (server nil)
+           (start-thread nil)
+           (start-result nil)
+           (start-error nil))
+      (unwind-protect
+           (progn
+             (setf (fdefinition
+                    'cl-tls-kit:make-tls13-server-ticket-key-store)
+                   (lambda (&rest arguments)
+                     (let ((store (apply original-store-maker arguments)))
+                       (push store stores)
+                       store))
+                   server (%https-listener-make-server))
+             (ensure-equal 1 (length stores))
+             (setf (fdefinition 'http-kit::%http-server-start-listener)
+                   (lambda (candidate start-token)
+                     (sb-thread:signal-semaphore start-entered)
+                     (unless (sb-thread:wait-on-semaphore release-start
+                                                           :timeout 5)
+                       (error "Timed out waiting to release stale startup."))
+                     (funcall original-start-listener candidate start-token)))
+             (setf start-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (handler-case
+                          (setf start-result (start-http-server server))
+                        (error (condition)
+                          (setf start-error condition))))
+                    :name "ticket store stale startup test"))
+             (ensure-true
+              (sb-thread:wait-on-semaphore start-entered :timeout 5))
+             (ensure-equal
+              server
+              (stop-http-server server :graceful-timeout 1))
+             (ensure-false (http-kit::http-server-ticket-key-store server))
+             (sb-thread:signal-semaphore release-start)
+             (sb-thread:join-thread start-thread :timeout 5 :default nil)
+             (ensure-false (sb-thread:thread-alive-p start-thread))
+             (ensure-false start-error)
+             (ensure-equal server start-result)
+             (ensure-equal 1 (length stores)))
+        (sb-thread:signal-semaphore release-start)
+        (when (and start-thread (sb-thread:thread-alive-p start-thread))
+          (sb-thread:join-thread start-thread :timeout 5 :default nil))
+        (setf (fdefinition 'cl-tls-kit:make-tls13-server-ticket-key-store)
+              original-store-maker
+              (fdefinition 'http-kit::%http-server-start-listener)
+              original-start-listener)
+        (when (and server
+                   (not (eq :stopped (http-kit::http-server-state server))))
+          (stop-http-server server :graceful-timeout 1))
+        (dolist (store stores)
+          (when (cl-tls-kit:tls13-server-ticket-key-store-p store)
+            (http-kit::%with-http-cleanup
+              (cl-tls-kit:destroy-tls13-server-ticket-key-store store))))))))
+#+sbcl
+(deftest https-listener-bounds-blocked-close-notify-by-stop-deadline
+  (let* ((material (%tls-server-test-material))
+         (close-notify-entered (sb-thread:make-semaphore :count 0))
+         (close-notify-transport nil)
+         (force-close-at nil)
+         (force-close-deadline nil)
+         (original-close-notify
+           (fdefinition 'http-kit/tls::%tls-server-send-close-notify))
+         (original-force-close
+           (fdefinition 'http-kit::%http-server-force-close-connections))
+         (graceful-timeout 0.1)
+         (server
+           (make-http-server
+            :host "127.0.0.1"
+            :port 0
+            :handler (lambda (request)
+                       (declare (ignore request))
+                       (make-http-response :status 204))
+            :certificate-chain (getf material :certificate-chain)
+            :private-key (getf material :private-key)
+            :handshake-timeout 5
+            :request-timeout 5
+            :idle-timeout 5
+            :graceful-timeout graceful-timeout))
+         (transport nil)
+         (tls-stream nil))
+    (unwind-protect
+         (progn
+           (sb-ext:without-package-locks
+             (setf (fdefinition 'http-kit/tls::%tls-server-send-close-notify)
+                   (lambda (state)
+                     (setf close-notify-transport
+                           (http-kit/tls::http-tls-server-state-transport-stream
+                            state))
+                     (sb-thread:signal-semaphore close-notify-entered)
+                     (let ((deadline
+                             (+ (get-internal-real-time)
+                                (* 5 internal-time-units-per-second))))
+                       (loop while (open-stream-p close-notify-transport)
+                             do (when (>= (get-internal-real-time) deadline)
+                                  (error "Timed out waiting for TLS transport abort."))
+                                (sleep 0.005)))
+                     t)))
+           (sb-ext:without-package-locks
+             (setf (fdefinition
+                    'http-kit::%http-server-force-close-connections)
+                   (lambda (candidate)
+                     (unless force-close-at
+                       (setf force-close-deadline
+                             (http-kit::%http-server-stop-deadline candidate)
+                             force-close-at (http-kit::%http-server-now)))
+                     (funcall original-force-close candidate))))
+           (start-http-server server)
+           (setf transport
+                 (open-http-tcp-stream
+                  (make-http-request
+                   :method "GET"
+                   :uri (format nil "http://127.0.0.1:~D/"
+                                (http-server-port server)))
+                  :timeout 5))
+           (setf tls-stream
+                 (funcall
+                  (%https-listener-real-tls-upgrader material)
+                  transport
+                  (parse-http-uri
+                   (format nil "https://localhost:~D/"
+                           (http-server-port server)))
+                  :timeout 5))
+           (write-sequence
+            (ascii "GET / HTTP/1.1|CRLF|Host: localhost|CRLF|Connection: close|CRLF||CRLF|")
+            tls-stream)
+           (finish-output tls-stream)
+           (ensure-true
+            (sb-thread:wait-on-semaphore close-notify-entered :timeout 5))
+           (ensure-equal server (stop-http-server server))
+           (ensure-false (open-stream-p close-notify-transport))
+           ;; A blocked close_notify must be released only after the stored
+           ;; stop deadline causes the coordinator to abort the raw transport.
+           (ensure-true force-close-at)
+           (ensure-true force-close-deadline)
+           (ensure-true (>= force-close-at force-close-deadline)))
+      (sb-ext:without-package-locks
+        (setf (fdefinition 'http-kit/tls::%tls-server-send-close-notify)
+              original-close-notify
+              (fdefinition 'http-kit::%http-server-force-close-connections)
+              original-force-close))
+      (when (and tls-stream (open-stream-p tls-stream))
+        (close tls-stream :abort t))
+      (when (and transport (open-stream-p transport))
+        (close-http-tcp-stream transport))
+      (unless (eq :stopped (http-kit::http-server-state server))
+        (stop-http-server server :graceful-timeout 1))
+      (%tls-server-test-remove-material material))))
+#+sbcl
+(deftest https-listener-aborts-http2-after-size-limit
+  (%with-https-listener-test-stubs (context)
+    (let* ((server (%https-listener-make-server))
+           (raw-stream (make-string-input-stream "raw"))
+           (original-close
+             (fdefinition 'http-kit::%http-server-close-connection-stream))
+           (connection nil)
+           (session-called-p nil)
+           (close-abort nil)
+           (termination
+             (make-condition 'http-size-limit-exceeded
+                             :message "request field limit exceeded"
+                             :kind :fields
+                             :limit 3
+                             :observed 4)))
+      (unwind-protect
+           (progn
+             (setf (http-kit::http-server-state server) :running
+                   (%https-listener-test-context-alpn context) "h2"
+                   (%https-listener-test-context-session-action context)
+                   (lambda (protocol stream handler options)
+                     (declare (ignore stream handler options))
+                     (setf session-called-p (eq protocol :http2))
+                     (values 0 termination)))
+             (sb-ext:without-package-locks
+               (setf (fdefinition
+                      'http-kit::%http-server-close-connection-stream)
+                     (lambda (candidate connection &key (abort t))
+                       (setf close-abort abort)
+                       (funcall original-close candidate connection
+                                :abort abort))))
+             (multiple-value-bind (reserved rejection)
+                 (http-kit::%http-server-reserve-connection
+                  server nil raw-stream "127.0.0.1" 1234)
+               (ensure-false rejection)
+               (setf connection reserved))
+             (http-kit::%http-server-run-connection server connection)
+             (ensure-true session-called-p)
+             (ensure-equal t close-abort)
+             (ensure-false (open-stream-p raw-stream))
+             (ensure-equal 0 (http-kit::http-server-connection-count server))
+             (ensure-equal :http2
+                           (first
+                            (first
+                             (%https-listener-test-context-session-calls
+                              context)))))
+        (sb-ext:without-package-locks
+          (setf (fdefinition
+                 'http-kit::%http-server-close-connection-stream)
+                original-close))
+        (when (open-stream-p raw-stream)
+          (close raw-stream :abort t))
+        (unless (eq :stopped (http-kit::http-server-state server))
+          (stop-http-server server :graceful-timeout 1))))))
+
+
+
 
