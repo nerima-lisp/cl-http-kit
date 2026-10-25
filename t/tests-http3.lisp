@@ -14637,6 +14637,195 @@
            (ensure-true (http-kit/http3:http3-client-open-p client)))
       (when (http-kit/http3:http3-client-open-p client)
         (http-kit/http3:close-http3-client client)))))
+(deftest http3-quic-adapter-enforces-peer-stream-limit-before-queueing
+  (let* ((constructor (quote cl-quic-kit:make-quic-client))
+         (constructor-original (symbol-function constructor))
+         (initializer (quote http-kit/http3::%http3-quic-adapter-initialize))
+         (initializer-original (symbol-function initializer))
+         (connection (cl-quic-kit:make-quic-connection
+                      :now-fn (constantly 0)
+                      :io-write (lambda (actual bytes)
+                                  (declare (ignore actual bytes))
+                                  nil)))
+         (quic nil)
+         (adapter nil)
+         (accepted nil)
+         (failure nil))
+    (unwind-protect
+         (progn
+           (setf (symbol-function constructor)
+                 (lambda (&rest arguments)
+                   (setf quic (apply constructor-original arguments))
+                   (cl-quic-kit:client-start quic)
+                   (cl-quic-kit:connection-set-state connection :established)
+                   (dolist (entry (list (cons 3 (octets 0 4 0))
+                                        (cons 7 (octets 128))))
+                     (cl-quic-kit:client-receive-frame
+                      quic
+                      (cl-quic-kit:make-frame
+                       :stream :stream-id (car entry) :offset 0
+                       :data (cdr entry) :len-present t)
+                      :level :1-rtt))
+                   quic)
+                 (symbol-function initializer)
+                 (lambda (actual initialize)
+                   (setf adapter actual)
+                   (funcall initializer-original actual initialize)))
+           (call-with-http3-quic-lifecycle-spies
+            (lambda (calls)
+              (declare (ignore calls))
+              (setf failure
+                    (http3-boundary-error
+                     (lambda ()
+                       (http-kit/http3:make-http3-quic-adapter
+                        :connection connection
+                        :hostname "example.test"
+                        :local-connection-id (octets 1 2 3 4)
+                        :destination-connection-id (octets 5 6 7 8)
+                        :now-fn (constantly 0)
+                        :timeout 1
+                        :http3-options
+                        (list :max-peer-unidirectional-streams 1))))))
+            :client-accept
+            (lambda (actual stream)
+              (declare (ignore actual))
+              (when stream (push stream accepted))))
+           (ensure-true (typep failure (quote http-protocol-error)))
+           (ensure-equal :http3-quic-adapter
+                         (http-kit:http-error-operation failure))
+           (ensure-equal
+            "The HTTP/3 peer unidirectional-stream limit was exceeded."
+            (http-kit:http-error-message failure))
+           (ensure-equal :h3-excessive-load
+                         (http-protocol-error-detail failure))
+           (ensure-equal 2 (length accepted))
+           (ensure-true
+            (every (lambda (stream)
+                     (plusp (cl-quic-kit:stream-readable-bytes stream)))
+                   accepted))
+           (ensure-equal nil
+                         (http-kit/http3::http3-quic-adapter-pending-peer-unidirectional-streams
+                          adapter))
+           (ensure-equal nil
+                         (http-kit/http3:http3-quic-adapter-http3-client adapter)))
+      (setf (symbol-function constructor) constructor-original
+            (symbol-function initializer) initializer-original)
+      (when (and quic (not (cl-quic-kit:quic-client-closed-p quic)))
+        (cl-quic-kit:client-close quic)))
+    (ensure-true (eq constructor-original (symbol-function constructor)))
+    (ensure-true (eq initializer-original (symbol-function initializer)))))
+(deftest http3-quic-adapter-checks-prefix-bytes-before-retention
+  (let* ((constructor (quote cl-quic-kit:make-quic-client))
+         (constructor-original (symbol-function constructor))
+         (initializer (quote http-kit/http3::%http3-quic-adapter-initialize))
+         (initializer-original (symbol-function initializer))
+         (settings-reader
+           (quote http-kit/http3::%http3-quic-adapter-await-peer-settings))
+         (settings-reader-original (symbol-function settings-reader))
+         (read-stream (quote cl-quic-kit:client-read-stream))
+         (read-stream-original (symbol-function read-stream))
+         (connection (cl-quic-kit:make-quic-connection
+                      :now-fn (constantly 0)
+                      :io-write (lambda (actual bytes)
+                                  (declare (ignore actual bytes))
+                                  nil)))
+         (quic nil)
+         (adapter nil)
+         (accepted nil)
+         (read-count 0)
+         (failure nil))
+    (unwind-protect
+         (progn
+           (setf (symbol-function constructor)
+                 (lambda (&rest arguments)
+                   (setf quic (apply constructor-original arguments))
+                   (cl-quic-kit:client-start quic)
+                   (cl-quic-kit:connection-set-state connection :established)
+                   (dolist (entry (list (cons 3 (octets 128))
+                                        (cons 7 (octets 128))))
+                     (cl-quic-kit:client-receive-frame
+                      quic
+                      (cl-quic-kit:make-frame
+                       :stream :stream-id (car entry) :offset 0
+                       :data (cdr entry) :len-present t)
+                      :level :1-rtt))
+                   quic)
+                 (symbol-function initializer)
+                 (lambda (actual initialize)
+                   (setf adapter actual)
+                   (funcall initializer-original actual initialize))
+                 (symbol-function settings-reader)
+                 (lambda (actual-client http3-client &rest arguments)
+                   (setf
+                    (http-kit/http3::http3-client-peer-qpack-encoder-buffer
+                     http3-client)
+                    (octets 9))
+                   (apply settings-reader-original actual-client http3-client
+                          arguments))
+                 (symbol-function read-stream)
+                 (lambda (actual stream &rest arguments)
+                   (when (and (eq actual quic)
+                              (member (cl-quic-kit:stream-id stream) (list 3 7)))
+                     (incf read-count))
+                   (apply read-stream-original actual stream arguments)))
+           (call-with-http3-quic-lifecycle-spies
+            (lambda (calls)
+              (declare (ignore calls))
+              (setf failure
+                    (http3-boundary-error
+                     (lambda ()
+                       (http-kit/http3:make-http3-quic-adapter
+                        :connection connection
+                        :hostname "example.test"
+                        :local-connection-id (octets 1 2 3 4)
+                        :destination-connection-id (octets 5 6 7 8)
+                        :now-fn (constantly 0)
+                        :timeout 1
+                        :http3-options (list :max-state-bytes 2))))))
+            :client-accept
+            (lambda (actual stream)
+              (declare (ignore actual))
+              (when stream (push stream accepted))))
+           (let ((client
+                   (http-kit/http3:http3-quic-adapter-http3-client adapter)))
+             (ensure-true (typep failure (quote http-protocol-error)))
+             (ensure-equal :http3-transport
+                           (http-kit:http-error-operation failure))
+             (ensure-equal
+              "HTTP/3 aggregate connection state exceeds its limit."
+              (http-kit:http-error-message failure))
+             (ensure-equal (list :h3-excessive-load 2 3)
+                           (http-protocol-error-detail failure))
+             (ensure-equal 2 (length accepted))
+             (ensure-equal 2 read-count)
+             (ensure-true
+              (every (lambda (stream)
+                       (zerop (cl-quic-kit:stream-readable-bytes stream)))
+                     accepted))
+             (ensure-equal
+              (octets 9)
+              (http-kit/http3::http3-client-peer-qpack-encoder-buffer client))
+             (ensure-equal 0
+                           (http-kit/http3::http3-client-peer-unidirectional-stream-count
+                            client))
+             (ensure-equal nil
+                           (http-kit/http3::http3-client-prefetched-stream-inputs
+                            client))
+             (ensure-equal nil
+                           (http-kit/http3::http3-client-peer-unidirectional-prefix-buffers
+                            client))
+             (ensure-equal nil
+                           (http-kit/http3::http3-client-peer-control-stream client))))
+      (setf (symbol-function constructor) constructor-original
+            (symbol-function initializer) initializer-original
+            (symbol-function settings-reader) settings-reader-original
+            (symbol-function read-stream) read-stream-original)
+      (when (and quic (not (cl-quic-kit:quic-client-closed-p quic)))
+        (cl-quic-kit:client-close quic)))
+    (ensure-true (eq constructor-original (symbol-function constructor)))
+    (ensure-true (eq initializer-original (symbol-function initializer)))
+    (ensure-true (eq settings-reader-original (symbol-function settings-reader)))
+    (ensure-true (eq read-stream-original (symbol-function read-stream)))))
 
 
 

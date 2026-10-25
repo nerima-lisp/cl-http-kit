@@ -6,6 +6,7 @@
   quic-client
   http3-client
   pending-peer-unidirectional-streams
+  (max-peer-unidirectional-streams +http3-default-max-peer-unidirectional-streams+)
   (started-p nil :type boolean)
   (closed-p nil :type boolean)
   (poll-interval 0 :type real))
@@ -161,8 +162,16 @@
                   while stream
                   do (unless (member stream pending-streams
                           :test (function eq))
-                       (setf pending-streams
-                             (append pending-streams (list stream)))))
+                       (progn
+                         (when (>= (length pending-streams)
+                                   (if adapter
+                                       (http3-quic-adapter-max-peer-unidirectional-streams adapter)
+                                       +http3-default-max-peer-unidirectional-streams+))
+                           (%http3-quic-adapter-error
+                            "The HTTP/3 peer unidirectional-stream limit was exceeded."
+                            :h3-excessive-load))
+                         (setf pending-streams
+                               (append pending-streams (list stream))))))
            (when adapter
              (setf (http3-quic-adapter-pending-peer-unidirectional-streams
                     adapter)
@@ -203,13 +212,24 @@
                      while stream
                      do (unless (member stream pending-streams
                              :test (function eq))
-                          (setf pending-streams
-                                (append pending-streams (list stream)))))
+                          (progn
+                            (when (>= (+ (http3-client-peer-unidirectional-stream-count http3-client)
+                                         (length pending-streams))
+                                      (http3-client-max-peer-unidirectional-streams http3-client))
+                              (%http3-quic-adapter-error
+                               "The HTTP/3 peer unidirectional-stream limit was exceeded."
+                               :h3-excessive-load))
+                            (setf pending-streams
+                                  (append pending-streams (list stream))))))
                (when adapter
                  (setf (http3-quic-adapter-pending-peer-unidirectional-streams
                         adapter)
                        pending-streams)))
              (preserve-pending-prefixes ()
+               (%h3-check-state-bytes
+                http3-client
+                (loop for input being the hash-values of prefix-buffers
+                      sum (length (or (first input) #()))))
                (maphash
                 (lambda (stream input)
                   (%h3-prefetch-stream-input
@@ -281,10 +301,15 @@
                      (let* ((previous (gethash stream prefix-buffers))
                             (empty (make-array 0 :element-type '(unsigned-byte 8)))
                             (buffer
-                              (%http3-concatenate-octets
-                               (if previous (first previous) empty)
-                               (or chunk empty))))
-                       (%h3-check-state-bytes http3-client)
+                              (progn
+                                (%h3-check-state-bytes
+                                 http3-client
+                                 (+ (loop for input being the hash-values of prefix-buffers
+                                          sum (length (or (first input) #())))
+                                    (length (or chunk empty))))
+                                (%http3-concatenate-octets
+                                 (if previous (first previous) empty)
+                                 (or chunk empty)))))
                        (multiple-value-bind (stream-type position)
                            (http3-varint-decode buffer :allow-incomplete-p t)
                          (declare (ignore position))
@@ -402,6 +427,9 @@ to be selected without exposing QUIC implementation details."
          (stream-prefix-sent (make-hash-table :test #'eq))
          (adapter (%make-http3-quic-adapter
                    :quic-client quic-client
+                   :max-peer-unidirectional-streams
+                   (getf http3-options :max-peer-unidirectional-streams
+                         +http3-default-max-peer-unidirectional-streams+)
                    :poll-interval poll-interval)))
     (%http3-quic-adapter-initialize adapter
                                     (lambda ()
