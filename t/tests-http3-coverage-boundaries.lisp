@@ -5635,7 +5635,7 @@
               (when (eq stream peer-control-stream)
                 (incf critical-read-count)
                 (when mutation (funcall mutation)))
-              (values nil nil :would-block)))
+              (values nil nil :would-block))))
          (entry
            (http-kit/http3::%make-http3-request-stream
             :stream (make-http3-test-stream :kind :request)
@@ -5730,7 +5730,7 @@
             (http-kit/http3::http3-client-scheduler-close-state client) nil
             (http-kit/http3::http3-client-peer-control-stream client) nil)
       (when (http-kit/http3:http3-client-open-p client)
-        (http-kit/http3:close-http3-client client))))))
+        (http-kit/http3:close-http3-client client)))))
 (deftest http3-native-scheduler-wait-entry-observes-racing-terminal-state
          (let* ((client
                  (http3-test-make-native-client
