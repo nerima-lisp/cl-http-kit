@@ -2276,7 +2276,7 @@
             (lambda (stream &key timeout deadline)
               (declare (ignore stream timeout deadline))
               (values nil t))
-            :poll-function (lambda () nil)
+            :poll-function (lambda () (cl-quic-kit:client-poll quic))
             :try-read-stream
             (lambda (stream &key timeout deadline)
               (declare (ignore timeout deadline))
