@@ -52,10 +52,6 @@
     (http-cancellation-token-cancelled-p token)))
 
 (defun %client-cancellation-token-register-handler (token handler)
-  (unless (functionp handler)
-    (%client-protocol-error
-     "The request cancellation handler must be a function."
-     handler))
   (let* ((entry (vector nil t nil))
          (invoke-handler
            (lambda ()
