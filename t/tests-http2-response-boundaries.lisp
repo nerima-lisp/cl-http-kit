@@ -47,7 +47,7 @@
                   "HTTP/2 DATA callbacks preserve frame boundaries")))
 
 (deftest http2-response-headers-callback-precedes-body-and-skips-information
-  (let ((events nil)
+  (let* ((events nil)
         (response
           (http-kit/http2:send-http2-request
            (http-kit/http2:make-http2-client
