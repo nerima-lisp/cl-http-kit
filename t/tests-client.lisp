@@ -638,6 +638,28 @@
                     (http-header-value
                      (http-request-headers effective-request)
                      "Accept-Encoding")))))
+(deftest client-send-rejects-invalid-cancellation-token
+  (let* ((transport-calls 0)
+         (client
+           (make-http-client
+            :cache nil
+            :transport-function
+            (lambda (request &key &allow-other-keys)
+              (declare (ignore request))
+              (incf transport-calls)
+              (client-test-response 200))))
+         (caught
+           (handler-case
+               (progn
+                 (http-client-send
+                  client "GET" "http://example.test/invalid-cancel-token"
+                  :cancel-token :invalid)
+                 nil)
+             (http-protocol-error (condition) condition))))
+    (ensure-true caught)
+    (ensure-equal :client (http-error-operation caught))
+    (ensure-equal :invalid (http-protocol-error-detail caught))
+    (ensure-equal 0 transport-calls)))
 
 (deftest client-multipart-parser-round-trip
   (multiple-value-bind (body content-type)
@@ -1709,6 +1731,37 @@
       (ensure-equal 1 http3-calls)
       (ensure-equal 1 producer-calls)
       (ensure-equal (if (eq body-kind :factory) 1 0) factory-calls))))
+(deftest client-alt-svc-active-cancellation-token-allows-pre-send-fallback
+  (let* ((http3-calls 0)
+         (tcp-calls 0)
+         (token (make-http-cancellation-token))
+         (client
+           (make-http-client
+            :cache nil
+            :transport-function
+            (lambda (request &key &allow-other-keys)
+              (declare (ignore request))
+              (incf tcp-calls)
+              (client-test-response 200))
+            :http3-transport-function
+            (lambda (request &key &allow-other-keys)
+              (declare (ignore request))
+              (incf http3-calls)
+              (error 'http-connection-error
+                     :message "synthetic pre-send failure"
+                     :request-sent-p nil)))))
+    (http-alternative-service-store-note-response
+     (http-client-alternative-service-store client)
+     "https://example.test/"
+     (client-test-response
+      200 :headers (list (make-http-header "Alt-Svc" "h3=\":443\"; ma=60"))))
+    (ensure-equal
+     200
+     (http-response-status
+      (http-client-send client "GET" "https://example.test/"
+                        :cancel-token token)))
+    (ensure-equal 1 http3-calls)
+    (ensure-equal 1 tcp-calls)))
 
 (deftest client-alt-svc-connect-timeout-preserves-producer-and-deadline
   (dolist (body-kind '(:producer :factory))
@@ -3102,6 +3155,67 @@
     (ensure-equal 1 calls)
     (ensure-equal :fresh
                   (nth-value 1 (http-cache-lookup cache request :now now)))))
+(deftest client-cache-304-callback-sees-only-merged-response
+  (let* ((now 1000)
+         (transport-calls 0)
+         (callback-count 0)
+         (callback-status nil)
+         (callback-etag nil)
+         (cache (make-http-cache :clock-function (lambda () now)))
+         (client
+           (make-http-client
+            :cache cache
+            :automatic-decompression-p nil
+            :transport-function
+            (lambda (request &key on-response-headers &allow-other-keys)
+              (incf transport-calls)
+              (ensure-equal
+               "\"v1\""
+               (http-header-value (http-request-headers request)
+                                  "If-None-Match"))
+              (let ((response
+                      (client-test-response
+                       304 :headers
+                       (list (make-http-header
+                              "Cache-Control" "max-age=60")
+                             (make-http-header "ETag" "\"v1\"")))))
+                (funcall on-response-headers
+                         304 (http-response-headers response))
+                response))))
+         (request
+           (http-client-request client "GET"
+                                "http://example.test/304-callback"))
+         (stale-entry nil))
+    (http-cache-store
+     cache request
+     (client-test-response
+      200
+      :headers (list (make-http-header "Cache-Control" "max-age=0")
+                     (make-http-header "ETag" "\"v1\"")
+                     (make-http-header "Content-Type" "text/plain"))
+      :body (ascii "cached"))
+     :now now)
+    (setf now 1001)
+    (multiple-value-bind (cached-response state entry)
+        (http-cache-lookup cache request :now now)
+      (declare (ignore cached-response))
+      (ensure-equal :stale state)
+      (setf stale-entry entry))
+    (let ((response
+            (http-client-send
+             client request
+             :cache-revalidation-entry stale-entry
+             :on-response-headers
+             (lambda (status headers)
+               (incf callback-count)
+               (setf callback-status status
+                     callback-etag (http-header-value headers "ETag"))))))
+      (ensure-equal 200 (http-response-status response))
+      (ensure-equal "cached" (octets-as-string (http-response-body response))))
+    (ensure-equal 1 transport-calls)
+    (ensure-equal 1 callback-count)
+    (ensure-equal 200 callback-status)
+    (ensure-equal "\"v1\"" callback-etag)))
 
 (deftest client-cache-request-no-cache-suppresses-stale-while-revalidate
   (let* ((now 2000)
