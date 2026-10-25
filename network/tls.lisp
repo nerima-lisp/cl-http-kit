@@ -422,6 +422,8 @@ driver's transport callbacks."
              (http-tls-server-state-early-data-offered-p state)))
       (http-timeout (condition) (error condition))
       (http-protocol-error (condition) (error condition))
+      #+sbcl (sb-ext:timeout () (%tls-timeout))
+      #+sbcl (sb-bsd-sockets:operation-timeout-error () (%tls-timeout))
       (error ()
              (%tls-server-fail "TLS transport read failed." :transport-error))))
 

@@ -388,6 +388,9 @@
     (let ((failure (%tls-server-failure-test-stream-fail-on stream)))
       (cond ((eq failure :read)
              (error "Injected TLS transport read failure."))
+            #+sbcl
+            ((eq failure :sbcl-timeout)
+             (signal 'sb-ext:timeout))
             ((typep failure 'condition)
              (error failure))))
     (call-next-method))
@@ -595,6 +598,36 @@
                       (lambda ()
                         (http-kit/tls::%tls-server-write-record
                          write-state (octets 1))))))
+      #+sbcl
+      (let* ((stream
+               (make-instance
+                '%tls-server-failure-test-stream
+                :input (octets)
+                :fail-on
+                (make-condition 'sb-bsd-sockets:operation-timeout-error)))
+             (state
+               (http-kit/tls::%make-http-tls-server-state
+                :driver nil :provider nil :transport-stream stream))
+             (condition
+               (handler-case
+                   (progn (http-kit/tls::%tls-server-read-record state) nil)
+                 (http-timeout (condition) condition))))
+        (ensure-true condition)
+        (close stream :abort t))
+      #+sbcl
+      (let* ((stream
+               (make-instance '%tls-server-failure-test-stream
+                              :input (octets)
+                              :fail-on :sbcl-timeout))
+             (state
+               (http-kit/tls::%make-http-tls-server-state
+                :driver nil :provider nil :transport-stream stream))
+             (condition
+               (handler-case
+                   (progn (http-kit/tls::%tls-server-read-record state) nil)
+                 (http-timeout (condition) condition))))
+        (ensure-true condition)
+        (close stream :abort t))
       (close read-stream :abort t)
       (close write-stream :abort t))
     (let* ((raw (make-instance '%tls-server-test-stream
