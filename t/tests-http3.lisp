@@ -14807,6 +14807,82 @@
         (cl-quic-kit:client-close quic)))
     (ensure-true (eq constructor-original (symbol-function constructor)))
     (ensure-true (eq initializer-original (symbol-function initializer)))))
+(deftest http3-quic-adapter-enforces-peer-stream-limit-after-control-data
+  (cl-weave:expect-assertions 8)
+  (let* ((constructor 'cl-quic-kit:make-quic-client)
+         (constructor-original (symbol-function constructor))
+         (settings-reader 'http-kit/http3::%http3-quic-adapter-await-peer-settings)
+         (settings-reader-original (symbol-function settings-reader))
+         (poll-original (symbol-function 'cl-quic-kit:client-poll))
+         (connection (cl-quic-kit:make-quic-connection
+                      :now-fn (constantly 0)
+                      :io-write (lambda (actual bytes)
+                                  (declare (ignore actual bytes))
+                                  nil)))
+         (quic nil)
+         (injected-p nil)
+         (failure nil))
+    (unwind-protect
+         (progn
+           (setf (symbol-function constructor)
+                 (lambda (&rest arguments)
+                   (setf quic (apply constructor-original arguments))
+                   (cl-quic-kit:client-start quic)
+                   (cl-quic-kit:connection-set-state connection :established)
+                   (cl-quic-kit:client-receive-frame
+                    quic
+                    (cl-quic-kit:make-frame
+                     :stream :stream-id 3 :offset 0 :data (octets 0)
+                     :len-present t)
+                    :level :1-rtt)
+                   quic)
+                 (symbol-function settings-reader)
+                 (lambda (actual-quic client &rest arguments)
+                   (apply settings-reader-original
+                          actual-quic client
+                          (append
+                           arguments
+                           (list :poll
+                                 (lambda (poll-client)
+                                   (funcall poll-original poll-client)
+                                   (unless injected-p
+                                     (setf injected-p t)
+                                     (cl-quic-kit:client-receive-frame
+                                      poll-client
+                                      (cl-quic-kit:make-frame
+                                       :stream :stream-id 7 :offset 0
+                                       :data (octets #x40) :len-present t)
+                                      :level :1-rtt))
+                                   poll-client))))))
+           (setf failure
+                 (http3-boundary-error
+                  (lambda ()
+                    (http-kit/http3:make-http3-quic-adapter
+                     :connection connection
+                     :hostname "example.test"
+                     :local-connection-id (octets 1 2 3 4)
+                     :destination-connection-id (octets 5 6 7 8)
+                     :now-fn (constantly 0)
+                     :timeout 1
+                     :http3-options
+                     (list :max-peer-unidirectional-streams 1)))))
+           (ensure-true injected-p)
+           (ensure-true (typep failure 'http-protocol-error))
+           (ensure-equal :http3-quic-adapter
+                         (http-kit:http-error-operation failure))
+           (ensure-equal
+            "The HTTP/3 peer unidirectional-stream limit was exceeded."
+            (http-kit:http-error-message failure))
+           (ensure-equal :h3-excessive-load
+                         (http-protocol-error-detail failure))
+           (ensure-true (cl-quic-kit:quic-client-closed-p quic)))
+      (setf (symbol-function constructor) constructor-original
+            (symbol-function settings-reader) settings-reader-original)
+      (when (and quic (not (cl-quic-kit:quic-client-closed-p quic)))
+        (cl-quic-kit:client-close quic)))
+    (ensure-true (eq constructor-original (symbol-function constructor)))
+    (ensure-true (eq settings-reader-original (symbol-function settings-reader))))
+)
 (deftest http3-quic-adapter-checks-prefix-bytes-before-retention
   (let* ((constructor (quote cl-quic-kit:make-quic-client))
          (constructor-original (symbol-function constructor))
