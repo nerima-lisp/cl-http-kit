@@ -972,6 +972,14 @@ becomes readable again."
   t))
 
 
+(defun %h3-request-cancel-function (client stream timeout deadline)
+  "Return a cancellation callback bound to STREAM and its request timing."
+  (lambda (&key (error-code #x10c))
+    (cancel-http3-stream client stream
+                         :error-code error-code
+                         :timeout timeout
+                         :deadline deadline)))
+
 (defun send-http3-priority-update
     (client element-id
             &key (kind :request)
@@ -3323,10 +3331,7 @@ the HTTP/3 API reference."
                   "A QPACK HTTP/3 decoder context is required with the decoder context."
                   decoder-context))
                (let ((cancel-function
-                      (lambda (&key (error-code #x10c))
-                        (cancel-http3-stream
-                         client stream :error-code error-code
-                         :timeout timeout :deadline deadline))))
+                      (%h3-request-cancel-function client stream timeout deadline)))
                  (when on-cancel
                    (let ((cleanup (funcall on-cancel cancel-function)))
                      (unless (or (null cleanup) (functionp cleanup))

@@ -6864,7 +6864,7 @@
 (deftest http3-client-cancellation-callbacks-require-functions
   (labels ((open-stream (request &key stream-type timeout deadline)
              (declare (ignore request timeout deadline))
-             (make-http3-test-stream :kind stream-type))
+             (values (make-http3-test-stream :kind stream-type) 0))
            (write-stream (stream octets &key fin-p timeout deadline)
              (declare (ignore stream octets fin-p timeout deadline)))
            (read-stream (stream &key timeout deadline)
