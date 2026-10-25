@@ -107,12 +107,18 @@
                       (setf warning-text (format nil "~A" warning-condition))
                       (muffle-warning))))
                (funcall thunk))
-             warning-text)))
+             warning-text))
+         (make-client (&optional close-stream)
+           (http3-test-make-native-client
+            :try-read-stream
+            (lambda (stream &key timeout deadline)
+              (declare (ignore stream timeout deadline))
+              (values nil nil :would-block))
+            :close-stream close-stream)))
     (let* ((stream-close-count 0)
            (quic-close-arguments nil)
            (client
-             (http3-test-make-native-client
-              :close-stream
+             (make-client
               (lambda (stream &key condition)
                 (declare (ignore stream condition))
                 (incf stream-close-count)
@@ -143,7 +149,7 @@
         (when (http-kit/http3:http3-client-open-p client)
           (http-kit/http3:close-http3-client client))))
     (let* ((quic-close-arguments nil)
-           (client (http3-test-make-native-client))
+           (client (make-client))
            (condition (connection-condition))
            (warning-text nil))
       (unwind-protect
