@@ -8013,3 +8013,105 @@
       (when cancel-thread
         (sb-thread:join-thread cancel-thread :timeout 5))
       (sb-thread:join-thread worker :timeout 5))))
+
+#+sbcl
+(progn
+  (defclass blocking-client-upload-stream (binary-test-stream)
+    ((write-started
+       :initarg :write-started
+       :reader blocking-client-upload-stream-write-started)
+     (release-write
+       :initarg :release-write
+       :reader blocking-client-upload-stream-release-write)
+     (upload-started-p
+       :initform nil
+       :accessor blocking-client-upload-stream-upload-started-p)
+     (closed-p
+       :initform nil
+       :accessor blocking-client-upload-stream-closed-p)))
+
+  (defmethod sb-gray:stream-write-sequence
+      ((stream blocking-client-upload-stream) sequence
+       &optional (start 0) end)
+    (if (blocking-client-upload-stream-upload-started-p stream)
+        (progn
+          (sb-thread:signal-semaphore
+           (blocking-client-upload-stream-write-started stream))
+          (unless (sb-thread:wait-on-semaphore
+                   (blocking-client-upload-stream-release-write stream)
+                   :timeout 5)
+            (error "Timed out waiting for upload cancellation."))
+          (when (blocking-client-upload-stream-closed-p stream)
+            (error "The HTTP test stream was closed during upload."))
+          (call-next-method))
+        (call-next-method)))
+
+  (deftest client-cancel-interrupts-streaming-upload
+    (let* ((write-started (sb-thread:make-semaphore :count 0))
+           (release-write (sb-thread:make-semaphore :count 0))
+           (stream
+             (make-instance
+              'blocking-client-upload-stream
+              :write-started write-started
+              :release-write release-write
+              :input
+              (ascii "HTTP/1.1 200 OK|CRLF|Content-Length: 0|CRLF||CRLF|")))
+           (token (make-http-cancellation-token))
+           (worker-done (sb-thread:make-semaphore :count 0))
+           (produced-chunks 0)
+           (close-count 0)
+           (request-condition nil)
+           (client
+             (make-http-client
+              :cache nil
+              :open-stream
+              (lambda (request &key timeout deadline &allow-other-keys)
+                (declare (ignore request timeout deadline))
+                stream)
+              :close-stream
+              (lambda (closed-stream)
+                (ensure-equal stream closed-stream)
+                (incf close-count)
+                (setf (blocking-client-upload-stream-closed-p stream) t)
+                (sb-thread:signal-semaphore release-write))))
+           (worker
+             (sb-thread:make-thread
+              (lambda ()
+                (unwind-protect
+                     (handler-case
+                         (http-client-send
+                          client "POST" "http://example.test/upload"
+                          :cancel-token token
+                          :request-body-length 8
+                          :request-body-function
+                          (lambda (limit)
+                            (ensure-equal 65536 limit)
+                            (incf produced-chunks)
+                            (setf
+                             (blocking-client-upload-stream-upload-started-p
+                              stream)
+                             t)
+                            (if (<= produced-chunks 2)
+                                (octets 1 2 3 4)
+                                nil)))
+                       (http-client-request-cancelled (condition)
+                         (setf request-condition condition))
+                       (error (condition)
+                         (setf request-condition condition)))
+                  (sb-thread:signal-semaphore worker-done))))))
+      (unwind-protect
+           (progn
+             (ensure-true
+              (sb-thread:wait-on-semaphore write-started :timeout 5))
+             (ensure-true (http-client-cancel-request token))
+             (ensure-false (http-client-cancel-request token))
+             (ensure-true
+              (sb-thread:wait-on-semaphore worker-done :timeout 5))
+             (sb-thread:join-thread worker :timeout 5)
+             (ensure-true
+              (typep request-condition 'http-client-request-cancelled))
+             (ensure-equal 1 produced-chunks)
+             (ensure-equal 1 close-count))
+        (setf (blocking-client-upload-stream-closed-p stream) t)
+        (sb-thread:signal-semaphore release-write)
+        (sb-thread:join-thread worker :timeout 5)))))

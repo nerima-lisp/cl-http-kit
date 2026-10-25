@@ -1,5 +1,32 @@
 (in-package #:http-kit)
 
+(defun %register-http1-cancellation-handler (on-cancel cancel-stream-function)
+  (when (and on-cancel (not (functionp on-cancel)))
+    (error 'http-protocol-error
+           :message "ON-CANCEL must be a function or NIL."
+           :operation :response-parse
+           :detail on-cancel))
+  (when (and cancel-stream-function
+             (not (functionp cancel-stream-function)))
+    (error 'http-protocol-error
+           :message "CANCEL-STREAM-FUNCTION must be a function or NIL."
+           :operation :response-parse
+           :detail cancel-stream-function))
+  (when (and on-cancel (not cancel-stream-function))
+    (error 'http-protocol-error
+           :message "ON-CANCEL requires a cancellation function."
+           :operation :response-parse
+           :detail on-cancel))
+  (let ((unregister-cancel
+          (when on-cancel
+            (funcall on-cancel cancel-stream-function))))
+    (when (and unregister-cancel (not (functionp unregister-cancel)))
+      (error 'http-protocol-error
+             :message "ON-CANCEL must return a function or NIL."
+             :operation :response-parse
+             :detail unregister-cancel))
+    unregister-cancel))
+
 (defun parse-http-response (input &key timeout deadline
                                   max-header-bytes max-fields max-body-bytes
                                   request-method
@@ -57,35 +84,14 @@ REQUEST-METHOD as \"HEAD\" for the bodyless response semantics of HEAD."
                :message "ON-RESPONSE-HEADERS must be a function or NIL."
                :operation :response-parse
                :detail on-response-headers))
-      (when (and on-cancel (not (functionp on-cancel)))
-        (error 'http-protocol-error
-               :message "ON-CANCEL must be a function or NIL."
-               :operation :response-parse
-               :detail on-cancel))
-      (when (and cancel-stream-function
-                 (not (functionp cancel-stream-function)))
-        (error 'http-protocol-error
-               :message "CANCEL-STREAM-FUNCTION must be a function or NIL."
-               :operation :response-parse
-               :detail cancel-stream-function))
-      (when (and on-cancel (not cancel-stream-function))
-        (error 'http-protocol-error
-               :message "ON-CANCEL requires a cancellation function."
-               :operation :response-parse
-               :detail on-cancel))
       (unless (member collect-body-p '(nil t))
         (error 'http-protocol-error
                :message "COLLECT-BODY-P must be NIL or T."
                :operation :response-parse
                :detail collect-body-p)))
     (let ((unregister-cancel
-           (when on-cancel
-             (funcall on-cancel cancel-stream-function))))
-      (when (and unregister-cancel (not (functionp unregister-cancel)))
-        (error 'http-protocol-error
-               :message "ON-CANCEL must return a function or NIL."
-               :operation :response-parse
-               :detail unregister-cancel))
+           (%register-http1-cancellation-handler
+            on-cancel cancel-stream-function)))
       (unwind-protect
           (loop
            (multiple-value-bind (status-line updated-bytes)

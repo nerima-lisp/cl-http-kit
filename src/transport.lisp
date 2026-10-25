@@ -268,86 +268,96 @@ TLS, proxy, or concurrency dependencies on the core system."
            :message "The stream boundary requires an open stream."
            :operation :connect
            :cause (type-of stream)))
-  (with-http-deadline (absolute-deadline timeout
-                        :inherited deadline
-                        :clock-function clock-function)
-    (%with-http-error-translation
-        ("The HTTP request over an open stream failed." :transport)
-      (let ((body-sent-p nil)
-            (expect-continue-p
-              (and (%request-expect-continue-p request)
-                   (%request-body-present-p request request-body-function)))
-            (transfer-mode nil)
-            (expected-body-length nil))
-        (labels ((send-body ()
-                   (unless body-sent-p
+  (let ((unregister-cancel
+         (%with-http-error-translation
+             ("The HTTP request over an open stream failed." :transport)
+           (%register-http1-cancellation-handler
+            on-cancel cancel-stream-function))))
+    (unwind-protect
+         (with-http-deadline (absolute-deadline timeout
+                               :inherited deadline
+                               :clock-function clock-function)
+           (%with-http-error-translation
+               ("The HTTP request over an open stream failed." :transport)
+             (let ((body-sent-p nil)
+                   (expect-continue-p
+                     (and (%request-expect-continue-p request)
+                          (%request-body-present-p request request-body-function)))
+                   (transfer-mode nil)
+                   (expected-body-length nil))
+               (labels ((send-body ()
+                          (unless body-sent-p
+                            (if request-body-function
+                                (%write-request-body-stream
+                                 stream request-body-function expected-body-length
+                                 transfer-mode absolute-deadline clock-function)
+                                (%write-request-body-octets
+                                 stream request transfer-mode expected-body-length
+                                 absolute-deadline clock-function))
+                            (finish-output stream)
+                            (setf body-sent-p t)))
+                        (handle-information (information)
+                          (when on-information
+                            (funcall on-information information))
+                          (when (and expect-continue-p
+                                     (= (http-response-status information) 100))
+                            (send-body))))
+                 (%check-deadline absolute-deadline clock-function :write)
+                 (if expect-continue-p
+                     (multiple-value-bind (head mode expected)
+                         (%request-head-wire
+                          request
+                          :request-target request-target
+                          :body-length (if request-body-function
+                                           request-body-length
+                                           (length (http-request-body request)))
+                          :body-length-known-p (if request-body-function
+                                                   (not (null request-body-length))
+                                                   t))
+                       (setf transfer-mode mode
+                             expected-body-length expected)
+                       (write-sequence head stream)
+                       (finish-output stream))
                      (if request-body-function
-                         (%write-request-body-stream
-                          stream request-body-function expected-body-length
-                          transfer-mode absolute-deadline clock-function)
-                         (%write-request-body-octets
-                          stream request transfer-mode expected-body-length
-                          absolute-deadline clock-function))
-                     (finish-output stream)
-                     (setf body-sent-p t)))
-                 (handle-information (information)
-                   (when on-information
-                     (funcall on-information information))
-                   (when (and expect-continue-p
-                              (= (http-response-status information) 100))
-                     (send-body))))
-          (%check-deadline absolute-deadline clock-function :write)
-          (if expect-continue-p
-              (multiple-value-bind (head mode expected)
-                  (%request-head-wire
-                   request
-                   :request-target request-target
-                   :body-length (if request-body-function
-                                    request-body-length
-                                    (length (http-request-body request)))
-                   :body-length-known-p (if request-body-function
-                                            (not (null request-body-length))
-                                            t))
-                (setf transfer-mode mode
-                      expected-body-length expected)
-                (write-sequence head stream)
-                (finish-output stream))
-              (if request-body-function
-                  (multiple-value-bind (head mode expected)
-                      (%request-head-wire
-                       request
-                       :request-target request-target
-                       :body-length request-body-length
-                       :body-length-known-p (not (null request-body-length)))
-                    (setf transfer-mode mode
-                          expected-body-length expected)
-                    (write-sequence head stream)
-                    (send-body))
-                  (let ((wire (serialize-http-request
-                               request :request-target request-target)))
-                    (write-sequence wire stream)
-                    (finish-output stream)
-                    (setf body-sent-p t))))
-          (%check-deadline absolute-deadline clock-function :read)
-          (let ((response
-                  (parse-http-response stream
-                                       :deadline absolute-deadline
-                                       :max-header-bytes max-header-bytes
-                                       :max-fields max-fields
-                                       :max-body-bytes max-body-bytes
-                                       :request-method (http-request-method request)
-                                       :on-body-chunk on-body-chunk
-                                       :on-information
-                                       (and (or on-information expect-continue-p)
-                                            #'handle-information)
-                                       :on-response-headers on-response-headers
-                                       :on-cancel on-cancel
-                                       :cancel-stream-function cancel-stream-function
-                                       :collect-body-p collect-body-p
-                                       :clock-function clock-function)))
-            (values response
-                    (and (or (not expect-continue-p) body-sent-p)
-                          (http-response-reusable-p request response)))))))))
+                         (multiple-value-bind (head mode expected)
+                             (%request-head-wire
+                              request
+                              :request-target request-target
+                              :body-length request-body-length
+                              :body-length-known-p (not (null request-body-length)))
+                           (setf transfer-mode mode
+                                 expected-body-length expected)
+                           (write-sequence head stream)
+                           (send-body))
+                         (let ((wire (serialize-http-request
+                                      request :request-target request-target)))
+                           (write-sequence wire stream)
+                           (finish-output stream)
+                           (setf body-sent-p t))))
+                 (%check-deadline absolute-deadline clock-function :read)
+                 (let ((response
+                         (parse-http-response stream
+                                              :deadline absolute-deadline
+                                              :max-header-bytes max-header-bytes
+                                              :max-fields max-fields
+                                              :max-body-bytes max-body-bytes
+                                              :request-method (http-request-method request)
+                                              :on-body-chunk on-body-chunk
+                                              :on-information
+                                              (and (or on-information expect-continue-p)
+                                                   #'handle-information)
+                                              :on-response-headers on-response-headers
+                                              :on-cancel nil
+                                              :cancel-stream-function nil
+                                              :collect-body-p collect-body-p
+                                              :clock-function clock-function)))
+                   (values response
+                           (and (or (not expect-continue-p) body-sent-p)
+                                 (http-response-reusable-p request response))))))))
+      (when unregister-cancel
+        (%with-http-error-translation
+            ("The HTTP request over an open stream failed." :transport)
+          (funcall unregister-cancel))))))
 
 (defun send-http-request-over-stream
     (request &key open-stream close-stream timeout deadline
