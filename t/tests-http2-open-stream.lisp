@@ -367,6 +367,7 @@
          connection 1 :priority-field-value (string #\Newline)))
       (http-kit/http2:close-http2-connection connection)))
 
+  (progn
   (deftest http2-public-connection-cancel-callback-default-code
     (let* ((stream (make-instance 'binary-session-stream
                                   :input (h2-response-wire (octets))))
@@ -407,6 +408,157 @@
                (ensure-equal (octets 0 0 0 8)
                              (http-kit/http2::%h2-frame-payload reset-frame))))
         (http-kit/http2:close-http2-connection connection))))
+  (deftest http2-public-connection-cancel-during-flow-control-wait-reuses-slot
+    (let* ((initial-input
+             (concatenate-octets
+              (h2-frame 4 0 0
+                        (octets 0 3 0 0 0 1 0 4 0 0 0 1))
+              (h2-frame 1 5 1 (octets #x88))))
+           (input
+             (make-array (length initial-input)
+                         :element-type (quote (unsigned-byte 8))
+                         :adjustable t
+                         :fill-pointer t
+                         :initial-contents initial-input))
+           (stream
+             (make-instance (quote binary-session-stream) :input input))
+           (connection
+             (http-kit/http2:make-http2-connection :stream stream))
+           (wait-symbol
+             (quote http-kit/http2::%h2-scheduler-condition-wait))
+           (original-wait (symbol-function wait-symbol))
+           (flow-wait-entered (sb-thread:make-semaphore :count 0))
+           (upload-finished (sb-thread:make-semaphore :count 0))
+           (upload-thread nil)
+           (upload-stream-id nil)
+           (upload-error nil)
+           (producer-calls 0)
+           (follow-up-stream-id nil))
+      (unwind-protect
+           (progn
+             (ensure-equal
+              200
+              (http-response-status
+               (http-kit/http2:send-http2-request-over-connection
+                connection
+                (make-http-request :method "GET"
+                                   :uri "https://127.0.0.1/warmup"))))
+             (ensure-equal
+              1
+              (http-kit/http2:http2-connection-peer-max-concurrent-streams
+               connection))
+             (setf (symbol-function wait-symbol)
+                   (lambda (wait-connection deadline clock-function)
+                     (sb-thread:signal-semaphore flow-wait-entered)
+                     (funcall original-wait
+                              wait-connection deadline clock-function)))
+             (http-kit/http2::%h2-with-scheduler-lock (connection)
+               (setf
+                (http-kit/http2::%http2-connection-scheduler-reader-active-p
+                 connection)
+                t))
+             (setf upload-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (unwind-protect
+                           (handler-case
+                               (http-kit/http2:send-http2-request-over-connection
+                                connection
+                                (make-http-request
+                                 :method "POST"
+                                 :uri "https://127.0.0.1/cancel-upload")
+                                :request-body-function
+                                (lambda (maximum-size)
+                                  (declare (ignore maximum-size))
+                                  (incf producer-calls)
+                                  (octets 65 66))
+                                :request-body-length 2
+                                :on-stream-open
+                                (lambda (stream-id cancel-function)
+                                  (declare (ignore cancel-function))
+                                  (setf upload-stream-id stream-id)))
+                             (error (condition)
+                               (setf upload-error condition)))
+                        (sb-thread:signal-semaphore upload-finished))))))
+             (ensure-true
+              (sb-thread:wait-on-semaphore flow-wait-entered :timeout 5))
+             (ensure-equal 3 upload-stream-id)
+             (http-kit/http2::%h2-with-scheduler-lock (connection)
+               (ensure-equal
+                0
+                (http-kit/http2::%h2-connection-stream-window
+                 connection upload-stream-id))
+               (ensure-true
+                (plusp
+                 (http-kit/http2::%http2-connection-peer-connection-window-size
+                  connection))))
+             (ensure-true
+              (http-kit/http2:cancel-http2-stream
+               connection upload-stream-id))
+             (ensure-true
+              (sb-thread:wait-on-semaphore upload-finished :timeout 5))
+             (sb-thread:join-thread upload-thread)
+             (setf upload-thread nil)
+             (ensure-true
+              (typep upload-error (quote http-connection-error)))
+             (ensure-equal
+              (list :local-cancel upload-stream-id 8)
+              (http-connection-error-cause upload-error))
+             (ensure-equal 1 producer-calls)
+             (ensure-true
+              (http-kit/http2:http2-connection-open-p connection))
+             (let ((upload-data
+                     (remove-if-not
+                      (lambda (frame)
+                        (and (= 0
+                                (http-kit/http2::%h2-frame-type frame))
+                             (= upload-stream-id
+                                (http-kit/http2::%h2-frame-stream-id frame))))
+                      (h2-output-frames stream))))
+               (ensure-equal 1 (length upload-data))
+               (ensure-equal
+                (octets 65)
+                (http-kit/http2::%h2-frame-payload (first upload-data))))
+             (setf (symbol-function wait-symbol) original-wait)
+             (loop for octet across (h2-frame 1 5 5 (octets #x88))
+                   do (vector-push-extend
+                       octet (binary-session-input stream)))
+             (http-kit/http2::%h2-with-scheduler-lock (connection)
+               (setf
+                (http-kit/http2::%http2-connection-scheduler-reader-active-p
+                 connection)
+                nil)
+               (http-kit/http2::%h2-scheduler-broadcast connection))
+             (ensure-equal
+              200
+              (http-response-status
+               (http-kit/http2:send-http2-request-over-connection
+                connection
+                (make-http-request :method "GET"
+                                   :uri "https://127.0.0.1/reused-slot")
+                :on-stream-open
+                (lambda (stream-id cancel-function)
+                  (declare (ignore cancel-function))
+                  (setf follow-up-stream-id stream-id)))))
+             (ensure-equal 5 follow-up-stream-id)
+             (ensure-true
+              (http-kit/http2:http2-connection-open-p connection))
+             (ensure-equal
+              1
+              (count-if
+               (lambda (frame)
+                 (and (= 0 (http-kit/http2::%h2-frame-type frame))
+                      (= upload-stream-id
+                         (http-kit/http2::%h2-frame-stream-id frame))))
+               (h2-output-frames stream)))
+        (when upload-thread
+          (when (and upload-stream-id
+                     (http-kit/http2:http2-connection-open-p connection))
+            (http-kit/http2:cancel-http2-stream
+             connection upload-stream-id))
+          (sb-thread:join-thread upload-thread))
+        (setf (symbol-function wait-symbol) original-wait)
+        (http-kit/http2:close-http2-connection connection)))))
 
   (deftest http2-public-connection-cancel-custom-and-direct-api
     (let* ((stream (make-instance 'binary-session-stream

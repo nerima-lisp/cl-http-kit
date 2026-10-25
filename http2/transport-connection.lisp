@@ -2009,8 +2009,12 @@ CONTINUATION frames must still be consumed contiguously from that queue."
           (%h2-with-scheduler-lock (connection)
             (let ((active-entry
                     (%h2-scheduler-entry-for-stream connection stream-id)))
-              (when (and active-entry (%h2-batch-entry-error active-entry))
-                (error (%h2-batch-entry-error active-entry)))
+              (let ((entry-error
+                      (or (and entry (%h2-batch-entry-error entry))
+                          (and active-entry
+                               (%h2-batch-entry-error active-entry)))))
+                (when entry-error
+                  (error entry-error)))
               (when (and active-entry
                          (%h2-batch-entry-request-body-abandoned-p active-entry))
                 (return-from %h2-scheduler-wait-for-window nil))
