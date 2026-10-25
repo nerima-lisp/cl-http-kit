@@ -858,6 +858,19 @@
                               (http-kit/http2::%h2-u32
                                (http-kit/http2::%h2-frame-payload frame) 0))
                             frames)))
+    (let ((callback-called-p nil)
+          (before (copy-seq (binary-session-output stream))))
+      (ensure-true
+       (http-kit/http2::%h2-scheduler-queue-callback
+        connection entry
+        (list :body (lambda (chunk)
+                      (declare (ignore chunk))
+                      (setf callback-called-p t))
+              (octets 120) 1 t t)))
+      (http-kit/http2::%h2-scheduler-run-entry-callbacks
+       connection entry clock)
+      (ensure-true callback-called-p)
+      (ensure-equal before (binary-session-output stream)))
     (let ((callback-error nil))
       (ensure-true
        (http-kit/http2::%h2-scheduler-queue-callback
@@ -897,6 +910,37 @@
           (ensure-equal 1 (http-kit/http2::%h2-frame-stream-id reset))
           (ensure-equal (octets 0 0 0 8)
                         (http-kit/http2::%h2-frame-payload reset)))))
+    (let* ((entry (http-kit/http2::%make-h2-batch-entry
+                   :request request :stream-id 3))
+           (callback-error nil)
+           (before (copy-seq (binary-session-output stream))))
+      (setf (http-kit/http2::%http2-connection-scheduler-entries connection)
+            (list entry))
+      (ensure-true
+       (http-kit/http2::%h2-scheduler-queue-callback
+        connection entry
+        (list :body (lambda (chunk)
+                      (declare (ignore chunk))
+                      (error "Replayed consumer rejected the chunk."))
+              (octets 120) 1 t t)))
+      (handler-case
+          (http-kit/http2::%h2-scheduler-run-entry-callbacks
+           connection entry clock)
+        (error (condition) (setf callback-error condition)))
+      (ensure-true (typep callback-error 'simple-error))
+      (ensure-true (http-kit/http2::%h2-batch-entry-local-retired-p entry))
+      (let* ((reader
+               (http-kit/http2::%h2-reader-for (binary-session-output stream)))
+             (frames nil))
+        (loop for frame = (http-kit/http2::%h2-read-frame reader 16384 nil nil)
+              until (eq frame :eof)
+              do (push frame frames))
+        (setf frames (nreverse frames))
+        (ensure-equal
+         (concatenate-octets before
+                             (http-kit/http2::%h2-frame-wire
+                              3 0 3 (octets 0 0 0 8)))
+         (binary-session-output stream))))
     (http-kit/http2:close-http2-connection connection)))
 #+sbcl
 (deftest http2-coverage-scheduler-retirement-and-control-state
@@ -939,7 +983,11 @@
             (list (list :body (lambda (chunk)
                                 (declare (ignore chunk))
                                 (setf callback-called-p t))
-                        (octets 99) 1 t)))
+                        (octets 99) 1 t nil)
+                  (list :body (lambda (chunk)
+                                (declare (ignore chunk))
+                                (setf callback-called-p t))
+                        (octets 100 101) 2 t t)))
       (http-kit/http2::%h2-scheduler-run-entry-callbacks
        connection entry clock)
       (ensure-false callback-called-p)
@@ -2205,7 +2253,8 @@
                  (http-kit/http2::%h2-batch-entry-callback-events entry)
                  (list (list :information #'identity
                              (make-http-response :status 103))
-                       (list :body #'identity (octets 97 98) 2 nil)))
+                       (list :body #'identity (octets 97 98) 2 nil nil)
+                       (list :body #'identity (octets 99) 1 nil t)))
            (http-kit/http2::%h2-scheduler-retire-entry
             connection entry
             (make-condition 'simple-error :format-control "Retire queued callbacks.")
