@@ -329,6 +329,47 @@
         (when upload-thread
           (sb-thread:join-thread upload-thread))
         (http-kit/http2:close-http2-connection connection))))
+  (deftest http2-response-headers-cancel-completed-stream-does-not-send-rst
+    (let* ((stream
+             (make-instance
+              'binary-session-stream
+              :input
+              (concatenate-octets
+               (h2-frame 4 0 0 (octets))
+               (h2-frame 1 5 1
+                         (h2-header-block (cons ":status" "200"))))))
+           (connection (http-kit/http2:make-http2-connection :stream stream))
+           (client
+             (make-http-client
+              :cache nil
+              :transport-function
+              (http-kit/http2:make-http2-connection-transport connection)))
+           (token (make-http-cancellation-token))
+           (condition
+             (handler-case
+                 (progn
+                   (http-client-send
+                    client "GET" "https://closed.test/bodyless"
+                    :cancel-token token
+                    :on-response-headers
+                    (lambda (status headers)
+                      (declare (ignore headers))
+                      (ensure-equal 200 status)
+                      (ensure-true (http-client-cancel-request token))))
+                   nil)
+               (http-client-request-cancelled (cancelled)
+                 cancelled))))
+      (unwind-protect
+           (progn
+             (ensure-true (typep condition 'http-client-request-cancelled))
+             (ensure-false
+              (find-if
+               (lambda (frame)
+                 (and (= 3 (http-kit/http2::%h2-frame-type frame))
+                      (= 1 (http-kit/http2::%h2-frame-stream-id frame))))
+               (h2-output-frames stream)))
+             (ensure-false (http-client-cancel-request token)))
+        (http-kit/http2:close-http2-connection connection))))
 
   (deftest http2-public-priority-update
     (let* ((stream

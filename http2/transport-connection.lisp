@@ -891,9 +891,20 @@ are rejected after this function marks the connection draining."
     stream-id))
 
 (defun cancel-http2-stream
-    (connection stream-id
-     &key (error-code 8) timeout deadline clock-function)
+    (connection stream-id &key (error-code 8) timeout deadline clock-function)
   "Cancel an active client-initiated STREAM-ID with an HTTP/2 RST_STREAM."
+  (%h2-cancel-http2-stream
+   connection stream-id
+   :error-code error-code
+   :timeout timeout
+   :deadline deadline
+   :clock-function clock-function))
+
+(defun %h2-cancel-http2-stream
+    (connection stream-id
+     &key (error-code 8) timeout deadline clock-function
+       (only-if-active-p nil))
+  "Cancel an active stream, optionally ignoring completed streams."
   (unless (http2-connection-p connection)
     (error 'http-kit:http-protocol-error
            :message "CANCEL-HTTP2-STREAM requires an HTTP2-CONNECTION."
@@ -926,8 +937,13 @@ are rejected after this function marks the connection draining."
                  :operation :http2-write
                  :detail stream-id))
         #+sbcl
-        (setf entry (%h2-scheduler-entry-for-stream connection stream-id))
-        (unless entry
+        (progn
+          (setf entry (%h2-scheduler-entry-for-stream connection stream-id))
+          (when (and only-if-active-p
+                     entry
+                     (%h2-batch-entry-response entry))
+            (setf entry nil)))
+        (unless (or entry only-if-active-p)
           (%h2-send-rst-stream
            (%h2-writer (%http2-connection-stream connection)
                        absolute-deadline clock
@@ -942,8 +958,8 @@ are rejected after this function marks the connection draining."
                           :message "The HTTP/2 stream was cancelled locally."
                           :operation :http2-write
                           :cause (list :local-cancel stream-id error-code))
-         clock 0 error-code)))
-  t))
+         clock 0 error-code only-if-active-p)))
+    t))
 
 (defun %h2-send-http2-request-over-connection-serial
     (connection request &key timeout deadline max-header-bytes max-fields max-body-bytes clock-function request-body-function request-body-length on-body-chunk on-information on-response-headers on-stream-open on-cancel (collect-body-p t) (huffman-p nil))
@@ -1498,13 +1514,15 @@ CONTINUATION frames must still be consumed contiguously from that queue."
 
   (defun %h2-scheduler-retire-entry
       (connection entry condition clock-function &optional (flow-credit 0)
-       (reset-error-code 8))
+       (reset-error-code 8) only-if-active-p)
     (let ((reset-p nil)
           (connection-credit flow-credit))
       (%h2-with-scheduler-lock (connection)
         (unless (or (%h2-batch-entry-local-retired-p entry)
                     (%h2-peer-stream-reset-condition-p
-                     (%h2-batch-entry-error entry)))
+                     (%h2-batch-entry-error entry))
+                    (and only-if-active-p
+                         (%h2-batch-entry-response entry)))
           (setf (%h2-batch-entry-local-retired-p entry) t)
           (unless (%h2-batch-entry-error entry)
             (setf (%h2-batch-entry-error entry) condition))
@@ -2402,11 +2420,12 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                   (setf cancel-function
                         (lambda (&rest arguments &key error-code)
                           (declare (ignore error-code))
-                          (cancel-http2-stream
+                          (%h2-cancel-http2-stream
                            connection (%h2-batch-entry-stream-id entry)
                            :error-code (getf arguments :error-code 8)
                            :deadline absolute-deadline
-                           :clock-function clock)))
+                           :clock-function clock
+                           :only-if-active-p t)))
                   (unwind-protect
                        (progn
                          (when on-cancel
