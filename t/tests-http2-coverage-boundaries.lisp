@@ -1660,6 +1660,30 @@
       (when waiter-thread
         (ignore-errors (sb-thread:join-thread waiter-thread)))))))
 #+sbcl
+(deftest http2-coverage-scheduler-condition-wait-reacquires-mutex
+  (let* ((stream (make-instance (quote binary-session-stream) :input (octets)))
+         (connection (http-kit/http2:make-http2-connection :stream stream))
+         (condition-wait-symbol (quote sb-thread:condition-wait))
+         (original-condition-wait (fdefinition condition-wait-symbol))
+         (lock (http-kit/http2::%http2-connection-scheduler-lock connection))
+         (wait-called-p nil))
+    (unwind-protect
+         (progn
+           (sb-ext:without-package-locks
+             (setf (fdefinition condition-wait-symbol)
+                   (lambda (waitqueue mutex &key timeout)
+                     (declare (ignore waitqueue timeout))
+                     (setf wait-called-p t)
+                     (sb-thread:release-mutex mutex))))
+           (http-kit/http2::%h2-with-scheduler-lock (connection)
+             (http-kit/http2::%h2-scheduler-condition-wait
+              connection nil (lambda () 0))
+             (ensure-true wait-called-p)
+             (ensure-true (sb-thread:holding-mutex-p lock))))
+      (sb-ext:without-package-locks
+        (setf (fdefinition condition-wait-symbol) original-condition-wait))
+      (http-kit/http2:close-http2-connection connection))))
+#+sbcl
 (deftest http2-coverage-scheduler-explicit-cancel-code
   (let* ((input
            (concatenate-octets
