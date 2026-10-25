@@ -1282,22 +1282,56 @@
             :on-body-chunk (lambda (chunk) (push (copy-seq chunk) chunks))
             :on-stream-open
             (lambda (stream-id cancel)
-              (setf opened stream-id)
-              (funcall cancel)))))
+              (declare (ignore cancel))
+              (setf opened stream-id)))))
     (ensure-equal 1 opened)
     (ensure-equal 200 (http-response-status response))
     (ensure-equal (octets) (http-response-body response))
     (ensure-equal (list (octets 97 98)) chunks)
     (let* ((frames (h2-output-frames stream))
-           (reset (find 3 frames :key #'http-kit/http2::%h2-frame-type))
            (data (find 0 frames :key #'http-kit/http2::%h2-frame-type)))
-      (ensure-true reset)
-      (ensure-equal (octets 0 0 0 8)
-                    (http-kit/http2::%h2-frame-payload reset))
       (ensure-true data)
       (ensure-equal (octets 120 121)
                     (http-kit/http2::%h2-frame-payload data)))
     (http-kit/http2:close-http2-connection connection))
+  (let* ((input
+           (concatenate-octets
+            (h2-frame 4 0 0 (octets))
+            (h2-frame 1 4 1
+                      (h2-header-block (cons ":status" "200")
+                                       (cons "content-length" "2")))
+            (h2-frame 0 1 1 (octets 97 98))))
+         (stream (make-instance 'binary-session-stream :input input))
+         (connection (http-kit/http2:make-http2-connection :stream stream))
+         (opened nil)
+         (failure nil)
+         (request
+           (make-http-request :method "POST" :uri "https://example.com/upload"
+                              :body (octets 120 121))))
+    (unwind-protect
+         (progn
+           (handler-case
+               (http-kit/http2::%h2-send-http2-request-over-connection-serial
+                connection request
+                :on-stream-open
+                (lambda (stream-id cancel)
+                  (setf opened stream-id)
+                  (funcall cancel)))
+             (http-connection-error (condition)
+               (setf failure condition)))
+           (ensure-equal 1 opened)
+           (ensure-true (typep failure 'http-connection-error))
+           (ensure-equal '(:local-cancel 1 8)
+                         (http-connection-error-cause failure))
+           (let* ((frames (h2-output-frames stream))
+                  (reset (find 3 frames :key #'http-kit/http2::%h2-frame-type))
+                  (data (find 0 frames :key #'http-kit/http2::%h2-frame-type)))
+             (ensure-true reset)
+             (ensure-equal 1 (http-kit/http2::%h2-frame-stream-id reset))
+             (ensure-equal (octets 0 0 0 8)
+                           (http-kit/http2::%h2-frame-payload reset))
+             (ensure-false data)))
+      (http-kit/http2:close-http2-connection connection)))
   (let* ((stream
            (make-instance 'binary-session-stream
                           :input (h2-frame 6 0 0 (octets 1 2 3 4 5 6 7 8))))
