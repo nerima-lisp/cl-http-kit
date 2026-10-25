@@ -890,7 +890,7 @@
           (when server
             (stop-http-server server :graceful-timeout 1))))))
 
-  (deftest https-listener-event-callback-failure-releases-connection
+  (deftest https-listener-alpn-event-callback-failure-releases-connection
     (%with-https-listener-test-stubs (context)
       (let ((server nil))
         (unwind-protect
@@ -899,8 +899,9 @@
                      (%https-listener-make-server
                       :on-event
                       (lambda (event)
-                        (when (eq (getf event :type) :connection-accepted)
-                          (error "event callback marker failure")))))
+                        (when (eq (getf event :type) :alpn-selected)
+                          (%https-listener-record-event context event)
+                          (error "ALPN event callback failure")))))
                (start-http-server server)
                (let ((client (%https-listener-connect server)))
                  (close-http-tcp-stream client))
@@ -916,6 +917,8 @@
                                (http-server-callback-error-callback condition))
                  (ensure-equal :event-callback-failed
                                (http-server-error-reason-code condition)))
+               (ensure-true
+                (%https-listener-event-present-p context :alpn-selected nil))
                (ensure-equal 0 (%https-listener-connection-count server)))
           (when server
             (stop-http-server server :graceful-timeout 1))))))
@@ -1447,73 +1450,34 @@
           (setf (fdefinition thread-maker) original))))
     (let* ((thread-maker 'sb-thread:make-thread)
            (original (fdefinition thread-maker))
+           (worker-start-failed-p nil)
            (server (%https-listener-make-server))
-           (listener (gensym "LISTENER"))
-           (raw-stream (make-string-input-stream "worker"))
-           (connection nil))
-      (setf (http-kit::http-server-state server) :running
-            (http-kit::http-server-listener server) listener)
-      (multiple-value-bind (reserved rejection)
-          (http-kit::%http-server-reserve-connection
-           server listener raw-stream nil nil)
-        (ensure-false rejection)
-        (setf connection reserved))
-      (ensure-equal 1 (http-kit::http-server-connection-count server))
-      (ensure-equal 1 (http-kit::http-server-handshake-count server))
+           (client nil))
       (unwind-protect
            (progn
              (sb-ext:without-package-locks
                (setf (fdefinition thread-maker)
                      (lambda (&rest arguments)
-                       (declare (ignore arguments))
-                       (error "worker thread creation failure"))))
-             (http-kit::%http-server-start-connection-worker server connection)
+                       (if (equal (getf (cdr arguments) :name)
+                                  "http server connection")
+                           (progn
+                             (setf worker-start-failed-p t)
+                             (error "worker thread creation failure"))
+                           (apply original arguments)))))
+             (start-http-server server)
+             (setf client (%https-listener-connect server))
+             (close-http-tcp-stream client)
+             (setf client nil)
+             (%https-listener-wait (lambda () (http-server-failure server)))
+             (ensure-true worker-start-failed-p)
              (ensure-equal :worker-start-failed
                            (http-server-error-reason-code
-                            (http-server-failure server)))
-             (ensure-false (open-stream-p raw-stream))
-             (ensure-equal 0 (http-kit::http-server-connection-count server))
-             (ensure-equal 0 (http-kit::http-server-handshake-count server)))
+                            (http-server-failure server))))
         (sb-ext:without-package-locks
-          (setf (fdefinition thread-maker) original))))
-    (setf (%https-listener-test-context-handshake-action context)
-          (lambda (stream timeout deadline)
-            (declare (ignore stream timeout deadline))
-            :not-a-stream))
-    (let* ((errors nil)
-           (server (%https-listener-make-server
-                    :on-error
-                    (lambda (condition details)
-                      (push (list condition details) errors))))
-           (raw-stream (make-string-input-stream "invalid TLS result"))
-           (connection
-             (http-kit::%make-http-server-connection :raw-stream raw-stream)))
-      (http-kit::%http-server-run-connection server connection)
-      (ensure-equal :invalid-tls-stream
-                    (http-server-error-reason-code
-                     (first (first errors))))
-      (ensure-equal :handshake
-                    (http-server-error-phase (first (first errors))))
-      (ensure-false (open-stream-p raw-stream)))
-    (setf (%https-listener-test-context-handshake-action context)
-          (lambda (stream timeout deadline)
-            (declare (ignore timeout deadline))
-            stream))
-    (let* ((server
-             (%https-listener-make-server
-              :on-event
-              (lambda (event)
-                (when (eq (getf event :type) :alpn-selected)
-                  (error "ALPN callback failure")))))
-           (raw-stream (make-string-input-stream "TLS stream"))
-           (connection
-             (http-kit::%make-http-server-connection :raw-stream raw-stream)))
-      (http-kit::%http-server-run-connection server connection)
-      (ensure-true (typep (http-server-failure server)
-                          'http-server-callback-error))
-      (ensure-equal :event-callback-failed
-                    (http-server-error-reason-code
-                     (http-server-failure server))))))
+          (setf (fdefinition thread-maker) original))
+        (when client
+          (close-http-tcp-stream client))
+        (stop-http-server server :graceful-timeout 1)))))
 #+sbcl
 (deftest https-listener-stop-sets-deadline-during-startup-error-callback
   (%with-https-listener-test-stubs (context)

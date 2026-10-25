@@ -323,7 +323,7 @@
                   :invalid-handshake-limit :invalid-timeout
                   :ticket-key-store-unavailable :invalid-tls-wrapper
                   :invalid-tls-credentials :invalid-ticket-key-store
-                  :connection-close-failed :invalid-tls-stream :unsupported-alpn
+                  :connection-close-failed :unsupported-alpn
                   :worker-start-failed :listener-open-failed :server-failed
                   :supervisor-start-failed :timeout :protocol-error
                   :connection-error)
@@ -571,10 +571,6 @@
                               :deadline
                               (%http-server-connection-handshake-deadline
                                connection)))
-               (unless (streamp tls-stream)
-                 (error 'http-server-error
-                        :reason-code :invalid-tls-stream
-                        :phase :handshake))
                (%http-server-set-tls-stream server connection tls-stream)
                (%http-server-release-handshake server connection)
                (setf phase :alpn)
