@@ -168,7 +168,7 @@
              (ensure-equal
               (list #x102 "synthetic HTTP/3 connection error")
               quic-close-arguments)
-             (ensure-true (search "Injected QUIC connection close failure." warning-text))
+             (ensure-true (search "Closing the HTTP/3 QUIC connection also failed after HTTP/3 connection error" warning-text))
              (ensure-false (http-kit/http3:http3-client-open-p client)))
         (setf (http-kit/http3::http3-client-close-connection client) nil)
         (when (http-kit/http3:http3-client-open-p client)
