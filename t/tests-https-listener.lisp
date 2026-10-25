@@ -1515,41 +1515,46 @@
                     (http-server-error-reason-code
                      (http-server-failure server))))))
 #+sbcl
-(deftest https-listener-stop-sets-deadline-after-supervisor-start-failure
+(deftest https-listener-stop-sets-deadline-during-startup-error-callback
   (%with-https-listener-test-stubs (context)
     (ensure-true context)
-    (let* ((thread-maker 'sb-thread:make-thread)
+    (let* ((thread-maker (quote sb-thread:make-thread))
            (original (fdefinition thread-maker))
+           (thread-attempts 0)
            (events nil)
-           (server
-             (%https-listener-make-server
-              :on-event
-              (lambda (event)
-                (push (getf event :type) events)))))
+           (stop-result nil)
+           (server nil))
+      (setf server
+            (%https-listener-make-server
+             :on-event
+             (lambda (event)
+               (push (getf event :type) events))
+             :on-error
+             (lambda (condition details)
+               (declare (ignore condition details))
+               (setf stop-result
+                     (stop-http-server server :graceful-timeout 5)))))
       (unwind-protect
            (progn
              (sb-ext:without-package-locks
                (setf (fdefinition thread-maker)
                      (lambda (&rest arguments)
-                       (declare (ignore arguments))
-                       (error "supervisor thread creation failure"))))
-             (unwind-protect
-                  (progn
-                    (start-http-server server)
-                    (ensure-equal
-                     :supervisor-start-failed
-                     (http-server-error-reason-code
-                      (http-server-failure server))))
-               (sb-ext:without-package-locks
-                 (setf (fdefinition thread-maker) original)))
+                       (incf thread-attempts)
+                       (if (= thread-attempts 1)
+                           (error "supervisor thread creation failure")
+                           (apply original arguments)))))
+             (start-http-server server)
              (ensure-equal
-              server
-              (stop-http-server server :graceful-timeout 1))
+              :supervisor-start-failed
+              (http-server-error-reason-code
+               (http-server-failure server)))
+             (ensure-equal server stop-result)
+             (ensure-equal 2 thread-attempts)
              (ensure-true (member :listener-stopped events)))
         (sb-ext:without-package-locks
           (setf (fdefinition thread-maker) original))
         (unless (member :listener-stopped events)
-          (stop-http-server server :graceful-timeout 1))))))
+          (stop-http-server server :graceful-timeout 5))))))
 
 
 #+sbcl
@@ -1769,6 +1774,47 @@
              (ensure-false (http-server-failure server)))
         (setf terminate-coordinator-on-stopped nil)
         (stop-http-server server :graceful-timeout 5)))))
+#+sbcl
+(deftest https-listener-skips-coordinator-join-after-deadline
+  (%with-https-listener-test-stubs (context)
+    (ensure-true context)
+    (let* ((stopped-event-entered (sb-thread:make-semaphore :count 0))
+           (release-stopped-event (sb-thread:make-semaphore :count 0))
+           (stopping-event-seen nil)
+           (stopped-event-completed nil)
+           (coordinator nil)
+           (server
+             (%https-listener-make-server
+              :on-event
+              (lambda (event)
+                (case (getf event :type)
+                  (:listener-stopping
+                   (setf stopping-event-seen t)
+                   (sleep 0.2))
+                  (:listener-stopped
+                   (setf coordinator sb-thread:*current-thread*)
+                   (sb-thread:signal-semaphore stopped-event-entered)
+                   (setf stopped-event-completed
+                         (sb-thread:wait-on-semaphore
+                          release-stopped-event :timeout 5))))))))
+      (unwind-protect
+           (progn
+             (ensure-equal
+              server
+              (stop-http-server server :graceful-timeout 0.05))
+             (ensure-true stopping-event-seen)
+             (ensure-true
+              (sb-thread:wait-on-semaphore stopped-event-entered :timeout 5))
+             (ensure-true (sb-thread:thread-alive-p coordinator))
+             (ensure-false stopped-event-completed)
+             (sb-thread:signal-semaphore release-stopped-event)
+             (sb-thread:join-thread coordinator :timeout 5 :default nil)
+             (ensure-false (sb-thread:thread-alive-p coordinator))
+             (ensure-true stopped-event-completed))
+        (sb-thread:signal-semaphore release-stopped-event)
+        (when coordinator
+          (sb-thread:join-thread coordinator :timeout 5 :default nil))
+        (stop-http-server server :graceful-timeout 1)))))
 #+sbcl
 (deftest https-listener-times-out-slow-real-tls-handshake
   (let* ((material (%tls-server-test-material))
