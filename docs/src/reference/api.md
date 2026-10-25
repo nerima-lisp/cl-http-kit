@@ -1000,7 +1000,11 @@ and `http-server-error-phase` expose safe error metadata, while
 Each server creates its own ticket-key store by default. Pass a store created
 with `cl-tls-kit:make-tls13-server-ticket-key-store` to multiple server
 instances to share their TLS 1.3 session-ticket keys. Each instance still
-enforces its own connection and handshake limits.
+enforces its own connection and handshake limits. A server automatically
+rotates only a store it created, on the first TLS connection after each
+12-hour interval. The caller that supplies a store is responsible for rotating
+it with `cl-tls-kit:rotate-tls13-server-ticket-key-store` and coordinating
+that rotation across every server that shares the store.
 
 ## TLS package
 

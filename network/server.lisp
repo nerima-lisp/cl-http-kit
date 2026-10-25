@@ -14,6 +14,8 @@
              (declare (ignore condition))
              (write-string "An HTTPS server callback failed." stream))))
 
+(defvar *http-server-clock-function* #'http-kit::%monotonic-time)
+
 (defstruct (http-server (:constructor %make-http-server))
   host
   port
@@ -124,7 +126,7 @@
                :private-key private-key
                :ticket-key-store ticket-key-store
                :alpn-protocols '("h2" "http/1.1")
-               :clock-function #'http-kit::%monotonic-time)))
+               :clock-function #'%http-server-now)))
         (unless (functionp wrapper)
           (%http-server-configuration-error :invalid-tls-wrapper))
         wrapper)
@@ -262,8 +264,7 @@
                   :phase phase
                   :callback callback))
 
-(defun %http-server-now ()
-  (http-kit::%monotonic-time))
+(defun %http-server-now () (funcall *http-server-clock-function*))
 
 (defun %http-server-broadcast (server)
   #+sbcl
