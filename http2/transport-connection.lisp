@@ -1069,10 +1069,11 @@ concurrent streams should use SEND-HTTP2-REQUESTS-OVER-CONNECTION."
                       (cancelled-p nil)
                       (cancel-error-code 8))
                   (let ((cancel-function
-                          (lambda (&key (error-code nil error-code-p))
+                          (lambda (&rest arguments &key error-code)
+                            (declare (ignore error-code))
                             (setf cancelled-p t
                                   cancel-error-code
-                                  (if error-code-p error-code 8))
+                                  (getf arguments :error-code 8))
                             (cancel-http2-stream
                              connection stream-id
                              :error-code cancel-error-code
@@ -2351,10 +2352,11 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                        collect-body-p
                        reader writer))
                 (setf cancel-function
-                      (lambda (&key (error-code nil error-code-p))
+                      (lambda (&rest arguments &key error-code)
+                        (declare (ignore error-code))
                         (cancel-http2-stream
                          connection (%h2-batch-entry-stream-id entry)
-                         :error-code (if error-code-p error-code 8)
+                         :error-code (getf arguments :error-code 8)
                          :deadline absolute-deadline
                          :clock-function clock)))
                 (unwind-protect
