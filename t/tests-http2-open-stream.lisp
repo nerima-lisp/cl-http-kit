@@ -4024,7 +4024,9 @@
              (concatenate-octets
               (h2-frame 4 0 0 (octets))
               (h2-frame 1 4 1 (h2-header-block (cons ":status" "200")))
-              (h2-frame 0 1 1 (octets 65 66))
+              (concatenate-octets
+               (h2-frame 0 0 1 (octets 65))
+               (h2-frame 0 1 1 (octets 66)))
               (h2-frame 1 5 3 (h2-header-block (cons ":status" "200")))))
            (stream (make-instance (quote binary-session-stream) :input input))
            (connection
