@@ -907,6 +907,22 @@
             :cancel-stream-function (lambda () nil)))
          invalid-cleanup-result)
         (ensure-equal 1 registration-count)))))
+(deftest http1-direct-parser-cancel-handler-unregisters-after-response
+  (let ((events '())
+        (response
+          (parse-http-response
+           (ascii "HTTP/1.1 200 OK|CRLF|Content-Length: 0|CRLF||CRLF|")
+           :on-cancel
+           (lambda (cancel-function)
+             (ensure-true (functionp cancel-function))
+             (push :registered events)
+             (lambda ()
+               (push :unregistered events)))
+           :cancel-stream-function
+           (lambda ()
+             (push :cancelled events)))))
+    (ensure-equal 200 (http-response-status response))
+    (ensure-equal '(:registered :unregistered) (nreverse events))))
 
 #+sbcl
 (deftest http1-final-response-headers-callback-failure-leaves-body-unread
