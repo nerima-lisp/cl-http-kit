@@ -8,7 +8,7 @@
   ;; &OPTIONAL and &KEY in the lambda list (which some implementations warn
   ;; about).  A keyword immediately after the callback means that collection
   ;; keeps its default value.
-  (let ((on-body-chunk nil) (on-information nil) (on-response-headers nil) (response-headers-fired-p nil) (collect-body-p t) (expected-stream-id 1) (hpack-context nil) (read-initial-settings-p t) (peer-max-frame-size nil) (initial-frames nil) (on-peer-settings nil) (control-handler nil) (budget-owner nil) (max-fields nil) (keyword-options options) (missing-value (gensym "MISSING-VALUE-")))
+  (let ((on-body-chunk nil) (on-information nil) (on-response-headers nil) (on-response-complete nil) (response-headers-fired-p nil) (collect-body-p t) (expected-stream-id 1) (hpack-context nil) (read-initial-settings-p t) (peer-max-frame-size nil) (initial-frames nil) (on-peer-settings nil) (control-handler nil) (budget-owner nil) (max-fields nil) (keyword-options options) (missing-value (gensym "MISSING-VALUE-")))
     (declare (ignorable peer-max-frame-size))
     (unless (or (null keyword-options)
                 (keywordp (car keyword-options)))
@@ -26,7 +26,7 @@
                       :message "An HTTP/2 response option is missing its value."
                       :operation :http2-read
                       :detail key))
-             (case key (:expected-stream-id (setf expected-stream-id value)) (:hpack-context (setf hpack-context value)) (:max-fields (setf max-fields value)) (:read-initial-settings-p (setf read-initial-settings-p value)) (:peer-max-frame-size (setf peer-max-frame-size value)) (:initial-frames (setf initial-frames value)) (:on-information (setf on-information value)) (:on-response-headers (setf on-response-headers value)) (:on-peer-settings (setf on-peer-settings value)) (:control-handler (setf control-handler value)) (:budget-owner (setf budget-owner value)) (otherwise (error 'http-kit:http-protocol-error :message "An unknown HTTP/2 response option was supplied." :operation :http2-read :detail key))))
+             (case key (:expected-stream-id (setf expected-stream-id value)) (:hpack-context (setf hpack-context value)) (:max-fields (setf max-fields value)) (:read-initial-settings-p (setf read-initial-settings-p value)) (:peer-max-frame-size (setf peer-max-frame-size value)) (:initial-frames (setf initial-frames value)) (:on-information (setf on-information value)) (:on-response-headers (setf on-response-headers value)) (:on-response-complete (setf on-response-complete value)) (:on-peer-settings (setf on-peer-settings value)) (:control-handler (setf control-handler value)) (:budget-owner (setf budget-owner value)) (otherwise (error 'http-kit:http-protocol-error :message "An unknown HTTP/2 response option was supplied." :operation :http2-read :detail key))))
     (let ((context (or hpack-context
                        (%h2-make-hpack-context :max-table-size +hpack-default-table-size+)))
         (status nil)
@@ -94,6 +94,8 @@
                    frame reader max-frame-size deadline clock-function
                    max-header-bytes context status headers body body-length
                    request-method expected-stream-id max-fields)
+                (when (and response on-response-complete)
+                  (funcall on-response-complete))
                 (when (and on-response-headers
                            (not response-headers-fired-p)
                            new-status
@@ -122,6 +124,8 @@
                   (%h2-send-window-update writer stream-id data-length))
                 (%h2-send-window-update writer 0 data-length)
                 (when end-stream
+                  (when on-response-complete
+                    (funcall on-response-complete))
                   (return-from %h2-read-response
                     (%h2-finish-request-response
                      status headers nil body request-method

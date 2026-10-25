@@ -1083,6 +1083,7 @@ concurrent streams should use SEND-HTTP2-REQUESTS-OVER-CONNECTION."
                   (incf (%http2-connection-next-stream-id connection) 2)
                   (let ((cancel-cleanup nil)
                         (cancelled-p nil)
+                        (response-complete-p nil)
                         (cancel-error-code 8))
                     (let ((cancel-function
                             (lambda (&rest arguments &key error-code)
@@ -1090,11 +1091,12 @@ concurrent streams should use SEND-HTTP2-REQUESTS-OVER-CONNECTION."
                               (setf cancelled-p t
                                     cancel-error-code
                                     (getf arguments :error-code 8))
-                              (cancel-http2-stream
+                              (%h2-cancel-http2-stream
                                connection stream-id
                                :error-code cancel-error-code
                                :deadline absolute-deadline
-                               :clock-function clock))))
+                               :clock-function clock
+                               :only-if-active-p response-complete-p))))
                       (unwind-protect
                            (progn
                              (when on-cancel
@@ -1156,6 +1158,9 @@ concurrent streams should use SEND-HTTP2-REQUESTS-OVER-CONNECTION."
                                                     :deadline absolute-deadline
                                                     :clock-function clock)
                                                    (error condition)))))
+                                        :on-response-complete
+                                        (lambda ()
+                                          (setf response-complete-p t))
                                         :budget-owner connection
                                         :read-initial-settings-p
                                         read-initial-settings-p

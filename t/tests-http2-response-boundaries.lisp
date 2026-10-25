@@ -169,8 +169,54 @@
                      (setf failure condition)))
                  (ensure-true (typep failure 'http-connection-error))
                  (ensure-equal (list :local-cancel 1 expected-error-code)
-                               (http-connection-error-cause failure)))
+                               (http-connection-error-cause failure))
+                 (let ((reset-frame
+                         (find-if
+                          (lambda (frame)
+                            (and (= 3 (http-kit/http2::%h2-frame-type frame))
+                                 (= 1
+                                    (http-kit/http2::%h2-frame-stream-id frame))))
+                          (h2-output-frames stream))))
+                   (ensure-true reset-frame)
+                   (ensure-equal (octets 0 0 0 expected-error-code)
+                                 (http-kit/http2::%h2-frame-payload reset-frame))))
             (http-kit/http2:close-http2-connection connection)))))))
+  (deftest http2-serial-cancel-after-bodyless-response-does-not-send-rst
+    (let* ((input
+             (concatenate-octets
+              (h2-frame 4 0 0 (octets))
+              (h2-frame 1 5 1
+                        (h2-header-block (cons ":status" "200")))))
+           (stream (make-instance 'binary-session-stream :input input))
+           (connection (http-kit/http2:make-http2-connection :stream stream))
+           (request
+             (make-http-request :method "GET"
+                                :uri "https://example.test/cancel-after-response"))
+           (cancel-function nil)
+           (response nil))
+      (unwind-protect
+           (progn
+             (setf response
+                   (http-kit/http2::%h2-send-http2-request-over-connection-serial
+                    connection request
+                    :on-cancel
+                    (lambda (callback)
+                      (setf cancel-function callback)
+                      nil)
+                    :on-response-headers
+                    (lambda (status headers)
+                      (declare (ignore headers))
+                      (ensure-equal 200 status)
+                      (ensure-true (functionp cancel-function))
+                      (funcall cancel-function))))
+             (ensure-equal 200 (http-response-status response))
+             (ensure-false
+              (find-if
+               (lambda (frame)
+                 (and (= 3 (http-kit/http2::%h2-frame-type frame))
+                      (= 1 (http-kit/http2::%h2-frame-stream-id frame))))
+               (h2-output-frames stream))))
+        (http-kit/http2:close-http2-connection connection))))
 
   (deftest http2-response-callbacks-cover-serial-and-scheduled-transport
     (let* ((input
