@@ -633,7 +633,10 @@ driver's transport callbacks."
         (%tls-server-handle-events state events))
     (http-timeout (condition) (error condition))
     (http-protocol-error (condition) (error condition))
-    (error ()
+    (error (condition)
+      #+sbcl
+      (when (typep condition 'sb-ext:timeout)
+        (%tls-timeout))
       (%tls-server-fail "TLS handshake failed." :handshake-failed))))
 
   (defun %tls-server-feed-handshake (state fragment)
@@ -767,9 +770,14 @@ driver's transport callbacks."
              state
              (cl-tls-kit:make-tls-plaintext outer-type (subseq wire 5)))
           (http-protocol-error (condition) (error condition))
-          (error ()
-                 (%tls-server-fail "TLS plaintext record is invalid."
-                                   :invalid-record)))))))
+          (error (condition)
+            (when (typep condition 'http-timeout)
+              (error condition))
+            #+sbcl
+            (when (typep condition 'sb-ext:timeout)
+              (%tls-timeout))
+            (%tls-server-fail "TLS plaintext record is invalid."
+                              :invalid-record)))))))
 
   (defun %tls-server-fill (state)
     (loop

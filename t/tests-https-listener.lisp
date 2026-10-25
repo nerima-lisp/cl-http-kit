@@ -1069,9 +1069,9 @@
      (waitqueue
        :initform (sb-thread:make-waitqueue :name "HTTPS TLS client stream")
        :reader %https-listener-client-stream-waitqueue)
-     (prefix-sent-p
+     (client-hello-sent-p
        :initform nil
-       :accessor %https-listener-client-stream-prefix-sent-p)
+       :accessor %https-listener-client-stream-client-hello-sent-p)
      (release-p
        :initform nil
        :accessor %https-listener-client-stream-release-p)))
@@ -1121,25 +1121,15 @@
                         :start record-end
                         :end (length bytes)))))
 
-  (defun %https-listener-stream-write-client-hello-prefix (stream bytes)
+  (defun %https-listener-stream-write-client-hello-and-stall (stream bytes)
     (let* ((transport (%https-listener-client-stream-transport stream))
-           (fragment-size (%https-listener-client-stream-fragment-size stream))
-           (record-end (+ 5 (ash (aref bytes 3) 8) (aref bytes 4)))
-           (first-end (min record-end (+ 5 fragment-size)))
-           (fragment-length (- first-end 5))
-           (header (vector
-                    cl-tls-kit:+tls-content-type-handshake+
-                    (aref bytes 1)
-                    (aref bytes 2)
-                    (ldb (byte 8 8) fragment-length)
-                    (ldb (byte 8 0) fragment-length))))
-      (write-sequence header transport)
-      (write-sequence bytes transport :start 5 :end first-end)
+           (record-end (+ 5 (ash (aref bytes 3) 8) (aref bytes 4))))
+      (write-sequence bytes transport :end record-end)
       (incf (%https-listener-client-stream-record-count stream))
       (finish-output transport)
       (sb-thread:with-mutex
           ((%https-listener-client-stream-lock stream))
-        (setf (%https-listener-client-stream-prefix-sent-p stream) t)
+        (setf (%https-listener-client-stream-client-hello-sent-p stream) t)
         (sb-thread:condition-broadcast
          (%https-listener-client-stream-waitqueue stream))
         (let ((deadline (+ (get-internal-real-time)
@@ -1151,8 +1141,8 @@
                     (%https-listener-client-stream-waitqueue stream)
                     (%https-listener-client-stream-lock stream)
                     :timeout 0.1))))
-      (%https-listener-write-client-hello-fragments
-       stream bytes first-end)))
+      (when (< record-end (length bytes))
+        (write-sequence bytes transport :start record-end))))
 
   (defmethod sb-gray:stream-write-sequence
       ((stream %https-listener-client-stream) sequence &optional (start 0) end)
@@ -1167,7 +1157,8 @@
               (:fragment
                (%https-listener-write-client-hello-fragments stream bytes))
               (:stall
-               (%https-listener-stream-write-client-hello-prefix stream bytes))))
+               (%https-listener-stream-write-client-hello-and-stall
+                stream bytes))))
           (write-sequence bytes transport))
       (finish-output transport)
       sequence))
@@ -1205,15 +1196,15 @@
        (first (getf material :certificate-chain))))
      :alpn-protocols (or alpn-protocols '("http/1.1"))))
 
-  (defun %https-listener-wait-for-client-prefix (stream)
+  (defun %https-listener-wait-for-client-hello (stream)
     (%https-listener-wait
      (lambda ()
        (sb-thread:with-mutex
            ((%https-listener-client-stream-lock stream))
-         (%https-listener-client-stream-prefix-sent-p stream)))
+         (%https-listener-client-stream-client-hello-sent-p stream)))
      5))
 
-  (defun %https-listener-release-client-prefix (stream)
+  (defun %https-listener-release-client-hello (stream)
     (sb-thread:with-mutex
         ((%https-listener-client-stream-lock stream))
       (setf (%https-listener-client-stream-release-p stream) t)
@@ -1747,7 +1738,7 @@
                                :timeout 5))
                       (error (condition)
                         (setf client-condition condition))))))
-           (ensure-true (%https-listener-wait-for-client-prefix transport))
+           (ensure-true (%https-listener-wait-for-client-hello transport))
            (%https-listener-wait
             (lambda () (%https-listener-errors context)))
            (let* ((entry (first (%https-listener-errors context)))
@@ -1762,7 +1753,7 @@
            (ensure-equal 0 (%https-listener-session-count context))
            (ensure-false
             (%https-listener-event-present-p context :alpn-selected nil))
-           (%https-listener-release-client-prefix transport)
+           (%https-listener-release-client-hello transport)
            (sb-thread:join-thread client-thread :default nil :timeout 5)
            (ensure-false (sb-thread:thread-alive-p client-thread))
            (ensure-false client-tls-stream)
@@ -1772,7 +1763,7 @@
               (and (zerop (%https-listener-connection-count server))
                    (zerop (%https-listener-handshake-count server))))))
       (when transport
-        (%https-listener-release-client-prefix transport)
+        (%https-listener-release-client-hello transport)
         (when (open-stream-p transport)
           (close-http-tcp-stream transport)))
       (when (and client-thread

@@ -1103,5 +1103,29 @@
         (close server-stream :abort t)
         (%tls-server-test-remove-material material))))
 
+  (deftest network-tls-server-preserves-handshake-deadline-timeout
+    (let* ((original-step (fdefinition 'cl-tls-kit:tls13-server-driver-step))
+           (state
+             (http-kit/tls::%make-http-tls-server-state
+              :driver nil :provider nil :transport-stream nil))
+           (condition nil))
+      (unwind-protect
+           (progn
+             (setf (fdefinition 'cl-tls-kit:tls13-server-driver-step)
+                   (lambda (&rest arguments)
+                     (declare (ignore arguments))
+                     (sb-ext:with-timeout 0.001
+                       (sleep 0.01))))
+             (setf condition
+                   (handler-case
+                       (progn
+                         (http-kit/tls::%tls-server-process-record
+                          state (octets 22 3 3 0 4 2 0 0 0))
+                         nil)
+                     (http-timeout (condition) condition)
+                     (http-protocol-error (condition) condition))))
+        (setf (fdefinition 'cl-tls-kit:tls13-server-driver-step)
+              original-step))
+      (ensure-true (typep condition 'http-timeout))))
 
   )
