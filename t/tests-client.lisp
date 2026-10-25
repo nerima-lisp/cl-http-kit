@@ -5428,8 +5428,15 @@
           (ensure-equal request effective)
           (ensure-equal "cached" (octets-as-string (http-response-body response)))
           (ensure-equal (http-response-status response) revalidation-status)
-          (ensure-true (eq (http-response-headers response)
-                           revalidation-headers))
+          (ensure-equal
+           (mapcar (lambda (header)
+                     (cons (http-header-name header)
+                           (http-header-content header)))
+                   (http-response-headers response))
+           (mapcar (lambda (header)
+                     (cons (http-header-name header)
+                           (http-header-content header)))
+                   revalidation-headers))
           (ensure-equal "\"v1\""
                         (http-header-value revalidation-headers "ETag"))
           (ensure-equal "\"v1\""
