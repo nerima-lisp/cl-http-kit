@@ -1376,17 +1376,17 @@
         ]
       },
       "locked": {
-        "lastModified": 1792528342,
-        "narHash": "sha256-8bT8rMmrySYlM1eI6FuFUFMmbpopv6RS9vc2DD56WeU=",
+        "lastModified": 1792940142,
+        "narHash": "sha256-PJygsDgArqjckL+kATBLDH1ouT9bHaEBtbuRzkR/DyE=",
         "owner": "nerima-lisp",
         "repo": "cl-tls-kit",
-        "rev": "d6cf61a9ac2c0af16c7a29db3de1075962ba08f9",
+        "rev": "4422629ceaf8b54b7fcec25e3a21eaa79e5becff",
         "type": "github"
       },
       "original": {
         "owner": "nerima-lisp",
         "repo": "cl-tls-kit",
-        "rev": "d6cf61a9ac2c0af16c7a29db3de1075962ba08f9",
+        "rev": "4422629ceaf8b54b7fcec25e3a21eaa79e5becff",
         "type": "github"
       }
     },
