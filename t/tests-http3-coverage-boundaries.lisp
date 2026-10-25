@@ -2530,7 +2530,7 @@
                          (setf (gethash stream read-stages) 2)
                          (values response-wire t :data))
                         (otherwise (values nil nil :would-block)))
-                    (values nil nil :would-block))))
+                    (values nil nil :would-block)))))
              (response nil)
              (failure
                (http3-boundary-error
@@ -2566,7 +2566,7 @@
                      (ensure-octets-equal
                       (ascii "body") (http-response-body response)))))
           (when (http-kit/http3:http3-client-open-p client)
-            (http-kit/http3:close-http3-client client))))))))
+            (http-kit/http3:close-http3-client client)))))))
 (deftest http3-qpack-public-synchronous-section-ack-runs-inside-serializer
   (multiple-value-bind (decoder-context section instruction)
       (http3-test-qpack-blocked-section
