@@ -120,7 +120,7 @@
   :license "MIT"
   :version "0.4.1"
   :depends-on ("cl-http-kit/network" "cl-http-kit/http2"
-               (:version "cl-tls-kit" "0.4.1")
+               (:version "cl-tls-kit" "0.5.0")
                "cl-crypto-kit")
   :pathname "network"
   :serial t

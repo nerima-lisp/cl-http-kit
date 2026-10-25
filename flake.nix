@@ -68,7 +68,7 @@
     };
 
     cl-tls-kit = {
-      url = "github:nerima-lisp/cl-tls-kit/4422629ceaf8b54b7fcec25e3a21eaa79e5becff";
+      url = "github:nerima-lisp/cl-tls-kit/2e58bf240bdfe40d885b4fb0d06757a0edb75f61";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.cl-weave.follows = "cl-weave";
       inputs.cl-crypto-kit.follows = "cl-crypto-kit";
