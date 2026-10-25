@@ -887,7 +887,10 @@ becomes readable again."
                                  'http-kit:http-connection-error
                                  :message "The HTTP/3 request stream was cancelled."
                                  :operation :http3-request
-                                 :request-sent-p t)))
+                                 :request-sent-p t
+                                 :cause (list :local-cancel
+                                              (%http3-request-stream-stream-id entry)
+                                              error-code))))
   t)
 
 (defun cancel-http3-stream
@@ -3483,7 +3486,10 @@ validated informational response in wire order."
               (quote http-kit:http-connection-error)
               :message "The HTTP/3 request stream was cancelled."
               :operation :http3-request
-              :request-sent-p t)))
+              :request-sent-p t
+              :cause (list :local-cancel
+                           (%http3-request-stream-stream-id entry)
+                           (%http3-request-stream-cancel-error-code entry)))))
           (http-kit::%check-deadline
            (%http3-request-stream-deadline entry)
            (function http-kit::%monotonic-time) :read)

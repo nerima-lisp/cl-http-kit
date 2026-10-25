@@ -13696,8 +13696,11 @@
              (ensure-equal :error (first owner-result))
              (ensure-true
               (typep (second owner-result) 'http-connection-error))
-             (ensure-equal :http3-request
-                           (http-error-operation (second owner-result)))
+             (progn
+               (ensure-equal :http3-request
+                             (http-error-operation (second owner-result)))
+               (ensure-equal '(:local-cancel 0 #x10c)
+                             (http-connection-error-cause (second owner-result))))
              (ensure-true
               (http-connection-error-request-sent-p (second owner-result)))
              (ensure-equal 1 (length cancel-calls))
