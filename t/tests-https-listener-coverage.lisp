@@ -308,8 +308,7 @@
           (cons 'http-kit/network:close-http-tcp-listener
                 (lambda (target)
                   (declare (ignore target))
-                  (setf (http-kit::http-server-listener server) replacement
-                        (http-kit::http-server-supervisor server) :replaced)
+                  (setf (http-kit::http-server-listener server) replacement)
                   nil))
           (cons 'http-kit::%http-server-force-close-connections
                 (lambda (target)
@@ -321,7 +320,7 @@
         (ensure-false (open-stream-p stream))
         (ensure-equal :failed (http-kit::http-server-state server))
         (ensure-equal replacement (http-kit::http-server-listener server))
-        (ensure-equal :replaced (http-kit::http-server-supervisor server))
+        (ensure-false (http-kit::http-server-supervisor server))
         (ensure-equal 0 (http-kit::http-server-connection-count server))
         (ensure-false (gethash worker (http-kit::http-server-workers server)))
         (ensure-equal :other

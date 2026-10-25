@@ -233,10 +233,7 @@
         (when (http-server-ticket-key-store-owned-p server)
           (setf (%http-server-connection-ticket-key-store connection)
                 (http-server-ticket-key-store server))
-          (when (http-server-ticket-key-store server)
-            (incf (gethash (http-server-ticket-key-store server)
-                           (http-server-ticket-key-store-users server)
-                           0))))))
+          (incf (gethash (http-server-ticket-key-store server) (http-server-ticket-key-store-users server) 0)))))
     (when uninstalled-store
       (%http-server-destroy-ticket-key-stores server (list uninstalled-store)))
     (when rotation-error
@@ -250,8 +247,7 @@
         (startup-error nil))
     (%with-http-server-lock (server)
       (when (and (eq (http-server-state server) :starting)
-                 (eq (http-server-start-token server) start-token)
-                 (not (http-server-shutdown-p server)))
+                 (eq (http-server-start-token server) start-token))
         (setf valid-start-p t)
         (when (and (http-server-ticket-key-store-owned-p server)
                    (null (http-server-ticket-key-store server)))
@@ -1015,8 +1011,7 @@
                     server :stopped
                     (list :type :listener-stopped :phase :shutdown))
                    (%with-http-server-lock (server)
-                     (when (eq supervisor (http-server-supervisor server))
-                       (setf (http-server-supervisor server) nil))
+                     (setf (http-server-supervisor server) nil)
                      (setf (http-server-start-token server) nil
                            (http-server-listener-wake-in-progress-p server) nil)
                      (unless (eq (http-server-state server) :failed)
@@ -1026,8 +1021,7 @@
                        (setf (http-server-shutdown-coordinator server) nil))
                      (%http-server-broadcast server)))
                  (%with-http-server-lock (server)
-                   (when (eq supervisor (http-server-supervisor server))
-                     (setf (http-server-supervisor server) nil))
+                   (setf (http-server-supervisor server) nil)
                    (setf (http-server-start-token server) nil
                          (http-server-listener-wake-in-progress-p server) nil
                          (http-server-shutdown-p server) nil
