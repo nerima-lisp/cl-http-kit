@@ -2878,6 +2878,8 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
         t))))
 
 (defun %h3-scheduler-read-entry-step (client entry)
+  (when (%http3-request-stream-qpack-token entry)
+    (return-from %h3-scheduler-read-entry-step nil))
   (multiple-value-bind (chunk fin-p status)
       (%h3-try-read-client-stream
        client (%http3-request-stream-stream entry)

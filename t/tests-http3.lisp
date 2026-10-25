@@ -3895,7 +3895,218 @@
       (sb-thread:signal-semaphore release-response)
       (when (http-kit/http3:http3-client-open-p client)
         (http-kit/http3:close-http3-client client))
-      (http3-test-join-native-thread owner-thread owner-finished)))))
+      (http3-test-join-native-thread owner-thread owner-finished))))
+
+(deftest http3-client-native-scheduler-does-not-read-response-while-qpack-blocked
+  (multiple-value-bind (decoder-context section instruction)
+      (http3-test-qpack-blocked-section
+       (list (cons ":status" "200")
+             (cons "content-length" "2")
+             (cons "x-blocked" "ready")))
+    (declare (ignore decoder-context))
+    (let* ((headers-wire
+             (http-kit/http3:encode-http3-frame
+              (http-kit/http3:make-http3-frame
+               :type http-kit/http3:+http3-headers-type+
+               :payload section)))
+           (first-data-wire
+             (http-kit/http3:encode-http3-frame
+              (http-kit/http3:make-http3-frame
+               :type http-kit/http3:+http3-data-type+
+               :payload (octets 65))))
+           (last-data-wire
+             (http-kit/http3:encode-http3-frame
+              (http-kit/http3:make-http3-frame
+               :type http-kit/http3:+http3-data-type+
+               :payload (octets 66))))
+           (whole-body-wire
+             (http-kit/http3:encode-http3-frame
+              (http-kit/http3:make-http3-frame
+               :type http-kit/http3:+http3-data-type+
+               :payload (octets 65 66))))
+           (peer-qpack
+             (make-http3-test-stream :kind :peer-qpack-encoder))
+           (peer-qpack-decoder
+             (make-http3-test-stream :kind :peer-qpack-decoder))
+           (poll-count 0)
+           (second-poll-started (sb-thread:make-semaphore :count 0))
+           (release-second-poll (sb-thread:make-semaphore :count 0))
+           (unblock-poll-started (sb-thread:make-semaphore :count 0))
+           (release-unblock-poll (sb-thread:make-semaphore :count 0))
+           (resume-poll-started (sb-thread:make-semaphore :count 0))
+           (release-resume-poll (sb-thread:make-semaphore :count 0))
+           (allow-decoder-p nil)
+           (decoder-sent-p nil)
+           (allow-encoder-p nil)
+           (encoder-sent-p nil)
+           (pre-unblock-data-sent-p nil)
+           (response-read-count 0)
+           (decoder-acks
+             (make-array 0 :element-type '(unsigned-byte 8)))
+           (cancel-count 0)
+           (request-entry nil)
+           (client
+             (http3-test-make-native-client
+              :poll-function
+              (lambda ()
+                (case (incf poll-count)
+                  (2
+                   (sb-thread:signal-semaphore second-poll-started)
+                   (sb-thread:wait-on-semaphore release-second-poll))
+                  (3
+                   (sb-thread:signal-semaphore unblock-poll-started)
+                   (sb-thread:wait-on-semaphore release-unblock-poll))
+                  (4
+                   (sb-thread:signal-semaphore resume-poll-started)
+                   (sb-thread:wait-on-semaphore release-resume-poll))))
+              :cancel-stream
+              (lambda (stream &key error-code timeout deadline)
+                (declare (ignore stream error-code timeout deadline))
+                (incf cancel-count)
+                t)
+              :qpack-settings
+              (list
+               (cons http-kit/http3:+http3-setting-qpack-max-table-capacity+ 256)
+               (cons http-kit/http3:+http3-setting-qpack-blocked-streams+ 1))
+              :write-stream
+              (lambda (stream bytes &key fin-p timeout deadline)
+                (declare (ignore fin-p timeout deadline))
+                (when (eq :qpack-decoder (http3-test-stream-kind stream))
+                  (setf decoder-acks
+                        (http3-test-concat-octets decoder-acks bytes))))
+              :try-read-stream
+              (lambda (stream &key timeout deadline)
+                (declare (ignore timeout deadline))
+                (cond
+                  ((eq stream peer-qpack)
+                   (if (and allow-encoder-p (not encoder-sent-p))
+                       (progn
+                         (setf encoder-sent-p t)
+                         (values
+                          (http3-test-concat-octets
+                           (http-kit/http3:http3-qpack-encoder-stream-prefix)
+                           instruction)
+                          nil :data))
+                     (values nil nil :would-block)))
+                  ((eq stream peer-qpack-decoder)
+                   (if (and allow-decoder-p (not decoder-sent-p))
+                       (progn
+                         (setf decoder-sent-p t)
+                         (values
+                          (http-kit/http3:http3-qpack-decoder-stream-prefix)
+                          nil :data))
+                     (values nil nil :would-block)))
+                  ((string= "/qpack"
+                            (http3-test-stream-kind stream))
+                   (case (incf response-read-count)
+                     (1 (values headers-wire nil :data))
+                     (otherwise
+                      (if encoder-sent-p
+                          (values
+                           (if pre-unblock-data-sent-p
+                               last-data-wire
+                             whole-body-wire)
+                           t :data)
+                        (progn
+                          (setf pre-unblock-data-sent-p t)
+                          (values first-data-wire nil :data))))))
+                  (t (values nil nil :would-block)))))))
+      (http-kit/http3:attach-http3-peer-qpack-encoder-stream
+       client peer-qpack)
+      (http-kit/http3:attach-http3-peer-qpack-decoder-stream
+       client peer-qpack-decoder)
+      (unwind-protect
+           (multiple-value-bind (request-thread request-finished request-result)
+               (http3-test-start-native-call
+                (lambda ()
+                  (http-kit/http3:send-http3-request
+                   client
+                   (make-http-request :method "GET"
+                                      :uri "https://example.test/qpack")
+                   :on-stream-open
+                   (lambda (stream stream-id cancel-request)
+                     (declare (ignore stream-id cancel-request))
+                     (setf request-entry
+                           (http-kit/http3::%h3-scheduler-entry-for-stream
+                            client stream)))))
+             (unwind-protect
+                  (progn
+                    (ensure-true
+                     (sb-thread:wait-on-semaphore second-poll-started
+                                                  :timeout 3))
+                    (sb-thread:signal-semaphore release-second-poll)
+                    (ensure-true
+                     (sb-thread:wait-on-semaphore unblock-poll-started
+                                                  :timeout 3))
+                    (ensure-equal 1 response-read-count)
+                    (setf allow-decoder-p t)
+                    (sb-thread:signal-semaphore release-unblock-poll)
+                    (ensure-true
+                     (sb-thread:wait-on-semaphore resume-poll-started
+                                                  :timeout 3))
+                    (ensure-equal 1 response-read-count)
+                    (sb-thread:with-mutex
+                        ((http-kit/http3::http3-client-scheduler-lock client))
+                      (ensure-true request-entry)
+                      (ensure-true
+                       (http-message-kit:qpack-blocked-stream-p
+                        (http-kit/http3::%http3-request-stream-qpack-token
+                         request-entry)))
+                      (ensure-equal nil
+                                    (http-kit/http3::%http3-request-stream-response-frames
+                                     request-entry))
+                      (ensure-equal
+                       http-kit/http3:+http3-headers-type+
+                       (http-kit/http3:http3-frame-type
+                        (http-kit/http3::%http3-request-stream-continuation
+                         request-entry)))
+                      (ensure-equal
+                       0
+                       (http-kit/http3::%http3-request-stream-response-body-length
+                        request-entry))
+                      (ensure-true decoder-sent-p)
+                      (ensure-true
+                       (http-kit/http3::http3-client-peer-qpack-decoder-prefix-seen-p
+                        client)))
+                    (setf allow-encoder-p t)
+                    (sb-thread:signal-semaphore release-resume-poll)
+                    (ensure-true
+                     (sb-thread:wait-on-semaphore request-finished :timeout 3))
+                    (ensure-equal :response (first request-result))
+                    (ensure-equal 200
+                                  (http-response-status (second request-result)))
+                    (ensure-equal
+                     "ready"
+                     (http-header-value
+                      (http-response-headers (second request-result))
+                      "x-blocked"))
+                    (ensure-octets-equal
+                     (octets 65 66)
+                     (http-response-body (second request-result)))
+                    (ensure-true encoder-sent-p)
+                    (ensure-false pre-unblock-data-sent-p)
+                    (ensure-equal 2 response-read-count)
+                    (ensure-true (plusp (length decoder-acks)))
+                    (ensure-equal 0 cancel-count)
+                    (ensure-true
+                     (http-kit/http3::%http3-request-stream-done-p request-entry))
+                    (ensure-false
+                     (http-kit/http3::%http3-request-stream-qpack-token
+                      request-entry))
+                    (ensure-equal nil
+                                  (http-kit/http3::%http3-request-stream-response-frames
+                                   request-entry))
+                    (ensure-equal
+                     0
+                     (http-kit/http3::http3-client-request-stream-count client)))
+               (setf allow-encoder-p t)
+               (sb-thread:signal-semaphore release-second-poll)
+               (sb-thread:signal-semaphore release-unblock-poll)
+               (sb-thread:signal-semaphore release-resume-poll)
+               (http3-test-join-native-thread request-thread request-finished)))
+        (when (http-kit/http3:http3-client-open-p client)
+          (http-kit/http3:close-http3-client client)))))))
+)
 
 (deftest http3-server-blocked-request-pauses-same-chunk
   (multiple-value-bind (decoder-table section instruction)
