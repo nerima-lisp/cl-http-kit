@@ -1097,11 +1097,12 @@
          (<= (+ 5 (ash (aref bytes 3) 8) (aref bytes 4))
              (length bytes))))
 
-  (defun %https-listener-write-client-hello-fragments (stream bytes)
+  (defun %https-listener-write-client-hello-fragments
+      (stream bytes &optional (start-position 5))
     (let* ((transport (%https-listener-client-stream-transport stream))
            (fragment-size (%https-listener-client-stream-fragment-size stream))
            (record-end (+ 5 (ash (aref bytes 3) 8) (aref bytes 4)))
-           (position 5))
+           (position start-position))
       (loop while (< position record-end)
             for end = (min record-end (+ position fragment-size))
             for length = (- end position)
@@ -1122,8 +1123,19 @@
 
   (defun %https-listener-stream-write-client-hello-prefix (stream bytes)
     (let* ((transport (%https-listener-client-stream-transport stream))
-           (prefix-end (min 8 (length bytes))))
-      (write-sequence bytes transport :end prefix-end)
+           (fragment-size (%https-listener-client-stream-fragment-size stream))
+           (record-end (+ 5 (ash (aref bytes 3) 8) (aref bytes 4)))
+           (first-end (min record-end (+ 5 fragment-size)))
+           (fragment-length (- first-end 5))
+           (header (vector
+                    cl-tls-kit:+tls-content-type-handshake+
+                    (aref bytes 1)
+                    (aref bytes 2)
+                    (ldb (byte 8 8) fragment-length)
+                    (ldb (byte 8 0) fragment-length))))
+      (write-sequence header transport)
+      (write-sequence bytes transport :start 5 :end first-end)
+      (incf (%https-listener-client-stream-record-count stream))
       (finish-output transport)
       (sb-thread:with-mutex
           ((%https-listener-client-stream-lock stream))
@@ -1139,10 +1151,8 @@
                     (%https-listener-client-stream-waitqueue stream)
                     (%https-listener-client-stream-lock stream)
                     :timeout 0.1))))
-      (when (< prefix-end (length bytes))
-        (write-sequence bytes transport
-                        :start prefix-end
-                        :end (length bytes)))))
+      (%https-listener-write-client-hello-fragments
+       stream bytes first-end)))
 
   (defmethod sb-gray:stream-write-sequence
       ((stream %https-listener-client-stream) sequence &optional (start 0) end)
