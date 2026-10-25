@@ -981,6 +981,14 @@ headers replace client default headers with the same case-insensitive name."
                  (* remaining 0.5))))
       (max now (- deadline fallback-minimum)))))
 
+(defun %client-http3-fallback-eligible-p
+    (condition request-body-started-p cancel-token response-observed-p)
+  (and (not (http-kit:http-connection-error-request-sent-p condition))
+       (not request-body-started-p)
+       (not (and cancel-token
+                 (%client-cancellation-token-cancelled-p cancel-token)))
+       (not response-observed-p)))
+
 (defun %client-call-transport
     (client request proxy-plan &key timeout deadline request-body-function
                                       request-body-length on-body-chunk
@@ -1093,13 +1101,11 @@ headers replace client default headers with the same case-insensitive name."
                          (http-connection-error (condition)
                            ;; Replay requires a transport guarantee and no
                            ;; producer or user callback already invoked.
-                           (if (and (null (http-kit:http-connection-error-request-sent-p
-                                           condition))
-                                    (not request-body-started-p)
-                                    (not (and cancel-token
-                                              (%client-cancellation-token-cancelled-p
-                                               cancel-token)))
-                                    (not response-observed-p))
+                           (if (%client-http3-fallback-eligible-p
+                                condition
+                                request-body-started-p
+                                cancel-token
+                                response-observed-p)
                                (fallback-to-tcp)
                                (error condition))))))
                   (t (call-tcp)))))

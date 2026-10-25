@@ -1763,6 +1763,46 @@
     (ensure-equal 1 http3-calls)
     (ensure-equal 1 tcp-calls)))
 
+(deftest client-alt-svc-cancelled-token-suppresses-pre-send-fallback
+  (let* ((http3-calls 0)
+         (tcp-calls 0)
+         (token (make-http-cancellation-token))
+         (client
+           (make-http-client
+            :cache nil
+            :transport-function
+            (lambda (request &key &allow-other-keys)
+              (declare (ignore request))
+              (incf tcp-calls)
+              (client-test-response 200))
+            :http3-transport-function
+            (lambda (request &key on-cancel &allow-other-keys)
+              (declare (ignore request))
+              (incf http3-calls)
+              (funcall on-cancel (lambda () nil))
+              (ensure-true (http-client-cancel-request token))
+              (error
+               (make-condition
+                (quote http-connection-error)
+                :message "synthetic pre-send failure"
+                :request-sent-p nil))))))
+    (http-alternative-service-store-note-response
+     (http-client-alternative-service-store client)
+     "https://example.test/"
+     (client-test-response
+      200 :headers (list (make-http-header "Alt-Svc" "h3=\":443\"; ma=60"))))
+    (let ((condition
+            (handler-case
+                (progn
+                  (http-client-send client "GET" "https://example.test/"
+                                    :cancel-token token)
+                  nil)
+              (http-client-request-cancelled (condition)
+                condition))))
+      (ensure-true condition))
+    (ensure-equal 1 http3-calls)
+    (ensure-equal 0 tcp-calls)))
+
 (deftest client-alt-svc-connect-timeout-preserves-producer-and-deadline
   (dolist (body-kind '(:producer :factory))
     (let* ((tcp-calls 0)
