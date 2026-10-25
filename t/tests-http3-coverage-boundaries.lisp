@@ -2482,7 +2482,7 @@
               (typep failure (find-class (quote http-invalid-header))))
              (ensure-equal :header (http-error-operation failure))
              (ensure-equal "x good" (http-invalid-header-name failure))
-             (ensure-equal "the field name is not a token."
+             (ensure-equal :name
                            (http-invalid-header-reason failure))
              (ensure-true (eq name (http-header-name header)))
              (ensure-equal before name)
