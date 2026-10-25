@@ -2954,7 +2954,7 @@
                        (http-request-uri effective-request))))
       (ensure-equal 0 calls))))
 (deftest client-only-if-cached-without-cache-preserves-effective-request
-  (let ((calls 0)
+  (let* ((calls 0)
         (client
           (make-http-client
            :cache nil
