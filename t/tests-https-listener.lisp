@@ -923,6 +923,36 @@
           (when server
             (stop-http-server server :graceful-timeout 1))))))
 
+  (deftest https-listener-accept-event-callback-failure-releases-connection
+    (%with-https-listener-test-stubs (context)
+      (let ((server nil))
+        (unwind-protect
+             (progn
+               (setf server
+                     (%https-listener-make-server
+                      :on-event
+                      (lambda (event)
+                        (when (eq (getf event :type) :connection-accepted)
+                          (error "accept event callback failure")))))
+               (start-http-server server)
+               (let ((client (%https-listener-connect server)))
+                 (close-http-tcp-stream client))
+               (%https-listener-wait
+                (lambda () (http-server-failure server)))
+               (%https-listener-wait
+                (lambda ()
+                  (and (zerop (%https-listener-connection-count server))
+                       (zerop (%https-listener-handshake-count server)))))
+               (let ((condition (http-server-failure server)))
+                 (ensure-true (typep condition 'http-server-callback-error))
+                 (ensure-equal :on-event
+                               (http-server-callback-error-callback condition))
+                 (ensure-equal :event-callback-failed
+                               (http-server-error-reason-code condition)))
+               (ensure-equal 0 (%https-listener-connection-count server)))
+          (when server
+            (stop-http-server server :graceful-timeout 1))))))
+
   (deftest https-listener-callback-failure-is-fatal-and-redacted
     (%with-https-listener-test-stubs (context)
       (let ((server nil))
