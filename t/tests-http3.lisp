@@ -14531,13 +14531,12 @@
                      (make-http-request
                       :method "GET"
                       :uri "https://example.test/waiter")))))
-               (ensure-true (http3-test-await-native-pending client 1))
+               (ensure-true (http3-test-await-native-pending client 2))
                (ensure-equal
-                1
-                (hash-table-count
-                 (http-kit/http3::http3-client-request-streams client)))
+                2
+                (http-kit/http3::http3-client-request-stream-count client))
                (ensure-equal
-                1
+                2
                 (length
                  (http-kit/http3::http3-client-pending-request-streams client)))
                (sb-thread:signal-semaphore release-poll)
