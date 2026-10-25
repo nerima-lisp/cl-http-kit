@@ -382,7 +382,7 @@ outside this direct function boundary."
                          (when (and stream (not stream-closed-p))
                            (setf stream-closed-p t))))
                    (when close-p
-                     (funcall close stream))))
+                     (funcall close stream)))))
         (with-http-deadline (absolute-deadline timeout
                             :inherited deadline
                             :clock-function clock-function)
@@ -416,7 +416,7 @@ outside this direct function boundary."
                     :collect-body-p collect-body-p
                     :clock-function clock-function))
               (when stream
-                (close-once))))))))))
+                (close-once)))))))))
 
 (defun send-http-request-over-stream/cps
     (request on-success
