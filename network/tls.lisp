@@ -387,7 +387,8 @@ driver's transport callbacks."
 (progn
   (defstruct (http-tls-server-state
               (:constructor %make-http-tls-server-state))
-    driver provider transport-stream
+    driver provider transport-stream deadline
+    (clock-function (function %tls-monotonic-time))
     (phase :initial)
     suite read-state write-state
     (selected-alpn nil)
@@ -413,19 +414,34 @@ driver's transport callbacks."
     (%tls-protocol-error message detail))
 
   (defun %tls-server-read-record (state)
-    (handler-case
-        (%tls-read-record
-         (http-tls-server-state-transport-stream state)
-         nil
-         :ciphertext-p
-         (or (http-tls-server-state-read-state state)
-             (http-tls-server-state-early-data-offered-p state)))
-      (http-timeout (condition) (error condition))
-      (http-protocol-error (condition) (error condition))
-      #+sbcl (sb-ext:timeout () (%tls-timeout))
-      #+sbcl (sb-bsd-sockets:operation-timeout-error () (%tls-timeout))
-      (error ()
-             (%tls-server-fail "TLS transport read failed." :transport-error))))
+    (labels ((deadline-expired-p ()
+               (let ((deadline (http-tls-server-state-deadline state)))
+                 (and deadline
+                      (>= (funcall
+                           (http-tls-server-state-clock-function state))
+                          deadline)))))
+      (handler-case
+          (let ((wire
+                  (%tls-read-record
+                   (http-tls-server-state-transport-stream state)
+                   nil
+                   :ciphertext-p
+                   (or (http-tls-server-state-read-state state)
+                       (http-tls-server-state-early-data-offered-p state)))))
+            (when (and (null wire) (deadline-expired-p))
+              (%tls-timeout))
+            wire)
+        (http-timeout (condition) (error condition))
+        (http-protocol-error (condition)
+          (if (deadline-expired-p)
+              (%tls-timeout)
+              (error condition)))
+        #+sbcl (sb-ext:timeout () (%tls-timeout))
+        #+sbcl (sb-bsd-sockets:operation-timeout-error () (%tls-timeout))
+        (error ()
+          (if (deadline-expired-p)
+              (%tls-timeout)
+              (%tls-server-fail "TLS transport read failed." :transport-error))))))
 
   (defun %tls-server-write-record (state bytes)
     (handler-case
@@ -946,7 +962,11 @@ driver's transport callbacks."
                                                                       :provider
                                                                       provider
                                                                       :transport-stream
-                                                                      stream)))
+                                                                      stream
+                                                                      :deadline
+                                                                      effective-deadline
+                                                                      :clock-function
+                                                                      clock-function)))
                                    (%tls-server-handshake state)
                                    (make-instance 'http-tls-stream
                                                   :driver

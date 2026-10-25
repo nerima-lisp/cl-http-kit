@@ -628,6 +628,35 @@
                  (http-timeout (condition) condition))))
         (ensure-true condition)
         (close stream :abort t))
+      (let* ((stream
+               (make-instance '%tls-server-test-stream
+                              :input (octets 22 3 3 0)))
+             (state
+               (http-kit/tls::%make-http-tls-server-state
+                :driver nil :provider nil :transport-stream stream
+                :deadline 1
+                :clock-function (lambda () 1)))
+             (condition
+               (handler-case
+                   (progn (http-kit/tls::%tls-server-read-record state) nil)
+                 (http-timeout (condition) condition)
+                 (http-protocol-error (condition) condition))))
+        (ensure-true (typep condition 'http-timeout))
+        (close stream :abort t))
+      (let* ((stream
+               (make-instance '%tls-server-test-stream :input (octets)))
+             (state
+               (http-kit/tls::%make-http-tls-server-state
+                :driver nil :provider nil :transport-stream stream
+                :deadline 1
+                :clock-function (lambda () 1)))
+             (condition
+               (handler-case
+                   (progn (http-kit/tls::%tls-server-read-record state) nil)
+                 (http-timeout (condition) condition)
+                 (http-protocol-error (condition) condition))))
+        (ensure-true (typep condition 'http-timeout))
+        (close stream :abort t))
       (close read-stream :abort t)
       (close write-stream :abort t))
     (let* ((raw (make-instance '%tls-server-test-stream
