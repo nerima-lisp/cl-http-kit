@@ -117,15 +117,14 @@
               (multiple-value-bind (end-stream new-body-length data-length)
                   (%h2-append-data-frame
                    frame status body body-length request-method max-body-bytes
-                   on-body-chunk collect-body-p expected-stream-id)
+                   on-body-chunk collect-body-p expected-stream-id
+                   on-response-complete)
                 (setf body-length new-body-length)
                 ;; Restore stream credit only while more response DATA can arrive.
                 (unless end-stream
                   (%h2-send-window-update writer stream-id data-length))
                 (%h2-send-window-update writer 0 data-length)
                 (when end-stream
-                  (when on-response-complete
-                    (funcall on-response-complete))
                   (return-from %h2-read-response
                     (%h2-finish-request-response
                      status headers nil body request-method

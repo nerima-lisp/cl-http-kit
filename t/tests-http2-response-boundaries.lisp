@@ -217,6 +217,126 @@
                       (= 1 (http-kit/http2::%h2-frame-stream-id frame))))
                (h2-output-frames stream))))
         (http-kit/http2:close-http2-connection connection))))
+  (deftest http2-serial-final-data-callback-cancel-preserves-response
+  #+sbcl
+  (let* ((input
+           (concatenate-octets
+            (h2-frame 4 0 0 (octets))
+            (h2-frame 1 4 1
+                      (h2-header-block (cons ":status" "200")
+                                       (cons "content-length" "1")))
+            (h2-frame 0 1 1 (octets 82))))
+         (stream (make-instance 'binary-session-stream :input input))
+         (connection (http-kit/http2:make-http2-connection :stream stream))
+         (request (make-http-request :method "GET"
+                                     :uri "https://example.test/final-data"))
+         (cancel-function nil)
+         (cancel-result nil)
+         (response nil))
+    (unwind-protect
+         (progn
+           (setf response
+                 (http-kit/http2::%h2-send-http2-request-over-connection-serial
+                  connection request
+                  :on-cancel
+                  (lambda (function)
+                    (setf cancel-function function)
+                    nil)
+                  :on-body-chunk
+                  (lambda (chunk)
+                    (ensure-octets-equal (octets 82) chunk)
+                    (ensure-true (functionp cancel-function))
+                    (setf cancel-result (funcall cancel-function)))))
+           (ensure-equal 200 (http-response-status response))
+           (ensure-octets-equal (octets 82) (http-response-body response))
+           (ensure-equal :response-complete cancel-result)
+           (ensure-false
+            (find-if
+             (lambda (frame)
+               (and (= 3 (http-kit/http2::%h2-frame-type frame))
+                    (= 1 (http-kit/http2::%h2-frame-stream-id frame))))
+             (h2-output-frames stream)))
+      (http-kit/http2:close-http2-connection connection)))
+  #-sbcl
+  (uiop:with-temporary-file (:pathname input-path)
+    (uiop:with-temporary-file (:pathname output-path)
+      (let ((input
+              (concatenate-octets
+               (h2-frame 4 0 0 (octets))
+               (h2-frame 1 4 1
+                         (h2-header-block (cons ":status" "200")
+                                          (cons "content-length" "1")))
+               (h2-frame 0 1 1 (octets 82)))))
+        (with-open-file (input-writer input-path
+                         :direction :output
+                         :if-exists :supersede
+                         :element-type '(unsigned-byte 8))
+          (write-sequence input input-writer)))
+      (let* ((input-stream
+               (open input-path :direction :input
+                     :element-type '(unsigned-byte 8)))
+             (output-stream
+               (open output-path :direction :output
+                     :if-exists :supersede
+                     :element-type '(unsigned-byte 8)))
+             (stream (make-two-way-stream input-stream output-stream))
+             (connection
+               (http-kit/http2:make-http2-connection :stream stream))
+             (request
+               (make-http-request :method "GET"
+                                  :uri "https://example.test/final-data"))
+             (cancel-function nil)
+             (cancel-result nil)
+             (response nil))
+        (unwind-protect
+             (progn
+               (setf response
+                     (http-kit/http2:send-http2-request-over-connection
+                      connection request
+                      :on-cancel
+                      (lambda (function)
+                        (setf cancel-function function)
+                        nil)
+                      :on-body-chunk
+                      (lambda (chunk)
+                        (ensure-octets-equal (octets 82) chunk)
+                        (ensure-true (functionp cancel-function))
+                        (setf cancel-result (funcall cancel-function)))))
+               (ensure-equal 200 (http-response-status response))
+               (ensure-octets-equal (octets 82) (http-response-body response))
+               (ensure-equal :response-complete cancel-result)
+               (http-kit/http2:close-http2-connection connection)
+               (setf connection nil)
+               (with-open-file (written-output output-path
+                                :direction :input
+                                :element-type '(unsigned-byte 8))
+                 (let* ((output
+                          (make-array (file-length written-output)
+                                      :element-type '(unsigned-byte 8)))
+                        (preface (h2-preface))
+                        (frame-offset (length preface))
+                        (reset-frame-p nil))
+                   (read-sequence output written-output)
+                   (ensure-true (>= (length output) frame-offset))
+                   (ensure-octets-equal preface
+                                        (subseq output 0 frame-offset))
+                   (loop while (< frame-offset (length output))
+                         do (ensure-true (<= (+ frame-offset 9)
+                                             (length output)))
+                            (let* ((payload-length
+                                     (+ (ash (aref output frame-offset) 16)
+                                        (ash (aref output (1+ frame-offset)) 8)
+                                        (aref output (+ frame-offset 2))))
+                                   (frame-end (+ frame-offset 9 payload-length)))
+                              (ensure-true (<= frame-end (length output)))
+                              (when (= (aref output (+ frame-offset 3)) 3)
+                                (setf reset-frame-p t))
+                              (setf frame-offset frame-end)))
+                   (ensure-true (> (length output) (length preface)))
+                   (ensure-false reset-frame-p))))
+          (when connection
+            (http-kit/http2:close-http2-connection connection)))))))
+)
 
   (deftest http2-response-callbacks-cover-serial-and-scheduled-transport
     (let* ((input
