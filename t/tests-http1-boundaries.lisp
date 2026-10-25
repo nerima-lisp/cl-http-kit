@@ -844,7 +844,7 @@
                     events)))))
     (ensure-equal 101 (http-response-status response))
     (ensure-equal 0 (length (http-response-body response)))
-    (ensure-equal '((101 "websocket")) (nreverse events))
+    (ensure-equal '() (nreverse events))
     (ensure-equal (length header-wire)
                   (binary-test-input-position source)))))
 (deftest http1-response-and-cancellation-callback-arguments-are-validated

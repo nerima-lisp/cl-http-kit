@@ -118,16 +118,13 @@ REQUEST-METHOD as \"HEAD\" for the bodyless response semantics of HEAD."
                               :operation :response-parse
                               :name "content-length"
                               :reason :forbidden))
-                     (progn
-                      (when on-response-headers
-                        (funcall on-response-headers status headers))
-                      (return
-                       (%make-header-only-http-response
-                        protocol-version status reason headers))))
+                     (return
+                      (%make-header-only-http-response
+                       protocol-version status reason headers)))
                    ;; Informational responses do not carry a response body;
                    ;; notify the caller and continue until the final response.
-                   ;; The 101 case above is a protocol switch rather than an
-                   ;; interim response.
+                   ;; A 101 switches protocols. Preserve its headers for the upgrade
+                   ;; while keeping it out of the final-response callback.
                    (if (< status 200)
                        (progn
                          (when content-length
