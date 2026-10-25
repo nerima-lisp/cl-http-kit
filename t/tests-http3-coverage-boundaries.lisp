@@ -4356,35 +4356,6 @@
               (http-kit/http3::%http3-request-stream-stream-id entry))))
       (when (http-kit/http3:http3-client-open-p client)
         (http-kit/http3:close-http3-client client)))))
-(deftest http3-native-scheduler-write-fields-requires-stream-id-for-dynamic-qpack
-  (let* ((client
-          (http3-test-make-native-client
-           :try-read-stream
-           (lambda (stream &key timeout deadline)
-             (declare (ignore stream timeout deadline))
-             (values nil nil :would-block))))
-         (encoder-context
-          (http-message-kit:make-qpack-context
-           :max-table-capacity 64 :table-capacity 64 :huffman nil))
-         (entry
-          (http-kit/http3::%make-http3-request-stream
-           :encoder-context encoder-context
-           :stream-id -1)))
-    (unwind-protect
-         (progn
-           (http-message-kit:qpack-encode-insert-with-literal-name
-            encoder-context "x-dynamic" "value" :huffman nil)
-           (let ((failure
-                   (http3-boundary-error
-                    (lambda ()
-                      (http-kit/http3::%h3-scheduler-write-fields
-                       client entry (list (cons ":method" "GET")) nil)))))
-             (ensure-true failure)
-             (ensure-equal
-              "Dynamic QPACK field encoding requires a numeric stream ID."
-              (http-error-message failure))))
-      (when (http-kit/http3:http3-client-open-p client)
-        (http-kit/http3:close-http3-client client)))))
 (deftest http3-native-scheduler-restores-failed-pending-entries-without-duplicates
   (let* ((client
           (http3-test-make-native-client

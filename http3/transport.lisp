@@ -2046,10 +2046,6 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
         (field-limit
          (min (or max-fields most-positive-fixnum)
               (http3-client-max-fields client))))
-    (unless (and (integerp stream-id) (>= stream-id 0))
-      (%h3-transport-error
-       "Dynamic QPACK field decoding requires a numeric stream ID."
-       stream-id))
     (%h3-decode-dynamic-field-section payload qpack-http3-decoder-context stream-id await-qpack
                                       (http3-client-serialize client) role
                                       (lambda (acknowledged-stream-id)
@@ -2716,11 +2712,6 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
             (plusp
              (http-message-kit:qpack-context-dynamic-entry-count
               encoder-context))))
-      (when (and use-dynamic-p
-                 (not (and (integerp stream-id) (>= stream-id 0))))
-        (%h3-transport-error
-         "Dynamic QPACK field encoding requires a numeric stream ID."
-         stream-id))
       (%h3-write-client-qpack-transaction
        client
        (lambda ()
