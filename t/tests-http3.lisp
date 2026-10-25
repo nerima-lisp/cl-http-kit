@@ -5234,23 +5234,14 @@
     (http-kit/http3:http3-quic-adapter-poll :not-an-adapter)))
 
 (deftest http3-quic-adapter-validates-options
-  (ensure-true
-   (http-kit/http3::%http3-quic-adapter-property-list-p nil))
-  (ensure-true
-   (http-kit/http3::%http3-quic-adapter-property-list-p
-    '(:max-fields 16 :max-header-bytes 1024)))
-  (ensure-false
-   (http-kit/http3::%http3-quic-adapter-property-list-p '(:max-fields)))
-  (ensure-false
-   (http-kit/http3::%http3-quic-adapter-property-list-p '(max-fields 16)))
   (signals http-protocol-error
     (http-kit/http3:make-http3-quic-adapter
      :hostname "example.test"
-     :http3-options '(:max-fields)))
+     :http3-options (quote (:max-fields))))
   (signals http-protocol-error
     (http-kit/http3:make-http3-quic-adapter
      :hostname "example.test"
-     :http3-options '(max-fields 16))))
+     :http3-options (quote (max-fields 16)))))
 
 (defun make-http3-quic-adapter-test-client (&key (established-p t) io-write)
   (http-kit/http3::%http3-quic-adapter-configure-protection)
@@ -5666,7 +5657,9 @@
                   :hostname "example.test" :alpn alpn :tls-provider provider
                   :tls-signature-algorithms algorithms :now-fn clock
                   :local-connection-id local-id :destination-connection-id destination-id
-                  :idle-timeout 17 :io-write write :on-close close :timeout 0))
+                  :idle-timeout 17 :io-write write :on-close close
+                  :http3-options (quote (:max-fields 16 :max-header-bytes 1024))
+                  :timeout 0))
                :connect-p t)
               (ensure-equal (list (list quic)) (gethash 'cl-quic-kit:client-start calls))
               (ensure-equal 1 (length (gethash 'cl-quic-kit:client-close calls)))
@@ -6698,17 +6691,24 @@
              (values nil t)))
     (signals http-protocol-error
       (http-kit/http3:make-http3-client
-       :open-stream #'open-stream
-       :write-stream #'write-stream
-       :read-stream #'read-stream
+       :open-stream (function open-stream)
+       :write-stream (function write-stream)
+       :read-stream (function read-stream)
        :cancel-stream :not-a-function))
+    (signals http-protocol-error
+      (http-kit/http3:make-http3-client
+       :open-stream (function open-stream)
+       :write-stream (function write-stream)
+       :read-stream (function read-stream)
+       :close-connection :not-a-function))
     (let ((client
             (http-kit/http3:make-http3-client
-             :open-stream #'open-stream
-             :write-stream #'write-stream
-             :read-stream #'read-stream
-             :cancel-stream (lambda (stream &key error-code timeout deadline)
-                              (declare (ignore stream error-code timeout deadline))))))
+             :open-stream (function open-stream)
+             :write-stream (function write-stream)
+             :read-stream (function read-stream)
+             :cancel-stream
+             (lambda (stream &key error-code timeout deadline)
+               (declare (ignore stream error-code timeout deadline))))))
       (signals http-protocol-error
         (http-kit/http3:send-http3-request
          client
