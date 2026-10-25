@@ -5424,88 +5424,96 @@
              (when (http-kit/http3:http3-client-open-p client)
                (http-kit/http3:close-http3-client client)))))
 (deftest http3-native-scheduler-response-drain-and-completion-branches
-         (let* ((client
-                 (http3-test-make-native-client
-                  :try-read-stream
-                  (lambda (stream &key timeout deadline)
-                    (declare (ignore stream timeout deadline))
-                    (values (octets) nil :data))))
-                (stream (make-http3-test-stream :kind :request))
-                (entry
-                 (http-kit/http3::%make-http3-request-stream
-                  :stream stream
-                  :request-method "GET"
-                  :response-status 200
-                  :final-response-p t))
-                (process-symbol 'http-kit/http3::%h3-scheduler-process-frame)
-                (original-process (symbol-function process-symbol)))
-           (unwind-protect
-               (progn
-                 (setf (http-kit/http3::%http3-request-stream-response-frames entry)
-                       (list
-                        (http-kit/http3:make-http3-frame
-                         :type http-kit/http3:+http3-data-type+
-                         :payload (octets 5))))
-                 (ensure-true
-                  (http-kit/http3::%h3-scheduler-drain-response-frames client entry))
-                 (ensure-equal
-                  1
-                  (http-kit/http3::%http3-request-stream-response-body-length entry))
-                 (setf (symbol-function process-symbol)
-                       (lambda (ignored-client ignored-entry ignored-frame)
-                         (declare (ignore ignored-client ignored-frame))
-                         (setf
-                          (http-kit/http3::%http3-request-stream-qpack-token
-                           ignored-entry)
-                          :blocked))
-                       (http-kit/http3::%http3-request-stream-response-frames entry)
-                       (list :blocked-frame))
-                 (ensure-equal nil
-                               (http-kit/http3::%h3-scheduler-drain-response-frames
-                                client entry))
-                 (ensure-equal
-                  :blocked
-                  (http-kit/http3::%http3-request-stream-qpack-token entry))
-                 (ensure-equal
-                  :blocked-frame
-                  (http-kit/http3::%http3-request-stream-continuation entry))
-                 (setf (symbol-function process-symbol)
-                       (lambda (ignored-client ignored-entry ignored-frame)
-                         (declare (ignore ignored-entry ignored-frame))
-                         (setf
-                          (http-kit/http3::http3-client-scheduler-close-state
-                           ignored-client)
-                          :closing))
-                       (http-kit/http3::%http3-request-stream-qpack-token entry) nil
-                       (http-kit/http3::%http3-request-stream-continuation entry) nil
-                       (http-kit/http3::%http3-request-stream-response-frames entry)
-                       (list :closing-frame))
-                 (ensure-equal nil
-                               (http-kit/http3::%h3-scheduler-drain-response-frames
-                                client entry))
-                 (ensure-equal nil
-                               (http-kit/http3::%http3-request-stream-continuation
-                                entry))
-                 (progn
-                   (http-kit/http3::%h3-scheduler-read-entry-step client entry)
-                   (ensure-equal
-                    (quote (:closing-frame))
-                    (http-kit/http3::%http3-request-stream-response-frames entry)))
-                 (setf (http-kit/http3::http3-client-scheduler-close-state client) nil
-                       (http-kit/http3::%http3-request-stream-response-frames entry) nil
-                       (http-kit/http3::%http3-request-stream-response-fin-p entry) t)
-                 (ensure-true
-                  (http-kit/http3::%h3-scheduler-complete-response-if-finished
-                   client entry))
-                 (ensure-true
-                  (http-kit/http3::%http3-request-stream-done-p entry))
-                 (ensure-equal 200
-                               (http-kit:http-response-status
-                                (http-kit/http3::%http3-request-stream-response entry))))
-             (setf (symbol-function process-symbol) original-process
-                   (http-kit/http3::http3-client-scheduler-close-state client) nil)
-             (when (http-kit/http3:http3-client-open-p client)
-               (http-kit/http3:close-http3-client client)))))
+  (let* ((client
+           (http3-test-make-native-client
+            :try-read-stream
+            (lambda (stream &key timeout deadline)
+              (declare (ignore stream timeout deadline))
+              (values (octets) nil :data))))
+         (stream (make-http3-test-stream :kind :request))
+         (entry
+           (http-kit/http3::%make-http3-request-stream
+            :stream stream
+            :request-method "GET"
+            :response-status 200
+            :final-response-p t))
+         (processed-frames nil)
+         (process-symbol 'http-kit/http3::%h3-scheduler-process-frame)
+         (original-process (symbol-function process-symbol)))
+    (unwind-protect
+         (progn
+           (setf (http-kit/http3::%http3-request-stream-response-frames entry)
+                 (list
+                  (http-kit/http3:make-http3-frame
+                   :type http-kit/http3:+http3-data-type+
+                   :payload (octets 5))))
+           (ensure-true
+            (http-kit/http3::%h3-scheduler-drain-response-frames client entry))
+           (ensure-equal
+            1
+            (http-kit/http3::%http3-request-stream-response-body-length entry))
+           (setf (symbol-function process-symbol)
+                 (lambda (ignored-client ignored-entry ignored-frame)
+                   (declare (ignore ignored-client ignored-frame))
+                   (setf
+                    (http-kit/http3::%http3-request-stream-qpack-token
+                     ignored-entry)
+                    :blocked))
+                 (http-kit/http3::%http3-request-stream-response-frames entry)
+                 (list :blocked-frame))
+           (ensure-equal nil
+                         (http-kit/http3::%h3-scheduler-drain-response-frames
+                          client entry))
+           (ensure-equal
+            :blocked
+            (http-kit/http3::%http3-request-stream-qpack-token entry))
+           (ensure-equal
+            :blocked-frame
+            (http-kit/http3::%http3-request-stream-continuation entry))
+           (setf (symbol-function process-symbol)
+                 (lambda (ignored-client ignored-entry ignored-frame)
+                   (declare (ignore ignored-entry))
+                   (push ignored-frame processed-frames)
+                   (setf
+                    (http-kit/http3::http3-client-scheduler-close-state
+                     ignored-client)
+                    :closing))
+                 (http-kit/http3::%http3-request-stream-qpack-token entry) nil
+                 (http-kit/http3::%http3-request-stream-continuation entry) nil
+                 (http-kit/http3::%http3-request-stream-response-frames entry)
+                 '(:closing-frame :remaining-frame))
+           (ensure-equal nil
+                         (http-kit/http3::%h3-scheduler-drain-response-frames
+                          client entry))
+           (ensure-equal '(:closing-frame) (reverse processed-frames))
+           (ensure-equal
+            '(:remaining-frame)
+            (http-kit/http3::%http3-request-stream-response-frames entry))
+           (ensure-equal nil
+                         (http-kit/http3::%http3-request-stream-continuation
+                          entry))
+           (ensure-true
+            (http-kit/http3::%h3-scheduler-read-entry-step client entry))
+           (ensure-equal '(:closing-frame) (reverse processed-frames))
+           (ensure-equal
+            '(:remaining-frame)
+            (http-kit/http3::%http3-request-stream-response-frames entry))
+           (setf (http-kit/http3::http3-client-scheduler-close-state client) nil
+                 (http-kit/http3::%http3-request-stream-response-frames entry) nil
+                 (http-kit/http3::%http3-request-stream-response-fin-p entry) t)
+           (ensure-true
+            (http-kit/http3::%h3-scheduler-complete-response-if-finished
+             client entry))
+           (ensure-true
+            (http-kit/http3::%http3-request-stream-done-p entry))
+           (ensure-equal
+            200
+            (http-kit:http-response-status
+             (http-kit/http3::%http3-request-stream-response entry))))
+      (setf (symbol-function process-symbol) original-process
+            (http-kit/http3::http3-client-scheduler-close-state client) nil)
+      (when (http-kit/http3:http3-client-open-p client)
+        (http-kit/http3:close-http3-client client)))))
 (deftest http3-native-scheduler-response-completion-rechecks-state-after-poll
          (let* ((mutation nil)
                 (peer-control-stream
