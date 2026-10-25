@@ -154,10 +154,11 @@
            (warning-text nil))
       (unwind-protect
            (progn
+             (http-kit/http3:close-http3-client client)
              (setf (http-kit/http3::http3-client-close-connection client)
-                   (lambda (&key error-code reason)
-                     (setf quic-close-arguments (list error-code reason))
-                     (error "Injected QUIC connection close failure.")))
+                     (lambda (&key error-code reason)
+                       (setf quic-close-arguments (list error-code reason))
+                       (error "Injected QUIC connection close failure.")))
              (setf warning-text
                    (capture-warning
                     (lambda ()
@@ -168,7 +169,7 @@
              (ensure-equal
               (list #x102 "synthetic HTTP/3 connection error")
               quic-close-arguments)
-             (ensure-true (search "Closing the HTTP/3 QUIC connection also failed after HTTP/3 connection error" warning-text))
+             (ensure-true (search "Injected QUIC connection close failure." warning-text))
              (ensure-false (http-kit/http3:http3-client-open-p client)))
         (setf (http-kit/http3::http3-client-close-connection client) nil)
         (when (http-kit/http3:http3-client-open-p client)
@@ -1210,7 +1211,7 @@
 
 (deftest http3-reachable-client-header-preflight-contract
   (dolist (row '(((("connection" . "close")) "connection"
-                "connection-specific fields are forbidden.")
+                "connection-specific fields are forbidden.") (((":method" . "GET")) ":method" "the field name is not a token.")
                ((("keep-alive" . "timeout=5")) "keep-alive"
                 "connection-specific fields are forbidden.")
                ((("proxy-connection" . "close")) "proxy-connection"
