@@ -14808,7 +14808,7 @@
     (ensure-true (eq constructor-original (symbol-function constructor)))
     (ensure-true (eq initializer-original (symbol-function initializer)))))
 (deftest http3-quic-adapter-enforces-peer-stream-limit-after-control-data
-  (cl-weave:expect-assertions 8)
+  (cl-weave:expect-assertions 18)
   (let* ((constructor 'cl-quic-kit:make-quic-client)
          (constructor-original (symbol-function constructor))
          (settings-reader 'http-kit/http3::%http3-quic-adapter-await-peer-settings)
