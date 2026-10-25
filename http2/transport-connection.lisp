@@ -14,14 +14,28 @@
                         callback-error))))
       (error callback-error)
       (error condition)))
+(defun %h2-call-with-response-header-callback-error-translation
+    (message-thunk operation-thunk callback-error-thunk body-thunk)
+  (handler-case
+      (handler-case
+          (funcall body-thunk)
+        (http-kit::http-error (condition)
+          (error condition))
+        (error (condition)
+          (error 'http-kit:http-connection-error
+                 :message (funcall message-thunk)
+                 :operation (funcall operation-thunk)
+                 :cause condition)))
+    (error (condition)
+      (%h2-rethrow-response-header-callback-error
+       condition (funcall callback-error-thunk)))))
 (defmacro %h2-with-response-header-callback-error-translation
     ((message operation callback-error) &body body)
-  `(handler-case
-       (http-kit::%with-http-error-translation
-           (,message ,operation)
-         ,@body)
-     (error (condition)
-       (%h2-rethrow-response-header-callback-error condition ,callback-error))))
+  `(%h2-call-with-response-header-callback-error-translation
+    (lambda () ,message)
+    (lambda () ,operation)
+    (lambda () ,callback-error)
+    (lambda () (progn ,@body))))
 
 (defun http2-client-connection (client)
   (and (http2-client-p client)
