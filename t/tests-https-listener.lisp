@@ -2367,4 +2367,59 @@
                  (not (eq :stopped (http-kit::http-server-state server))))
         (stop-http-server server :graceful-timeout 2))
       (%tls-server-test-remove-material material))))
+#+sbcl
+(deftest https-listener-sends-close-notify-after-request-close
+  (let* ((material (%tls-server-test-material))
+         (server
+           (make-http-server
+            :host "127.0.0.1"
+            :port 0
+            :handler (lambda (request)
+                       (declare (ignore request))
+                       (make-http-response :status 204))
+            :certificate-chain (getf material :certificate-chain)
+            :private-key (getf material :private-key)
+            :handshake-timeout 5
+            :request-timeout 5
+            :idle-timeout 5
+            :graceful-timeout 2))
+         (transport nil)
+         (tls-stream nil))
+    (unwind-protect
+         (progn
+           (start-http-server server)
+           (setf transport
+                 (open-http-tcp-stream
+                  (make-http-request
+                   :method "GET"
+                   :uri (format nil "http://127.0.0.1:~D/"
+                                (http-server-port server)))
+                  :timeout 5))
+           (setf tls-stream
+                 (funcall
+                  (%https-listener-real-tls-upgrader material)
+                  transport
+                  (parse-http-uri
+                   (format nil "https://localhost:~D/"
+                           (http-server-port server)))
+                  :timeout 5))
+           (write-sequence
+            (ascii "GET / HTTP/1.1|CRLF|Host: localhost|CRLF|Connection: close|CRLF||CRLF|")
+            tls-stream)
+           (finish-output tls-stream)
+           (ensure-equal
+            204
+            (http-response-status
+             (parse-http-response tls-stream :timeout 5)))
+           (ensure-equal
+            :eof
+            (sb-ext:with-timeout 5
+              (read-byte tls-stream nil :eof))))
+      (when (and tls-stream (open-stream-p tls-stream))
+        (close tls-stream :abort t))
+      (when (and transport (open-stream-p transport))
+        (close-http-tcp-stream transport))
+      (unless (eq :stopped (http-kit::http-server-state server))
+        (stop-http-server server :graceful-timeout 2))
+      (%tls-server-test-remove-material material))))
 

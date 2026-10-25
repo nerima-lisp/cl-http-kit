@@ -557,7 +557,7 @@
          (setf (gethash connection (http-server-connections server)) t))))
     (values connection rejection)))
 
-(defun %http-server-close-connection-stream (server connection)
+(defun %http-server-close-connection-stream (server connection &key (abort t))
   (let ((stream nil))
     (%with-http-server-lock (server)
       (unless (%http-server-connection-closed-p connection)
@@ -568,7 +568,7 @@
               (%http-server-connection-raw-stream connection) nil)))
     (when stream
       (handler-case
-          (close stream :abort t)
+          (close stream :abort abort)
         (error ()
           (%http-server-mark-failed
            server
@@ -652,7 +652,8 @@
         (protocol nil)
         (reported-p (list nil))
         (raw-stream (%http-server-connection-raw-stream connection))
-        (tls-stream nil))
+        (tls-stream nil)
+        (session-completed-p nil))
     (unwind-protect
          (handler-case
              (progn
@@ -690,6 +691,7 @@
                (setf phase :session)
                (%http-server-serve-session
                 server connection tls-stream protocol reported-p)
+               (setf session-completed-p t)
                (%http-server-emit-event
                 server
                 (list :type :connection-closed
@@ -713,7 +715,8 @@
                     (%http-server-connection-peer-port connection))
                  (http-server-callback-error (callback-condition)
                    (%http-server-mark-failed server callback-condition))))))
-      (%http-server-close-connection-stream server connection)
+      (%http-server-close-connection-stream
+       server connection :abort (not session-completed-p))
       (%http-server-release-connection server connection))))
 
 #+sbcl
