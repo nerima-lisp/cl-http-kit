@@ -25,8 +25,9 @@ historical release behavior, not the current API contract; see the
 ### Changed
 
 - cap buffered request-body bytes across active HTTPS listener sessions;
-- ignore TLS record `legacy_record_version` as required by RFC 8446 section 5.1
-  while continuing to validate record content types and lengths;
+- TLS server wrapper ignores record `legacy_record_version` as required by
+  RFC 8446 section 5.1 while continuing to validate record content types and
+  lengths;
 
 ### HTTP/2
 

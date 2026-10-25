@@ -1049,8 +1049,8 @@ listener accepts only `h2` and `http/1.1`.
 
 The TLS package is TLS 1.3 only through cl-tls-kit. TLS 1.2 and OCSP/CRL are
 outside the current boundary.
-The server ignores the TLS record `legacy_record_version` as required by
-RFC 8446 section 5.1 while continuing to validate record content types and
+The TLS server wrapper ignores the record `legacy_record_version` as required
+by RFC 8446 section 5.1 while continuing to validate record content types and
 lengths.
 
 ## Observability package
