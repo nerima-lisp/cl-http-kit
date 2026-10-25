@@ -4390,4 +4390,32 @@
               (http-kit/http2::%http2-connection-scheduler-entries connection))
              (ensure-false
               (http-kit/http2::%h2-batch-entry-local-retired-p entry)))
+        (http-kit/http2:close-http2-connection connection))))
+  (deftest http2-cancel-after-body-sent-preserves-completed-response
+    (let* ((stream (make-instance (quote binary-session-stream) :input (octets)))
+           (connection (http-kit/http2:make-http2-connection :stream stream))
+           (entry
+             (http-kit/http2::%make-h2-batch-entry :stream-id 1)))
+      (unwind-protect
+           (progn
+             (setf (http-kit/http2::%http2-connection-next-stream-id connection) 3
+                   (http-kit/http2::%http2-connection-scheduler-entries connection)
+                   (list entry)
+                   (http-kit/http2::%h2-batch-entry-response entry) :completed
+                   (http-kit/http2::%h2-batch-entry-body-sent-p entry) t)
+             (ensure-true
+              (http-kit/http2:cancel-http2-stream connection 1))
+             (ensure-equal
+              (list entry)
+              (http-kit/http2::%http2-connection-scheduler-entries connection))
+             (ensure-false
+              (http-kit/http2::%h2-batch-entry-local-retired-p entry))
+             (ensure-false
+              (http-kit/http2::%h2-batch-entry-request-body-abandoned-p entry))
+             (ensure-false
+              (find-if
+               (lambda (frame)
+                 (and (= 3 (http-kit/http2::%h2-frame-type frame))
+                      (= 1 (http-kit/http2::%h2-frame-stream-id frame))))
+               (h2-output-frames stream))))
         (http-kit/http2:close-http2-connection connection)))))
