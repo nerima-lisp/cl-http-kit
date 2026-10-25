@@ -14601,8 +14601,15 @@
              :payload (octets))))
          (response-sent-p nil)
          (close-calls nil)
+         (cancel-events nil)
          (client
            (http3-test-make-native-client
+            :cancel-stream
+            (lambda (stream &key error-code timeout deadline)
+              (declare (ignore timeout deadline))
+              (setf (http3-test-stream-closed-p stream) t)
+              (push (list stream error-code) cancel-events)
+              t)
             :try-read-stream
             (lambda (stream &key timeout deadline)
               (declare (ignore timeout deadline))
@@ -14630,6 +14637,10 @@
             failure
             "HTTP/3 control frames are not valid on a request stream."
             http-kit/http3:+http3-settings-type+)
+           (ensure-equal 1 (length cancel-events))
+           (ensure-equal "/stream-error"
+                         (http3-test-stream-kind (first (first cancel-events))))
+           (ensure-equal #x10c (second (first cancel-events)))
            (ensure-equal nil close-calls)
            (ensure-true (http-kit/http3:http3-client-open-p client)))
       (when (http-kit/http3:http3-client-open-p client)
