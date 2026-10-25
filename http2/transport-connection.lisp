@@ -6,6 +6,20 @@
      ,@body)
   #-sbcl
   `(progn ,@body))
+(defmacro %h2-with-response-header-callback-error-translation
+    ((message operation callback-error) &body body)
+  `(handler-case
+       (http-kit::%with-http-error-translation
+           (,message ,operation)
+         ,@body)
+     (error (condition)
+       (if (and ,callback-error
+                (or (eq condition ,callback-error)
+                    (and (typep condition 'http-kit:http-connection-error)
+                         (eq (http-kit:http-connection-error-cause condition)
+                             ,callback-error))))
+           (error ,callback-error)
+           (error condition)))))
 
 (defun http2-client-connection (client)
   (and (http2-client-p client)
@@ -1003,8 +1017,9 @@ concurrent streams should use SEND-HTTP2-REQUESTS-OVER-CONNECTION."
       (%h2-validate-limit :max-header-bytes header-limit)
       (%h2-validate-limit :max-fields field-limit)
       (%h2-validate-limit :max-body-bytes body-limit :allow-zero t)
-      (http-kit::%with-http-error-translation
-          ("The HTTP/2 connection request failed." :http2-connection)
+      (%h2-with-response-header-callback-error-translation
+          ("The HTTP/2 connection request failed."
+           :http2-connection response-header-callback-error)
         (handler-case
             (let* ((session-started-p
                      (%http2-connection-session-started-p connection))
@@ -1153,9 +1168,8 @@ concurrent streams should use SEND-HTTP2-REQUESTS-OVER-CONNECTION."
                       (when (functionp cancel-cleanup)
                         (funcall cancel-cleanup)))))))
           (error (condition)
-            (unless (and (%h2-peer-stream-reset-condition-p condition)
-                         (not (eq condition
-                                  response-header-callback-error)))
+            (unless (or (%h2-peer-stream-reset-condition-p condition)
+                        (eq condition response-header-callback-error))
               (close-http2-connection connection))
             (error condition)))))))
 
@@ -2298,7 +2312,8 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                      (%http2-connection-max-body-bytes connection))
                  (%http2-connection-max-body-bytes connection)))
            (reader (%h2-reader-for (%http2-connection-stream connection)))
-           (entry nil))
+           (entry nil)
+           (response-header-callback-error nil))
       (unless (functionp clock)
         (error 'http-kit:http-protocol-error
                :message "An HTTP/2 request clock must be callable."
@@ -2310,8 +2325,9 @@ CONTINUATION frames must still be consumed contiguously from that queue."
         (%h2-validate-limit :max-header-bytes header-limit)
         (%h2-validate-limit :max-fields field-limit)
         (%h2-validate-limit :max-body-bytes body-limit :allow-zero t)
-        (http-kit::%with-http-error-translation
-            ("The HTTP/2 connection request failed." :http2-connection)
+        (%h2-with-response-header-callback-error-translation
+            ("The HTTP/2 connection request failed."
+             :http2-connection response-header-callback-error)
           (handler-case
               (let ((writer (%h2-scheduler-writer
                              connection absolute-deadline clock))
@@ -2322,7 +2338,16 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                        connection request request-body-function
                        request-body-length header-limit field-limit body-limit
                        absolute-deadline clock huffman-p on-body-chunk
-                       on-information on-response-headers collect-body-p
+                       on-information
+                       (and on-response-headers
+                            (lambda (status headers)
+                              (handler-case
+                                  (funcall on-response-headers status headers)
+                                (error (condition)
+                                  (setf response-header-callback-error
+                                        condition)
+                                  (error condition)))))
+                       collect-body-p
                        reader writer))
                 (setf cancel-function
                       (lambda (&key (error-code 8))
