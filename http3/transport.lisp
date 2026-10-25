@@ -1187,7 +1187,7 @@ becomes readable again."
                  stream-type))
               (values t (subseq buffer position)))))))
 
-(defun %h3-consume-stream-prefix (buffer prefix-seen-p expected-type error-detail)
+(defun %h3-consume-stream-prefix (buffer prefix-seen-p expected-type)
   (if prefix-seen-p
       (values t buffer)
       (multiple-value-bind (stream-type position)
@@ -1196,16 +1196,49 @@ becomes readable again."
             (values nil buffer)
             (progn
               (unless (= stream-type expected-type)
-                (%h3-transport-error
+                (%h3-connection-transport-error
                  "The peer HTTP/3 unidirectional stream has the wrong type."
-                 error-detail))
+                 :h3-stream-creation-error #x103))
               (values t (subseq buffer position)))))))
 
-(defun %h3-qpack-stream-error (condition detail)
-  (error 'http-protocol-error
-         :message (http-kit:http-error-message condition)
-         :operation :qpack
-         :detail detail))
+(progn
+  (defun %h3-qpack-stream-error (condition detail error-code)
+    (%h3-connection-transport-error
+     (http-kit:http-error-message condition)
+     detail
+     error-code))
+
+  (progn
+  (defun %h3-promote-http3-control-error (condition)
+    (let ((detail (http-kit:http-protocol-error-detail condition)))
+      (cond
+        ((eq detail :h3-settings-error)
+         (%h3-connection-transport-error
+          (http-kit:http-error-message condition) detail #x109))
+        ((eq detail :h3-frame-unexpected)
+         (%h3-connection-transport-error
+          (http-kit:http-error-message condition) detail #x105))
+        ((eq detail :h3-missing-settings)
+         (%h3-connection-transport-error
+          (http-kit:http-error-message condition) detail #x10a))
+        (t
+         (error condition)))))
+
+  (defun %h3-promote-qpack-decompression-error (condition)
+    (let* ((cause (if (typep condition
+                             'http-message-kit:http-connection-error)
+                      (http-message-kit:http-connection-error-cause condition)
+                      condition))
+           (detail (and (typep cause 'http-protocol-error)
+                        (http-kit:http-protocol-error-detail cause))))
+      (when (and (consp detail)
+                 (eq (first detail) :qpack-decompression-failed)
+                 (not (typep (second detail) 'http-size-limit-exceeded)))
+        (%h3-connection-transport-error
+         (http-kit:http-error-message condition)
+         detail
+         #x200)))
+    (error condition))))
 
 (defun attach-http3-peer-control-stream (client stream)
   "Attach the peer's incoming HTTP/3 control stream to CLIENT.
@@ -1267,10 +1300,13 @@ HTTP3-CLIENT-PEER-CONTROL-STATE."
                 buffer remainder)
           (when prefix-seen-p
             (multiple-value-bind (new-events frame-remainder)
-                (process-http3-control-bytes
-                 (http3-client-peer-control-state client)
-                 buffer :allow-incomplete-p t
-                 :max-frame-size (http3-client-max-frame-size client))
+                (handler-case
+                    (process-http3-control-bytes
+                     (http3-client-peer-control-state client)
+                     buffer :allow-incomplete-p t
+                     :max-frame-size (http3-client-max-frame-size client))
+                  (http-protocol-error (condition)
+                    (%h3-promote-http3-control-error condition)))
               (setf events new-events
                     buffer frame-remainder))))
         (when (and (http3-control-state-settings-received-p
@@ -1303,19 +1339,22 @@ HTTP3-CLIENT-PEER-CONTROL-STATE."
                      t)))))
         (when ended-p
           (unless (http3-client-peer-control-prefix-seen-p client)
-            (%http3-control-error
-             "The peer HTTP/3 control stream ended before its stream-type prefix."))
+            (%h3-connection-transport-error
+             "The peer HTTP/3 control stream ended before its stream-type prefix."
+             :h3-closed-critical-stream #x104))
           (when (plusp (array-total-size buffer))
-            (%http3-control-error
-             "The peer HTTP/3 control stream ended with a truncated frame."))
+            (%h3-connection-transport-error
+             "The peer HTTP/3 control stream ended with a truncated frame."
+             :h3-closed-critical-stream #x104))
           (unless (http3-control-state-settings-received-p
                    (http3-client-peer-control-state client))
-            (%http3-control-error
-             "The peer HTTP/3 control stream ended before SETTINGS."))
+            (%h3-connection-transport-error
+             "The peer HTTP/3 control stream ended before SETTINGS."
+             :h3-closed-critical-stream #x104))
           (setf (http3-client-peer-control-fin-p client) t)
-          (%http3-control-error
+          (%h3-connection-transport-error
            "The peer closed the HTTP/3 control stream."
-           :h3-closed-critical-stream))
+           :h3-closed-critical-stream #x104))
         (setf (http3-client-peer-control-buffer client) buffer)
         (values events ended-p)))))
 
@@ -1441,8 +1480,7 @@ HTTP3-CLIENT-PEER-CONTROL-STATE."
                    (%h3-consume-stream-prefix
                     buffer
                     (http3-client-peer-qpack-encoder-prefix-seen-p client)
-                    +http3-qpack-encoder-stream-type+
-                    :qpack-encoder-stream-error)
+                    +http3-qpack-encoder-stream-type+)
                  (setf (http3-client-peer-qpack-encoder-prefix-seen-p client)
                        seen-p
                        buffer remainder)
@@ -1460,19 +1498,18 @@ HTTP3-CLIENT-PEER-CONTROL-STATE."
                          (setf events new-events
                                buffer (subseq buffer consumed)))
                      (http-protocol-error (condition)
-                       (%h3-qpack-stream-error
-                        condition :qpack-encoder-stream-error)))))
+                       (%h3-qpack-stream-error condition :qpack-encoder-stream-error #x201)))))
                (when ended-p
                  (setf (http3-client-peer-qpack-encoder-fin-p client) t)
                  (when (or (not (http3-client-peer-qpack-encoder-prefix-seen-p
                                  client))
                            (plusp (length buffer)))
-                   (%h3-transport-error
+                   (%h3-connection-transport-error
                     "The peer QPACK encoder stream ended with truncated input."
-                    :qpack-encoder-stream-error))
-                 (%h3-transport-error
+                    :qpack-encoder-stream-error #x201))
+                 (%h3-connection-transport-error
                   "The peer closed the QPACK encoder stream."
-                  :h3-closed-critical-stream))
+                  :h3-closed-critical-stream #x104))
                (setf (http3-client-peer-qpack-encoder-buffer client) buffer)
                (%h3-check-state-bytes client)
                (values events ended-p
@@ -1507,8 +1544,7 @@ HTTP3-CLIENT-PEER-CONTROL-STATE."
                (%h3-consume-stream-prefix
                 buffer
                 (http3-client-peer-qpack-decoder-prefix-seen-p client)
-                +http3-qpack-decoder-stream-type+
-                :qpack-decoder-stream-error)
+                +http3-qpack-decoder-stream-type+)
              (setf (http3-client-peer-qpack-decoder-prefix-seen-p client)
                    seen-p
                    buffer remainder)
@@ -1526,18 +1562,17 @@ HTTP3-CLIENT-PEER-CONTROL-STATE."
                      (setf events new-events
                            buffer (subseq buffer consumed)))
                  (http-protocol-error (condition)
-                   (%h3-qpack-stream-error
-                    condition :qpack-decoder-stream-error)))))
+                   (%h3-qpack-stream-error condition :qpack-decoder-stream-error #x202)))))
            (when ended-p
              (setf (http3-client-peer-qpack-decoder-fin-p client) t)
              (when (or (not (http3-client-peer-qpack-decoder-prefix-seen-p client))
                        (plusp (length buffer)))
-               (%h3-transport-error
+               (%h3-connection-transport-error
                 "The peer QPACK decoder stream ended with truncated input."
-                :qpack-decoder-stream-error))
-             (%h3-transport-error
+                :qpack-decoder-stream-error #x202))
+             (%h3-connection-transport-error
               "The peer closed the QPACK decoder stream."
-              :h3-closed-critical-stream))
+              :h3-closed-critical-stream #x104))
            (setf (http3-client-peer-qpack-decoder-buffer client) buffer)
            (%h3-check-state-bytes client)
            (values events ended-p)))))))
@@ -2046,22 +2081,29 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
         (field-limit
          (min (or max-fields most-positive-fixnum)
               (http3-client-max-fields client))))
-    (%h3-decode-dynamic-field-section payload qpack-http3-decoder-context stream-id await-qpack
-                                      (http3-client-serialize client) role
-                                      (lambda (acknowledged-stream-id)
-                                        (%h3-check-qpack-section-acknowledgment-stream-id
-                                         stream-id acknowledged-stream-id)
-                                        (%h3-write-client-qpack-section-ack-serialized
-                                         client acknowledged-stream-id timeout deadline))
-                                      header-limit field-limit
-                                      :serialize-whole-operation-p t
-                                      :serialize-guard (lambda ()
-                                                         (unless (and (http3-client-open-p client)
-                                                                      (eq qpack-http3-decoder-context
-                                                                          (http3-client-qpack-http3-decoder-context client)))
-                                                           (%h3-transport-error
-                                                            "A live HTTP/3 client with its own QPACK decoder context is required.")))
-                                      :return-blocked-p return-blocked-p)))
+    (handler-case
+        (%h3-decode-dynamic-field-section
+         payload qpack-http3-decoder-context stream-id await-qpack
+         (http3-client-serialize client) role
+         (lambda (acknowledged-stream-id)
+           (%h3-check-qpack-section-acknowledgment-stream-id
+            stream-id acknowledged-stream-id)
+           (%h3-write-client-qpack-section-ack-serialized
+            client acknowledged-stream-id timeout deadline))
+         header-limit field-limit
+         :serialize-whole-operation-p t
+         :serialize-guard
+         (lambda ()
+           (unless (and (http3-client-open-p client)
+                        (eq qpack-http3-decoder-context
+                            (http3-client-qpack-http3-decoder-context client)))
+             (%h3-transport-error
+              "A live HTTP/3 client with its own QPACK decoder context is required.")))
+         :return-blocked-p return-blocked-p)
+      (http-message-kit:http-connection-error (condition)
+        (%h3-promote-qpack-decompression-error condition))
+      (http-protocol-error (condition)
+        (%h3-promote-qpack-decompression-error condition)))))
 
 (defun %h3-read-response
     (client stream &key on-body-chunk on-information collect-body-p
@@ -3497,7 +3539,9 @@ validated informational response in wire order."
             progress-p))
       (error (condition)
         (unless (%h3-scheduler-close-started-p client)
-          (%h3-scheduler-fail-entry client entry condition))
+          (if (typep condition 'http3-connection-protocol-error)
+              (%h3-scheduler-fail-connection client condition)
+              (%h3-scheduler-fail-entry client entry condition)))
         t))))
 
 (defun %h3-scheduler-owner-loop (client owner-entry)
