@@ -6884,17 +6884,29 @@
        :close-connection :not-a-function))
     (let ((client
             (http-kit/http3:make-http3-client
-             :open-stream (function open-stream)
-             :write-stream (function write-stream)
-             :read-stream (function read-stream)
-             :cancel-stream
-             (lambda (stream &key error-code timeout deadline)
-               (declare (ignore stream error-code timeout deadline))))))
-      (signals http-protocol-error
-        (http-kit/http3:send-http3-request
-         client
-         (make-http-request :method "GET" :uri "https://example.test/")
-         :on-stream-open :not-a-function)))))
+             :open-stream #'open-stream
+             :write-stream #'write-stream
+             :read-stream #'read-stream
+             :cancel-stream (lambda (stream &key error-code timeout deadline)
+                              (declare (ignore stream error-code timeout deadline))))))
+      (let ((request
+              (make-http-request :method "GET" :uri "https://example.test/")))
+        (signals http-protocol-error
+          (http-kit/http3:send-http3-request
+           client request :on-stream-open :not-a-function))
+        (signals http-protocol-error
+          (http-kit/http3:send-http3-request
+           client request :on-response-headers :not-a-function))
+        (signals http-protocol-error
+          (http-kit/http3:send-http3-request
+           client request :on-cancel :not-a-function))
+        (signals http-protocol-error
+          (http-kit/http3:send-http3-request
+           client request
+           :on-cancel
+           (lambda (cancel-function)
+             (declare (ignore cancel-function))
+             :not-a-cleanup)))))))
 
 (deftest http3-client-rejects-request-stream-excluded-by-goaway
   (let ((request-stream (make-http3-test-stream :kind :request))
@@ -6936,7 +6948,8 @@
 (deftest http3-request-cancel-function-forwards-default-code-and-timing
   (let ((request-stream (make-http3-test-stream :kind :request))
         (cancel-call nil)
-        (closed-condition :unset))
+        (closed-condition :unset)
+        (registered-cancel-function nil))
     (labels ((open-stream (request &key stream-type timeout deadline)
                (declare (ignore request timeout deadline))
                (if (eq stream-type :request)
@@ -6965,14 +6978,19 @@
            (make-http-request :method "GET" :uri "https://example.test/")
            :timeout 23
            :deadline 47
+           :on-cancel
+           (lambda (cancel-function)
+             (setf registered-cancel-function cancel-function)
+             (funcall cancel-function)
+             nil)
            :on-stream-open
            (lambda (stream stream-id cancel-function)
              (ensure-true (eq request-stream stream))
              (ensure-equal 17 stream-id)
              (ensure-true (functionp cancel-function))
-             (funcall cancel-function))))))
-    (ensure-equal (list request-stream #x10c 23 47) cancel-call)
-    (ensure-true (typep closed-condition 'error))))
+             (ensure-true (eq cancel-function registered-cancel-function))))))
+      (ensure-equal (list request-stream #x10c 23 47) cancel-call)
+      (ensure-true (typep closed-condition 'error)))))
 
 (deftest http3-request-cancel-failure-still-closes-request-stream
   (let ((request-stream (make-http3-test-stream :kind :request))
