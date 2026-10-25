@@ -611,33 +611,32 @@ driver's transport callbacks."
         (%tls-server-fail "TLS handshake failed." :handshake-failed))))
 
   (defun %tls-server-step-handshake-message (state wire)
-  (when (and (eq (http-tls-server-state-phase state) :initial)
-             (not (http-tls-server-state-client-hello-received-p state))
-             (plusp (length wire))
-             (= (aref wire 0) 1))
-    (setf (http-tls-server-state-client-hello-received-p state) t)
+    (when (and (eq (http-tls-server-state-phase state) :initial)
+               (not (http-tls-server-state-client-hello-received-p state))
+               (plusp (length wire))
+               (= (aref wire 0) 1))
+      (setf (http-tls-server-state-client-hello-received-p state) t)
+      (handler-case
+          (let* ((hello (cl-tls-kit:decode-handshake wire))
+                 (extensions (cl-tls-kit:tls13-client-hello-extensions hello)))
+            (setf (http-tls-server-state-early-data-offered-p state)
+                  (not (null
+                        (find 42 extensions
+                              :key #'cl-tls-kit:tls-extension-type)))))
+        (cl-tls-kit:tls13-decode-error () nil)))
     (handler-case
-        (let* ((hello (cl-tls-kit:decode-handshake wire))
-               (extensions (cl-tls-kit:tls13-client-hello-extensions hello)))
-          (setf (http-tls-server-state-early-data-offered-p state)
-                (not (null
-                      (find 42 extensions
-                            :key #'cl-tls-kit:tls-extension-type)))))
-      (cl-tls-kit:tls13-decode-error () nil)))
-  (handler-case
-      (multiple-value-bind (driver events)
-          (cl-tls-kit:tls13-server-driver-step
-           (http-tls-server-state-driver state) wire
-           :level (http-tls-server-state-phase state))
-        (setf (http-tls-server-state-driver state) driver)
-        (%tls-server-handle-events state events))
-    (http-timeout (condition) (error condition))
-    (http-protocol-error (condition) (error condition))
-    (error (condition)
-      #+sbcl
-      (when (typep condition 'sb-ext:timeout)
-        (%tls-timeout))
-      (%tls-server-fail "TLS handshake failed." :handshake-failed))))
+        (multiple-value-bind (driver events)
+            (cl-tls-kit:tls13-server-driver-step
+             (http-tls-server-state-driver state) wire
+             :level (http-tls-server-state-phase state))
+          (setf (http-tls-server-state-driver state) driver)
+          (%tls-server-handle-events state events))
+      (http-protocol-error (condition) (error condition))
+      #+sbcl (sb-ext:timeout () (%tls-timeout))
+      (error (condition)
+             (when (typep condition 'http-timeout)
+               (error condition))
+             (%tls-server-fail "TLS handshake failed." :handshake-failed))))
 
   (defun %tls-server-feed-handshake (state fragment)
   (let ((position 0))
@@ -648,10 +647,6 @@ driver's transport callbacks."
                       (required (+ current count))
                       (capacity (array-total-size buffer))
                       (maximum (+ 4 (* 1024 1024))))
-                 (when (> required maximum)
-                   (%tls-server-fail
-                    "TLS handshake message exceeds its size limit."
-                    :handshake-message-too-large))
                  (when (< capacity required)
                    (let ((new-capacity
                            (min maximum
@@ -770,14 +765,12 @@ driver's transport callbacks."
              state
              (cl-tls-kit:make-tls-plaintext outer-type (subseq wire 5)))
           (http-protocol-error (condition) (error condition))
+          #+sbcl (sb-ext:timeout () (%tls-timeout))
           (error (condition)
-            (when (typep condition 'http-timeout)
-              (error condition))
-            #+sbcl
-            (when (typep condition 'sb-ext:timeout)
-              (%tls-timeout))
-            (%tls-server-fail "TLS plaintext record is invalid."
-                              :invalid-record)))))))
+                 (when (typep condition 'http-timeout)
+                   (error condition))
+                 (%tls-server-fail "TLS plaintext record is invalid."
+                                   :invalid-record)))))))
 
   (defun %tls-server-fill (state)
     (loop

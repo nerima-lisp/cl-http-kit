@@ -1040,8 +1040,81 @@
                (%tls-server-test-condition
                 (lambda ()
                   (http-kit/tls::%tls-server-decrypt-record state wire)))))
-        (ensure-equal :invalid-driver-state
-                      (http-protocol-error-detail condition))))
+        (progn
+          (ensure-equal :invalid-driver-state
+                        (http-protocol-error-detail condition))
+          (let* ((stream
+                   (make-instance '%tls-server-failure-test-stream
+                                  :input (octets) :fail-on :read))
+                 (state
+                   (http-kit/tls::%make-http-tls-server-state
+                    :driver nil :provider nil :transport-stream stream
+                    :deadline 1 :clock-function (lambda () 1))))
+            (unwind-protect
+                 (let ((condition
+                         (handler-case
+                             (progn (http-kit/tls::%tls-server-read-record state) nil)
+                           (http-timeout (condition) condition))))
+                   (ensure-true (typep condition 'http-timeout))
+                   (ensure-equal :tls (http-timeout-kind condition)))
+              (close stream :abort t)))
+          (let ((state
+                  (http-kit/tls::%make-http-tls-server-state
+                   :driver nil :provider nil :transport-stream nil)))
+            (%tls-server-test-with-spy
+             'cl-tls-kit:tls13-server-driver-step
+             (lambda (&rest arguments)
+               (declare (ignore arguments))
+               (signal 'sb-ext:timeout))
+             (lambda ()
+               (let ((condition
+                       (handler-case
+                           (progn
+                             (http-kit/tls::%tls-server-step-handshake-message
+                              state (octets 2 0 0 0))
+                             nil)
+                         (http-timeout (condition) condition))))
+                 (ensure-true (typep condition 'http-timeout))
+                 (ensure-equal :tls (http-timeout-kind condition))))))
+          (let* ((timeout
+                   (make-condition 'http-timeout
+                                   :message "TLS plaintext processing expired."
+                                   :operation :tls :kind :tls))
+                 (state
+                   (http-kit/tls::%make-http-tls-server-state
+                    :driver nil :provider nil :transport-stream nil)))
+            (%tls-server-test-with-spy
+             'cl-tls-kit:make-tls-plaintext
+             (lambda (&rest arguments)
+               (declare (ignore arguments))
+               (error timeout))
+             (lambda ()
+               (let ((observed
+                       (handler-case
+                           (progn
+                             (http-kit/tls::%tls-server-process-record
+                              state (octets 22 3 3 0 0))
+                             nil)
+                         (http-timeout (condition) condition))))
+                 (ensure-true (eq timeout observed)))))
+          (let ((state
+                  (http-kit/tls::%make-http-tls-server-state
+                   :driver nil :provider nil :transport-stream nil)))
+            (%tls-server-test-with-spy
+             'cl-tls-kit:make-tls-plaintext
+             (lambda (&rest arguments)
+               (declare (ignore arguments))
+               (signal 'sb-ext:timeout))
+             (lambda ()
+               (let ((condition
+                       (handler-case
+                           (progn
+                             (http-kit/tls::%tls-server-process-record
+                              state (octets 22 3 3 0 0))
+                             nil)
+                         (http-timeout (condition) condition))))
+                 (ensure-true (typep condition 'http-timeout))
+                 (ensure-equal :tls (http-timeout-kind condition))))))))))
     (let* ((material (%tls-server-test-material))
            (client-stream
              (make-instance '%tls-server-test-stream :input (octets)))
