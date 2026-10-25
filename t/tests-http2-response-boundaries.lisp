@@ -107,6 +107,40 @@
            (ensure-true (eq callback-error observed-error))
            (ensure-true (http-kit/http2:http2-connection-open-p connection)))
       (http-kit/http2:close-http2-connection connection))))
+  (deftest http2-generic-on-stream-open-errors-are-translated
+  (dolist (sender
+           (list #'http-kit/http2::%h2-send-http2-request-over-connection-serial
+                 #'http-kit/http2:send-http2-request-over-connection))
+    (let* ((stream
+             (make-instance 'binary-session-stream
+                            :input (h2-frame 4 0 0 (octets))))
+           (connection
+             (http-kit/http2:make-http2-connection :stream stream))
+           (request
+             (make-http-request :method "GET"
+                                :uri "https://example.test/error-hook"))
+           (failure
+             (make-condition 'simple-error
+                             :format-control "stream-open hook failed"
+                             :format-arguments nil))
+           (observed-error nil))
+      (unwind-protect
+           (progn
+             (handler-case
+                 (funcall sender
+                          connection request
+                          :on-stream-open
+                          (lambda (stream-id cancel-function)
+                            (declare (ignore stream-id cancel-function))
+                            (error failure)))
+               (error (condition)
+                 (setf observed-error condition)))
+             (ensure-true
+              (typep observed-error 'http-kit:http-connection-error))
+             (ensure-true
+              (eq failure
+                  (http-kit:http-connection-error-cause observed-error))))
+        (http-kit/http2:close-http2-connection connection)))))
   (deftest http2-response-cancel-callbacks-use-default-and-custom-codes
   (dolist (sender
            (list #'http-kit/http2::%h2-send-http2-request-over-connection-serial
