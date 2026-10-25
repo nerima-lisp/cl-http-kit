@@ -21,7 +21,7 @@
                       (lambda ()
                         (http-kit/http3:attach-http3-peer-control-stream
                          client replacement)))
-                     "An HTTP/3 client can have only one peer control stream." nil)
+                     "An HTTP/3 client can have only one peer control stream." :h3-stream-creation-error)
                     (ensure-equal reads (http3-boundary-fixture-reads fixture))
                     (ensure-equal closes
                                   (length (http3-boundary-fixture-closes fixture))))))
