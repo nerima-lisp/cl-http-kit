@@ -819,7 +819,7 @@
                       events))
               :on-body-chunk
               (lambda (chunk)
-                (push (list :body (octets-as-string chunk)) events))))
+                (push (list :body (octets-as-string chunk)) events)))))
       (ensure-equal 200 (http-response-status response))
       (ensure-octets-equal (ascii "abc") (http-response-body response))
       (ensure-equal '((:information 103)
@@ -828,7 +828,7 @@
                     (nreverse events))
       #+sbcl
       (when stream-p
-        (ensure-equal (length wire) (binary-test-input-position source)))))
+        (ensure-equal (length wire) (binary-test-input-position source))))
   #+sbcl
   (let* ((header-wire (ascii
                        "HTTP/1.1 101 Switching Protocols|CRLF|Upgrade: websocket|CRLF||CRLF|"))
