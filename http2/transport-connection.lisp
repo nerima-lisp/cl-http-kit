@@ -6,6 +6,14 @@
      ,@body)
   #-sbcl
   `(progn ,@body))
+(defun %h2-rethrow-response-header-callback-error (condition callback-error)
+  (if (and callback-error
+           (or (eq condition callback-error)
+               (and (typep condition 'http-kit:http-connection-error)
+                    (eq (http-kit:http-connection-error-cause condition)
+                        callback-error))))
+      (error callback-error)
+      (error condition)))
 (defmacro %h2-with-response-header-callback-error-translation
     ((message operation callback-error) &body body)
   `(handler-case
@@ -13,13 +21,7 @@
            (,message ,operation)
          ,@body)
      (error (condition)
-       (if (and ,callback-error
-                (or (eq condition ,callback-error)
-                    (and (typep condition 'http-kit:http-connection-error)
-                         (eq (http-kit:http-connection-error-cause condition)
-                             ,callback-error))))
-           (error ,callback-error)
-           (error condition)))))
+       (%h2-rethrow-response-header-callback-error condition ,callback-error))))
 
 (defun http2-client-connection (client)
   (and (http2-client-p client)
