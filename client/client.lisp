@@ -1039,15 +1039,19 @@ headers replace client default headers with the same case-insensitive name."
             (append arguments
                     (list :on-cancel
                           (lambda (cancel-function)
-                            (%client-cancellation-token-register-handler
-                             cancel-token
-                             (lambda (&rest cancel-arguments)
-                               (when (and
-                                      (eq :response-complete
-                                          (apply cancel-function
-                                                 cancel-arguments))
-                                      on-response-complete-cancel)
-                                 (funcall on-response-complete-cancel))))))))
+  (unless (functionp cancel-function)
+    (%client-protocol-error
+     "The transport cancellation handler must be a function."
+     cancel-function))
+  (%client-cancellation-token-register-handler
+   cancel-token
+   (lambda (&rest cancel-arguments)
+     (when (and
+            (eq :response-complete
+                (apply cancel-function
+                       cancel-arguments))
+            on-response-complete-cancel)
+       (funcall on-response-complete-cancel))))))))
       (%client-signal-if-cancelled cancel-token))
     (when (or request-body-function request-body-length)
       (setf arguments
