@@ -847,6 +847,66 @@
     (ensure-equal '((101 "websocket")) (nreverse events))
     (ensure-equal (length header-wire)
                   (binary-test-input-position source)))))
+(deftest http1-response-and-cancellation-callback-arguments-are-validated
+  (let ((wire (ascii "HTTP/1.1 200 OK|CRLF|Content-Length: 0|CRLF||CRLF|"))
+        (invalid-response-callback :invalid-response-callback)
+        (invalid-cancel-callback :invalid-cancel-callback)
+        (invalid-cancel-function :invalid-cancel-function)
+        (invalid-cleanup-result :invalid-cleanup-result))
+    (labels ((expect-parse-error (thunk detail)
+               (let ((caught
+                       (handler-case
+                           (progn (funcall thunk) nil)
+                         (http-protocol-error (condition) condition))))
+                 (ensure-true (typep caught 'http-protocol-error))
+                 (ensure-equal :response-parse (http-error-operation caught))
+                 (ensure-equal detail (http-protocol-error-detail caught))
+                 caught)))
+      (expect-parse-error
+       (lambda ()
+         (parse-http-response wire
+                              :on-response-headers invalid-response-callback))
+       invalid-response-callback)
+      (expect-parse-error
+       (lambda ()
+         (parse-http-response wire :on-cancel invalid-cancel-callback))
+       invalid-cancel-callback)
+      (let ((registration-count 0))
+        (expect-parse-error
+         (lambda ()
+           (parse-http-response
+            wire
+            :on-cancel
+            (lambda (cancel-function)
+              (declare (ignore cancel-function))
+              (incf registration-count)
+              nil)
+            :cancel-stream-function invalid-cancel-function))
+         invalid-cancel-function)
+        (ensure-equal 0 registration-count))
+      (let* ((cancel-handler (lambda (cancel-function)
+                               (declare (ignore cancel-function))
+                               nil))
+             (caught
+               (expect-parse-error
+                (lambda ()
+                  (parse-http-response wire :on-cancel cancel-handler))
+                cancel-handler)))
+        (ensure-true (eq cancel-handler
+                         (http-protocol-error-detail caught))))
+      (let ((registration-count 0))
+        (expect-parse-error
+         (lambda ()
+           (parse-http-response
+            wire
+            :on-cancel
+            (lambda (cancel-function)
+              (ensure-true (functionp cancel-function))
+              (incf registration-count)
+              invalid-cleanup-result)
+            :cancel-stream-function (lambda () nil)))
+         invalid-cleanup-result)
+        (ensure-equal 1 registration-count)))))
 
 #+sbcl
 (deftest http1-final-response-headers-callback-failure-leaves-body-unread
