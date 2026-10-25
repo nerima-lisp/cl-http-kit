@@ -100,14 +100,16 @@
               (http-kit/http3::%h3-connection-transport-error
                "synthetic HTTP/3 connection error" nil #x102))))
          (capture-warning (thunk)
-           (let ((warning-text nil))
+           (let ((warning-text nil)
+                 (warning-condition-value nil))
              (handler-bind
                  ((warning
                     (lambda (warning-condition)
-                      (setf warning-text (format nil "~A" warning-condition))
+                      (setf warning-text (format nil "~A" warning-condition)
+                            warning-condition-value warning-condition)
                       (muffle-warning))))
                (funcall thunk))
-             warning-text))
+             (list warning-text warning-condition-value)))
          (make-client (&optional close-stream)
            (http3-test-make-native-client
             :try-read-stream
@@ -143,7 +145,7 @@
              (ensure-equal
               (list #x102 "synthetic HTTP/3 connection error")
               quic-close-arguments)
-             (ensure-true (search "Injected stream close failure." warning-text))
+             (ensure-true (search "Injected stream close failure." (first warning-text)))
              (ensure-false (http-kit/http3:http3-client-open-p client)))
         (setf (http-kit/http3::http3-client-close-connection client) nil)
         (when (http-kit/http3:http3-client-open-p client)
@@ -169,7 +171,15 @@
              (ensure-equal
               (list #x102 "synthetic HTTP/3 connection error")
               quic-close-arguments)
-             (ensure-true (search "Injected QUIC connection close failure." warning-text))
+             (ensure-true
+              (and (search "Closing the HTTP/3 QUIC connection also failed after HTTP/3 connection error"
+                           (first warning-text))
+                   (typep (second warning-text) (quote simple-warning))
+                   (some (lambda (argument)
+                           (and (typep argument (quote simple-error))
+                                (string= "Injected QUIC connection close failure."
+                                         (simple-condition-format-control argument))))
+                         (simple-condition-format-arguments (second warning-text)))))
              (ensure-false (http-kit/http3:http3-client-open-p client)))
         (setf (http-kit/http3::http3-client-close-connection client) nil)
         (when (http-kit/http3:http3-client-open-p client)
