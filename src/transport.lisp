@@ -249,6 +249,7 @@ for connection close."
     (request stream &key timeout deadline
                       max-header-bytes max-fields max-body-bytes
                       request-target on-body-chunk on-information
+                      on-response-headers on-cancel cancel-stream-function
                       request-body-function request-body-length
                       (collect-body-p t)
                       (clock-function #'%monotonic-time))
@@ -339,6 +340,9 @@ TLS, proxy, or concurrency dependencies on the core system."
                                        :on-information
                                        (and (or on-information expect-continue-p)
                                             #'handle-information)
+                                       :on-response-headers on-response-headers
+                                       :on-cancel on-cancel
+                                       :cancel-stream-function cancel-stream-function
                                        :collect-body-p collect-body-p
                                        :clock-function clock-function)))
             (values response
@@ -349,6 +353,7 @@ TLS, proxy, or concurrency dependencies on the core system."
     (request &key open-stream close-stream timeout deadline
                    max-header-bytes max-fields max-body-bytes
                    request-target on-body-chunk on-information
+                   on-response-headers on-cancel
                    request-body-function request-body-length
                    (collect-body-p t)
                    (clock-function #'%monotonic-time))
@@ -363,44 +368,62 @@ outside this direct function boundary."
    request request-body-function request-body-length)
   (multiple-value-bind (open close)
       (%validate-stream-boundary open-stream close-stream)
-    (let ((stream nil))
-      (with-http-deadline (absolute-deadline timeout
+    (let ((stream nil)
+          (stream-closed-p nil)
+          #+sbcl (close-lock (sb-thread:make-mutex
+                              :name "HTTP stream close")))
+      (labels ((close-once ()
+                 (let ((close-p
+                         #+sbcl
+                         (sb-thread:with-mutex (close-lock)
+                           (when (and stream (not stream-closed-p))
+                             (setf stream-closed-p t)))
+                         #-sbcl
+                         (when (and stream (not stream-closed-p))
+                           (setf stream-closed-p t))))
+                   (when close-p
+                     (funcall close stream))))
+        (with-http-deadline (absolute-deadline timeout
                             :inherited deadline
                             :clock-function clock-function)
-        (%with-http-error-translation
-            ("The HTTP stream request failed." :transport)
-          (unwind-protect
-               (progn
-                 (setf stream
-                       (funcall open request
-                                :timeout timeout
-                                :deadline absolute-deadline))
-                 (unless (streamp stream)
-                   (error 'http-connection-error
-                          :message "The stream factory did not return a stream."
-                          :operation :connect
-                          :cause (type-of stream)))
-                 (send-http-request-over-open-stream
-                  request stream
-                  :deadline absolute-deadline
-                  :max-header-bytes max-header-bytes
-                  :max-fields max-fields
-                  :max-body-bytes max-body-bytes
-                  :request-target request-target
-                  :on-body-chunk on-body-chunk
-                  :on-information on-information
-                  :request-body-function request-body-function
-                  :request-body-length request-body-length
-                  :collect-body-p collect-body-p
-                  :clock-function clock-function))
-            (when stream
-              (funcall close stream))))))))
+          (%with-http-error-translation
+              ("The HTTP stream request failed." :transport)
+            (unwind-protect
+                 (progn
+                   (setf stream
+                         (funcall open request
+                                  :timeout timeout
+                                  :deadline absolute-deadline))
+                   (unless (streamp stream)
+                     (error 'http-connection-error
+                            :message "The stream factory did not return a stream."
+                            :operation :connect
+                            :cause (type-of stream)))
+                   (send-http-request-over-open-stream
+                    request stream
+                    :deadline absolute-deadline
+                    :max-header-bytes max-header-bytes
+                    :max-fields max-fields
+                    :max-body-bytes max-body-bytes
+                    :request-target request-target
+                    :on-body-chunk on-body-chunk
+                    :on-information on-information
+                    :on-response-headers on-response-headers
+                    :on-cancel on-cancel
+                    :cancel-stream-function #'close-once
+                    :request-body-function request-body-function
+                    :request-body-length request-body-length
+                    :collect-body-p collect-body-p
+                    :clock-function clock-function))
+              (when stream
+                (close-once))))))))))
 
 (defun send-http-request-over-stream/cps
     (request on-success
      &key on-error open-stream close-stream timeout deadline
        max-header-bytes max-fields max-body-bytes
        request-target on-body-chunk on-information
+       on-response-headers on-cancel
        request-body-function request-body-length
        (collect-body-p t)
        (clock-function #'%monotonic-time))
@@ -419,6 +442,8 @@ outside this direct function boundary."
       :request-target request-target
       :on-body-chunk on-body-chunk
       :on-information on-information
+      :on-response-headers on-response-headers
+      :on-cancel on-cancel
       :request-body-function request-body-function
       :request-body-length request-body-length
       :collect-body-p collect-body-p

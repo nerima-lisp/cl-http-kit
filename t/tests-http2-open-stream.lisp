@@ -3784,3 +3784,103 @@
           (ensure-true (http-kit/http2:http2-connection-open-p connection))
           (http-kit/http2:close-http2-connection connection)
           (ensure-equal 1 (car closes)))))))
+
+#+sbcl
+(progn
+  (deftest http2-response-headers-callback-error-resets-only-stream
+    (let* ((stream
+             (make-instance
+              'binary-session-stream
+              :input
+              (concatenate-octets
+               (h2-frame 4 0 0 (octets))
+               (h2-frame 1 4 1
+                         (h2-header-block (cons ":status" "200")))
+               (h2-frame 0 1 1 (octets 65)))))
+           (connection (http-kit/http2:make-http2-connection :stream stream))
+           (callback-error
+             (make-condition 'simple-error
+                             :format-control "response rejected"
+                             :format-arguments nil))
+           (body-callback-count 0)
+           (failure nil))
+      (unwind-protect
+           (progn
+             (handler-case
+                 (http-kit/http2:send-http2-request-over-connection
+                  connection
+                  (make-http-request :method "GET"
+                                     :uri "https://127.0.0.1/reject")
+                  :on-response-headers
+                  (lambda (status headers)
+                    (declare (ignore headers))
+                    (ensure-equal 200 status)
+                    (error callback-error))
+                  :on-body-chunk
+                  (lambda (chunk)
+                    (declare (ignore chunk))
+                    (incf body-callback-count)))
+               (error (condition)
+                 (setf failure condition)))
+             (ensure-true (eq callback-error failure))
+             (ensure-equal 0 body-callback-count)
+             (ensure-true
+              (http-kit/http2:http2-connection-open-p connection))
+             (let ((reset-frame
+                     (find-if
+                      (lambda (frame)
+                        (and (= 3 (http-kit/http2::%h2-frame-type frame))
+                             (= 1
+                                (http-kit/http2::%h2-frame-stream-id frame))))
+                      (h2-output-frames stream))))
+               (ensure-true reset-frame)
+               (ensure-equal (octets 0 0 0 8)
+                             (http-kit/http2::%h2-frame-payload reset-frame))))
+        (http-kit/http2:close-http2-connection connection))))
+
+  (deftest http2-manager-response-headers-cancel-registration-cleanup
+    (let* ((stream
+             (make-instance
+              'binary-session-stream
+              :input
+              (concatenate-octets
+               (h2-frame 4 0 0 (octets))
+               (h2-frame 1 5 1
+                         (h2-header-block (cons ":status" "200")
+                                          (cons "content-type" "text/plain"))))))
+           (cancel-function nil)
+           (cleanup-count 0)
+           (response-headers nil)
+           (manager
+             (http-kit/http2:make-http2-connection-manager
+              :open-connection
+              (lambda (request &rest arguments)
+                (declare (ignore request arguments))
+                (http-kit/http2:make-http2-connection :stream stream))))
+           (transport
+             (http-kit/http2:make-http2-connection-manager-transport manager))
+           (response nil))
+      (unwind-protect
+           (progn
+             (setf response
+                   (funcall transport
+                            (make-http-request :method "GET"
+                                               :uri "https://127.0.0.1/manager")
+                            :on-response-headers
+                            (lambda (status headers)
+                              (setf response-headers
+                                    (list status
+                                          (http-header-value
+                                           headers "content-type"))))
+                            :on-cancel
+                            (lambda (function)
+                              (setf cancel-function function)
+                              (lambda () (incf cleanup-count)))))
+             (ensure-equal 200 (http-response-status response))
+             (ensure-equal '(200 "text/plain") response-headers)
+             (ensure-true (functionp cancel-function))
+             (ensure-equal 1 cleanup-count)
+             (ensure-equal 1
+                           (http-kit/http2:http2-connection-manager-connection-count
+                            manager)))
+        (http-kit/http2:close-http2-connection-manager manager)))))

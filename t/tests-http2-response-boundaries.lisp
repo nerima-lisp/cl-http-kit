@@ -46,6 +46,38 @@
                   (nreverse chunks)
                   "HTTP/2 DATA callbacks preserve frame boundaries")))
 
+(deftest http2-response-headers-callback-precedes-body-and-skips-information
+  (let ((events nil)
+        (response
+          (http-kit/http2:send-http2-request
+           (http-kit/http2:make-http2-client
+            :exchange
+            (lambda (request wire &key timeout deadline)
+              (declare (ignore request wire timeout deadline))
+              (concatenate-octets
+               (h2-frame 4 0 0 (octets))
+               (h2-frame 1 4 1 (h2-header-block (cons ":status" "103")))
+               (h2-frame 1 4 1
+                         (h2-header-block (cons ":status" "200")
+                                          (cons "content-type"
+                                                "text/event-stream")
+                                          (cons "content-length" "2")))
+               (h2-frame 0 1 1 (octets 65 66)))))
+           (make-http-request :method "GET" :uri "https://example.test/")
+           :on-response-headers
+           (lambda (status headers)
+             (push (list :headers status
+                         (http-header-value headers "content-type"))
+                   events))
+           :on-body-chunk
+           (lambda (chunk)
+             (push (list :body (copy-seq chunk)) events)))))
+    (ensure-equal 200 (http-response-status response))
+    (ensure-equal
+     (list (list :headers 200 "text/event-stream")
+           (list :body (octets 65 66)))
+     (nreverse events))))
+
 (deftest http2-accepts-padded-response-frames
   (let* ((header-block (h2-header-block
                         (cons ":status" "200")

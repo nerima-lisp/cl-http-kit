@@ -2209,7 +2209,7 @@ HTTP/3 API reference."
         (%h3-promote-qpack-decompression-error condition)))))
 
 (defun %h3-read-response
-    (client stream &key on-body-chunk on-information collect-body-p
+    (client stream &key on-response-headers on-body-chunk on-information collect-body-p
             (max-body-bytes http-kit::*default-max-body-bytes*)
             max-header-bytes max-fields
             qpack-http3-decoder-context stream-id await-qpack
@@ -2268,7 +2268,16 @@ HTTP/3 API reference."
                               (progn
                                 (setf status new-status
                                       headers new-headers
-                                      final-response-p t))
+                                      final-response-p t)
+                                (when on-response-headers
+                                  (funcall
+                                   on-response-headers new-status
+                                   (mapcar
+                                    (lambda (header)
+                                      (http-kit:make-http-header
+                                       (copy-seq (http-kit:http-header-name header))
+                                       (copy-seq (http-kit:http-header-content header))))
+                                    new-headers))))
                               (progn
                                 (when (http-kit:http-header-values
                                        new-headers "content-length")
@@ -3135,12 +3144,12 @@ HTTP/3 API reference."
 )
 
 (defun send-http3-request
-    (client request &key on-body-chunk on-information (collect-body-p t)
+    (client request &key on-response-headers on-body-chunk on-information (collect-body-p t)
             max-header-bytes max-fields
             (max-body-bytes http-kit::*default-max-body-bytes*)
             request-body-function request-body-length
             qpack-encoder-context qpack-decoder-context qpack-http3-decoder-context
-            await-qpack (huffman-p nil) on-stream-open on-push-promise
+            await-qpack (huffman-p nil) on-stream-open on-cancel on-push-promise
             timeout deadline)
   "Send REQUEST on a new HTTP/3 bidirectional stream and read its response.
 
@@ -3180,9 +3189,16 @@ the HTTP/3 API reference."
   (unless (or (null on-push-promise) (functionp on-push-promise))
     (%h3-transport-error "ON-PUSH-PROMISE must be a function or NIL."
                          on-push-promise))
-  (unless (or (null on-information) (functionp on-information))
-    (%h3-transport-error "ON-INFORMATION must be a function or NIL."
-                         on-information))
+  (progn
+    (unless (or (null on-information) (functionp on-information))
+      (%h3-transport-error "ON-INFORMATION must be a function or NIL."
+                           on-information))
+    (unless (or (null on-response-headers) (functionp on-response-headers))
+      (%h3-transport-error
+       "ON-RESPONSE-HEADERS must be a function or NIL."
+       on-response-headers))
+    (unless (or (null on-cancel) (functionp on-cancel))
+      (%h3-transport-error "ON-CANCEL must be a function or NIL." on-cancel)))
   (unless (or (null max-header-bytes)
               (%h3-positive-limit-p max-header-bytes))
     (%h3-transport-error
@@ -3232,7 +3248,8 @@ the HTTP/3 API reference."
                  (http3-client-qpack-http3-decoder-context client))))
          (stream nil)
          (stream-id nil)
-         (failure nil))
+         (failure nil)
+         (cancel-cleanup nil))
     (multiple-value-setq (request-fields declared-body-length)
       (if request-body-function
           (if request-body-length
@@ -3305,12 +3322,20 @@ the HTTP/3 API reference."
                  (%h3-transport-error
                   "A QPACK HTTP/3 decoder context is required with the decoder context."
                   decoder-context))
-               (when on-stream-open
-                 (funcall on-stream-open stream stream-id
-                          (lambda (&key (error-code #x10c))
-                            (cancel-http3-stream
-                             client stream :error-code error-code
-                             :timeout timeout :deadline deadline))))
+               (let ((cancel-function
+                      (lambda (&key (error-code #x10c))
+                        (cancel-http3-stream
+                         client stream :error-code error-code
+                         :timeout timeout :deadline deadline))))
+                 (when on-cancel
+                   (let ((cleanup (funcall on-cancel cancel-function)))
+                     (unless (or (null cleanup) (functionp cleanup))
+                       (%h3-transport-error
+                        "ON-CANCEL must return a cleanup function or NIL."
+                        (type-of cleanup)))
+                     (setf cancel-cleanup cleanup)))
+                 (when on-stream-open
+                   (funcall on-stream-open stream stream-id cancel-function)))
                (progn (%h3-write-request-field-section
                  client stream request-fields encoder-context
                  stream-id huffman-p
@@ -3381,6 +3406,7 @@ the HTTP/3 API reference."
                   :fin-p t :timeout timeout :deadline deadline))
                (%h3-read-response
                 client stream
+                :on-response-headers on-response-headers
                 :on-body-chunk on-body-chunk
                 :on-information on-information
                 :collect-body-p collect-body-p
@@ -3398,10 +3424,14 @@ the HTTP/3 API reference."
              (setf failure condition)
              (error condition)))
       (unwind-protect
-           (funcall (http3-client-close-stream client)
-                    stream :condition failure)
-        (when (plusp (http3-client-request-stream-count client))
-          (decf (http3-client-request-stream-count client)))))))
+           (unwind-protect
+               (when cancel-cleanup
+                 (funcall cancel-cleanup))
+             (unwind-protect
+                 (funcall (http3-client-close-stream client)
+                          stream :condition failure)
+               (when (plusp (http3-client-request-stream-count client))
+                 (decf (http3-client-request-stream-count client)))))))))
 (progn
 (defun %h3-scheduler-resume-ready-token (client token)
   (let ((entry (%h3-scheduler-entry-for-token client token)))
@@ -3943,11 +3973,11 @@ the HTTP/3 API reference."
 
 (defun send-http3-request/cps
     (client request on-success
-     &key on-error on-body-chunk on-information (collect-body-p t)
+     &key on-error on-response-headers on-body-chunk on-information (collect-body-p t)
        max-header-bytes max-fields
        (max-body-bytes http-kit::*default-max-body-bytes*) request-body-function
        request-body-length qpack-encoder-context qpack-decoder-context
-       qpack-http3-decoder-context await-qpack (huffman-p nil) on-stream-open
+       qpack-http3-decoder-context await-qpack (huffman-p nil) on-stream-open on-cancel
        on-push-promise timeout deadline)
   "Send REQUEST and deliver its response to ON-SUCCESS. ON-SUCCESS, ON-ERROR, and
 all callbacks forwarded to SEND-HTTP3-REQUEST follow the callback completion
@@ -3956,6 +3986,7 @@ contract in the HTTP/3 API reference."
    (lambda ()
      (send-http3-request
       client request
+      :on-response-headers on-response-headers
       :on-body-chunk on-body-chunk
       :on-information on-information
       :collect-body-p collect-body-p
@@ -3970,6 +4001,7 @@ contract in the HTTP/3 API reference."
       :await-qpack await-qpack
       :huffman-p huffman-p
       :on-stream-open on-stream-open
+      :on-cancel on-cancel
       :on-push-promise on-push-promise
       :timeout timeout
       :deadline deadline))
@@ -5204,7 +5236,7 @@ callback completion contract in the HTTP/3 API reference."
 (defun send-http3-request-over-connection-manager
     (manager request
      &key (connection-key nil connection-key-supplied-p)
-       on-body-chunk on-information (collect-body-p t)
+       on-response-headers on-cancel on-body-chunk on-information (collect-body-p t)
        max-header-bytes max-fields
        (max-body-bytes http-kit::*default-max-body-bytes*)
        request-body-function request-body-length proxy proxy-plan
@@ -5243,7 +5275,9 @@ callback completion contract in the HTTP/3 API reference."
     (handler-case
         (let ((response
                 (send-http3-request
-                 client request :on-body-chunk on-body-chunk
+                 client request :on-response-headers on-response-headers
+                 :on-cancel on-cancel
+                 :on-body-chunk on-body-chunk
                  :on-information on-information
                  :collect-body-p collect-body-p
                  :max-header-bytes max-header-bytes
@@ -5277,7 +5311,7 @@ the HTTP/3 API reference."
            &key timeout deadline max-header-bytes max-fields
              (max-body-bytes http-kit::*default-max-body-bytes*)
              request-body-function request-body-length
-             on-body-chunk on-information (collect-body-p t)
+             on-response-headers on-cancel on-body-chunk on-information (collect-body-p t)
              proxy proxy-plan
              (connection-key nil connection-key-supplied-p)
              &allow-other-keys)
@@ -5292,6 +5326,8 @@ the HTTP/3 API reference."
                   :max-body-bytes max-body-bytes
                   :request-body-function request-body-function
                   :request-body-length request-body-length
+                  :on-response-headers on-response-headers
+                  :on-cancel on-cancel
                   :on-body-chunk on-body-chunk
                   :on-information on-information
                   :collect-body-p collect-body-p

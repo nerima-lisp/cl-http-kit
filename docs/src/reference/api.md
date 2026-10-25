@@ -1201,6 +1201,11 @@ The base condition type for failures raised by the client policy layer.
 
 Return the detail value carried by an HTTP-CLIENT-ERROR.
 
+### `http-client-request-cancelled`
+
+The condition signaled when a request is cancelled through its cancellation
+token.
+
 ### `http-redirect-limit-exceeded`
 
 The condition type signaled when a redirect policy reaches its maximum.
@@ -1954,6 +1959,25 @@ strict-transport-store creates a new RFC 6797 store; explicitly passing nil
 disables HSTS. Omitting alternative-service-store creates a new RFC 7838 store;
 explicitly passing nil disables alternative-service discovery.
 
+### `make-http-cancellation-token`
+
+Create a one-shot token for cancelling one or more active requests. A token
+already cancelled before a request begins causes that send to signal
+`HTTP-CLIENT-REQUEST-CANCELLED`.
+
+### `http-client-cancel-request`
+
+Mark TOKEN cancelled and invoke the cancellation functions registered by active
+requests. Return true only when this call changes the token to cancelled. A
+token can be shared between concurrent requests; cancellation functions are
+removed when their transport operations complete. Each transport owns how it
+interrupts I/O. The direct HTTP/1.1 stream transport closes its stream. HTTP/2
+sends `RST_STREAM`; if the request caller currently owns a blocked synchronous
+frame read, it observes cancellation after that read completes or its deadline
+expires. An HTTP/3 transport must supply a `cancel-stream` callback to
+`make-http3-client`; the built-in cl-quic-kit adapter does not currently supply
+one.
+
 ### `http-client-clear-connections`
 
 Clear CLIENT's connection pool and all HTTP/2 managers registered with that
@@ -1990,14 +2014,18 @@ contract for any request features the application uses:
 ```lisp
 (request &key timeout deadline max-header-bytes max-fields max-body-bytes
   proxy proxy-plan request-body-function request-body-length
-  on-body-chunk on-information (collect-body-p t))
+  on-body-chunk on-information on-response-headers on-cancel
+  (collect-body-p t))
 ```
 
 The first seven keywords, through `proxy-plan`, are always passed. The body
 producer and length keywords are passed together when either is supplied;
 response callbacks are passed only when supplied; `collect-body-p` is passed
-only when false. A legacy transport supporting only the always-passed keywords
-can serve requests that do not use these features.
+only when false. `on-cancel` is passed when the caller supplies a cancellation
+token. A transport calls it with a function that cancels the active request and
+retains the returned cleanup function until the request completes. A legacy
+transport supporting only the always-passed keywords can serve requests that do
+not use these features.
 
 `http3-transport-function` has the same contract plus `alternative-service`.
 That keyword is always passed: a selected `http-alternative-service` for
@@ -2174,7 +2202,8 @@ request after redirects or retries.
 
 Send keywords are TIMEOUT, DEADLINE, REDIRECT-POLICY, RETRY-POLICY,
 REQUEST-BODY-FUNCTION, REQUEST-BODY-FACTORY, REQUEST-BODY-LENGTH,
-ON-BODY-CHUNK, ON-INFORMATION, COLLECT-BODY-P, COOKIE-SAME-SITE-P,
+ON-BODY-CHUNK, ON-INFORMATION, ON-RESPONSE-HEADERS, CANCEL-TOKEN,
+COLLECT-BODY-P, COOKIE-SAME-SITE-P,
 COOKIE-TOP-LEVEL-NAVIGATION-P, and COOKIE-PARTITION-KEY.
 
 REQUEST-BODY-FUNCTION is called with a chunk-size argument and returns an
@@ -2185,8 +2214,25 @@ cannot accompany a nonempty in-memory body. REQUEST-BODY-LENGTH requires a
 producer or factory. A non-replayable producer is sent once.
 
 ON-BODY-CHUNK is called with one body chunk; ON-INFORMATION is called with one
-informational response. COLLECT-BODY-P defaults to true and controls whether
-the response body is retained.
+informational response. ON-RESPONSE-HEADERS is called with the final response
+status and header list before body chunks; informational responses use
+ON-INFORMATION instead. Once response headers are delivered, client retries,
+authentication replay, and redirects are suppressed for that response.
+COLLECT-BODY-P defaults to true and controls whether the response body is
+retained.
+
+`MAKE-HTTP-CANCELLATION-TOKEN` creates a one-shot token. Pass it as
+`:CANCEL-TOKEN`; `HTTP-CLIENT-CANCEL-REQUEST` marks the token cancelled and
+invokes cancellation handlers for its active requests. It returns true only on
+the first call. A send using a cancelled token signals
+`HTTP-CLIENT-REQUEST-CANCELLED`. The token may be shared by concurrent requests.
+Cancellation callbacks are removed when each transport operation completes.
+Active-I/O cancellation depends on the selected transport: the direct HTTP/1.1
+stream transport closes its stream, HTTP/2 sends `RST_STREAM` but a caller
+blocked in a synchronous frame read waits for that read or its deadline, and
+HTTP/3 requires a backend `cancel-stream` callback. The built-in cl-quic-kit
+adapter currently has no such callback. Custom transports receive `:on-cancel`
+and must use it to register a function that interrupts the active operation.
 COOKIE-SAME-SITE-P and COOKIE-TOP-LEVEL-NAVIGATION-P supply the request context
 for SameSite cookie selection. COOKIE-PARTITION-KEY supplies the canonical
 top-level-site identifier for Partitioned cookie acceptance and selection.

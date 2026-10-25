@@ -301,6 +301,7 @@ be used concurrently from multiple threads."
     (pool request &key key timeout deadline max-header-bytes max-fields max-body-bytes
           proxy-plan proxy request-target request-body-function
           request-body-length on-body-chunk on-information
+          on-response-headers on-cancel
           (collect-body-p t))
   (%pool-ensure-pool pool)
   (unless (http-request-p request)
@@ -321,7 +322,15 @@ be used concurrently from multiple threads."
          (stream nil)
          (opened-at nil)
          (generation nil)
-         (retained-p nil))
+         (retained-p nil)
+         (stream-closed-p nil)
+         (stream-close-lock (%make-client-lock "http-pool-active-stream-close")))
+    (flet ((close-current-stream ()
+             (%with-client-lock (stream-close-lock)
+               (when (and stream (not stream-closed-p))
+                 (setf stream-closed-p t)
+                 (%pool-close pool stream))
+               nil)))
     (handler-case
         (with-http-deadline
          (absolute-deadline timeout
@@ -378,35 +387,45 @@ be used concurrently from multiple threads."
                 :request-body-length request-body-length
                 :on-body-chunk on-body-chunk
                 :on-information on-information
+                :on-response-headers on-response-headers
+                :on-cancel on-cancel
+                :cancel-stream-function #'close-current-stream
                 :collect-body-p collect-body-p
                 :clock-function #'%pool-monotonic-time)
              (if reusable-p
-                 (progn
-                   (%with-client-lock ((%http-connection-pool-lock pool))
-                     (%pool-retain pool key stream opened-at (%pool-now pool)
-                                   generation))
-                   (setf retained-p t))
-                 (%pool-close pool stream))
-             (setf stream nil)
+                 (%with-client-lock (stream-close-lock)
+                   (if stream-closed-p
+                       nil
+                       (progn
+                         (%with-client-lock ((%http-connection-pool-lock pool))
+                           (%pool-retain pool key stream opened-at (%pool-now pool)
+                                         generation))
+                         (setf retained-p t
+                               stream nil))))
+                 (close-current-stream))
+             (unless retained-p
+               (close-current-stream)
+               (setf stream nil))
              response)))
       (%http-client-alpn-handoff (condition)
         (error condition))
       (http-error (condition)
         (unless retained-p
-          (%pool-close pool stream))
+          (close-current-stream))
         (error condition))
       (error (condition)
         (unless retained-p
-          (%pool-close pool stream))
+          (close-current-stream))
         (error 'http-connection-error
                :message "The pooled HTTP exchange signaled an error."
                :operation :transport
-               :cause condition)))))
+               :cause condition))))))
 
 (defun http-connection-pool-send
     (pool request &key key timeout deadline max-header-bytes max-fields max-body-bytes
                      proxy-plan proxy request-target request-body-function
                      request-body-length on-body-chunk on-information
+                     on-response-headers on-cancel
                      (collect-body-p t))
   "Send REQUEST using an idle connection or a newly opened stream.
 
@@ -429,6 +448,8 @@ and neither side requested connection closure."
        :request-body-length request-body-length
        :on-body-chunk on-body-chunk
        :on-information on-information
+       :on-response-headers on-response-headers
+       :on-cancel on-cancel
        :collect-body-p collect-body-p)
     (%http-client-alpn-handoff (condition)
       (%pool-close pool (%http-client-alpn-handoff-stream condition))

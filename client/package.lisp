@@ -269,6 +269,9 @@
    #:http-client-max-body-bytes
    #:http-client-on-request
    #:http-client-on-response
+   #:make-http-cancellation-token
+   #:http-client-cancel-request
+   #:http-client-request-cancelled
    #:http-client-request
    #:http-client-send))
 

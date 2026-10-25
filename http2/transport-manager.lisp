@@ -721,12 +721,7 @@ CLOSE-HTTP2-CONNECTION-MANAGER also prevents future calls."
        (null request-body-function)))
 
 (defun send-http2-request-over-connection-manager
-    (manager request
-     &key (connection-key nil connection-key-supplied-p)
-       timeout deadline max-header-bytes max-fields max-body-bytes clock-function
-       request-body-function request-body-length
-       on-body-chunk on-information (collect-body-p t) (huffman-p nil)
-       proxy-plan proxy)
+    (manager request &key (connection-key nil connection-key-supplied-p) timeout deadline max-header-bytes max-fields max-body-bytes clock-function request-body-function request-body-length on-body-chunk on-information on-response-headers on-cancel (collect-body-p t) (huffman-p nil) proxy-plan proxy)
   (loop
     with retried-p = nil
     do
@@ -749,6 +744,8 @@ CLOSE-HTTP2-CONNECTION-MANAGER also prevents future calls."
                            :request-body-length request-body-length
                            :on-body-chunk on-body-chunk
                            :on-information on-information
+                           :on-response-headers on-response-headers
+                           :on-cancel on-cancel
                            :collect-body-p collect-body-p
                            :huffman-p huffman-p))
                   (error (condition)
@@ -804,7 +801,8 @@ CLOSE-HTTP2-CONNECTION-MANAGER also prevents future calls."
   (lambda (request
            &key timeout deadline max-header-bytes max-fields max-body-bytes clock-function
              request-body-function request-body-length
-             on-body-chunk on-information (collect-body-p t) (huffman-p nil)
+             on-body-chunk on-information on-response-headers on-cancel
+             (collect-body-p t) (huffman-p nil)
              (connection-key nil connection-key-supplied-p)
              proxy-plan proxy
              &allow-other-keys)
@@ -822,6 +820,8 @@ CLOSE-HTTP2-CONNECTION-MANAGER also prevents future calls."
          :request-body-length request-body-length
          :on-body-chunk on-body-chunk
          :on-information on-information
+         :on-response-headers on-response-headers
+         :on-cancel on-cancel
          :collect-body-p collect-body-p
          :huffman-p huffman-p
          :proxy-plan proxy-plan
@@ -838,6 +838,8 @@ CLOSE-HTTP2-CONNECTION-MANAGER also prevents future calls."
          :request-body-length request-body-length
          :on-body-chunk on-body-chunk
          :on-information on-information
+         :on-response-headers on-response-headers
+         :on-cancel on-cancel
          :collect-body-p collect-body-p
          :huffman-p huffman-p
          :proxy-plan proxy-plan

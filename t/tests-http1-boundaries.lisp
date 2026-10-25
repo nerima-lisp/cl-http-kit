@@ -795,3 +795,124 @@
                      (ensure-equal :eof (read-byte source nil :eof))
                      (ensure-octets-equal (octets) (binary-test-output source))))
               (when stream-p (close source)))))))))
+
+(deftest http1-final-response-headers-callback-precedes-body
+  (dolist (stream-p '(nil #+sbcl t))
+    (let* ((wire (ascii "HTTP/1.1 103 Early Hints|CRLF|Link: </style.css>; rel=preload|CRLF||CRLF|HTTP/1.1 200 OK|CRLF|Content-Length: 3|CRLF||CRLF|abc"))
+           (source (if stream-p
+                       #+sbcl (make-instance 'binary-test-stream :input wire)
+                       #-sbcl wire
+                       wire))
+           (events '())
+           (response
+             (parse-http-response
+              source
+              :on-information
+              (lambda (information)
+                (push (list :information
+                            (http-response-status information))
+                      events))
+              :on-response-headers
+              (lambda (status headers)
+                (push (list :headers status
+                            (http-header-value headers "content-length"))
+                      events))
+              :on-body-chunk
+              (lambda (chunk)
+                (push (list :body (octets-as-string chunk)) events))))
+      (ensure-equal 200 (http-response-status response))
+      (ensure-octets-equal (ascii "abc") (http-response-body response))
+      (ensure-equal '((:information 103)
+                      (:headers 200 "3")
+                      (:body "abc"))
+                    (nreverse events))
+      #+sbcl
+      (when stream-p
+        (ensure-equal (length wire) (binary-test-input-position source)))))
+  #+sbcl
+  (let* ((header-wire (ascii
+                       "HTTP/1.1 101 Switching Protocols|CRLF|Upgrade: websocket|CRLF||CRLF|"))
+         (wire (concatenate-octets header-wire (ascii "upgraded")))
+         (source (make-instance 'binary-test-stream :input wire))
+         (events nil)
+         (response
+           (parse-http-response
+            source
+            :on-response-headers
+            (lambda (status headers)
+              (push (list status (http-header-value headers "upgrade"))
+                    events)))))
+    (ensure-equal 101 (http-response-status response))
+    (ensure-equal 0 (length (http-response-body response)))
+    (ensure-equal '((101 "websocket")) (nreverse events))
+    (ensure-equal (length header-wire)
+                  (binary-test-input-position source)))))
+
+#+sbcl
+(deftest http1-final-response-headers-callback-failure-leaves-body-unread
+  (let* ((header-wire (ascii "HTTP/1.1 200 OK|CRLF|Content-Length: 3|CRLF||CRLF|"))
+         (wire (concatenate-octets header-wire (ascii "abc")))
+         (source (make-instance 'binary-test-stream :input wire))
+         (callback-error
+           (make-condition 'simple-error
+                           :format-control "response header callback failed"
+                           :format-arguments '()))
+         (body-calls 0)
+         (caught
+           (handler-case
+               (progn
+                 (parse-http-response
+                  source
+                  :on-response-headers
+                  (lambda (status headers)
+                    (ensure-equal 200 status)
+                    (ensure-equal "3"
+                                  (http-header-value headers "content-length"))
+                    (error callback-error))
+                  :on-body-chunk
+                  (lambda (chunk)
+                    (declare (ignore chunk))
+                    (incf body-calls)))
+                 nil)
+             (simple-error (condition) condition))))
+    (ensure-true (eq callback-error caught))
+    (ensure-equal 0 body-calls)
+    (ensure-equal (length header-wire)
+                  (binary-test-input-position source))))
+
+#+sbcl
+(deftest http1-direct-stream-cancel-closes-once-and-unregisters
+  (let* ((request (make-http-request :method "GET"
+                                    :uri "http://127.0.0.1/"))
+         (wire (ascii "HTTP/1.1 200 OK|CRLF|Content-Length: 3|CRLF||CRLF|abc"))
+         (stream (make-instance 'binary-test-stream :input wire))
+         (events '())
+         (response
+           (send-http-request-over-stream
+            request
+            :open-stream
+            (lambda (received-request &key timeout deadline)
+              (declare (ignore timeout deadline))
+              (ensure-equal request received-request)
+              stream)
+            :close-stream
+            (lambda (closed-stream)
+              (ensure-equal stream closed-stream)
+              (push :closed events))
+            :on-cancel
+            (lambda (cancel-function)
+              (push :registered events)
+              (funcall cancel-function)
+              (lambda () (push :unregistered events)))
+            :on-response-headers
+            (lambda (status headers)
+              (ensure-equal 200 status)
+              (ensure-equal "3" (http-header-value headers "content-length"))
+              (push :headers events))
+            :on-body-chunk
+            (lambda (chunk)
+              (ensure-octets-equal (ascii "abc") chunk)
+              (push :body events)))))
+    (ensure-equal 200 (http-response-status response))
+    (ensure-equal '(:registered :closed :headers :body :unregistered)
+                  (nreverse events))))

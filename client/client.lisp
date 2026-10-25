@@ -293,7 +293,8 @@
 (defun %client-transport-from-stream-boundary (open-stream close-stream)
   (lambda (request &key timeout deadline max-header-bytes max-fields max-body-bytes
                          request-target request-body-function request-body-length
-                         on-body-chunk on-information (collect-body-p t)
+                         on-body-chunk on-information on-response-headers on-cancel
+                         (collect-body-p t)
                          proxy-plan proxy)
     (send-http-request-over-stream
      request
@@ -319,6 +320,8 @@
      :request-body-length request-body-length
      :on-body-chunk on-body-chunk
      :on-information on-information
+     :on-response-headers on-response-headers
+     :on-cancel on-cancel
      :collect-body-p collect-body-p
      :clock-function #'%client-monotonic-time)))
 
@@ -342,7 +345,8 @@
 (defun %client-transport-from-connection-pool (connection-pool &key allow-alpn-handoff)
   (lambda (request &key timeout deadline max-header-bytes max-fields max-body-bytes
                          request-target request-body-function request-body-length
-                         on-body-chunk on-information (collect-body-p t)
+                         on-body-chunk on-information on-response-headers on-cancel
+                         (collect-body-p t)
                          proxy-plan proxy)
     (funcall (if allow-alpn-handoff
                  #'%http-connection-pool-send-with-alpn-handoff
@@ -361,6 +365,8 @@
      :request-body-length request-body-length
      :on-body-chunk on-body-chunk
      :on-information on-information
+     :on-response-headers on-response-headers
+     :on-cancel on-cancel
      :collect-body-p collect-body-p)))
 
 (defun %client-runtime-function (package-name function-name)
@@ -859,6 +865,23 @@ headers replace client default headers with the same case-insensitive name."
       (funcall on-body-chunk body)))
   response)
 
+(defun %client-signal-if-cancelled (token &optional cause)
+  (when (and token (%client-cancellation-token-cancelled-p token))
+    (error 'http-client-request-cancelled
+           :message "The HTTP request was cancelled."
+           :operation :cancel
+           :detail cause)))
+
+(defun %client-deliver-response-headers
+    (response on-response-headers cancel-token)
+  (%client-signal-if-cancelled cancel-token)
+  (when on-response-headers
+    (funcall on-response-headers
+             (http-response-status response)
+             (http-response-headers response)))
+  (%client-signal-if-cancelled cancel-token)
+  response)
+
 (defun %client-request-with-proxy-authorization (request proxy-plan)
   (let* ((forward-p (and proxy-plan
                          (eq (getf proxy-plan :mode) :forward)))
@@ -961,7 +984,7 @@ headers replace client default headers with the same case-insensitive name."
 (defun %client-call-transport
     (client request proxy-plan &key timeout deadline request-body-function
                                       request-body-length on-body-chunk
-                                      on-information
+                                      on-information on-response-headers cancel-token
                                       (collect-body-p t))
   (let* ((request-body-started-p nil)
          (response-observed-p nil)
@@ -991,6 +1014,22 @@ headers replace client default headers with the same case-insensitive name."
                           (lambda (response)
                             (setf response-observed-p t)
                             (funcall on-information response))))))
+    (when on-response-headers
+      (setf arguments
+            (append arguments
+                    (list :on-response-headers
+                          (lambda (status headers)
+                            (setf response-observed-p t)
+                            (funcall on-response-headers status headers)
+                            (%client-signal-if-cancelled cancel-token))))))
+    (when cancel-token
+      (setf arguments
+            (append arguments
+                    (list :on-cancel
+                          (lambda (cancel-function)
+                            (%client-cancellation-token-register-handler
+                             cancel-token cancel-function)))))
+      (%client-signal-if-cancelled cancel-token))
     (when (or request-body-function request-body-length)
       (setf arguments
             (append arguments
@@ -1057,6 +1096,9 @@ headers replace client default headers with the same case-insensitive name."
                            (if (and (null (http-kit:http-connection-error-request-sent-p
                                            condition))
                                     (not request-body-started-p)
+                                    (not (and cancel-token
+                                              (%client-cancellation-token-cancelled-p
+                                               cancel-token)))
                                     (not response-observed-p))
                                (fallback-to-tcp)
                                (error condition))))))
@@ -1071,6 +1113,7 @@ headers replace client default headers with the same case-insensitive name."
     (client request proxy-plan policy &key timeout deadline request-body-function
                                                 request-body-factory request-body-length
                                                 on-body-chunk
+                                                on-response-headers cancel-token
                                                 on-information
                                                 (cookie-same-site-p t)
                                                 (cookie-top-level-navigation-p nil)
@@ -1081,11 +1124,18 @@ headers replace client default headers with the same case-insensitive name."
          (max-attempts (http-retry-policy-max-attempts policy))
          (last-response nil)
          (response-body-observed-p nil)
+         (response-headers-observed-p nil)
          (effective-on-body-chunk
            (and on-body-chunk
                 (lambda (chunk)
                   (setf response-body-observed-p t)
                   (funcall on-body-chunk chunk))))
+         (effective-on-response-headers
+           (and on-response-headers
+                (lambda (status headers)
+                  (setf response-body-observed-p t
+                        response-headers-observed-p t)
+                  (funcall on-response-headers status headers))))
          (body-replayable-p
            (or (null request-body-function)
                request-body-factory))
@@ -1100,6 +1150,7 @@ headers replace client default headers with the same case-insensitive name."
                :message "The HTTP operation exceeded its deadline."
                :operation :request
                :kind :deadline))
+      (%client-signal-if-cancelled cancel-token)
       (when (http-client-on-request client)
         (funcall (http-client-on-request client) request attempt))
       (let ((attempt-body-function
@@ -1119,7 +1170,10 @@ headers replace client default headers with the same case-insensitive name."
                            :request-body-length request-body-length
                            :on-body-chunk effective-on-body-chunk
                            :on-information on-information
+                           :on-response-headers effective-on-response-headers
+                           :cancel-token cancel-token
                            :collect-body-p collect-body-p)))
+            (%client-signal-if-cancelled cancel-token)
             (when (http-client-cache client)
               (setf response-time
                     (funcall
@@ -1166,7 +1220,8 @@ headers replace client default headers with the same case-insensitive name."
                    client policy response attempt deadline)
                   (incf attempt))
                 (let ((stale-response
-                        (and stale-if-error-function
+                        (and (not response-headers-observed-p)
+                             stale-if-error-function
                              (member (http-response-status response)
                                      '(500 502 503 504)
                                      :test #'eql)
@@ -1187,6 +1242,7 @@ headers replace client default headers with the same case-insensitive name."
                   (return (values response attempt (not (null stale-response))
                                   request-time response-time)))))
         (http-error (condition)
+          (%client-signal-if-cancelled cancel-token condition)
           (if (and (< attempt max-attempts)
                    body-replayable-p
                    (or (%client-retry-method-p policy request)
@@ -1198,11 +1254,14 @@ headers replace client default headers with the same case-insensitive name."
                  client policy last-response attempt deadline)
                 (incf attempt))
                (let ((stale-response
-                       (and stale-if-error-function
+                       (and (not response-headers-observed-p)
+                            stale-if-error-function
                             (%client-stale-if-error-condition-p condition)
                             (funcall stale-if-error-function))))
                  (if stale-response
                      (progn
+                       (%client-deliver-response-headers
+                        stale-response on-response-headers cancel-token)
                        (when (http-client-on-response client)
                          (funcall (http-client-on-response client)
                                   stale-response request attempt))
@@ -1393,8 +1452,11 @@ headers replace client default headers with the same case-insensitive name."
    (%cache-request-directives (http-request-headers request))
    "only-if-cached"))
 
-(defun %client-only-if-cached-response (client request on-body-chunk)
+(defun %client-only-if-cached-response
+    (client request on-body-chunk on-response-headers cancel-token)
   (let ((response (make-http-response :status 504)))
+    (%client-deliver-response-headers
+     response on-response-headers cancel-token)
     (%client-deliver-body-chunk response on-body-chunk)
     (when (http-client-on-response client)
       (funcall (http-client-on-response client) response request 0))
@@ -1416,7 +1478,8 @@ headers replace client default headers with the same case-insensitive name."
     (client request &key timeout deadline redirect-policy retry-policy
                          request-body-function request-body-factory
                          request-body-length
-                         on-body-chunk on-information (collect-body-p t)
+                         on-body-chunk on-information on-response-headers
+                         cancel-token (collect-body-p t)
                          (cookie-same-site-p t)
                          (cookie-top-level-navigation-p nil)
                          cookie-partition-key
@@ -1444,6 +1507,15 @@ eligible stale cache entry may be returned through the configured scheduler."
   (when on-information
     (%ensure-function on-information
                       "The informational response callback must be a function."))
+  (when on-response-headers
+    (%ensure-function on-response-headers
+                      "The response header callback must be a function."))
+  (when cancel-token
+    (unless (http-cancellation-token-p cancel-token)
+      (%client-protocol-error
+       "The request cancellation token must come from MAKE-HTTP-CANCELLATION-TOKEN."
+       cancel-token)))
+  (%client-signal-if-cancelled cancel-token)
   (%client-validate-collect-body-p collect-body-p)
   (%cookie-partition-key cookie-partition-key)
   (let* ((effective-deadline
@@ -1494,6 +1566,12 @@ eligible stale cache entry may be returned through the configured scheduler."
                 (lambda (chunk)
                   (setf response-body-observed-p t)
                   (funcall on-body-chunk chunk))))
+         (effective-on-response-headers
+           (and on-response-headers
+                (lambda (status headers)
+                  (unless (and cache-revalidation-entry (= status 304))
+                    (setf response-body-observed-p t)
+                    (funcall on-response-headers status headers)))))
          (stale-entry cache-revalidation-entry))
     (unless (http-redirect-policy-p redirect-policy)
       (%client-protocol-error "The redirect policy must be an HTTP-REDIRECT-POLICY."
@@ -1511,7 +1589,8 @@ eligible stale cache entry may be returned through the configured scheduler."
                (or (null (http-client-cache client))
                    (not (%client-cacheable-method-p current-request))))
       (return-from %http-client-send-request
-        (%client-only-if-cached-response client current-request on-body-chunk)))
+        (%client-only-if-cached-response client current-request on-body-chunk
+                 effective-on-response-headers cancel-token)))
     (when (and (http-client-cache client)
                (%client-cacheable-method-p current-request))
       (multiple-value-bind (response state entry forward-reason)
@@ -1522,6 +1601,8 @@ eligible stale cache entry may be returned through the configured scheduler."
           (setf response
                 (%cache-status-hit-response
                  (http-client-cache client) response entry))
+          (%client-deliver-response-headers
+           response effective-on-response-headers cancel-token)
           (%client-deliver-body-chunk response on-body-chunk)
           (when (http-client-on-response client)
             (funcall (http-client-on-response client) response current-request 0))
@@ -1529,8 +1610,8 @@ eligible stale cache entry may be returned through the configured scheduler."
             (values response current-request)))
         (when only-if-cached-p
           (return-from %http-client-send-request
-            (%client-only-if-cached-response
-             client current-request on-body-chunk)))
+            (%client-only-if-cached-response client current-request on-body-chunk
+                     effective-on-response-headers cancel-token)))
         (when (eq state :stale)
           (let* ((now (funcall (http-cache-clock-function
                                 (http-client-cache client))))
@@ -1562,6 +1643,8 @@ eligible stale cache entry may be returned through the configured scheduler."
               (setf stale-response
                     (%cache-status-hit-response
                      (http-client-cache client) stale-response entry now))
+              (%client-deliver-response-headers
+               stale-response effective-on-response-headers cancel-token)
               (when (http-client-on-response client)
                 (funcall (http-client-on-response client)
                          stale-response current-request 0))
@@ -1596,6 +1679,8 @@ eligible stale cache entry may be returned through the configured scheduler."
                              :request-body-factory request-body-factory
                              :request-body-length request-body-length
                              :on-body-chunk effective-on-body-chunk
+                             :on-response-headers effective-on-response-headers
+                             :cancel-token cancel-token
                              :on-information on-information
                              :cookie-same-site-p cookie-same-site-p
                              :cookie-top-level-navigation-p
@@ -1619,6 +1704,8 @@ eligible stale cache entry may be returned through the configured scheduler."
             (setf response (%client-response-merge-304
                             (http-cache-entry-response stale-entry)
                             response))
+            (%client-deliver-response-headers
+             response effective-on-response-headers cancel-token)
             (%client-deliver-body-chunk response on-body-chunk))
           (let* ((challenge-values
                    (and (= (http-response-status response) 401)

@@ -12042,30 +12042,49 @@
                                                   ("content-length" . "1"))) nil)
                   (list (http3-boundary-data "a") t))))
          (events nil)
+         (request-stream nil)
+         (cancel-function nil)
          (response
            (http-kit/http3:send-http3-request
             (http3-boundary-fixture-client fixture)
             (make-http-request :method "GET" :uri "https://example.test/")
             :collect-body-p nil
+            :on-cancel
+            (lambda (cancel)
+              (setf cancel-function cancel)
+              (push :cancel-register events)
+              (lambda ()
+                (ensure-false (http3-test-stream-closed-p request-stream))
+                (push :cancel-cleanup events)))
             :on-stream-open
             (lambda (stream stream-id cancel)
+              (setf request-stream stream)
               (ensure-true (eq stream (first (http3-boundary-fixture-streams fixture))))
               (ensure-equal 0 stream-id)
               (ensure-true (functionp cancel))
+              (ensure-true (eq cancel cancel-function))
               (ensure-equal nil (http3-test-stream-writes stream))
               (ensure-equal 0 (http3-boundary-fixture-reads fixture))
               (push :open events))
             :on-information
-            (lambda (response)
-              (ensure-equal 103 (http-response-status response))
+            (lambda (information)
+              (ensure-equal 103 (http-response-status information))
               (ensure-equal 1 (http3-boundary-fixture-reads fixture))
               (push :information events))
+            :on-response-headers
+            (lambda (status headers)
+              (ensure-equal 200 status)
+              (ensure-equal "1" (http-header-value headers "content-length"))
+              (ensure-equal 2 (http3-boundary-fixture-reads fixture))
+              (push :response-headers events))
             :on-body-chunk
             (lambda (chunk)
               (ensure-true (equalp (ascii "a") chunk))
               (ensure-equal 3 (http3-boundary-fixture-reads fixture))
               (push :body events)))))
-    (ensure-equal '(:open :information :body) (reverse events))
+    (ensure-equal '(:cancel-register :open :information :response-headers :body
+                    :cancel-cleanup)
+                  (reverse events))
     (ensure-equal 200 (http-response-status response))
     (ensure-equal 0 (length (http-response-body response)))
     (let* ((writes (reverse (http3-test-stream-writes
@@ -12080,7 +12099,8 @@
       (ensure-equal http-kit/http3:+http3-headers-type+
                     (http-kit/http3:http3-frame-type (first headers)))
       (ensure-true (member '(":method" . "GET")
-                           (http3-test-qpack-decode (http-kit/http3:http3-frame-payload (first headers)))
+                           (http3-test-qpack-decode
+                            (http-kit/http3:http3-frame-payload (first headers)))
                            :test #'equal))
       (ensure-equal http-kit/http3:+http3-data-type+
                     (http-kit/http3:http3-frame-type (first data)))
@@ -12090,7 +12110,7 @@
     (http-kit/http3:close-http3-client (http3-boundary-fixture-client fixture))))
 
 (deftest http3-public-response-callback-failure-releases-capacity
-  (dolist (phase '(:open :information :body))
+  (dolist (phase '(:open :information :headers :body))
     (let* ((fixture
              (http3-boundary-fixture
               (list (list (http3-boundary-headers '((":status" . "103"))) nil)
@@ -12116,17 +12136,29 @@
                    (ensure-equal 103 (http-response-status response))
                    (push :information calls)
                    (when (eq phase :information) (error primary)))
+                 :on-response-headers
+                 (lambda (status headers)
+                   (ensure-equal 200 status)
+                   (ensure-equal "1" (http-header-value headers "content-length"))
+                   (push :headers calls)
+                   (when (eq phase :headers) (error primary)))
                  :on-body-chunk
                  (lambda (chunk)
                    (ensure-true (equalp (ascii "a") chunk))
                    (push :body calls)
                    (when (eq phase :body) (error primary))))))))
       (ensure-true (eq primary failure))
-      (ensure-equal (ecase phase (:open '(:open))
-                                (:information '(:open :information))
-                                (:body '(:open :information :body)))
+      (ensure-equal (ecase phase
+                      (:open '(:open))
+                      (:information '(:open :information))
+                      (:headers '(:open :information :headers))
+                      (:body '(:open :information :headers :body)))
                     (reverse calls))
-      (ensure-equal (ecase phase (:open 0) (:information 1) (:body 3))
+      (ensure-equal (ecase phase
+                      (:open 0)
+                      (:information 1)
+                      (:headers 2)
+                      (:body 3))
                     (http3-boundary-fixture-reads fixture))
       (when (eq phase :open)
         (ensure-equal nil (http3-test-stream-writes
@@ -12905,7 +12937,17 @@
                (setf response
                      (funcall
                       (http-kit/http3:make-http3-connection-manager-transport manager)
-                      request :proxy nil :proxy-plan plan))
+                      request :proxy nil :proxy-plan plan
+                      :on-response-headers
+                      (lambda (status headers)
+                        (ensure-equal 204 status)
+                        (ensure-equal nil headers)
+                        (push :response-headers events))
+                      :on-cancel
+                      (lambda (cancel-function)
+                        (ensure-true (functionp cancel-function))
+                        (push :cancel-register events)
+                        (lambda () (push :cancel-unregister events)))))
              (http-protocol-error (error-condition)
                (setf condition error-condition)))
            (setf retained-count
@@ -12928,6 +12970,15 @@
           (ensure-equal '(:open-client t) (first request-events))
           (ensure-true (member :write-stream request-events))
           (ensure-true (member :read-stream request-events))
+          (ensure-true (member :response-headers request-events))
+          (ensure-true (member :cancel-register request-events))
+          (ensure-true (member :cancel-unregister request-events))
+          (ensure-true (< (position :open-stream request-events)
+                          (position :cancel-register request-events)))
+          (ensure-true (< (position :response-headers request-events)
+                          (position :cancel-unregister request-events)))
+          (ensure-true (< (position :cancel-unregister request-events)
+                          (position :close-stream request-events)))
           (ensure-equal 1 retained-count))
         (progn
           (ensure-true (typep condition 'http-protocol-error))
