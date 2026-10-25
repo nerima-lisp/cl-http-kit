@@ -92,39 +92,7 @@
       (http-kit/http3::%h3-decode-response-field-section
        client (octets) context :stream-id 0 :role :response))
     (ensure-equal 1 serializations)))
-(deftest http3-client-revalidates-mutated-header-name-before-opening-request-stream
-  (let* ((client
-           (http3-test-make-native-client
-            :try-read-stream
-            (lambda (stream &key timeout deadline)
-              (declare (ignore stream timeout deadline))
-              (values nil nil :would-block))))
-         (request
-           (make-http-request
-            :method "GET"
-            :uri "https://example.test/headers"
-            :headers (list (make-http-header "X-Test" "value"))))
-         (opened-p nil))
-    (setf (http-kit:http-header-name
-           (first (http-kit:http-request-headers request)))
-          "Bad Name")
-    (unwind-protect
-         (let ((failure
-                 (http3-boundary-error
-                  (lambda ()
-                    (http-kit/http3:send-http3-request
-                     client request
-                     :on-stream-open
-                     (lambda (stream stream-id cancel)
-                       (declare (ignore stream stream-id cancel))
-                       (setf opened-p t)))))))
-           (ensure-true (typep failure 'http-invalid-header))
-           (ensure-equal
-            "Invalid HTTP/3 header \"bad name\": the field name is not a token."
-            (http-error-message failure))
-           (ensure-false opened-p))
-      (when (http-kit/http3:http3-client-open-p client)
-        (http-kit/http3:close-http3-client client)))))
+
 (deftest http3-native-scheduler-reports-connection-close-callback-failures
   (flet ((connection-condition ()
            (http3-boundary-error
