@@ -2054,6 +2054,8 @@
                   (/ (get-internal-real-time)
                      internal-time-units-per-second))))
            (stores nil)
+           (wrapper-error-reported (sb-thread:make-semaphore :count 0))
+           (wrapper-error-reason nil)
            (server nil)
            (client nil))
       (unwind-protect
@@ -2065,7 +2067,14 @@
                      (let ((store (apply original-store-maker arguments)))
                        (push store stores)
                        store)))
-             (setf server (%https-listener-make-server))
+             (setf server
+                   (%https-listener-make-server
+                    :on-error
+                    (lambda (condition details)
+                      (declare (ignore details))
+                      (setf wrapper-error-reason
+                            (http-server-error-reason-code condition))
+                      (sb-thread:signal-semaphore wrapper-error-reported))))
              (ensure-equal 1 (length stores))
              (start-http-server server)
              (setf clock-offset (* 13 60 60)
@@ -2076,6 +2085,9 @@
                    client (%https-listener-connect server))
              (close-http-tcp-stream client)
              (setf client nil)
+             (ensure-true
+              (sb-thread:wait-on-semaphore wrapper-error-reported :timeout 5))
+             (ensure-equal :invalid-tls-credentials wrapper-error-reason)
              (%https-listener-wait
               (lambda () (zerop (%https-listener-connection-count server))))
              (ensure-equal 2 (length stores))
