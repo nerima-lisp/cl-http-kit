@@ -1318,6 +1318,7 @@ concurrent streams should use SEND-HTTP2-REQUESTS-OVER-CONNECTION."
                            :adjustable t
                            :fill-pointer 0))
   (body-length 0)
+  (response-complete-p nil)
   response)
 
 (defstruct (%h2-scheduler-ping-waiter
@@ -1443,7 +1444,7 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                 (progn
                   (when (%h2-batch-entry-on-response-headers entry)
                     (funcall (%h2-batch-entry-on-response-headers entry)
-                             candidate-status candidate-headers))
+                             candidate-status candidate-headers end-stream))
                   (values candidate-status candidate-headers
                           (when end-stream
                             (%h2-finish-request-response
@@ -1680,8 +1681,13 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                         (setf (%h2-batch-entry-data-deferred-p entry) nil)))))
                  (:deferred-data
                   (unless entry-error
-                    (%h2-scheduler-dispatch-frame
-                     connection (second event) nil nil nil clock-function t)
+                    (handler-case
+                        (%h2-scheduler-dispatch-frame
+                         connection (second event) nil nil nil clock-function t)
+                      (http-kit:http-size-limit-exceeded (condition)
+                        (%h2-scheduler-retire-entry
+                         connection entry condition clock-function)
+                        (error condition)))
                     (%h2-with-scheduler-lock (connection)
                       (unless
                           (some (lambda (pending-event)
@@ -1979,10 +1985,14 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                           (list :information on-information response))))
                      (%h2-batch-entry-on-response-headers processing-entry)
                      (when on-response-headers
-                       (lambda (status headers)
-                         (%h2-scheduler-queue-callback
-                          connection entry
-                          (list :response-headers on-response-headers
+                       (lambda (status headers end-stream)
+                          (when end-stream
+                            (%h2-with-scheduler-lock (connection)
+                              (setf (%h2-batch-entry-response-complete-p entry)
+                                    t)))
+                          (%h2-scheduler-queue-callback
+                           connection entry
+                           (list :response-headers on-response-headers
                                 status headers)))))
                (multiple-value-bind (status headers response)
                    (%h2-batch-process-headers-frame
@@ -2521,7 +2531,11 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                            :error-code (getf arguments :error-code 8)
                            :deadline absolute-deadline
                            :clock-function clock
-                           :only-if-active-p t)))
+                           :only-if-active-p t
+                           :response-complete-p
+                           (%h2-with-scheduler-lock (connection)
+                             (or (%h2-batch-entry-response-complete-p entry)
+                                 (%h2-batch-entry-response entry))))))
                   (unwind-protect
                        (progn
                          (when on-cancel

@@ -1147,11 +1147,11 @@ headers replace client default headers with the same case-insensitive name."
            (%make-client-lock "http-client-response-complete-cancel"))
          (response-complete-cancel-predicate
            (lambda ()
-             (%with-client-lock ((response-complete-cancel-lock))
+             (%with-client-lock (response-complete-cancel-lock)
                response-complete-cancelled-p)))
          (on-response-complete-cancel
            (lambda ()
-             (%with-client-lock ((response-complete-cancel-lock))
+             (%with-client-lock (response-complete-cancel-lock)
                (setf response-complete-cancelled-p t))))
          (effective-on-body-chunk
            (and on-body-chunk
