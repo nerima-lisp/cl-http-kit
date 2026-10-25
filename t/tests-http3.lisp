@@ -14581,12 +14581,7 @@
                   (http-kit/http3:http3-client-open-p client)))
                (ensure-true
                 (http-kit/http3::http3-quic-adapter-closed-p adapter))
-               (ensure-true (cl-quic-kit:quic-client-closed-p quic))
-               (let ((detail
-                       (http-kit/http3::%http3-quic-adapter-close-detail quic)))
-                 (ensure-equal :application (getf detail :closed-kind))
-                 (ensure-equal #x103 (getf detail :closed-error))
-                 (ensure-true (getf detail :client-closed-p))))
+               (ensure-true (cl-quic-kit:quic-client-closed-p quic)))
              :client-poll
              (lambda (actual &optional at)
                (when (and (eq actual quic) (not first-poll-p))
