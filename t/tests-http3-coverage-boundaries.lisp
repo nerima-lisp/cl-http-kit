@@ -4965,7 +4965,7 @@
       (when (http-kit/http3:http3-client-open-p client)
         (http-kit/http3:close-http3-client client)))))
 (deftest http3-native-scheduler-does-not-write-ineligible-request-entries
-  (let ((writes nil)
+  (let* ((writes nil)
         (client
           (http3-test-make-native-client
            :try-read-stream
