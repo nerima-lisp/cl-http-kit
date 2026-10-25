@@ -4965,33 +4965,37 @@
       (when (http-kit/http3:http3-client-open-p client)
         (http-kit/http3:close-http3-client client)))))
 (deftest http3-native-scheduler-does-not-write-ineligible-request-entries
-  (let* ((writes nil)
-        (client
-          (http3-test-make-native-client
-           :try-read-stream
-           (lambda (stream &key timeout deadline)
-             (declare (ignore stream timeout deadline))
-             (values nil nil :would-block))
-           :write-stream
-           (lambda (stream bytes &key fin-p timeout deadline)
-             (declare (ignore stream fin-p timeout deadline))
-             (push (copy-seq bytes) writes)))))
+  (let* ((entry-streams nil)
+         (writes nil)
+         (client
+           (http3-test-make-native-client
+            :try-read-stream
+            (lambda (stream &key timeout deadline)
+              (declare (ignore stream timeout deadline))
+              (values nil nil :would-block))
+            :write-stream
+            (lambda (stream bytes &key fin-p timeout deadline)
+              (declare (ignore fin-p timeout deadline))
+              (when (member stream entry-streams :test #'eq)
+                (push (copy-seq bytes) writes))))))
     (flet ((make-entry (started-p done-p state)
-             (http-kit/http3::%make-http3-request-stream
-              :stream (make-http3-test-stream :kind :request)
-              :stream-id 0
-              :request-fields
-              (list (cons ":method" "GET")
-                    (cons ":scheme" "https")
-                    (cons ":authority" "example.test")
-                    (cons ":path" "/"))
-              :request-body (ascii "body")
-              :encoder-context
-              (http-message-kit:make-qpack-context
-               :max-table-capacity 0 :table-capacity 0 :huffman nil)
-              :request-write-state state
-              :started-p started-p
-              :done-p done-p)))
+             (let ((stream (make-http3-test-stream :kind :request)))
+               (push stream entry-streams)
+               (http-kit/http3::%make-http3-request-stream
+                :stream stream
+                :stream-id 0
+                :request-fields
+                (list (cons ":method" "GET")
+                      (cons ":scheme" "https")
+                      (cons ":authority" "example.test")
+                      (cons ":path" "/"))
+                :request-body (ascii "body")
+                :encoder-context
+                (http-message-kit:make-qpack-context
+                 :max-table-capacity 0 :table-capacity 0 :huffman nil)
+                :request-write-state state
+                :started-p started-p
+                :done-p done-p))))
       (unwind-protect
            (let ((never-started
                    (make-entry nil nil (list :headers-sent-p t)))
