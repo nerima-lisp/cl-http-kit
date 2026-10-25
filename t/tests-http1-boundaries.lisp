@@ -908,7 +908,7 @@
          invalid-cleanup-result)
         (ensure-equal 1 registration-count)))))
 (deftest http1-direct-parser-cancel-handler-unregisters-after-response
-  (let ((events '())
+  (let* ((events '())
         (response
           (parse-http-response
            (ascii "HTTP/1.1 200 OK|CRLF|Content-Length: 0|CRLF||CRLF|")
