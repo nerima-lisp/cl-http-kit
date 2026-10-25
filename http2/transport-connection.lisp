@@ -1274,6 +1274,8 @@ concurrent streams should use SEND-HTTP2-REQUESTS-OVER-CONNECTION."
   callback-events
   callback-events-tail
   data-deferred-p
+  (deferred-data-count 0)
+  (deferred-data-bytes 0)
   (body-position 0)
   status
   headers
@@ -1460,42 +1462,90 @@ CONTINUATION frames must still be consumed contiguously from that queue."
       (unless stream-only-p
         (%h2-send-window-update writer 0 increment))))
 
-  (defun %h2-scheduler-queue-callback
+    (defun %h2-scheduler-queue-callback
       (connection entry event &optional queue-only-when-data-deferred-p)
     (let ((queued-p nil)
           (overflow-condition nil)
-          (max-pending-information-events 16))
+          (max-pending-information-events 16)
+          ;; Empty DATA frames retain queue nodes too, so cap both dimensions.
+          (max-pending-deferred-data-events 4096)
+          (max-pending-deferred-data-bytes (* 1024 1024))
+          (deferred-data-event-p (eq (first event) :deferred-data))
+          (deferred-data-payload-bytes
+            (if (eq (first event) :deferred-data)
+                (length (%h2-frame-payload (second event)))
+                0)))
       (%h2-with-scheduler-lock (connection)
         (unless (or (%h2-batch-entry-local-retired-p entry)
                     (%h2-batch-entry-error entry)
                     (and queue-only-when-data-deferred-p
                          (not (%h2-batch-entry-data-deferred-p entry))))
-          (if (and (eq (first event) :information)
-                   (>= (count :information
-                              (%h2-batch-entry-callback-events entry)
-                              :key (function first)
-                              :test (function eq))
-                       max-pending-information-events))
-              (setf overflow-condition
-                    (make-condition
-                     (quote http-kit:http-protocol-error)
-                     :message
-                     "The peer exceeded the pending informational response callback limit."
-                     :operation :http2-read
-                     :detail
-                     (list :information-callback-queue
-                           (%h2-batch-entry-stream-id entry)
-                           max-pending-information-events))
-                    (%h2-batch-entry-error entry) overflow-condition)
-              (let ((cell (list event))
-                    (tail (%h2-batch-entry-callback-events-tail entry)))
-                (if tail
-                    (setf (cdr tail) cell)
-                    (setf (%h2-batch-entry-callback-events entry) cell))
-                (setf (%h2-batch-entry-callback-events-tail entry) cell
-                      queued-p t)
-                (when (eq (first event) :response-headers)
-                  (setf (%h2-batch-entry-data-deferred-p entry) t))))
+          (let* ((scheduler-entries
+                   (%http2-connection-scheduler-entries connection))
+                 (pending-deferred-data-events
+                   (reduce #'+ scheduler-entries
+                           :key #'%h2-batch-entry-deferred-data-count
+                           :initial-value 0))
+                 (pending-deferred-data-bytes
+                   (reduce #'+ scheduler-entries
+                           :key #'%h2-batch-entry-deferred-data-bytes
+                           :initial-value 0))
+                 (next-deferred-data-events
+                   (1+ pending-deferred-data-events))
+                 (next-deferred-data-bytes
+                   (+ pending-deferred-data-bytes
+                      deferred-data-payload-bytes)))
+            (cond
+              ((and (eq (first event) :information)
+                    (>= (count :information
+                               (%h2-batch-entry-callback-events entry)
+                               :key (function first)
+                               :test (function eq))
+                        max-pending-information-events))
+               (setf overflow-condition
+                     (make-condition
+                      (quote http-kit:http-protocol-error)
+                      :message
+                      "The peer exceeded the pending informational response callback limit."
+                      :operation :http2-read
+                      :detail
+                      (list :information-callback-queue
+                            (%h2-batch-entry-stream-id entry)
+                            max-pending-information-events))
+                     (%h2-batch-entry-error entry) overflow-condition))
+              ((and deferred-data-event-p
+                    (or (> next-deferred-data-events
+                           max-pending-deferred-data-events)
+                        (> next-deferred-data-bytes
+                           max-pending-deferred-data-bytes)))
+               (setf overflow-condition
+                     (make-condition
+                      (quote http-kit:http-protocol-error)
+                      :message
+                      "The peer exceeded the deferred DATA callback queue limit."
+                      :operation :http2-read
+                      :detail
+                      (list :deferred-data-callback-queue
+                            (%h2-batch-entry-stream-id entry)
+                            :count next-deferred-data-events
+                            :max-count max-pending-deferred-data-events
+                            :bytes next-deferred-data-bytes
+                            :max-bytes max-pending-deferred-data-bytes))
+                     (%h2-batch-entry-error entry) overflow-condition))
+              (t
+               (let ((cell (list event))
+                     (tail (%h2-batch-entry-callback-events-tail entry)))
+                 (if tail
+                     (setf (cdr tail) cell)
+                     (setf (%h2-batch-entry-callback-events entry) cell))
+                 (setf (%h2-batch-entry-callback-events-tail entry) cell
+                       queued-p t)
+                 (when deferred-data-event-p
+                   (incf (%h2-batch-entry-deferred-data-count entry))
+                   (incf (%h2-batch-entry-deferred-data-bytes entry)
+                         deferred-data-payload-bytes))
+                 (when (eq (first event) :response-headers)
+                   (setf (%h2-batch-entry-data-deferred-p entry) t))))))
           (%h2-scheduler-broadcast connection)))
       (when overflow-condition
         (%h2-scheduler-retire-entry
@@ -1504,58 +1554,65 @@ CONTINUATION frames must still be consumed contiguously from that queue."
       queued-p))
 
   (defun %h2-scheduler-pop-callback (connection entry)
-    (%h2-with-scheduler-lock (connection)
-      (let ((events (%h2-batch-entry-callback-events entry)))
-        (when events
+  (%h2-with-scheduler-lock (connection)
+    (let ((events (%h2-batch-entry-callback-events entry)))
+      (when events
+        (let ((event (car events)))
           (setf (%h2-batch-entry-callback-events entry) (cdr events))
           (unless (%h2-batch-entry-callback-events entry)
             (setf (%h2-batch-entry-callback-events-tail entry) nil))
-          (car events)))))
+          (when (eq (first event) :deferred-data)
+            (decf (%h2-batch-entry-deferred-data-count entry))
+            (decf (%h2-batch-entry-deferred-data-bytes entry)
+                  (length (%h2-frame-payload (second event)))))
+          event)))))
 
   (defun %h2-scheduler-retire-entry
-      (connection entry condition clock-function &optional (flow-credit 0)
-       (reset-error-code 8) only-if-active-p)
-    (let ((reset-p nil)
-          (connection-credit flow-credit))
-      (%h2-with-scheduler-lock (connection)
-        (unless (or (%h2-batch-entry-local-retired-p entry)
-                    (%h2-peer-stream-reset-condition-p
-                     (%h2-batch-entry-error entry))
-                    (and only-if-active-p
-                         (%h2-batch-entry-response entry)))
-          (setf (%h2-batch-entry-local-retired-p entry) t)
-          (unless (%h2-batch-entry-error entry)
-            (setf (%h2-batch-entry-error entry) condition))
-          (setf reset-p
-                (member entry (%http2-connection-scheduler-entries connection)
-                        :test #'eq))
-          (%h2-scheduler-remove-entry connection entry)
-          (loop for event in (%h2-batch-entry-callback-events entry)
-                do (case (first event)
-                     (:body
-                      (unless (sixth event)
-                        (incf connection-credit (fourth event))))))
-          (setf (%h2-batch-entry-callback-events entry) nil
-                (%h2-batch-entry-callback-events-tail entry) nil
-                (%h2-batch-entry-data-deferred-p entry) nil
-                (%h2-batch-entry-body-vector entry)
-                (make-array 0 :element-type '(unsigned-byte 8)
-                            :adjustable t :fill-pointer 0)
-                (%h2-batch-entry-body-length entry) 0
-                (%h2-batch-entry-response entry) nil)
-          (%h2-scheduler-broadcast connection)))
-      (handler-case
-          (progn
-            (when (plusp connection-credit)
-              (%h2-scheduler-return-flow-credit
-               connection 0 connection-credit clock-function t))
-            (when reset-p
-              (%h2-send-rst-stream
-               (%h2-scheduler-control-writer connection clock-function)
-               (%h2-batch-entry-stream-id entry) reset-error-code)))
-        (error (reset-condition)
-          (%h2-scheduler-fail-connection connection reset-condition)
-          (error reset-condition)))))
+    (connection entry condition clock-function &optional (flow-credit 0)
+     (reset-error-code 8) only-if-active-p)
+  (let ((reset-p nil)
+        (connection-credit flow-credit))
+    (%h2-with-scheduler-lock (connection)
+      (unless (or (%h2-batch-entry-local-retired-p entry)
+                  (%h2-peer-stream-reset-condition-p
+                   (%h2-batch-entry-error entry))
+                  (and only-if-active-p
+                       (%h2-batch-entry-response entry)))
+        (setf (%h2-batch-entry-local-retired-p entry) t)
+        (unless (%h2-batch-entry-error entry)
+          (setf (%h2-batch-entry-error entry) condition))
+        (setf reset-p
+              (member entry (%http2-connection-scheduler-entries connection)
+                      :test #'eq))
+        (%h2-scheduler-remove-entry connection entry)
+        (loop for event in (%h2-batch-entry-callback-events entry)
+              do (case (first event)
+                   (:body
+                    (unless (sixth event)
+                      (incf connection-credit (fourth event))))))
+        (setf (%h2-batch-entry-callback-events entry) nil
+              (%h2-batch-entry-callback-events-tail entry) nil
+              (%h2-batch-entry-data-deferred-p entry) nil
+              (%h2-batch-entry-deferred-data-count entry) 0
+              (%h2-batch-entry-deferred-data-bytes entry) 0
+              (%h2-batch-entry-body-vector entry)
+              (make-array 0 :element-type '(unsigned-byte 8)
+                          :adjustable t :fill-pointer 0)
+              (%h2-batch-entry-body-length entry) 0
+              (%h2-batch-entry-response entry) nil)
+        (%h2-scheduler-broadcast connection)))
+    (handler-case
+        (progn
+          (when (plusp connection-credit)
+            (%h2-scheduler-return-flow-credit
+             connection 0 connection-credit clock-function t))
+          (when reset-p
+            (%h2-send-rst-stream
+             (%h2-scheduler-control-writer connection clock-function)
+             (%h2-batch-entry-stream-id entry) reset-error-code)))
+      (error (reset-condition)
+        (%h2-scheduler-fail-connection connection reset-condition)
+        (error reset-condition)))))
 
   (defun %h2-scheduler-run-entry-callbacks
       (connection entry clock-function)
