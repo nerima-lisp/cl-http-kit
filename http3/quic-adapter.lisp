@@ -84,6 +84,10 @@
          "Timed out waiting for HTTP/3 request body flow control."))
       (cl-quic-kit:client-poll quic-client)
       (sleep 0.005))))
+(defun %http3-quic-adapter-stream-write-pending-p (quic-client stream)
+  (or (cl-quic-kit:client-stream-write-pending-p quic-client stream)
+      ;; A peer may stop request writes while its complete response remains readable.
+      (cl-quic-kit:stream-stopped-p stream)))
 
 (defun %http3-quic-adapter-read
     (quic-client http3-client stream &key timeout deadline poll-interval)
@@ -517,8 +521,7 @@ to be selected without exposing QUIC implementation details."
                                                    (append
                                                      (list :stream-write-pending-p
                                                        (lambda (stream)
-                                                         (cl-quic-kit:client-stream-write-pending-p
-                                                          quic-client stream))
+                                                         (%http3-quic-adapter-stream-write-pending-p quic-client stream))
                                                        :try-write-stream
                                                        (lambda (stream octets &key fin-p timeout deadline)
                                                          (cl-quic-kit:client-write-stream

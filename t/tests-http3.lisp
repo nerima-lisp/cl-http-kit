@@ -2243,6 +2243,91 @@
            (ensure-true (plusp try-reads))
            (ensure-equal 0 blocking-reads))
       (http-kit/http3:close-http3-client client))))
+(deftest http3-client-native-scheduler-preserves-response-after-peer-stops-request
+  (let* ((quic (make-http3-quic-adapter-test-client))
+         (response-wire (http3-test-native-response-wire (octets 7 8)))
+         (request-stream nil)
+         (response-read-count 0)
+         (request-body-calls 0)
+         (request-writes nil)
+         (client
+           (http-kit/http3:make-http3-client
+            :open-stream
+            (lambda (request &key stream-type timeout deadline)
+              (declare (ignore timeout deadline))
+              (let ((stream
+                      (cl-quic-kit:client-open-stream
+                       quic request :stream-type stream-type)))
+                (if request
+                    (progn
+                      (setf request-stream stream)
+                      (values stream (cl-quic-kit:stream-id stream)))
+                    stream)))
+            :write-stream
+            (lambda (stream octets &key fin-p timeout deadline)
+              (declare (ignore stream octets fin-p timeout deadline)))
+            :try-write-stream
+            (lambda (stream octets &key fin-p timeout deadline)
+              (declare (ignore fin-p timeout deadline))
+              (when (eq stream request-stream)
+                (push (copy-seq octets) request-writes))
+              t)
+            :read-stream
+            (lambda (stream &key timeout deadline)
+              (declare (ignore stream timeout deadline))
+              (values nil t))
+            :poll-function (lambda () nil)
+            :try-read-stream
+            (lambda (stream &key timeout deadline)
+              (declare (ignore timeout deadline))
+              (ensure-true (eq request-stream stream))
+              (incf response-read-count)
+              (case response-read-count
+                (1 (values nil nil :would-block))
+                (2
+                 ;; H3_NO_ERROR stops request uploads without aborting the response.
+                 (cl-quic-kit:client-receive-frame
+                  quic
+                  (cl-quic-kit:make-frame
+                   :stop-sending
+                   :stream-id (cl-quic-kit:stream-id stream)
+                   :application-protocol-error-code 0)
+                  :level :1-rtt)
+                 (values nil nil :would-block))
+                (t (values response-wire t :data))))
+            :stream-write-pending-p
+            (lambda (stream)
+              (%http3-quic-adapter-stream-write-pending-p quic stream))))
+         (adapter
+           (http-kit/http3::%make-http3-quic-adapter
+            :quic-client quic :http3-client client)))
+    (unwind-protect
+         (let ((response
+                 (http-kit/http3:send-http3-request
+                  client
+                  (make-http-request
+                   :method "POST" :uri "https://example.test/upload")
+                  :request-body-function
+                  (lambda (max-chunk)
+                    (declare (ignore max-chunk))
+                    (incf request-body-calls)
+                    (octets request-body-calls)))))
+           (ensure-equal 200 (http-response-status response))
+           (ensure-equal (octets 7 8) (http-response-body response))
+           (ensure-true (cl-quic-kit:stream-stopped-p request-stream))
+           (ensure-equal 1 request-body-calls)
+           (ensure-equal 2 (length request-writes))
+           (ensure-equal 3 response-read-count)
+           (ensure-equal
+            (list http-kit/http3:+http3-headers-type+
+                  http-kit/http3:+http3-data-type+)
+            (mapcar
+             (lambda (encoded)
+               (let ((frames (http-kit/http3:decode-http3-frames encoded)))
+                 (ensure-equal 1 (length frames))
+                 (http-kit/http3:http3-frame-type (first frames))))
+             (nreverse request-writes))))
+      (http-kit/http3:close-http3-quic-adapter adapter))))
 (deftest http3-client-native-scheduler-request-stream-write-failure-fails-entry
   (let* ((client nil)
          (request-stream nil)
