@@ -284,13 +284,24 @@
              (replacement (gensym "REPLACEMENT-"))
              (stream (make-string-input-stream "active"))
              (connection
-               (http-kit::%make-http-server-connection :raw-stream stream)))
+               (http-kit::%make-http-server-connection
+                :raw-stream stream :handshake-p nil))
+             (worker-ready (sb-thread:make-semaphore :count 0))
+             (worker
+               (sb-thread:make-thread
+                (lambda ()
+                  (sb-thread:wait-on-semaphore worker-ready)
+                  (http-kit::%http-server-release-connection
+                   server connection))))
+             (force-close
+               (fdefinition 'http-kit::%http-server-force-close-connections)))
         (setf (http-kit::http-server-state server) :failed
               (http-kit::http-server-supervisor server) supervisor
               (http-kit::http-server-listener server) listener
               (http-kit::http-server-shutdown-coordinator server) :other
               (http-kit::http-server-stop-deadline server) 0.0d0
               (http-kit::http-server-connection-count server) 1
+              (gethash worker (http-kit::http-server-workers server)) t
               (gethash connection (http-kit::http-server-connections server)) t)
         (%https-listener-test-call-with-function-stubs
          (list
@@ -299,7 +310,11 @@
                   (declare (ignore target))
                   (setf (http-kit::http-server-listener server) replacement
                         (http-kit::http-server-supervisor server) :replaced)
-                  nil)))
+                  nil))
+          (cons 'http-kit::%http-server-force-close-connections
+                (lambda (target)
+                  (funcall force-close target)
+                  (sb-thread:signal-semaphore worker-ready))))
          (lambda ()
            (http-kit::%http-server-shutdown-coordinator server)))
         (sb-thread:join-thread supervisor)
@@ -307,6 +322,8 @@
         (ensure-equal :failed (http-kit::http-server-state server))
         (ensure-equal replacement (http-kit::http-server-listener server))
         (ensure-equal :replaced (http-kit::http-server-supervisor server))
+        (ensure-equal 0 (http-kit::http-server-connection-count server))
+        (ensure-false (gethash worker (http-kit::http-server-workers server)))
         (ensure-equal :other
                       (http-kit::http-server-shutdown-coordinator server)))
       (let ((server (%https-listener-make-server)))
