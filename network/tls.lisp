@@ -728,14 +728,7 @@ driver's transport callbacks."
 
   (defun %tls-server-process-record (state wire)
     (let* ((outer-type (aref wire 0))
-           (version (+ (ash (aref wire 1) 8) (aref wire 2)))
            (read-state (http-tls-server-state-read-state state)))
-      (unless (or (= version cl-tls-kit:+tls-record-version+)
-                  (and (= version #x0301)
-                       (= outer-type cl-tls-kit:+tls-content-type-handshake+)
-                       (not (http-tls-server-state-client-hello-received-p state))))
-        (%tls-server-fail "TLS record has an invalid legacy version."
-                          :invalid-record-version))
       (cond
        ((= outer-type 20)
         (unless (equalp (subseq wire 5) #(1))
