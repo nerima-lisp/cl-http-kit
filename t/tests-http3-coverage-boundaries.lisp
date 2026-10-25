@@ -4964,71 +4964,53 @@
            (ensure-false (http-kit/http3:http3-client-open-p client)))
       (when (http-kit/http3:http3-client-open-p client)
         (http-kit/http3:close-http3-client client)))))
-(deftest http3-native-scheduler-pending-and-write-entry-boundaries
-         (let* ((client (http3-test-make-native-client :try-read-stream (lambda (stream &key timeout deadline)
-                                                                          (declare (ignore stream timeout deadline))
-                                                                          (values nil nil :would-block))))
-                (done-entry
-                 (http-kit/http3::%make-http3-request-stream
-                  :started-p t :done-p t))
-                (never-started
-                 (http-kit/http3::%make-http3-request-stream))
-                (started
-                 (http-kit/http3::%make-http3-request-stream :started-p t))
-                (finished
-                 (http-kit/http3::%make-http3-request-stream
-                  :started-p t :request-write-state '(:finished-p t)))
-                (dynamic-context
-                 (http-message-kit:make-qpack-context
-                  :max-table-capacity 64 :table-capacity 64 :huffman nil))
-                (dynamic-entry
-                 (http-kit/http3::%make-http3-request-stream
-                  :encoder-context dynamic-context :stream-id nil)))
-           (unwind-protect
-               (progn
-                 (setf (http-kit/http3::http3-client-pending-request-streams client)
-                       (list done-entry)
-                       (http-kit/http3::http3-client-scheduler-close-state client)
-                       :closing)
-                 (http-kit/http3::%h3-scheduler-start-pending client)
-                 (ensure-equal
-                  (list done-entry)
-                  (http-kit/http3::http3-client-pending-request-streams client))
-                 (setf (http-kit/http3::http3-client-scheduler-close-state client) nil)
-                 (http-kit/http3::%h3-scheduler-start-pending client)
-                 (ensure-equal nil
-                               (http-kit/http3::http3-client-pending-request-streams
-                                client))
-                 (ensure-equal nil
-                               (http-kit/http3::%h3-scheduler-write-entry-step
-                                client never-started))
-                 (ensure-equal nil
-                               (http-kit/http3::%h3-scheduler-write-entry-step
-                                client done-entry))
-                 (setf (http-kit/http3::http3-client-scheduler-close-state client)
-                       :closing)
-                 (ensure-equal nil
-                               (http-kit/http3::%h3-scheduler-write-entry-step
-                                client started))
-                 (setf (http-kit/http3::http3-client-scheduler-close-state client) nil)
-                 (ensure-equal nil
-                               (http-kit/http3::%h3-scheduler-write-entry-step
-                                client finished))
-                 (http-message-kit:qpack-encode-insert-with-literal-name
-                  dynamic-context "x-dynamic" "value" :huffman nil)
-                 (let ((failure
-                        (http3-boundary-error
-                         (lambda ()
-                           (http-kit/http3::%h3-scheduler-write-fields
-                            client dynamic-entry
-                            (list (cons ":method" "GET")) nil)))))
-                   (ensure-true failure)
-                   (ensure-equal
-                    "Dynamic QPACK field encoding requires a numeric stream ID."
-                    (http-error-message failure))))
+(deftest http3-native-scheduler-does-not-write-ineligible-request-entries
+  (let ((writes nil)
+        (client
+          (http3-test-make-native-client
+           :write-stream
+           (lambda (stream bytes &key fin-p timeout deadline)
+             (declare (ignore stream fin-p timeout deadline))
+             (push (copy-seq bytes) writes)))))
+    (flet ((make-entry (started-p done-p state)
+             (http-kit/http3::%make-http3-request-stream
+              :stream (make-http3-test-stream :kind :request)
+              :stream-id 0
+              :request-fields
+              (list (cons ":method" "GET")
+                    (cons ":scheme" "https")
+                    (cons ":authority" "example.test")
+                    (cons ":path" "/"))
+              :request-body (ascii "body")
+              :encoder-context
+              (http-message-kit:make-qpack-context
+               :max-table-capacity 0 :table-capacity 0 :huffman nil)
+              :request-write-state state
+              :started-p started-p
+              :done-p done-p)))
+      (unwind-protect
+           (let ((never-started
+                   (make-entry nil nil (list :headers-sent-p t)))
+                 (done (make-entry t t (list :headers-sent-p t)))
+                 (closing (make-entry t nil (list :headers-sent-p t)))
+                 (finished
+                   (make-entry t nil
+                               (list :headers-sent-p t :finished-p t))))
+             (http-kit/http3::%h3-scheduler-write-entry-step
+              client never-started)
+             (ensure-equal nil writes)
+             (http-kit/http3::%h3-scheduler-write-entry-step client done)
+             (ensure-equal nil writes)
+             (setf (http-kit/http3::http3-client-scheduler-close-state client)
+                   :closing)
+             (http-kit/http3::%h3-scheduler-write-entry-step client closing)
+             (ensure-equal nil writes)
              (setf (http-kit/http3::http3-client-scheduler-close-state client) nil)
-             (when (http-kit/http3:http3-client-open-p client)
-               (http-kit/http3:close-http3-client client)))))
+             (http-kit/http3::%h3-scheduler-write-entry-step client finished)
+             (ensure-equal nil writes))
+        (setf (http-kit/http3::http3-client-scheduler-close-state client) nil)
+        (when (http-kit/http3:http3-client-open-p client)
+          (http-kit/http3:close-http3-client client))))))
 (deftest http3-native-scheduler-peer-duplicates-and-close-during-start
          (let* ((available (list (make-http3-test-stream :kind :peer)))
                 (client
