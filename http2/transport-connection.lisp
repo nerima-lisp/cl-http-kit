@@ -572,7 +572,14 @@ are rejected after this function marks the connection draining."
                          (when (or (zerop size)
                                    (>= (min stream-window connection-window)
                                        size))
-                           (funcall writer wire)
+                           (progn
+                             (funcall writer wire)
+                             (when (and scheduler-entry
+                                        end-stream-p
+                                        (= size payload-size))
+                               (setf (%h2-batch-entry-body-sent-p
+                                      scheduler-entry)
+                                     t)))
                            (when (plusp size)
                              (decf
                               (%http2-connection-peer-connection-window-size
@@ -620,7 +627,10 @@ are rejected after this function marks the connection draining."
                          (%h2-header-frames
                           (%h2-encode-header-block trailer-fields
                                                    :huffman-p huffman-p)
-                          t (effective-max-frame-size) stream-id))))
+                          t (effective-max-frame-size) stream-id)))
+                       (when scheduler-entry
+                         (setf (%h2-batch-entry-body-sent-p scheduler-entry)
+                               t)))
                      (funcall
                       writer
                       (%h2-concat
@@ -903,8 +913,8 @@ are rejected after this function marks the connection draining."
 (defun %h2-cancel-http2-stream
     (connection stream-id
      &key (error-code 8) timeout deadline clock-function
-       (only-if-active-p nil))
-  "Cancel an active stream, optionally ignoring completed streams."
+       (only-if-active-p nil) response-complete-p)
+  "Cancel an active stream, optionally preserving its completed response."
   (unless (http2-connection-p connection)
     (error 'http-kit:http-protocol-error
            :message "CANCEL-HTTP2-STREAM requires an HTTP2-CONNECTION."
@@ -913,7 +923,9 @@ are rejected after this function marks the connection draining."
   (let ((clock (or clock-function
                    (%http2-connection-clock-function connection)))
         (error-code (%h2-control-error-code error-code))
-        (entry nil))
+        (entry nil)
+        (response-complete-p response-complete-p)
+        (abort-upload-p nil))
     (unless (functionp clock)
       (error 'http-kit:http-protocol-error
              :message "An HTTP/2 cancellation clock must be callable."
@@ -939,11 +951,25 @@ are rejected after this function marks the connection draining."
         #+sbcl
         (progn
           (setf entry (%h2-scheduler-entry-for-stream connection stream-id))
-          (when (and only-if-active-p
-                     entry
-                     (%h2-batch-entry-response entry))
+          (when (and entry (%h2-batch-entry-response entry))
+            (setf response-complete-p t))
+          (when response-complete-p
+            (when (and entry
+                       (not (%h2-batch-entry-body-sent-p entry)))
+              (setf (%h2-batch-entry-request-body-abandoned-p entry) t
+                    abort-upload-p t)
+              (%h2-scheduler-broadcast connection))
             (setf entry nil)))
-        (unless (or entry only-if-active-p)
+        (unless (or entry
+                    only-if-active-p
+                    response-complete-p)
+          (%h2-send-rst-stream
+           (%h2-writer (%http2-connection-stream connection)
+                       absolute-deadline clock
+                       #+sbcl (%http2-connection-writer-lock connection)
+                       #-sbcl nil)
+           stream-id error-code))
+        (when abort-upload-p
           (%h2-send-rst-stream
            (%h2-writer (%http2-connection-stream connection)
                        absolute-deadline clock
@@ -959,7 +985,9 @@ are rejected after this function marks the connection draining."
                           :operation :http2-write
                           :cause (list :local-cancel stream-id error-code))
          clock 0 error-code only-if-active-p)))
-    t))
+    (if (and only-if-active-p response-complete-p)
+        :response-complete
+        t)))
 
 (defun %h2-send-http2-request-over-connection-serial
     (connection request &key timeout deadline max-header-bytes max-fields max-body-bytes clock-function request-body-function request-body-length on-body-chunk on-information on-response-headers on-stream-open on-cancel (collect-body-p t) (huffman-p nil))
@@ -1096,7 +1124,8 @@ concurrent streams should use SEND-HTTP2-REQUESTS-OVER-CONNECTION."
                                :error-code cancel-error-code
                                :deadline absolute-deadline
                                :clock-function clock
-                               :only-if-active-p response-complete-p))))
+                               :only-if-active-p response-complete-p
+                               :response-complete-p response-complete-p))))
                       (unwind-protect
                            (progn
                              (when on-cancel
@@ -2365,7 +2394,12 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                 (push entry (%http2-connection-scheduler-entries connection))
                 (incf (%http2-connection-next-stream-id connection) 2)
                 (handler-case
-                    (funcall writer header-wire)
+                    (progn
+                      (funcall writer header-wire)
+                      (when (and (null body-function)
+                                 (zerop (array-total-size body))
+                                 (null trailer-fields))
+                        (setf (%h2-batch-entry-body-sent-p entry) t)))
                   (http-kit:http-timeout (condition)
                     (%h2-scheduler-remove-entry connection entry)
                     (%h2-scheduler-broadcast connection)

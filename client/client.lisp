@@ -993,6 +993,8 @@ headers replace client default headers with the same case-insensitive name."
     (client request proxy-plan &key timeout deadline request-body-function
                                       request-body-length on-body-chunk
                                       on-information on-response-headers cancel-token
+                                      on-response-complete-cancel
+                                      response-complete-cancel-p
                                       (collect-body-p t))
   (let* ((request-body-started-p nil)
          (response-observed-p nil)
@@ -1029,14 +1031,23 @@ headers replace client default headers with the same case-insensitive name."
                           (lambda (status headers)
                             (setf response-observed-p t)
                             (funcall on-response-headers status headers)
-                            (%client-signal-if-cancelled cancel-token))))))
+                            (unless (and response-complete-cancel-p
+                                         (funcall response-complete-cancel-p))
+                              (%client-signal-if-cancelled cancel-token)))))))
     (when cancel-token
       (setf arguments
             (append arguments
                     (list :on-cancel
                           (lambda (cancel-function)
                             (%client-cancellation-token-register-handler
-                             cancel-token cancel-function)))))
+                             cancel-token
+                             (lambda (&rest cancel-arguments)
+                               (when (and
+                                      (eq :response-complete
+                                          (apply cancel-function
+                                                 cancel-arguments))
+                                      on-response-complete-cancel)
+                                 (funcall on-response-complete-cancel))))))))
       (%client-signal-if-cancelled cancel-token))
     (when (or request-body-function request-body-length)
       (setf arguments
@@ -1131,6 +1142,17 @@ headers replace client default headers with the same case-insensitive name."
          (last-response nil)
          (response-body-observed-p nil)
          (response-headers-observed-p nil)
+         (response-complete-cancelled-p nil)
+         (response-complete-cancel-lock
+           (%make-client-lock "http-client-response-complete-cancel"))
+         (response-complete-cancel-predicate
+           (lambda ()
+             (%with-client-lock ((response-complete-cancel-lock))
+               response-complete-cancelled-p)))
+         (on-response-complete-cancel
+           (lambda ()
+             (%with-client-lock ((response-complete-cancel-lock))
+               (setf response-complete-cancelled-p t))))
          (effective-on-body-chunk
            (and on-body-chunk
                 (lambda (chunk)
@@ -1178,8 +1200,13 @@ headers replace client default headers with the same case-insensitive name."
                            :on-information on-information
                            :on-response-headers effective-on-response-headers
                            :cancel-token cancel-token
+                           :on-response-complete-cancel
+                           on-response-complete-cancel
+                           :response-complete-cancel-p
+                           response-complete-cancel-predicate
                            :collect-body-p collect-body-p)))
-            (%client-signal-if-cancelled cancel-token)
+            (unless (funcall response-complete-cancel-predicate)
+              (%client-signal-if-cancelled cancel-token))
             (when (http-client-cache client)
               (setf response-time
                     (funcall

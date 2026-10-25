@@ -345,23 +345,19 @@
               :transport-function
               (http-kit/http2:make-http2-connection-transport connection)))
            (token (make-http-cancellation-token))
-           (condition
-             (handler-case
-                 (progn
-                   (http-client-send
-                    client "GET" "https://closed.test/bodyless"
-                    :cancel-token token
-                    :on-response-headers
-                    (lambda (status headers)
-                      (declare (ignore headers))
-                      (ensure-equal 200 status)
-                      (ensure-true (http-client-cancel-request token))))
-                   nil)
-               (http-client-request-cancelled (cancelled)
-                 cancelled))))
+           (response
+             (http-client-send
+              client "GET" "https://closed.test/bodyless"
+              :cancel-token token
+              :on-response-headers
+              (lambda (status headers)
+                (declare (ignore headers))
+                (ensure-equal 200 status)
+                (ensure-true (http-client-cancel-request token))))))
       (unwind-protect
            (progn
-             (ensure-true (typep condition 'http-client-request-cancelled))
+             (ensure-equal 200 (http-response-status response))
+             (ensure-equal (octets) (http-response-body response))
              (ensure-false
               (find-if
                (lambda (frame)
@@ -369,6 +365,77 @@
                       (= 1 (http-kit/http2::%h2-frame-stream-id frame))))
                (h2-output-frames stream)))
              (ensure-false (http-client-cancel-request token)))
+        (http-kit/http2:close-http2-connection connection))))
+  (deftest http2-client-cancel-after-response-complete-stops-upload
+    (let* ((stream
+             (make-instance
+              'binary-session-stream
+              :input
+              (concatenate-octets
+               (h2-frame 4 0 0 (octets))
+               (h2-frame 1 4 1
+                         (h2-header-block (cons ":status" "200")))
+               (h2-frame 0 1 1 (octets 82)))))
+           (connection
+             (http-kit/http2:make-http2-connection :stream stream))
+           (client
+             (make-http-client
+              :cache nil
+              :transport-function
+              (http-kit/http2:make-http2-connection-transport connection)))
+           (token (make-http-cancellation-token))
+           (producer-calls 0)
+           (response nil))
+      (http-kit/http2::%h2-with-scheduler-lock (connection)
+        (setf (http-kit/http2::%http2-connection-peer-initial-window-size
+               connection)
+              1))
+      (unwind-protect
+           (progn
+             (setf response
+                   (http-client-send
+                    client
+                    (http-client-request
+                     client "POST" "https://closed.test/upload")
+                    :request-body-function
+                    (lambda (maximum-size)
+                      (declare (ignore maximum-size))
+                      (incf producer-calls)
+                      (when (= producer-calls 1)
+                        (octets 65 66)))
+                    :request-body-length 2
+                    :cancel-token token
+                    :on-body-chunk
+                    (lambda (chunk)
+                      (ensure-equal (octets 82) chunk)
+                      (ensure-true (http-client-cancel-request token)))))
+             (ensure-equal 200 (http-response-status response))
+             (ensure-equal (octets 82) (http-response-body response))
+             (ensure-equal 1 producer-calls)
+             (ensure-false (http-client-cancel-request token))
+             (let* ((frames (h2-output-frames stream))
+                    (upload-data
+                      (remove-if-not
+                       (lambda (frame)
+                         (and (= 0 (http-kit/http2::%h2-frame-type frame))
+                              (= 1 (http-kit/http2::%h2-frame-stream-id frame))))
+                       frames))
+                    (reset-frame
+                      (find-if
+                       (lambda (frame)
+                         (and (= 3 (http-kit/http2::%h2-frame-type frame))
+                              (= 1 (http-kit/http2::%h2-frame-stream-id frame))))
+                       frames)))
+               (ensure-equal 1 (length upload-data))
+               (ensure-equal (octets 65)
+                             (http-kit/http2::%h2-frame-payload
+                              (first upload-data)))
+               (ensure-true reset-frame)
+               (ensure-equal (octets 0 0 0 8)
+                             (http-kit/http2::%h2-frame-payload reset-frame))
+               (ensure-true
+                (< (position (first upload-data) frames :test #'eq)
+                   (position reset-frame frames :test #'eq)))))
         (http-kit/http2:close-http2-connection connection))))
 
   (deftest http2-public-priority-update
