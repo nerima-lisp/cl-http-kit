@@ -3566,7 +3566,7 @@
                         (http-kit/http2::%http2-connection-max-fields connection)
                         (http-kit/http2::%http2-connection-max-body-bytes
                          connection)
-                        nil #'http-kit::%monotonic-time nil nil nil t nil
+                        nil #'http-kit::%monotonic-time nil nil nil nil t nil
                         (lambda (wire)
                           (ensure-true (plusp (length wire)))
                           (error failure)))
@@ -3596,7 +3596,7 @@
                      (http-kit/http2::%http2-connection-max-header-bytes connection)
                      (http-kit/http2::%http2-connection-max-fields connection)
                      (http-kit/http2::%http2-connection-max-body-bytes connection)
-                     nil #'http-kit::%monotonic-time nil nil nil t nil nil)
+                     nil #'http-kit::%monotonic-time nil nil nil nil t nil nil)
                   (http-kit:http-connection-error (condition) condition))))
           (ensure-true (typep observed 'http-kit:http-connection-error))
           (ensure-equal :http2-client (http-kit:http-error-operation observed))
