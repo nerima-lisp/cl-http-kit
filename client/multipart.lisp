@@ -384,9 +384,9 @@ grammar.  The returned Content-Type quotes its boundary parameter."
 CONTENT-TYPE may be the complete Content-Type header value.  BOUNDARY is an
 explicit alternative for callers that already parsed that header.  Part
 values remain octets when they are not valid text; callers may interpret them
-according to each part's Content-Type.  MAX-BODY-BYTES limits the sum of part
-bodies, while MAX-HEADER-BYTES applies to each part's header block.
-MAX-INPUT-BYTES limits the complete encoded body before it is copied."
+based on the associated Content-Type.  MAX-BODY-BYTES limits the sum of part
+bodies, while MAX-HEADER-BYTES applies to each part header block.
+MAX-INPUT-BYTES limits the complete encoded body size before parsing begins."
   (unless (or (null max-input-bytes)
               (and (integerp max-input-bytes) (>= max-input-bytes 0)))
     (%client-protocol-error
@@ -402,7 +402,7 @@ MAX-INPUT-BYTES limits the complete encoded body before it is copied."
            :operation :multipart
            :detail (list :limit max-input-bytes
                          :observed (length body))))
-  (let* ((octets (%copy-client-octets body))
+  (let* ((octets body)
          (header-boundary (%multipart-content-type-boundary content-type))
          (boundary (or boundary header-boundary)))
     (when (and boundary header-boundary

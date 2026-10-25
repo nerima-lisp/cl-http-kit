@@ -188,4 +188,16 @@
    #:http-timeout
    #:http-timeout-kind
    #:http-unsupported-feature
-   #:http-unsupported-feature-name))
+   #:http-unsupported-feature-name
+   #:make-http-server
+   #:start-http-server
+   #:stop-http-server
+   #:http-server
+   #:http-server-p
+   #:http-server-port
+   #:http-server-failure
+   #:http-server-error
+   #:http-server-error-reason-code
+   #:http-server-error-phase
+   #:http-server-callback-error
+   #:http-server-callback-error-callback))

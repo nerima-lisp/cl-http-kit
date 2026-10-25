@@ -161,8 +161,7 @@
                    (incf calls)
                    (funcall original body)))
            (ensure-false (parse-http-multipart-body small :boundary "b"))
-           (ensure-equal 1 calls)
-           (setf calls 0)
+           (ensure-equal 0 calls)
            (handler-case (parse-http-multipart-body large :boundary "b")
              (http-size-limit-exceeded (condition) (setf caught condition)))
            (ensure-true (typep caught 'http-size-limit-exceeded))
@@ -174,6 +173,6 @@
            (ensure-equal 0 calls)
            (ensure-false (parse-http-multipart-body large :boundary "b"
                                                          :max-input-bytes nil))
-           (ensure-equal 1 calls))
+           (ensure-equal 0 calls))
       (setf (fdefinition symbol) original))
     (ensure-true (eq original (fdefinition symbol)))))

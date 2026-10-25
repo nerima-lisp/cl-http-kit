@@ -275,7 +275,26 @@
                (http-protocol-error (condition) condition))))
       (ensure-true (typep condition 'http-protocol-error))
       (ensure-equal :request-parse (http-error-operation condition))
-      (ensure-equal value (http-protocol-error-detail condition))))
+      (ensure-equal
+       (if (eq option :on-body-chunk)
+           (list value nil nil)
+           value)
+       (http-protocol-error-detail condition))))
+  (dolist (callbacks (list (list nil #'identity)
+                           (list #'identity nil)))
+    (destructuring-bind (reserve-body-bytes release-body-bytes) callbacks
+      (let ((condition
+              (handler-case
+                  (parse-http-request
+                   (octets)
+                   :reserve-body-bytes reserve-body-bytes
+                   :release-body-bytes release-body-bytes)
+                (http-protocol-error (condition) condition))))
+        (ensure-true (typep condition 'http-protocol-error))
+        (ensure-equal :request-parse (http-error-operation condition))
+        (ensure-equal
+         (list nil reserve-body-bytes release-body-bytes)
+         (http-protocol-error-detail condition)))))
   (ensure-equal nil (parse-http-request (octets) :allow-eof-p t)))
 
 (deftest core-coverage-http1-request-authority-errors

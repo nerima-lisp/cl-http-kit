@@ -22,5 +22,6 @@
            #:http-network-listener-address-family
            #:open-http-tcp-listener
            #:accept-http-tcp-stream
+           #:wake-http-tcp-listener
            #:close-http-tcp-listener
            #:serve-http1-listener))

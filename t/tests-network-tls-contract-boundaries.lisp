@@ -580,8 +580,16 @@
        (lambda () (make-http-tls-upgrader :alpn-protocols (list protocol)))
        :tls :invalid-alpn))
     (dolist (protocol (list "h" (make-string 255 :initial-element #\a)))
-      (ensure-true (functionp (make-http-tls-upgrader :verify nil
-                                                    :alpn-protocols (list protocol)))))
+      (ensure-true (functionp (make-http-tls-upgrader :verify :optional
+                                                     :trust-anchors (list t)
+                                                     :alpn-protocols (list protocol)))))
+    (let ((condition
+            (%network-tls-contract-condition
+             (lambda () (make-http-tls-upgrader :verify nil))
+             'http-unsupported-feature :tls)))
+      (ensure-equal :tls-certificate-verification-disable
+                    (http-unsupported-feature-name condition))
+      (ensure-equal :disabled (http-protocol-error-detail condition)))
     (dolist (options '((:certificate :certificate) (:key :key)))
       (%network-tls-contract-protocol
        (lambda () (apply #'make-http-tls-upgrader options))
@@ -597,37 +605,33 @@
 
   (deftest network-tls-contract-tls-stream-and-server-inputs
     (%network-tls-contract-protocol
-     (lambda () (http-tls-selected-alpn-protocol :not-stream)) :tls :not-stream)
+     (lambda () (http-tls-selected-alpn-protocol :not-stream)) :tls :invalid-stream)
     (%network-tls-contract-protocol
-     (lambda () (funcall (make-http-tls-upgrader :verify nil) :not-stream nil))
+     (lambda ()
+       (funcall (make-http-tls-upgrader :verify :optional
+                                        :trust-anchors (list t))
+                :not-stream nil))
      :tls :not-stream)
-    (dolist (options '(nil (:certificate :certificate) (:key :key)))
+    (dolist (options '(nil (:certificate-chain nil) (:private-key nil)))
       (%network-tls-contract-protocol
        (lambda () (apply #'make-http-tls-server-wrapper options))
        :tls '(:role "server" :required t)))
     (%network-tls-contract-protocol
-     (lambda () (make-http-tls-server-wrapper :certificate :certificate :key :key
-                                             :clock-function nil))
+     (lambda () (make-http-tls-server-wrapper :clock-function nil))
      :tls :invalid-clock-function)
-    (let ((wrapper (make-http-tls-server-wrapper :certificate :certificate :key :key))
-          (stream (make-instance 'network-tls-contract-stream :input (octets))))
+    (let ((stream (make-instance 'network-tls-contract-stream :input (octets))))
       (unwind-protect
-           (progn
-             (%network-tls-contract-protocol
-              (lambda () (funcall wrapper :not-stream)) :tls :not-stream)
-             (dolist (case (list (list (lambda () (funcall wrapper stream)) :tls-server)
-                                (list (lambda () (http-tls-selected-alpn-protocol stream))
-                                      :tls-alpn-result)))
-               (let ((condition
-                       (%network-tls-contract-condition
-                        (first case) 'http-unsupported-feature :tls)))
-                 (ensure-equal (second case) (http-unsupported-feature-name condition))
-                 (ensure-true (open-stream-p stream))
-                 (ensure-equal 0 (network-tls-contract-close-count stream)))))
+           (let ((condition
+                   (%network-tls-contract-condition
+                    (lambda () (http-tls-selected-alpn-protocol stream))
+                    'http-unsupported-feature :tls)))
+             (ensure-equal :tls-alpn-result (http-unsupported-feature-name condition))
+             (ensure-true (open-stream-p stream))
+             (ensure-equal 0 (network-tls-contract-close-count stream)))
         (close stream :abort t))))
 
   (deftest network-tls-contract-handshake-input-cleanup
-    (dolist (case '((() :eof)
+    (dolist (case '((() :handshake-failed)
                     ((22 3) :truncated-record)
                     ((22 3 3 0 2 1) :truncated-record)
                     ((22 3 3 64 1) :record-overflow)))
@@ -638,7 +642,9 @@
              (progn
                (%network-tls-contract-protocol
                 (lambda ()
-                  (funcall (make-http-tls-upgrader :verify nil) stream
+                  (funcall (make-http-tls-upgrader :verify :optional
+                                   :trust-anchors (list t))
+                           stream
                            (http-request-uri
                             (make-http-request :method "GET" :uri "https://127.0.0.1/"))
                            :timeout 2))
@@ -658,7 +664,8 @@
            (let ((condition
                    (%network-tls-contract-condition
                     (lambda ()
-                      (funcall (make-http-tls-upgrader :verify nil
+                      (funcall (make-http-tls-upgrader :verify :optional
+                                                       :trust-anchors (list t)
                                                        :clock-function (lambda () 1))
                                stream (http-request-uri
                                        (make-http-request :method "GET"
@@ -831,7 +838,8 @@
                         (ensure-equal :not-found (http-protocol-error-detail condition))
                         (ensure-equal 0 (length (binary-test-output stream))))
                       (progn
-                        (ensure-equal :eof (http-protocol-error-detail condition))
+                        (ensure-equal :handshake-failed
+                                      (http-protocol-error-detail condition))
                         (ensure-true (plusp (length (binary-test-output stream)))))))
                 (ensure-false (open-stream-p stream))
                 (ensure-equal (if (eq verify :required) 1 2)
@@ -891,9 +899,13 @@
                          (lambda ()
                            (let ((upgrader
                                    (if native-timeout-p
-                                       (make-http-tls-upgrader :verify nil)
                                        (make-http-tls-upgrader
-                                        :verify nil :clock-function (lambda () tick)))))
+                                        :verify :optional
+                                        :trust-anchors (list t))
+                                       (make-http-tls-upgrader
+                                        :verify :optional
+                                        :trust-anchors (list t)
+                                        :clock-function (lambda () tick)))))
                              (if native-timeout-p
                                  (funcall upgrader stream (parse-http-uri "https://127.0.0.1/")
                                           :timeout 0.02)
@@ -915,14 +927,51 @@
            (progn
              (%network-tls-contract-protocol
               (lambda ()
-                (funcall (make-http-tls-upgrader :verify nil) stream
+                (funcall (make-http-tls-upgrader
+                           :verify :optional
+                           :trust-anchors (list t))
+                         stream
                          (parse-http-uri "https://127.0.0.1/")))
-              :tls :eof)
+              :tls :handshake-failed)
              (ensure-false (open-stream-p stream))
              (ensure-equal 2 (network-tls-contract-close-count stream))
              (ensure-true (network-tls-contract-abort-p stream))
              (ensure-true (plusp (length (binary-test-output stream)))))
         (when (open-stream-p stream) (close stream :abort t))))))
+#+sbcl
+(progn
+  (deftest network-tls-contract-wake-listener
+    (%network-tls-contract-protocol
+     (lambda () (wake-http-tcp-listener :not-listener)) :wake :not-listener)
+    (let ((listener (open-http-tcp-listener)))
+      (unwind-protect
+           (progn
+             (ensure-equal nil (close-http-tcp-listener listener))
+             (ensure-equal nil (wake-http-tcp-listener listener)))
+        (close-http-tcp-listener listener)))
+    (dolist (ipv6-p '(nil t))
+      (let ((listener (open-http-tcp-listener :ipv6-p ipv6-p))
+            (accepted nil))
+        (unwind-protect
+             (progn
+               (ensure-equal (if ipv6-p :ipv6 :ipv4)
+                             (http-network-listener-address-family listener))
+               (ensure-equal
+                (if ipv6-p
+                    "0000:0000:0000:0000:0000:0000:0000:0000"
+                    "0.0.0.0")
+                (http-network-listener-address listener))
+               (ensure-equal nil (wake-http-tcp-listener listener))
+               (multiple-value-bind (stream address port)
+                   (accept-http-tcp-stream listener :timeout 2)
+                 (setf accepted stream)
+                 (ensure-true (streamp stream))
+                 (ensure-true
+                  (if ipv6-p (find #\: address)
+                      (string= "127.0.0.1" address)))
+                 (ensure-true (plusp port))))
+          (when accepted (close accepted :abort t))
+          (close-http-tcp-listener listener))))))
 
 #+sbcl
 (progn
@@ -1416,18 +1465,20 @@
          (list (list 23 (octets)) (list 23 (octets 7 8)) (list 21 (octets 1 0))))
       (unwind-protect
            (let ((buffer (octets 99 99 99 99 99 99)))
-             (ensure-equal 3 (read-sequence buffer stream :start 1 :end 5))
+             (ensure-equal 3 (sb-gray:stream-read-sequence stream buffer 1 5))
              (ensure-octets-equal #(99 7 8 99 99 99) buffer)
              (ensure-equal :eof (read-byte stream nil :eof))
              (ensure-equal 2 (read-sequence buffer stream :start 2 :end 2))
-             (ensure-true (cl-tls-kit:tls13-client-driver-close-notify-received-p driver))
-             (ensure-true (cl-tls-kit:tls13-client-driver-closed-p driver))
+             (ensure-equal :eof
+                           (cl-tls-kit:tls13-client-driver-read-application-data
+                            driver))
              (ensure-equal '(:read :read :read :write :driver-close) (coerce events 'list))
              (ensure-equal 1 (length written))
              (let ((plaintext (cl-tls-kit:decrypt-tls13-traffic-record (aref written 0) peer-read)))
                (ensure-equal 21 (cl-tls-kit:tls-plaintext-content-type plaintext))
                (ensure-octets-equal #(1 0) (cl-tls-kit:tls-plaintext-fragment plaintext)))
              (ensure-true (open-stream-p raw))
+             (ensure-true (search "TLS stream" (princ-to-string stream)))
              (ensure-true (close stream))
              (ensure-false (open-stream-p stream))
              (ensure-false (open-stream-p raw))
@@ -1459,7 +1510,6 @@
              (let ((alert (cl-tls-kit:decrypt-tls13-traffic-record (aref written 2) peer-read)))
                (ensure-equal 21 (cl-tls-kit:tls-plaintext-content-type alert))
                (ensure-octets-equal #(1 0) (cl-tls-kit:tls-plaintext-fragment alert)))
-             (ensure-true (cl-tls-kit:tls13-client-driver-closed-p driver))
              (ensure-false (open-stream-p raw))
              (ensure-false (network-tls-contract-abort-p raw))
              (ensure-equal '(:write :write :write :driver-close (:raw-close nil))
@@ -1476,7 +1526,6 @@
            (progn
              (%network-tls-contract-protocol (lambda () (read-byte stream))
                                              :tls '(:peer-alert 2 40))
-             (ensure-true (cl-tls-kit:tls13-client-driver-closed-p driver))
              (ensure-equal '(:read :driver-close) (coerce events 'list))
              (ensure-equal 0 (length written))
              (ensure-true (close stream :abort t))
@@ -1507,7 +1556,6 @@
           (ensure-equal 1 (network-tls-contract-close-count raw))
           (ensure-equal (not (null (member case '(:abort :already-closed :write-error :both-errors))))
                         (network-tls-contract-abort-p raw))
-          (ensure-equal (not (eq case :abort)) (cl-tls-kit:tls13-client-driver-closed-p driver))
           (ensure-equal (case case
                           (:abort '((:raw-close t)))
                           (:already-closed '((:raw-close t) :write :driver-close))
@@ -1839,6 +1887,7 @@
       (ensure-equal nil (close-http-tcp-listener listener)))))
 
 #+sbcl
+(progn
 (deftest network-public-default-session-options-contract
   (let ((listener (open-http-tcp-listener :host "127.0.0.1"))
         (peer nil) (accepted nil) (events nil) (errors 0))
@@ -1896,3 +1945,167 @@
     (ensure-false (open-stream-p accepted))
     (ensure-false (open-stream-p peer))
     (ensure-equal nil (close-http-tcp-listener listener))))
+
+(deftest network-tls-contract-missing-default-trust-store
+  (%network-tls-contract-with-spy
+   'cl-tls-kit:default-trust-store-path
+   (lambda (original) (declare (ignore original)) (lambda () nil))
+   (lambda ()
+     (ensure-equal nil
+                   (http-kit/tls::%tls-load-trust-anchors :optional nil))
+     (let ((condition
+             (%network-tls-contract-condition
+              (lambda ()
+                (http-kit/tls::%tls-load-trust-anchors :required nil))
+              'http-unsupported-feature :tls)))
+       (ensure-equal :tls-trust-store
+                     (http-unsupported-feature-name condition))
+       (ensure-equal :not-found
+                     (http-protocol-error-detail condition))))))
+
+
+(deftest network-tls-contract-server-cipher-and-alert-boundaries
+  (dolist (mapping '((#x1301 :aes-128-gcm)
+                     (#x1302 :aes-256-gcm)
+                     (#x1303 :chacha20-poly1305)
+                     (#x1304 :aes-128-ccm)))
+    (ensure-equal (second mapping)
+                  (http-kit/tls::%tls-server-cipher-algorithm
+                   (first mapping))))
+  (let ((state
+          (http-kit/tls::%make-http-tls-server-state
+           :driver nil :provider nil :transport-stream nil))
+        (levels nil))
+    (%network-tls-contract-with-spy
+     'http-kit/tls::%tls-server-send-plaintext
+     (lambda (original)
+       (declare (ignore original))
+       (lambda (&rest arguments)
+         (push (second arguments) levels)))
+     (lambda ()
+       (setf (http-kit/tls::http-tls-server-state-handshake-complete-p state) t)
+       (http-kit/tls::%tls-server-fatal-alert state 20)
+       (setf (http-kit/tls::http-tls-server-state-handshake-complete-p state) nil
+             (http-kit/tls::http-tls-server-state-write-state state) :write-state)
+       (http-kit/tls::%tls-server-fatal-alert state 20)
+       (setf (http-kit/tls::http-tls-server-state-write-state state) nil)
+       (http-kit/tls::%tls-server-fatal-alert state 20)))
+    (ensure-equal '(:initial :handshake :application) levels)))
+)
+#+sbcl
+(progn
+  (deftest network-tls-contract-server-event-output-boundaries
+    (let* ((provider (cl-tls-kit:make-cl-crypto-kit-provider))
+           (secret (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
+           (raw (make-instance 'network-tls-contract-stream :input (octets)))
+           (state (http-kit/tls::%make-http-tls-server-state
+                   :driver nil :provider provider :transport-stream raw)))
+      (ensure-true (search "TLS server state" (princ-to-string state)))
+      (ensure-equal cl-tls-kit:+tls-content-type-application-data+
+                    (http-kit/tls::%tls-server-content-type :application-data))
+      (%network-tls-contract-protocol
+       (lambda () (http-kit/tls::%tls-server-content-type :unsupported))
+       :tls :unsupported-record-type)
+      (%network-tls-contract-protocol
+       (lambda () (http-kit/tls::%tls-server-cipher-algorithm #xffff))
+       :tls :unsupported-cipher-suite)
+      (%network-tls-contract-protocol
+       (lambda () (http-kit/tls::%tls-server-traffic-state state secret))
+       :tls :invalid-driver-state)
+      (%network-tls-contract-protocol
+       (lambda ()
+         (http-kit/tls::%tls-server-send-plaintext
+          state :renegotiation cl-tls-kit:+tls-content-type-application-data+ (octets 41)))
+       :tls :invalid-driver-state)
+      (setf (http-kit/tls::http-tls-server-state-write-state state) :not-a-traffic-state)
+      (%network-tls-contract-protocol
+       (lambda ()
+         (http-kit/tls::%tls-server-send-plaintext
+          state :application cl-tls-kit:+tls-content-type-application-data+ (octets 41)))
+       :tls :record-protection-failed)
+      (ensure-equal 0 (length (binary-test-output raw)))
+      (setf (http-kit/tls::http-tls-server-state-write-state state) nil)
+      (%network-tls-contract-protocol
+       (lambda ()
+         (http-kit/tls::%tls-server-handle-events
+          state
+          (list (list :type :cipher-suite :suite #x1301)
+                (list :type :secret :direction :sideways :level :handshake
+                      :secret secret))))
+       :tls :invalid-driver-state)
+      (ensure-equal #x1301 (http-kit/tls::http-tls-server-state-suite state))
+      (ensure-equal :initial (http-kit/tls::http-tls-server-state-phase state))
+      (ensure-false (http-kit/tls::http-tls-server-state-read-state state))
+      (ensure-false (http-kit/tls::http-tls-server-state-write-state state))
+      (ensure-equal 0 (length (binary-test-output raw)))
+      (close raw :abort t)))
+
+  (deftest network-tls-contract-server-record-stream-boundaries
+    (let* ((raw (make-instance 'network-tls-contract-stream :input (octets)))
+           (state (http-kit/tls::%make-http-tls-server-state
+                   :driver nil :provider nil :transport-stream raw))
+           (legacy-handshake (octets 22 3 1 0 1 1)))
+      (ensure-equal nil (http-kit/tls::%tls-server-process-record state legacy-handshake))
+      (ensure-false (http-kit/tls::http-tls-server-state-client-hello-received-p state))
+      (setf (http-kit/tls::http-tls-server-state-client-hello-received-p state) t)
+      (%network-tls-contract-protocol
+       (lambda () (http-kit/tls::%tls-server-process-record state legacy-handshake))
+       :tls :invalid-record-version)
+      (setf (http-kit/tls::http-tls-server-state-client-hello-received-p state) nil
+            (http-kit/tls::http-tls-server-state-early-data-offered-p state) t)
+      (%network-tls-contract-protocol
+       (lambda ()
+         (http-kit/tls::%tls-server-process-record state (octets 23 3 3 0 1 41)))
+       :tls :early-data-rejected)
+      (ensure-octets-equal #(21 3 3 0 2 2 10) (binary-test-output raw))
+      (setf (fill-pointer (binary-test-output raw)) 0
+            (http-kit/tls::http-tls-server-state-early-data-offered-p state) nil
+            (http-kit/tls::http-tls-server-state-read-state state) :read-keys)
+      (%network-tls-contract-protocol
+       (lambda () (http-kit/tls::%tls-server-process-record state (octets 22 3 3 0 0)))
+       :tls :unexpected-record)
+      (setf (http-kit/tls::http-tls-server-state-read-state state) nil)
+      (%network-tls-contract-protocol
+       (lambda ()
+         (http-kit/tls::%tls-server-dispatch-plaintext
+          state (cl-tls-kit:make-tls-plaintext cl-tls-kit:+tls-content-type-alert+
+                                               (octets 1 0))))
+       :tls :handshake-failed)
+      (close raw :abort t))
+    (let* ((raw (make-instance 'network-tls-contract-stream :input (octets)))
+           (state (http-kit/tls::%make-http-tls-server-state
+                   :driver nil :provider nil :transport-stream raw)))
+      (%network-tls-contract-protocol
+       (lambda () (http-kit/tls::%tls-server-handshake state))
+       :tls :handshake-failed)
+      (close raw :abort t))
+    (let* ((raw (make-instance 'network-tls-contract-stream :input (octets)))
+           (state (http-kit/tls::%make-http-tls-server-state
+                   :driver nil :provider nil :transport-stream raw))
+           (stream (http-kit/tls::%make-http-tls-stream state raw)))
+      (%network-tls-contract-protocol
+       (lambda () (read-byte stream))
+       :tls :missing-close-notify)
+      (ensure-true (open-stream-p stream))
+      (ensure-true (open-stream-p raw))
+      (ensure-equal 0 (length (binary-test-output raw)))
+      (close stream :abort t))
+    (let* ((raw (make-instance 'network-tls-contract-stream :input (octets)))
+           (state (http-kit/tls::%make-http-tls-server-state
+                   :driver nil :provider nil :transport-stream raw)))
+      (ensure-true (http-kit/tls::%tls-server-send-close-notify state))
+      (ensure-false (http-kit/tls::http-tls-server-state-close-sent-p state))
+      (ensure-equal 0 (length (binary-test-output raw)))
+      (close raw :abort t))
+    (let* ((raw (make-instance 'network-tls-contract-stream :input (octets)))
+           (state (http-kit/tls::%make-http-tls-server-state
+                   :driver nil :provider nil :transport-stream raw))
+           (stream (http-kit/tls::%make-http-tls-stream state raw)))
+      (%network-tls-contract-protocol
+       (lambda () (write-byte 42 stream))
+       :tls :record-encryption-failed)
+      (ensure-true (open-stream-p stream))
+      (ensure-true (open-stream-p raw))
+      (ensure-equal 0 (length (binary-test-output raw)))
+      (close stream :abort t))))
+

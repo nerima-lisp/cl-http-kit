@@ -8,11 +8,11 @@ RFC coverage.
 
 The registered systems in this checkout are version 0.4.1. The current
 integration source has native default client wiring, proxy-environment
-parsing, lock-backed pool/cookie state, and four-kit dependency declarations.
+parsing, and lock-backed pool/cookie state.
 The URL-and-method convenience form is available through `http-client-send`.
-The TLS wrapper requires cl-tls-kit 0.1.2 or later for the native TLS 1.3 client path; server
-wrapping remains an explicit unsupported boundary because the kit does not
-expose a server driver.
+The TLS wrapper requires cl-tls-kit 0.1.0 or later for native TLS 1.3 client
+connections and the HTTPS listener. `make-http-server` negotiates `h2` or
+`http/1.1` and dispatches to the matching server session.
 
 ## HTTP/1.1
 
@@ -138,14 +138,15 @@ The client creates native TCP, TLS 1.3, and pooling boundaries when no custom
 transport is supplied. The `cl-http-kit/tls` system uses cl-tls-kit for client
 certificate verification, trust-store loading, and handshake deadlines.
 Verification defaults to `:required`; `:optional` applies the same policy.
-Only `nil` skips certificate-chain, hostname, and trust checks, and it does
-not disable the TLS CertificateVerify signature check. The TLS stream
-requires a peer close_notify before treating transport EOF as clean closure.
-Server-side TLS wrapping is explicitly unsupported by the current kit boundary.
-For an HTTPS server, terminate TLS in a reverse proxy or load balancer and
-forward plain HTTP to `cl-http-kit/network`. Configure the proxy to preserve
-the original host and scheme according to the application's trusted-forwarding
-policy; cl-http-kit does not validate forwarded headers automatically.
+Passing `nil` to `make-http-tls-upgrader` is unsupported because the pinned
+cl-tls-kit client driver exposes no certificate-verification bypass. The TLS
+stream requires a peer close_notify before treating transport EOF as clean
+closure.
+The native HTTPS listener terminates TLS directly. A TLS-terminating proxy can
+forward cleartext HTTP/1.1 to `serve-http1-listener`; `make-http-server` accepts
+only HTTPS. Configure forwarded host and scheme according to the application's
+trusted-forwarding policy; cl-http-kit does not validate forwarded headers
+automatically.
 Origin 401 and proxy 407 challenges are parsed with the RFC 9110
 challenge grammar and can be answered by separate provider callbacks. Each
 provider receives at most one safe replay opportunity; streamed responses and
@@ -227,7 +228,8 @@ address metadata, and `close-http-tcp-listener` closes the listener. It keeps
 TLS, ALPN, and proxy negotiation outside the socket opener. Applications can
 compose the separate `cl-http-kit/tls` cl-tls-kit client wrapper around
 connected streams while retaining control of certificate and protocol policy.
-Server-side wrapping is an explicit unsupported boundary.
+TLS and ALPN remain outside the socket primitives; the higher-level HTTPS
+listener is provided by `cl-http-kit/tls`.
 
 serve-http1-listener combines accept and serve-http1-session dispatch for a
 caller-owned listener, with connection limits and accept/error callbacks.

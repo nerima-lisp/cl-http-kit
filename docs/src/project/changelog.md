@@ -13,6 +13,18 @@ historical release behavior, not the current API contract; see the
   `cl-websocket-kit` and SSE consumers to `sse-kit` from `cl-sse-kit`.
   See the
   [WebSocket and SSE migration guide](migration.md#websocket-and-sse-api-migration).
+- reject `:verify nil` because the pinned cl-tls-kit client driver does not
+  expose a supported way to disable certificate verification;
+
+### Added
+
+- add an HTTPS listener on SBCL with ALPN negotiation for HTTP/2 and HTTP/1.1,
+  bounded connection and request resources, lifecycle callbacks, and graceful
+  shutdown;
+
+### Changed
+
+- cap buffered request-body bytes across active HTTPS listener sessions;
 
 ### HTTP/2
 
@@ -23,7 +35,7 @@ historical release behavior, not the current API contract; see the
   the stream ID while another request is in progress and has not failed,
   otherwise a list with `0` (the DATA frame type) followed by the stream ID.
 
-## 0.4.1
+## 0.4.1 (historical)
 
 - require certificate-chain, hostname, and trust verification by default on
   the native TLS client path; retain CertificateVerify signature verification
@@ -76,7 +88,7 @@ historical release behavior, not the current API contract; see the
 - terminate HTTP/2 server connections explicitly on transport EOF and invoke
   the configured stream-close callback.
 
-## 0.4.0
+## 0.4.0 (historical)
 
 The 0.4.0 release is a breaking integration release for the 0.x series:
 
@@ -90,24 +102,19 @@ The 0.4.0 release is a breaking integration release for the 0.x series:
 - support environment-based proxy selection (`HTTP_PROXY`, `HTTPS_PROXY`,
   and `NO_PROXY`, including lowercase names), proxy/origin authentication,
   and thread-safe pool and cookie state;
-- keep the native client path on HTTP/1.1; HTTP/2 uses its explicit transport
-  boundary, while HTTP/3 is not selected automatically and an explicitly
-  supplied cl-quic-kit adapter can drive the client QUIC connection and HTTP/3
-  stream lifecycle;
+- at 0.4.0, the native client path used HTTP/1.1 and HTTP/2 used its explicit
+  transport boundary. HTTP/3 was not selected automatically; a supplied
+  cl-quic-kit adapter could drive the client QUIC connection and HTTP/3 stream
+  lifecycle;
 - add HTTP/3 client loopback coverage through the cl-quic-kit adapter for
   Alt-Svc, fallback, and explicit HTTP/3 modes;
 - update the dependency pins for cl-crypto-kit, cl-deflate-kit, cl-tls-kit,
   and cl-quic-kit to their release integration branches;
-- verify the release gate on Ubuntu x86_64 with `nix flake check`, including
-  the test and lint checks defined by the flake; run the separate strict MkDocs
-  build for documentation when publishing the docs.
+- the 0.4.0 release gate required `nix flake check` on Ubuntu x86_64, including
+  the configured test and lint checks; documentation publication required a
+  separate strict MkDocs build.
 
 The 0.4.0 runtime verification was limited to Ubuntu x86_64. Its HTTP/3
 connection path was verified through the cl-quic-kit adapter; native QUIC
 sockets and server acceptance were outside that release boundary.
 
-## Earlier 0.3.x source
-
-The 0.3.x source provided callback and stream APIs for HTTP/1.1, injected
-HTTP/2, injected HTTP/3 framing, client policy helpers, native TCP/DNS, and
-the cl-tls-kit TLS 1.3 client wrapper.
