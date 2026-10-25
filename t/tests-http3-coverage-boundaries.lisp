@@ -3106,10 +3106,17 @@
     (ensure-octets-equal
      (octets 1 2)
      (http-kit/http3:http3-frame-payload extension-frame))
-    (ensure-equal
-     t
+    (progn
      (http-kit/http3::%h3-scheduler-process-frame
-      nil entry extension-frame))
+      nil entry extension-frame)
+     (ensure-equal
+      nil (http-kit/http3::%http3-request-stream-response-status entry))
+     (ensure-equal
+      nil (http-kit/http3::%http3-request-stream-response-headers entry))
+     (ensure-equal
+      0 (http-kit/http3::%http3-request-stream-response-body-length entry))
+     (ensure-equal
+      nil (http-kit/http3::%http3-request-stream-response-frames entry)))
     (http3-public-error-check
      failure
      "HTTP/3 control frames are not valid on a request stream."
