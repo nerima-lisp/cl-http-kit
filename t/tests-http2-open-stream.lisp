@@ -4013,3 +4013,100 @@
             (sb-thread:signal-semaphore release-headers))
           (sb-thread:join-thread first-thread))
         (http-kit/http2:close-http2-connection connection))))
+#+sbcl
+(progn
+  (deftest http2-response-headers-callback-replays-data-after-success
+    (let* ((headers-entered (sb-thread:make-semaphore :count 0))
+           (release-headers (sb-thread:make-semaphore :count 0))
+           (release-signaled-p nil)
+           (callback-wait-result nil)
+           (input
+             (concatenate-octets
+              (h2-frame 4 0 0 (octets))
+              (h2-frame 1 4 1 (h2-header-block (cons ":status" "200")))
+              (h2-frame 0 1 1 (octets 65 66))
+              (h2-frame 1 5 3 (h2-header-block (cons ":status" "200")))))
+           (stream (make-instance (quote binary-session-stream) :input input))
+           (connection
+             (http-kit/http2:make-http2-connection
+              :stream stream :max-body-bytes 2))
+           (first-response nil)
+           (first-failure nil)
+           (second-response nil)
+           (second-failure nil)
+           (body-chunks nil)
+           (first-thread nil))
+      (unwind-protect
+           (progn
+             (setf first-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (handler-case
+                          (setf first-response
+                                (http-kit/http2:send-http2-request-over-connection
+                                 connection
+                                 (make-http-request
+                                  :method "GET"
+                                  :uri "https://race.test/first")
+                                 :on-response-headers
+                                 (lambda (status headers)
+                                   (declare (ignore status headers))
+                                   (sb-thread:signal-semaphore headers-entered)
+                                   (setf callback-wait-result
+                                         (sb-thread:wait-on-semaphore
+                                          release-headers :timeout 10)))
+                                 :on-body-chunk
+                                 (lambda (chunk)
+                                   (push (copy-seq chunk) body-chunks))))
+                        (error (condition)
+                          (setf first-failure condition))))))
+             (ensure-true
+              (sb-thread:wait-on-semaphore headers-entered :timeout 5))
+             (handler-case
+                 (setf second-response
+                       (http-kit/http2:send-http2-request-over-connection
+                        connection
+                        (make-http-request
+                         :method "GET"
+                         :uri "https://race.test/second")))
+               (error (condition)
+                 (setf second-failure condition)))
+             (setf release-signaled-p t)
+             (sb-thread:signal-semaphore release-headers)
+             (sb-thread:join-thread first-thread)
+             (setf first-thread nil)
+             (ensure-false first-failure)
+             (ensure-false second-failure)
+             (ensure-true callback-wait-result)
+             (ensure-true first-response)
+             (ensure-true second-response)
+             (ensure-equal 200 (http-response-status first-response))
+             (ensure-equal (octets 65 66) (http-response-body first-response))
+             (ensure-equal 200 (http-response-status second-response))
+             (ensure-equal (octets) (http-response-body second-response))
+             (ensure-equal (list (octets 65 66)) (nreverse body-chunks)))
+        (when first-thread
+          (unless release-signaled-p
+            (sb-thread:signal-semaphore release-headers))
+          (sb-thread:join-thread first-thread))
+        (http-kit/http2:close-http2-connection connection))))
+  (deftest http2-cancel-keeps-completed-response-entry
+    (let* ((stream (make-instance (quote binary-session-stream) :input (octets)))
+           (connection (http-kit/http2:make-http2-connection :stream stream))
+           (entry
+             (http-kit/http2::%make-h2-batch-entry :stream-id 1)))
+      (unwind-protect
+           (progn
+             (setf (http-kit/http2::%http2-connection-next-stream-id connection) 3
+                   (http-kit/http2::%http2-connection-scheduler-entries connection)
+                   (list entry)
+                   (http-kit/http2::%h2-batch-entry-response entry) :completed)
+             (ensure-true
+              (http-kit/http2::%h2-cancel-http2-stream
+               connection 1 :only-if-active-p t))
+             (ensure-equal
+              (list entry)
+              (http-kit/http2::%http2-connection-scheduler-entries connection))
+             (ensure-false
+              (http-kit/http2::%h2-batch-entry-local-retired-p entry)))
+        (http-kit/http2:close-http2-connection connection)))))
