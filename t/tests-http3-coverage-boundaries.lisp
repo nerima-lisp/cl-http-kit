@@ -5489,8 +5489,11 @@
                  (ensure-equal nil
                                (http-kit/http3::%http3-request-stream-continuation
                                 entry))
-                 (ensure-true
-                  (http-kit/http3::%h3-scheduler-read-entry-step client entry))
+                 (progn
+                   (http-kit/http3::%h3-scheduler-read-entry-step client entry)
+                   (ensure-equal
+                    (quote (:closing-frame))
+                    (http-kit/http3::%http3-request-stream-response-frames entry)))
                  (setf (http-kit/http3::http3-client-scheduler-close-state client) nil
                        (http-kit/http3::%http3-request-stream-response-frames entry) nil
                        (http-kit/http3::%http3-request-stream-response-fin-p entry) t)
