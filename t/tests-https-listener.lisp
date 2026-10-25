@@ -1514,6 +1514,43 @@
       (ensure-equal :event-callback-failed
                     (http-server-error-reason-code
                      (http-server-failure server))))))
+#+sbcl
+(deftest https-listener-stop-sets-deadline-after-supervisor-start-failure
+  (%with-https-listener-test-stubs (context)
+    (ensure-true context)
+    (let* ((thread-maker 'sb-thread:make-thread)
+           (original (fdefinition thread-maker))
+           (events nil)
+           (server
+             (%https-listener-make-server
+              :on-event
+              (lambda (event)
+                (push (getf event :type) events)))))
+      (unwind-protect
+           (progn
+             (sb-ext:without-package-locks
+               (setf (fdefinition thread-maker)
+                     (lambda (&rest arguments)
+                       (declare (ignore arguments))
+                       (error "supervisor thread creation failure"))))
+             (unwind-protect
+                  (progn
+                    (start-http-server server)
+                    (ensure-equal
+                     :supervisor-start-failed
+                     (http-server-error-reason-code
+                      (http-server-failure server))))
+               (sb-ext:without-package-locks
+                 (setf (fdefinition thread-maker) original)))
+             (ensure-equal
+              server
+              (stop-http-server server :graceful-timeout 1))
+             (ensure-true (member :listener-stopped events)))
+        (sb-ext:without-package-locks
+          (setf (fdefinition thread-maker) original))
+        (unless (member :listener-stopped events)
+          (stop-http-server server :graceful-timeout 1))))))
+
 
 #+sbcl
 (progn
@@ -1685,6 +1722,53 @@
              (or (%https-listener-event-present-p
                   context :listener-stopped nil)
                  (eq :failed (http-kit::http-server-state server))))))))))
+#+sbcl
+(deftest https-listener-preserves-external-ticket-store-through-public-stop
+  (%with-https-listener-test-stubs (context)
+    (ensure-true context)
+    (let* ((store (cl-tls-kit:make-tls13-server-ticket-key-store))
+           (server (%https-listener-make-server :ticket-key-store store)))
+      (unwind-protect
+           (progn
+             (start-http-server server)
+             (ensure-equal
+              server
+              (stop-http-server server :graceful-timeout 1))
+             (ensure-true (cl-tls-kit:tls13-server-ticket-key-store-p store))
+             (ensure-true
+              (eq store
+                  (cl-tls-kit:rotate-tls13-server-ticket-key-store store))))
+        (stop-http-server server :graceful-timeout 1)))))
+#+sbcl
+(deftest https-listener-stop-joins-aborted-shutdown-coordinator
+  (%with-https-listener-test-stubs (context)
+    (ensure-true context)
+    (let* ((stopped-event-seen nil)
+           (terminate-coordinator-on-stopped t)
+           (server
+             (%https-listener-make-server
+              :on-event
+              (lambda (event)
+                (when (and terminate-coordinator-on-stopped
+                           (eq :listener-stopped (getf event :type)))
+                  (setf stopped-event-seen t
+                        terminate-coordinator-on-stopped nil)
+                  (sb-thread:terminate-thread sb-thread:*current-thread*)))))
+           (stop-error nil))
+      (unwind-protect
+           (progn
+             (setf stop-error
+                   (handler-case
+                       (progn
+                         (stop-http-server server :graceful-timeout 5)
+                         nil)
+                     (sb-thread:join-thread-error (condition) condition)))
+             (ensure-true stopped-event-seen)
+             (ensure-true
+              (typep stop-error (quote sb-thread:join-thread-error)))
+             (ensure-false (http-server-failure server)))
+        (setf terminate-coordinator-on-stopped nil)
+        (stop-http-server server :graceful-timeout 5)))))
 #+sbcl
 (deftest https-listener-times-out-slow-real-tls-handshake
   (let* ((material (%tls-server-test-material))
