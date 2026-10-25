@@ -1976,7 +1976,10 @@ sends `RST_STREAM`; if the request caller currently owns a blocked synchronous
 frame read, it observes cancellation after that read completes or its deadline
 expires. An HTTP/3 transport must supply a `cancel-stream` callback to
 `make-http3-client`; the built-in cl-quic-kit adapter does not currently supply
-one.
+one. With that adapter, `http-client-cancel-request` marks the token cancelled
+and signals `http-protocol-error` with operation `:http3-transport` and detail
+`:unsupported`. It sends no stream reset or stop-sending signal, so active I/O
+can continue until it completes or its deadline expires.
 
 ### `http-client-clear-connections`
 
@@ -2231,8 +2234,11 @@ Active-I/O cancellation depends on the selected transport: the direct HTTP/1.1
 stream transport closes its stream, HTTP/2 sends `RST_STREAM` but a caller
 blocked in a synchronous frame read waits for that read or its deadline, and
 HTTP/3 requires a backend `cancel-stream` callback. The built-in cl-quic-kit
-adapter currently has no such callback. Custom transports receive `:on-cancel`
-and must use it to register a function that interrupts the active operation.
+adapter currently has no such callback. On that adapter, cancellation signals
+`http-protocol-error` with operation `:http3-transport` and detail `:unsupported`
+after marking the token cancelled; it does not interrupt active I/O. Custom
+transports receive `:on-cancel` and must use it to register a function that
+interrupts the active operation.
 COOKIE-SAME-SITE-P and COOKIE-TOP-LEVEL-NAVIGATION-P supply the request context
 for SameSite cookie selection. COOKIE-PARTITION-KEY supplies the canonical
 top-level-site identifier for Partitioned cookie acceptance and selection.

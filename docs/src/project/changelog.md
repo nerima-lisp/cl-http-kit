@@ -59,7 +59,10 @@ historical release behavior, not the current API contract; see the
   HTTP/1.1 reads and sends HTTP/2 `RST_STREAM`; synchronous HTTP/2 reads may not
   return until a frame arrives or the request deadline expires. HTTP/3 requires
   a backend `cancel-stream` callback, which the built-in cl-quic-kit adapter
-  does not currently provide.
+  does not currently provide. With that adapter, cancellation marks the token
+  cancelled and signals `http-protocol-error` with operation
+  `:http3-transport` and detail `:unsupported`; it sends no stream reset or
+  stop-sending signal, so active I/O can continue until completion or deadline.
 
 ## 0.4.1 (historical)
 
