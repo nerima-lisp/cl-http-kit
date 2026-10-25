@@ -4412,10 +4412,5 @@
               (http-kit/http2::%h2-batch-entry-local-retired-p entry))
              (ensure-false
               (http-kit/http2::%h2-batch-entry-request-body-abandoned-p entry))
-             (ensure-false
-              (find-if
-               (lambda (frame)
-                 (and (= 3 (http-kit/http2::%h2-frame-type frame))
-                      (= 1 (http-kit/http2::%h2-frame-stream-id frame))))
-               (h2-output-frames stream))))
+             (ensure-equal 0 (length (binary-session-output stream))))
         (http-kit/http2:close-http2-connection connection)))))
