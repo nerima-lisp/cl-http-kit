@@ -610,8 +610,7 @@
       (cond
         ((%http-server-connection-closing-p connection)
          (when abort
-           (setf stream (or (%http-server-connection-raw-stream connection)
-                            (%http-server-connection-tls-stream connection))
+           (setf stream (%http-server-connection-raw-stream connection)
                  (%http-server-connection-closed-p connection) t)))
         ((%http-server-connection-closed-p connection)
          nil)
