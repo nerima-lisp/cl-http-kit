@@ -156,7 +156,6 @@
            (warning-text nil))
       (unwind-protect
            (progn
-             (http-kit/http3:close-http3-client client)
              (setf (http-kit/http3::http3-client-close-connection client)
                      (lambda (&key error-code reason)
                        (setf quic-close-arguments (list error-code reason))

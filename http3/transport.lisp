@@ -3446,7 +3446,10 @@ validated informational response in wire order."
 (defun %h3-scheduler-fail-connection (client condition)
   (let ((close-failure
           (handler-case
-              (close-http3-client client :condition condition)
+              (progn
+                ;; A truthy close result means success, not a failure.
+                (close-http3-client client :condition condition)
+                nil)
             (error (caught-condition)
               caught-condition))))
     (let ((close-connection (http3-client-close-connection client)))
