@@ -661,6 +661,18 @@
     (ensure-equal :invalid (http-protocol-error-detail caught))
     (ensure-equal 0 transport-calls)))
 
+(deftest client-cancel-request-rejects-invalid-token
+  (let ((caught
+          (handler-case
+              (progn
+                (http-client-cancel-request :invalid)
+                nil)
+            (http-protocol-error (condition)
+              condition))))
+    (ensure-true caught)
+    (ensure-equal :client (http-error-operation caught))
+    (ensure-equal :invalid (http-protocol-error-detail caught))))
+
 (deftest client-multipart-parser-round-trip
   (multiple-value-bind (body content-type)
       (make-http-multipart-body
@@ -1763,6 +1775,32 @@
     (ensure-equal 1 http3-calls)
     (ensure-equal 1 tcp-calls)))
 
+(deftest client-transport-rejects-invalid-cancel-handler
+  (let* ((token (make-http-cancellation-token))
+         (transport-returned-p nil)
+         (client
+           (make-http-client
+            :cache nil
+            :transport-function
+            (lambda (request &key on-cancel &allow-other-keys)
+              (declare (ignore request))
+              (funcall on-cancel :invalid)
+              (setf transport-returned-p t)
+              (client-test-response 200))))
+         (caught
+           (handler-case
+               (progn
+                 (http-client-send
+                  client "GET" "http://example.test/invalid-cancel-handler"
+                  :cancel-token token)
+                 nil)
+             (http-protocol-error (condition)
+               condition))))
+    (ensure-true caught)
+    (ensure-equal :client (http-error-operation caught))
+    (ensure-equal :invalid (http-protocol-error-detail caught))
+    (ensure-false transport-returned-p)))
+
 (deftest client-alt-svc-cancelled-token-suppresses-pre-send-fallback
   (let* ((http3-calls 0)
          (tcp-calls 0)
@@ -1802,6 +1840,76 @@
       (ensure-true condition))
     (ensure-equal 1 http3-calls)
     (ensure-equal 0 tcp-calls)))
+
+(deftest client-cancellation-registration-after-cancel-runs-handler
+  (let* ((token (make-http-cancellation-token))
+         (cancel-handler-calls 0)
+         (client
+           (make-http-client
+            :cache nil
+            :transport-function
+            (lambda (request &key on-cancel &allow-other-keys)
+              (declare (ignore request))
+              (ensure-true (http-client-cancel-request token))
+              (funcall on-cancel
+                       (lambda ()
+                         (incf cancel-handler-calls)))
+              (client-test-response 200))))
+         (caught
+           (handler-case
+               (progn
+                 (http-client-send
+                  client "GET" "http://example.test/late-cancel-handler"
+                  :cancel-token token)
+                 nil)
+             (http-client-request-cancelled (condition)
+               condition))))
+    (ensure-true caught)
+    (ensure-equal 1 cancel-handler-calls)
+    (ensure-false (http-client-cancel-request token))))
+
+(deftest client-cancel-request-runs-all-handlers-after-failure
+  (let* ((token (make-http-cancellation-token))
+         (failing-handler-calls 0)
+         (active-handler-calls 0)
+         (unregistered-handler-calls 0)
+         (client
+           (make-http-client
+            :cache nil
+            :transport-function
+            (lambda (request &key on-cancel &allow-other-keys)
+              (declare (ignore request))
+              (let ((unregister
+                      (funcall
+                       on-cancel
+                       (lambda ()
+                         (incf unregistered-handler-calls)))))
+                (funcall
+                 on-cancel
+                 (lambda ()
+                   (incf active-handler-calls)))
+                (funcall
+                 on-cancel
+                 (lambda ()
+                   (incf failing-handler-calls)
+                   (funcall unregister)
+                   (error "cancel handler failed")))
+                (http-client-cancel-request token)
+                (client-test-response 200)))))
+         (caught
+           (handler-case
+               (progn
+                 (http-client-send
+                  client "GET" "http://example.test/cancel-handler-failure"
+                  :cancel-token token)
+                 nil)
+             (simple-error (condition)
+               condition))))
+    (ensure-true caught)
+    (ensure-equal 1 failing-handler-calls)
+    (ensure-equal 1 active-handler-calls)
+    (ensure-equal 0 unregistered-handler-calls)
+    (ensure-false (http-client-cancel-request token))))
 
 (deftest client-alt-svc-connect-timeout-preserves-producer-and-deadline
   (dolist (body-kind '(:producer :factory))
