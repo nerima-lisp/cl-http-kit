@@ -374,13 +374,13 @@ outside this direct function boundary."
                               :name "HTTP stream close")))
       (labels ((close-once ()
                  (let ((close-p
-                         #+sbcl
-                         (sb-thread:with-mutex (close-lock)
-                           (when (and stream (not stream-closed-p))
-                             (setf stream-closed-p t)))
-                         #-sbcl
-                         (when (and stream (not stream-closed-p))
-                           (setf stream-closed-p t))))
+                         (or #+sbcl
+                             (sb-thread:with-mutex (close-lock)
+                               (when (and stream (not stream-closed-p))
+                                 (setf stream-closed-p t)))
+                             #-sbcl
+                             (when (and stream (not stream-closed-p))
+                               (setf stream-closed-p t)))))
                    (when close-p
                      (funcall close stream)))))
         (with-http-deadline (absolute-deadline timeout
