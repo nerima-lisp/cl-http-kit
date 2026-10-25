@@ -1588,89 +1588,92 @@
         (http-kit::%http-server-close-connection-stream server connection)
         (ensure-equal 1 (%https-listener-close-error-count stream))))))
 #+sbcl
-(deftest https-listener-waits-for-connections-to-deadline
+(deftest https-listener-rotates-owned-ticket-stores-through-public-api
   (%with-https-listener-test-stubs (context)
-    (ensure-true context)
-    (let ((server (%https-listener-make-server))
-          (original-now (symbol-function 'http-kit::%http-server-now)))
+    (let* ((original-clock http-kit::*http-server-clock-function*)
+           (original-store-maker
+             (fdefinition 'cl-tls-kit:make-tls13-server-ticket-key-store))
+           (clock-offset 0.0d0)
+           (clock
+             (lambda ()
+               (+ clock-offset
+                  (/ (get-internal-real-time)
+                     internal-time-units-per-second))))
+           (owned-key-generation-count 0)
+           (owned-key-materials nil)
+           (owned-random
+             (lambda (size)
+               (let ((seed (incf owned-key-generation-count)))
+                 (push seed owned-key-materials)
+                 (make-array size
+                             :element-type (quote (unsigned-byte 8))
+                             :initial-element seed))))
+           (external-key-generation-count 0)
+           (external-store
+             (funcall
+              original-store-maker
+              :random
+              (lambda (size)
+                (incf external-key-generation-count)
+                (make-array size
+                            :element-type (quote (unsigned-byte 8))
+                            :initial-element 201))))
+           (owned-server nil)
+           (external-server nil)
+           (owned-client nil)
+           (external-client nil))
       (unwind-protect
            (progn
-             (ensure-true
-              (http-kit::%http-server-wait-for-connections server 0))
-             (setf (http-kit::http-server-connection-count server) 1
-                   (fdefinition 'http-kit::%http-server-now)
-                   (let ((times '(0.0d0 1.0d0)))
-                     (lambda () (pop times))))
-             (ensure-false
-              (http-kit::%http-server-wait-for-connections server 0.01d0)))
-        (setf (fdefinition 'http-kit::%http-server-now) original-now)))))
-#+sbcl
-(deftest https-listener-rotates-owned-ticket-stores-and-preserves-external-ones
-  (%with-https-listener-test-stubs (context)
-    (let* ((owned-server (%https-listener-make-server))
-           (original-store
-             (http-kit::http-server-ticket-key-store owned-server))
-           (external-store (cl-tls-kit:make-tls13-server-ticket-key-store))
-           (external-server
-             (%https-listener-make-server :ticket-key-store external-store))
-           (original-rotate
-             (fdefinition 'cl-tls-kit:rotate-tls13-server-ticket-key-store))
-           (rotation-count 0))
-      (unwind-protect
-           (progn
-             (ensure-true
-              (http-kit::http-server-ticket-key-store-owned-p owned-server))
-             (ensure-false
-              (http-kit::http-server-ticket-key-store-owned-p external-server))
-             (setf (http-kit::http-server-ticket-key-rotation-deadline
-                    owned-server)
-                   0.0d0
-                   (http-kit::http-server-ticket-key-rotation-deadline
-                    external-server)
-                   0.0d0
+             (setf http-kit::*http-server-clock-function* clock
                    (fdefinition
-                    'cl-tls-kit:rotate-tls13-server-ticket-key-store)
-                   (lambda (store &key clock)
-                     (declare (ignore clock))
-                     (ensure-true (eq original-store store))
-                     (incf rotation-count)
-                     store))
-             (ensure-true
-              (http-kit::%http-server-rotate-ticket-key-store-if-due
-               owned-server))
-             (ensure-false
-              (http-kit::%http-server-rotate-ticket-key-store-if-due
-               external-server))
-             (ensure-equal 1 rotation-count)
-             (ensure-true
-              (> (http-kit::http-server-ticket-key-rotation-deadline
-                  owned-server)
-                 (http-kit::%http-server-now)))
-             (stop-http-server owned-server :graceful-timeout 1)
-             (ensure-false (http-kit::http-server-ticket-key-store owned-server))
-             (ensure-false (http-kit::http-server-tls-wrapper owned-server))
-             (ensure-true
-              (eq external-store
-                  (http-kit::http-server-ticket-key-store external-server)))
-             (stop-http-server external-server :graceful-timeout 1)
-             (ensure-true
-              (eq external-store
-                  (http-kit::http-server-ticket-key-store external-server)))
+                    'cl-tls-kit:make-tls13-server-ticket-key-store)
+                   (lambda (&rest arguments)
+                     (apply original-store-maker :random owned-random
+                            arguments)))
+             (setf owned-server (%https-listener-make-server)
+                   external-server
+                   (%https-listener-make-server
+                    :ticket-key-store external-store))
+             (setf (fdefinition
+                    'cl-tls-kit:make-tls13-server-ticket-key-store)
+                   original-store-maker)
+             (ensure-equal 1 owned-key-generation-count)
+             (ensure-equal 1 external-key-generation-count)
+             (setf clock-offset (* 13 60 60))
              (start-http-server owned-server)
+             (setf owned-client (%https-listener-connect owned-server))
+             (close-http-tcp-stream owned-client)
+             (setf owned-client nil)
+             (%https-listener-wait
+              (lambda () (= 1 (%https-listener-session-count context))))
+             (ensure-equal 2 owned-key-generation-count)
              (ensure-false
-              (eq original-store
-                  (http-kit::http-server-ticket-key-store owned-server)))
+              (= (first owned-key-materials)
+                 (second owned-key-materials)))
+             (start-http-server external-server)
+             (setf external-client (%https-listener-connect external-server))
+             (close-http-tcp-stream external-client)
+             (setf external-client nil)
+             (%https-listener-wait
+              (lambda () (= 2 (%https-listener-session-count context))))
+             (ensure-equal 1 external-key-generation-count)
              (ensure-true
-              (functionp (http-kit::http-server-tls-wrapper owned-server)))
-             (stop-http-server owned-server :graceful-timeout 1))
-        (setf (fdefinition
-               'cl-tls-kit:rotate-tls13-server-ticket-key-store)
-              original-rotate)
+              (cl-tls-kit:tls13-server-ticket-key-store-p external-store))
+             (stop-http-server owned-server :graceful-timeout 1)
+             (stop-http-server external-server :graceful-timeout 1))
+        (when (and owned-client (open-stream-p owned-client))
+          (close-http-tcp-stream owned-client))
+        (when (and external-client (open-stream-p external-client))
+          (close-http-tcp-stream external-client))
         (dolist (server (list owned-server external-server))
-          (unless (eq :stopped (http-kit::http-server-state server))
-            (handler-case
-                (stop-http-server server :graceful-timeout 1)
-              (error () nil))))))))
+          (when (and server
+                     (not (eq :stopped
+                              (http-kit::http-server-state server))))
+            (stop-http-server server :graceful-timeout 1)))
+        (setf http-kit::*http-server-clock-function* original-clock
+              (fdefinition
+               'cl-tls-kit:make-tls13-server-ticket-key-store)
+              original-store-maker)))))
 #+sbcl
 (deftest https-listener-does-not-report-stopped-while-handler-worker-runs
   (%with-https-listener-test-stubs (context)
