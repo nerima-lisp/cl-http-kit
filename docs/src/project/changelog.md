@@ -27,6 +27,9 @@ historical release behavior, not the current API contract; see the
 ### Changed
 
 - cap buffered request-body bytes across active HTTPS listener sessions;
+- destroy per-connection ticket-key stores created by TLS server wrappers when
+  their driver closes, while leaving supplied shared stores caller-owned for
+  cross-connection resumption;
 - TLS server wrapper ignores record `legacy_record_version` as required by
   RFC 8446 section 5.1 while continuing to validate record content types and
   lengths;

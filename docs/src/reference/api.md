@@ -4,7 +4,8 @@ This page documents the primary exported symbols of the registered ASDF
 systems. Package definition files remain authoritative for lower-level and
 auxiliary exports not described here.
 
-The registered systems in this checkout are version 0.4.1.
+The registered systems in this checkout declare version 0.4.1. This reference
+describes the current checkout and may include unreleased changes.
 
 ## Core package
 
@@ -997,8 +998,9 @@ and `http-server-error-phase` expose safe error metadata, while
 `http-server-callback-error-callback` identifies whether `:on-event` or
 `:on-error` failed.
 
-Each server creates and owns a ticket-key store by default. On the first TLS
-connection after each 12-hour interval, the server replaces its owned store
+Each server creates and owns a ticket-key store by default. Its first 12-hour
+rotation interval starts when the server is created. On the first TLS
+connection after each interval, the server replaces its owned store
 and, after all connections using it finish, zeroizes the previous store's keys
 and destroys the store. TLS session tickets encrypted with the previous store
 cannot resume after rotation. The server also zeroizes its owned store's keys
@@ -1028,10 +1030,13 @@ PASSWORD are reserved for a future client-certificate integration and currently
 signal an unsupported-feature condition when supplied. The client wrapper
 preserves the binary-stream boundary and applies handshake deadlines.
 :OPTIONAL applies the same certificate-chain, hostname, and trust checks as
-:REQUIRED. Certificate verification remains enabled for every supported value.
-TRUST-ANCHORS accepts parsed X.509 certificate objects. When anchors are not
-supplied and VERIFY is :OPTIONAL or :REQUIRED, the upgrader loads PEM
-certificates from the CA file selected by cl-tls-kit. SSL_CERT_FILE takes
+:REQUIRED when trust anchors are available. Certificate verification remains
+enabled for every supported value. TRUST-ANCHORS accepts parsed X.509
+certificate objects. When anchors are not supplied and VERIFY is :OPTIONAL or
+:REQUIRED, the upgrader loads PEM certificates from the CA file selected by
+cl-tls-kit. If no default CA file is available, :OPTIONAL passes no trust
+anchors to the driver, while :REQUIRED signals :tls-trust-store with detail
+:not-found before starting the handshake. SSL_CERT_FILE takes
 precedence over NIX_SSL_CERT_FILE, followed by an existing platform CA file.
 The wrapper rejects transport EOF without a peer close_notify instead of
 treating a truncated TLS stream as a completed HTTP response.
@@ -1044,7 +1049,16 @@ the cl-tls-kit driver from creating a ticket-key store, resumption secret, or
 `NewSessionTicket` message. It returns a callback invoked as
 `(funcall wrapper stream &key timeout deadline)`. The callback completes the
 TLS 1.3 server handshake and returns the negotiated TLS stream; `timeout` and
-`deadline` bound the handshake.
+`deadline` bound the handshake. When session tickets are enabled and no
+`ticket-key-store` is supplied, each callback creates a driver-owned store for
+that connection. Closing the returned TLS stream, normally or with `:abort`,
+closes its driver and destroys that store; a handshake or setup failure also
+closes the driver. A supplied store remains caller-owned when a connection
+closes. To resume sessions across connections handled by this wrapper, pass the
+same store with `:ticket-key-store` on each invocation and destroy it only after
+all connections using it have closed. The HTTPS listener instead owns one
+default store shared by its connections; its shutdown and rotation lifecycle is
+unchanged.
 HTTP-TLS-SELECTED-ALPN-PROTOCOL returns the protocol negotiated on an upgraded
 client or server stream, or NIL when no protocol was negotiated. The HTTPS
 listener accepts only `h2` and `http/1.1`.
@@ -2019,7 +2033,9 @@ Retry-After.
 
 ### `http-client-wall-clock-function`
 
-Return the configured monotonic timing function.
+Return the configured monotonic timing function used for deadlines. The
+accessor's `wall-clock` name is historical; this function does not return
+wall-clock time.
 
 ### `http-client-sleep-function`
 

@@ -871,22 +871,35 @@ driver's transport callbacks."
 
     (defmethod close ((stream http-tls-stream) &key abort)
       (unless (%tls-stream-closed-p stream)
-        (let ((completed-p nil)
-              (transport (%tls-stream-transport-stream stream))
-              (driver (%tls-stream-driver stream)))
+        (let* ((completed-p nil)
+               (transport (%tls-stream-transport-stream stream))
+               (driver (%tls-stream-driver stream))
+               (server-state (and (typep driver 'http-tls-server-state)
+                                  driver))
+               (server-driver
+                 (and server-state
+                      (http-tls-server-state-driver server-state)))
+               (driver-closed-p nil))
           (unwind-protect
                (progn
                  (unless abort
-                   (if (typep driver 'http-tls-server-state)
-                       (%tls-server-send-close-notify driver)
+                   (if server-state
+                       (%tls-server-send-close-notify server-state)
                        (cl-tls-kit:tls13-client-driver-close driver)))
+                 (when server-driver
+                   (cl-tls-kit:tls13-server-driver-close server-driver)
+                   (setf driver-closed-p t))
                  (setf completed-p t))
             (unwind-protect
-                 (when (open-stream-p transport)
-                   (if completed-p
-                       (close transport :abort abort)
-                       (http-kit::%with-http-cleanup
-                         (close transport :abort t))))
+                 (unwind-protect
+                     (when (open-stream-p transport)
+                       (if completed-p
+                           (close transport :abort abort)
+                           (http-kit::%with-http-cleanup
+                             (close transport :abort t))))
+                   (when (and server-driver (not driver-closed-p))
+                     (http-kit::%with-http-cleanup
+                       (cl-tls-kit:tls13-server-driver-close server-driver))))
               (setf (%tls-stream-closed-p stream) t)))))
       t))
 
@@ -915,74 +928,61 @@ driver's transport callbacks."
       (%tls-protocol-error "TLS ticket key store is invalid."
                            :invalid-ticket-key-store))
     #+sbcl
-    (let ((shared-store
-           (when session-tickets-p
-             (or ticket-key-store
-                 (handler-case (cl-tls-kit:make-tls13-server-ticket-key-store)
-                   (error ()
-                     (%tls-protocol-error "TLS ticket key store could not be created."
-                                          :invalid-ticket-key-store))))))
+    (let ((server-ticket-key-store (and session-tickets-p ticket-key-store))
           (server-alpn (copy-list alpn-protocols)))
       (lambda (stream &key timeout deadline &allow-other-keys)
         (unless (streamp stream)
           (%tls-protocol-error "TLS server wrapper requires a Lisp stream."
                                :invalid-stream))
-        (handler-case (let ((effective-deadline
-                             (http-deadline timeout
-                                            :deadline
-                                            deadline
-                                            :clock-function
-                                            clock-function))
-                            (completed-p nil))
-                        (unwind-protect
-                            (prog1
-                              (%call-with-tls-deadline
-                               (lambda ()
-                                 (let* ((provider
-                                         (cl-tls-kit:make-cl-crypto-kit-provider))
-                                        (driver
-                                         (cl-tls-kit:make-tls13-server-driver
-                                          :provider
-                                          provider
-                                          :certificate-chain
-                                          certificate-chain
-                                          :private-key
-                                          private-key
-                                          :ticket-key-store
-                                          shared-store
-                                          :session-tickets
-                                          session-tickets-p
-                                          :alpn-protocols
-                                          server-alpn))
-                                        (state
-                                         (%make-http-tls-server-state :driver
-                                                                      driver
-                                                                      :provider
-                                                                      provider
-                                                                      :transport-stream
-                                                                      stream
-                                                                      :deadline
-                                                                      effective-deadline
-                                                                      :clock-function
-                                                                      clock-function)))
-                                   (%tls-server-handshake state)
-                                   (make-instance 'http-tls-stream
-                                                  :driver
-                                                  state
-                                                  :transport-stream
-                                                  stream)))
-                               effective-deadline
-                               clock-function)
-                              (setf completed-p t))
-                          (unless completed-p
-                            (http-kit::%with-http-cleanup
-                             (when (open-stream-p stream)
-                               (close stream :abort t))))))
-          (http-timeout (condition)
-            (error condition))
-          (http-protocol-error (condition)
-            (error condition))
-          (error ()
-            (%tls-server-fail "TLS server handshake failed." :handshake-failed)))))
+        (let ((driver nil))
+          (handler-case
+              (let ((effective-deadline
+                      (http-deadline timeout
+                                     :deadline
+                                     deadline
+                                     :clock-function
+                                     clock-function))
+                    (completed-p nil))
+                (unwind-protect
+                     (prog1
+                       (%call-with-tls-deadline
+                        (lambda ()
+                          (let ((provider
+                                  (cl-tls-kit:make-cl-crypto-kit-provider)))
+                            (setf driver
+                                  (cl-tls-kit:make-tls13-server-driver
+                                   :provider provider
+                                   :certificate-chain certificate-chain
+                                   :private-key private-key
+                                   :ticket-key-store server-ticket-key-store
+                                   :session-tickets session-tickets-p
+                                   :alpn-protocols server-alpn))
+                            (let ((state
+                                    (%make-http-tls-server-state
+                                     :driver driver
+                                     :provider provider
+                                     :transport-stream stream
+                                     :deadline effective-deadline
+                                     :clock-function clock-function)))
+                              (%tls-server-handshake state)
+                              (make-instance 'http-tls-stream
+                                             :driver state
+                                             :transport-stream stream))))
+                        effective-deadline
+                        clock-function)
+                       (setf completed-p t))
+                  (unless completed-p
+                    (http-kit::%with-http-cleanup
+                      (when driver
+                        (cl-tls-kit:tls13-server-driver-close driver)))
+                    (http-kit::%with-http-cleanup
+                      (when (open-stream-p stream)
+                        (close stream :abort t))))))
+            (http-timeout (condition)
+              (error condition))
+            (http-protocol-error (condition)
+              (error condition))
+            (error ()
+              (%tls-server-fail "TLS server handshake failed." :handshake-failed))))))
     #-sbcl
     (%tls-unsupported :tls-native-server)))
