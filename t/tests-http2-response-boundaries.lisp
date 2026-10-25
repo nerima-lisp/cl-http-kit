@@ -46,8 +46,7 @@
                   (nreverse chunks)
                   "HTTP/2 DATA callbacks preserve frame boundaries")))
 
-(progn
-  (deftest http2-response-headers-callback-precedes-body-and-skips-information
+(deftest http2-response-headers-callback-precedes-body-and-skips-information
     (let* ((events nil)
            (response
              (http-kit/http2:send-http2-request
@@ -79,61 +78,61 @@
              (list :body (octets 65 66)))
        (nreverse events))))
   (deftest http2-response-header-http-error-is-preserved
-    (let* ((input
-             (concatenate-octets
-              (h2-frame 4 0 0 (octets))
-              (h2-frame 1 5 1
-                        (h2-header-block (cons ":status" "200")))))
-           (stream (make-instance 'binary-session-stream :input input))
+  (let* ((input
+           (concatenate-octets
+            (h2-frame 4 0 0 (octets))
+            (h2-frame 1 5 1
+                      (h2-header-block (cons ":status" "200")))))
+         (stream (make-instance 'binary-session-stream :input input))
+         (connection (http-kit/http2:make-http2-connection :stream stream))
+         (request (make-http-request :method "GET"
+                                     :uri "https://example.test/reject"))
+         (callback-error
+           (make-condition 'http-protocol-error
+                           :message "response rejected"
+                           :operation :test-callback
+                           :detail :rejected))
+         (observed-error nil))
+    (unwind-protect
+         (progn
+           (handler-case
+               (http-kit/http2::%h2-send-http2-request-over-connection-serial
+                connection request
+                :on-response-headers
+                (lambda (status headers)
+                  (declare (ignore status headers))
+                  (error callback-error)))
+             (error (condition)
+               (setf observed-error condition)))
+           (ensure-true (eq callback-error observed-error))
+           (ensure-true (http-kit/http2:http2-connection-open-p connection)))
+      (http-kit/http2:close-http2-connection connection))))
+  (deftest http2-response-cancel-callbacks-use-default-code
+  (dolist (sender
+           (list #'http-kit/http2::%h2-send-http2-request-over-connection-serial
+                 #'http-kit/http2:send-http2-request-over-connection))
+    (let* ((stream
+             (make-instance 'binary-session-stream
+                            :input (h2-frame 4 0 0 (octets))))
            (connection (http-kit/http2:make-http2-connection :stream stream))
            (request (make-http-request :method "GET"
-                                       :uri "https://example.test/reject"))
-           (callback-error
-             (make-condition 'http-protocol-error
-                             :message "response rejected"
-                             :operation :test-callback
-                             :detail :rejected))
-           (observed-error nil))
+                                       :uri "https://example.test/cancel"))
+           (failure nil))
       (unwind-protect
            (progn
              (handler-case
-                 (http-kit/http2::%h2-send-http2-request-over-connection-serial
-                  connection request
-                  :on-response-headers
-                  (lambda (status headers)
-                    (declare (ignore status headers))
-                    (error callback-error)))
+                 (funcall sender
+                          connection request
+                          :on-cancel
+                          (lambda (cancel-function)
+                            (funcall cancel-function)
+                            nil))
                (error (condition)
-                 (setf observed-error condition)))
-             (ensure-true (eq callback-error observed-error))
-             (ensure-true (http-kit/http2:http2-connection-open-p connection)))
-        (http-kit/http2:close-http2-connection connection))))
-  (deftest http2-response-cancel-callbacks-use-default-code
-    (dolist (sender
-             (list #'http-kit/http2::%h2-send-http2-request-over-connection-serial
-                   #'http-kit/http2:send-http2-request-over-connection))
-      (let* ((stream
-               (make-instance 'binary-session-stream
-                              :input (h2-frame 4 0 0 (octets))))
-             (connection (http-kit/http2:make-http2-connection :stream stream))
-             (request (make-http-request :method "GET"
-                                         :uri "https://example.test/cancel"))
-             (failure nil))
-        (unwind-protect
-             (progn
-               (handler-case
-                   (funcall sender
-                            connection request
-                            :on-cancel
-                            (lambda (cancel-function)
-                              (funcall cancel-function)
-                              nil))
-                 (error (condition)
-                   (setf failure condition)))
-               (ensure-true (typep failure 'http-connection-error))
-               (ensure-equal '(:local-cancel 1 8)
-                             (http-connection-error-cause failure)))
-          (http-kit/http2:close-http2-connection connection)))))
+                 (setf failure condition)))
+             (ensure-true (typep failure 'http-connection-error))
+             (ensure-equal '(:local-cancel 1 8)
+                           (http-connection-error-cause failure)))
+        (http-kit/http2:close-http2-connection connection)))))
 
   (deftest http2-response-callbacks-cover-serial-and-scheduled-transport
     (let* ((input
@@ -295,7 +294,6 @@
              (ensure-true (typep failure 'http-protocol-error))
              (ensure-equal :invalid (http-protocol-error-detail failure)))
         (http-kit/http2:close-http2-connection connection))))
-)
 
 (deftest http2-accepts-padded-response-frames
   (let* ((header-block (h2-header-block
