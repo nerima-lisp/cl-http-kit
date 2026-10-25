@@ -4968,6 +4968,10 @@
   (let ((writes nil)
         (client
           (http3-test-make-native-client
+           :try-read-stream
+           (lambda (stream &key timeout deadline)
+             (declare (ignore stream timeout deadline))
+             (values nil nil :would-block))
            :write-stream
            (lambda (stream bytes &key fin-p timeout deadline)
              (declare (ignore stream fin-p timeout deadline))
