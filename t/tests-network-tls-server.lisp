@@ -1177,3 +1177,40 @@
         (%tls-server-test-remove-material material))))
 
   )
+
+#+sbcl
+(deftest tls-server-bounds-handshake-buffer-growth-for-one-byte-fragments
+  (let* ((message-size (+ 4 (* 1024 1024)))
+         (message
+           (make-array message-size
+                       :element-type (quote (unsigned-byte 8))
+                       :initial-element 0))
+         (fragment (make-array 1 :element-type (quote (unsigned-byte 8))))
+         (state (http-kit/tls::%make-http-tls-server-state))
+         (buffer (http-kit/tls::http-tls-server-state-handshake-buffer state))
+         (last-capacity (array-total-size buffer))
+         (growth-count 0)
+         (estimated-copied-bytes 0))
+    (setf (aref message 0) 1
+          (aref message 1) #x10)
+    (loop for position below (1- message-size)
+          for buffer =
+            (http-kit/tls::http-tls-server-state-handshake-buffer state)
+          for buffered-before = (fill-pointer buffer)
+          do (setf (aref fragment 0) (aref message position))
+             (http-kit/tls::%tls-server-feed-handshake state fragment)
+             (let* ((buffer
+                      (http-kit/tls::http-tls-server-state-handshake-buffer
+                       state))
+                    (capacity (array-total-size buffer)))
+               (unless (= capacity last-capacity)
+                 (incf growth-count)
+                 (incf estimated-copied-bytes buffered-before)
+                 (setf last-capacity capacity)
+                 (ensure-true (<= growth-count 20)))))
+    (let ((buffer
+            (http-kit/tls::http-tls-server-state-handshake-buffer state)))
+      (ensure-equal (1- message-size) (fill-pointer buffer))
+      (ensure-true (<= growth-count 20))
+      (ensure-true
+       (<= estimated-copied-bytes (* 2 (fill-pointer buffer)))))))
