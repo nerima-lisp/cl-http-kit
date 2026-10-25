@@ -21,6 +21,7 @@
   max-connection-age
   clock-function
   lock
+  (generation 0)
   (clear-callbacks nil)
   (entries nil))
 
@@ -227,19 +228,22 @@ be used concurrently from multiple threads."
               (remove oldest entries :test #'eq))
         (%pool-close pool (%http-pooled-connection-stream oldest))))))
 
-(defun %pool-retain (pool key stream opened-at last-used)
+(defun %pool-retain (pool key stream opened-at last-used generation)
   (let ((max-idle (%http-connection-pool-max-idle pool)))
-    (if (zerop max-idle)
-        (%pool-close pool stream)
-        (progn
-          (when (>= (length (%http-connection-pool-entries pool)) max-idle)
-            (%pool-evict-oldest pool))
-          (push (%make-http-pooled-connection
-                 :key key
-                 :stream stream
-                 :opened-at opened-at
-                 :last-used last-used)
-                (%http-connection-pool-entries pool)))))
+    (cond
+      ((/= generation (%http-connection-pool-generation pool))
+       (%pool-close pool stream))
+      ((zerop max-idle)
+       (%pool-close pool stream))
+      (t
+       (when (>= (length (%http-connection-pool-entries pool)) max-idle)
+         (%pool-evict-oldest pool))
+       (push (%make-http-pooled-connection
+              :key key
+              :stream stream
+              :opened-at opened-at
+              :last-used last-used)
+             (%http-connection-pool-entries pool)))))
   pool)
 
 (defun %pool-open (pool request &key timeout deadline proxy-plan proxy)
@@ -270,12 +274,13 @@ be used concurrently from multiple threads."
           (%http-connection-pool-max-connection-age pool))))
 
 (defun http-connection-pool-clear (pool)
-  "Close and remove every idle connection in POOL, returning its count."
+  "Close idle entries in POOL and invoke its clear callbacks. Return the number of idle entries removed."
   (%pool-ensure-pool pool)
   (let ((entries nil)
         (callbacks nil)
         (callback-error nil))
     (%with-client-lock ((%http-connection-pool-lock pool))
+      (incf (%http-connection-pool-generation pool))
       (setf entries (%http-connection-pool-entries pool)
             callbacks (copy-list
                        (%http-connection-pool-clear-callbacks pool))
@@ -315,6 +320,7 @@ be used concurrently from multiple threads."
                      :cause condition))))
          (stream nil)
          (opened-at nil)
+         (generation nil)
          (retained-p nil))
     (handler-case
         (with-http-deadline
@@ -322,10 +328,11 @@ be used concurrently from multiple threads."
                             :inherited deadline
                             :clock-function #'%pool-monotonic-time)
          (let ((entry
-                (unless *client-preopened-http-stream*
-                  (%with-client-lock ((%http-connection-pool-lock pool))
-                                     (%pool-purge-expired pool)
-                                     (%pool-take pool key)))))
+                (%with-client-lock ((%http-connection-pool-lock pool))
+                  (setf generation (%http-connection-pool-generation pool))
+                  (unless *client-preopened-http-stream*
+                    (%pool-purge-expired pool)
+                    (%pool-take pool key)))))
            (cond
             (*client-preopened-http-stream*
              (setf stream (prog1 *client-preopened-http-stream*
@@ -349,7 +356,7 @@ be used concurrently from multiple threads."
                  (error '%http-client-alpn-handoff
                         :stream opened-stream))
                 ((or (null negotiated-alpn)
-    (equal negotiated-alpn "http/1.1"))
+                     (equal negotiated-alpn "http/1.1"))
                  nil)
                 (t
                  (%pool-protocol-error
@@ -376,24 +383,25 @@ be used concurrently from multiple threads."
              (if reusable-p
                  (progn
                    (%with-client-lock ((%http-connection-pool-lock pool))
-                                      (%pool-retain pool key stream opened-at (%pool-now pool)))
+                     (%pool-retain pool key stream opened-at (%pool-now pool)
+                                   generation))
                    (setf retained-p t))
-               (%pool-close pool stream))
+                 (%pool-close pool stream))
              (setf stream nil)
              response)))
       (%http-client-alpn-handoff (condition)
-                                 (error condition))
+        (error condition))
       (http-error (condition)
-                  (unless retained-p
-                    (%pool-close pool stream))
-                  (error condition))
+        (unless retained-p
+          (%pool-close pool stream))
+        (error condition))
       (error (condition)
-             (unless retained-p
-               (%pool-close pool stream))
-             (error 'http-connection-error
-                    :message "The pooled HTTP exchange signaled an error."
-                    :operation :transport
-                    :cause condition)))))
+        (unless retained-p
+          (%pool-close pool stream))
+        (error 'http-connection-error
+               :message "The pooled HTTP exchange signaled an error."
+               :operation :transport
+               :cause condition)))))
 
 (defun http-connection-pool-send
     (pool request &key key timeout deadline max-header-bytes max-fields max-body-bytes

@@ -138,11 +138,9 @@
                    frame status body body-length request-method max-body-bytes
                    on-body-chunk collect-body-p expected-stream-id)
                 (setf body-length new-body-length)
-                ;; DATA consumes both the per-stream and connection-level
-                ;; receive windows.  Restore them after processing the
-                ;; payload so a stream transport can receive bodies larger
-                ;; than the initial 65,535-byte window.
-                (%h2-send-window-update writer stream-id data-length)
+                ;; Restore stream credit only while more response DATA can arrive.
+                (unless end-stream
+                  (%h2-send-window-update writer stream-id data-length))
                 (%h2-send-window-update writer 0 data-length)
                 (when end-stream
                   (return-from %h2-read-response

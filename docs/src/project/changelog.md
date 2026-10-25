@@ -14,6 +14,15 @@ historical release behavior, not the current API contract; see the
   See the
   [WebSocket and SSE migration guide](migration.md#websocket-and-sse-api-migration).
 
+### HTTP/2
+
+- report malformed PING frames received while awaiting an acknowledgement as
+  `http-protocol-error` with `:http2-client` operation and the received frame
+  as detail.
+- document `:http2-read` detail for DATA on a never-opened HTTP/2 client stream:
+  the stream ID while another request is in progress and has not failed,
+  otherwise a list with `0` (the DATA frame type) followed by the stream ID.
+
 ## 0.4.1
 
 - require certificate-chain, hostname, and trust verification by default on
