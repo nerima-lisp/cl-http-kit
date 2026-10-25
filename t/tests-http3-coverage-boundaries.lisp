@@ -2480,7 +2480,7 @@
                        (http-kit/http3:send-http3-request client request)))))
              (ensure-true
               (typep failure (find-class (quote http-invalid-header))))
-             (ensure-equal :http3-header (http-error-operation failure))
+             (ensure-equal :header (http-error-operation failure))
              (ensure-equal "x good" (http-invalid-header-name failure))
              (ensure-equal "the field name is not a token."
                            (http-invalid-header-reason failure))
