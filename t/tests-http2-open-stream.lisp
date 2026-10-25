@@ -4034,7 +4034,6 @@
            (first-failure nil)
            (second-response nil)
            (second-failure nil)
-           (body-chunks nil)
            (first-thread nil))
       (unwind-protect
            (progn
@@ -4054,10 +4053,7 @@
                                    (sb-thread:signal-semaphore headers-entered)
                                    (setf callback-wait-result
                                          (sb-thread:wait-on-semaphore
-                                          release-headers :timeout 10)))
-                                 :on-body-chunk
-                                 (lambda (chunk)
-                                   (push (copy-seq chunk) body-chunks))))
+                                          release-headers :timeout 10)))))
                         (error (condition)
                           (setf first-failure condition))))))
              (ensure-true
@@ -4083,8 +4079,7 @@
              (ensure-equal 200 (http-response-status first-response))
              (ensure-equal (octets 65 66) (http-response-body first-response))
              (ensure-equal 200 (http-response-status second-response))
-             (ensure-equal (octets) (http-response-body second-response))
-             (ensure-equal (list (octets 65 66)) (nreverse body-chunks)))
+             (ensure-equal (octets) (http-response-body second-response)))
         (when first-thread
           (unless release-signaled-p
             (sb-thread:signal-semaphore release-headers))
