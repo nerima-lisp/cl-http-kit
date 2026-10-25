@@ -3884,3 +3884,91 @@
                            (http-kit/http2:http2-connection-manager-connection-count
                             manager)))
         (http-kit/http2:close-http2-connection-manager manager)))))
+#+sbcl
+(deftest http2-response-headers-callback-defers-data-until-callback-completes
+    (let* ((callback-error
+             (make-condition (quote simple-error)
+                             :format-control "headers rejected"
+                             :format-arguments nil))
+           (headers-entered (sb-thread:make-semaphore :count 0))
+           (release-headers (sb-thread:make-semaphore :count 0))
+           (release-signaled-p nil)
+           (input
+             (concatenate-octets
+              (h2-frame 4 0 0 (octets))
+              (h2-frame 1 4 1 (h2-header-block (cons ":status" "200")))
+              (h2-frame 0 0 1 (octets 65 66))
+              (h2-frame 1 5 3 (h2-header-block (cons ":status" "200")))))
+           (stream (make-instance (quote binary-session-stream) :input input))
+           (connection
+             (http-kit/http2:make-http2-connection
+              :stream stream :max-body-bytes 1))
+           (callback-failure nil)
+           (second-failure nil)
+           (second-response nil)
+           (body-callback-count 0)
+           (first-thread nil))
+      (unwind-protect
+           (progn
+             (setf first-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (handler-case
+                          (http-kit/http2:send-http2-request-over-connection
+                           connection
+                           (make-http-request :method "GET"
+                                              :uri "https://race.test/first")
+                           :on-response-headers
+                           (lambda (status headers)
+                             (declare (ignore status headers))
+                             (sb-thread:signal-semaphore headers-entered)
+                             (sb-thread:wait-on-semaphore
+                              release-headers :timeout 10)
+                             (error callback-error))
+                           :on-body-chunk
+                           (lambda (chunk)
+                             (declare (ignore chunk))
+                             (incf body-callback-count)))
+                        (error (condition)
+                          (setf callback-failure condition))))))
+             (ensure-true
+              (sb-thread:wait-on-semaphore headers-entered :timeout 5))
+             (handler-case
+                 (setf second-response
+                       (http-kit/http2:send-http2-request-over-connection
+                        connection
+                        (make-http-request :method "GET"
+                                           :uri "https://race.test/second")))
+               (error (condition)
+                 (setf second-failure condition)))
+             (setf release-signaled-p t)
+             (sb-thread:signal-semaphore release-headers)
+             (sb-thread:join-thread first-thread)
+             (setf first-thread nil)
+             (ensure-equal 200 (http-response-status second-response))
+             (ensure-false second-failure)
+             (ensure-true (eq callback-error callback-failure))
+             (ensure-equal 0 body-callback-count)
+             (let ((window-updates
+                     (remove-if-not
+                      (lambda (frame)
+                        (= 8 (http-kit/http2::%h2-frame-type frame)))
+                      (h2-output-frames stream))))
+               (ensure-equal
+                1
+                (count-if
+                 (lambda (frame)
+                   (and (zerop (http-kit/http2::%h2-frame-stream-id frame))
+                        (= 2
+                           (http-kit/http2::%h2-u32
+                            (http-kit/http2::%h2-frame-payload frame) 0))))
+                 window-updates))
+               (ensure-equal
+                0
+                (count 1 window-updates
+                       :key #'http-kit/http2::%h2-frame-stream-id))))
+        (when first-thread
+          (unless release-signaled-p
+            (sb-thread:signal-semaphore release-headers))
+          (sb-thread:join-thread first-thread))
+        (http-kit/http2:close-http2-connection connection))))

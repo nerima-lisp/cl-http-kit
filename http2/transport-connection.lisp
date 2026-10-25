@@ -1257,6 +1257,7 @@ concurrent streams should use SEND-HTTP2-REQUESTS-OVER-CONNECTION."
   local-retired-p
   callback-events
   callback-events-tail
+  data-deferred-p
   (body-position 0)
   status
   headers
@@ -1435,19 +1436,24 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                 (%http2-connection-writer-lock connection)))
 
   (defun %h2-scheduler-return-flow-credit
-      (connection stream-id increment clock-function &optional connection-only-p)
+      (connection stream-id increment clock-function
+       &optional connection-only-p stream-only-p)
     (let ((writer (%h2-scheduler-control-writer connection clock-function)))
       (unless connection-only-p
         (%h2-send-window-update writer stream-id increment))
-      (%h2-send-window-update writer 0 increment)))
+      (unless stream-only-p
+        (%h2-send-window-update writer 0 increment))))
 
-  (defun %h2-scheduler-queue-callback (connection entry event)
+  (defun %h2-scheduler-queue-callback
+      (connection entry event &optional queue-only-when-data-deferred-p)
     (let ((queued-p nil)
           (overflow-condition nil)
           (max-pending-information-events 16))
       (%h2-with-scheduler-lock (connection)
         (unless (or (%h2-batch-entry-local-retired-p entry)
-                    (%h2-batch-entry-error entry))
+                    (%h2-batch-entry-error entry)
+                    (and queue-only-when-data-deferred-p
+                         (not (%h2-batch-entry-data-deferred-p entry))))
           (if (and (eq (first event) :information)
                    (>= (count :information
                               (%h2-batch-entry-callback-events entry)
@@ -1471,7 +1477,9 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                     (setf (cdr tail) cell)
                     (setf (%h2-batch-entry-callback-events entry) cell))
                 (setf (%h2-batch-entry-callback-events-tail entry) cell
-                      queued-p t)))
+                      queued-p t)
+                (when (eq (first event) :response-headers)
+                  (setf (%h2-batch-entry-data-deferred-p entry) t))))
           (%h2-scheduler-broadcast connection)))
       (when overflow-condition
         (%h2-scheduler-retire-entry
@@ -1505,10 +1513,13 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                         :test #'eq))
           (%h2-scheduler-remove-entry connection entry)
           (loop for event in (%h2-batch-entry-callback-events entry)
-                when (eq (first event) :body)
-                  do (incf connection-credit (fourth event)))
+                do (case (first event)
+                     (:body
+                      (unless (sixth event)
+                        (incf connection-credit (fourth event))))))
           (setf (%h2-batch-entry-callback-events entry) nil
                 (%h2-batch-entry-callback-events-tail entry) nil
+                (%h2-batch-entry-data-deferred-p entry) nil
                 (%h2-batch-entry-body-vector entry)
                 (make-array 0 :element-type '(unsigned-byte 8)
                             :adjustable t :fill-pointer 0)
@@ -1551,29 +1562,50 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                       (error (condition)
                         (%h2-scheduler-retire-entry
                          connection entry condition clock-function)
-                        (error condition)))))
+                        (error condition)))
+                    (%h2-with-scheduler-lock (connection)
+                      (unless
+                          (some (lambda (pending-event)
+                                  (eq (first pending-event) :deferred-data))
+                                (%h2-batch-entry-callback-events entry))
+                        (setf (%h2-batch-entry-data-deferred-p entry) nil)))))
+                 (:deferred-data
+                  (unless entry-error
+                    (%h2-scheduler-dispatch-frame
+                     connection (second event) nil nil nil clock-function t)
+                    (%h2-with-scheduler-lock (connection)
+                      (unless
+                          (some (lambda (pending-event)
+                                  (eq (first pending-event) :deferred-data))
+                                (%h2-batch-entry-callback-events entry))
+                        (setf (%h2-batch-entry-data-deferred-p entry) nil)))))
                  (:body
                   (if entry-error
-                      (%h2-scheduler-return-flow-credit
-                       connection 0 (fourth event) clock-function t)
+                      (unless (sixth event)
+                        (%h2-scheduler-return-flow-credit
+                         connection 0 (fourth event) clock-function t))
                       (progn
                         (handler-case
                             (funcall (second event) (third event))
                           (error (condition)
                             (%h2-scheduler-retire-entry
                              connection entry condition clock-function
-                             (fourth event))
+                             (if (sixth event) 0 (fourth event)))
                             (error condition)))
-                        (%h2-scheduler-return-flow-credit
-                         connection
-                         (%h2-batch-entry-stream-id entry)
-                         (fourth event)
-                         clock-function
-                         (%h2-with-scheduler-lock (connection)
-                           (or (%h2-batch-entry-local-retired-p entry)
-                               (%h2-batch-entry-error entry)
-                               (%h2-batch-entry-response entry)
-                               (fifth event)))))))))))
+                        (let ((connection-only-p
+                                (%h2-with-scheduler-lock (connection)
+                                  (or (%h2-batch-entry-local-retired-p entry)
+                                      (%h2-batch-entry-error entry)
+                                      (%h2-batch-entry-response entry)
+                                      (fifth event)))))
+                          (unless (and (sixth event) connection-only-p)
+                            (%h2-scheduler-return-flow-credit
+                             connection
+                             (%h2-batch-entry-stream-id entry)
+                             (fourth event)
+                             clock-function
+                             connection-only-p
+                             (sixth event)))))))))))
 
   (defun %h2-scheduler-entry-for-stream (connection stream-id)
     (%h2-batch-entry-for-stream
@@ -1782,7 +1814,8 @@ CONTINUATION frames must still be consumed contiguously from that queue."
        :max-fields (%http2-connection-max-fields connection))))
 
   (defun %h2-scheduler-dispatch-frame
-      (connection frame reader writer deadline clock-function)
+      (connection frame reader writer deadline clock-function
+       &optional replayed-data-p)
     (declare (ignore writer))
     (when (%http2-connection-scheduler-first-peer-frame-p connection)
       (unless (and (= (%h2-frame-type frame) +http2-settings-type+)
@@ -1894,6 +1927,15 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                                     stream-id
                                     (list type stream-id)))))
            (when entry
+             (when (and (not replayed-data-p)
+                        (%h2-scheduler-queue-callback
+                         connection entry (list :deferred-data frame) t))
+               (let ((flow-controlled-length
+                       (length (%h2-frame-payload frame))))
+                 (when (plusp flow-controlled-length)
+                   (%h2-scheduler-return-flow-credit
+                    connection 0 flow-controlled-length clock-function t)))
+               (return-from %h2-scheduler-dispatch-frame nil))
   (if (%h2-batch-entry-local-retired-p entry)
       (%h2-scheduler-dispatch-retired-data
        connection entry frame clock-function)
@@ -1917,7 +1959,8 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                             connection entry
                             (list :body callback payload flow-controlled-length
                                   (/= 0 (logand (%h2-frame-flags frame)
-                                                +http2-end-stream-flag+)))))))))
+                                                +http2-end-stream-flag+))
+                                  replayed-data-p)))))))
           (multiple-value-bind (end-stream-p body-length payload-length)
               (%h2-append-data-frame*
                frame
@@ -1940,10 +1983,13 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                   (setf (%h2-batch-entry-body-length entry) body-length))
               (unless callback-queued-p
                 (%h2-with-scheduler-lock (connection)
-                  (unless (%http2-connection-closed-p connection)
+                  (unless (or (%http2-connection-closed-p connection)
+                              (and replayed-data-p
+                                   (or retired-p end-stream-p)))
                     (%h2-scheduler-return-flow-credit
                      connection stream-id payload-length clock-function
-                     (or retired-p end-stream-p))))))
+                     (or retired-p end-stream-p)
+                     replayed-data-p)))))
             (when end-stream-p
               (%h2-scheduler-mark-response
                connection entry
