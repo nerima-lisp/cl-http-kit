@@ -6,29 +6,19 @@
      ,@body)
   #-sbcl
   `(progn ,@body))
-(defun %h2-rethrow-response-header-callback-error (condition callback-error)
-  (if (and callback-error
-           (or (eq condition callback-error)
-               (and (typep condition 'http-kit:http-connection-error)
-                    (eq (http-kit:http-connection-error-cause condition)
-                        callback-error))))
-      (error callback-error)
-      (error condition)))
 (defun %h2-call-with-response-header-callback-error-translation
     (message-thunk operation-thunk callback-error-thunk body-thunk)
   (handler-case
-      (handler-case
-          (funcall body-thunk)
-        (http-kit::http-error (condition)
-          (error condition))
-        (error (condition)
+      (funcall body-thunk)
+    (http-kit::http-error (condition)
+      (error condition))
+    (error (condition)
+      (if (eq condition (funcall callback-error-thunk))
+          (error condition)
           (error 'http-kit:http-connection-error
                  :message (funcall message-thunk)
                  :operation (funcall operation-thunk)
-                 :cause condition)))
-    (error (condition)
-      (%h2-rethrow-response-header-callback-error
-       condition (funcall callback-error-thunk)))))
+                 :cause condition)))))
 (defun http2-client-connection (client)
   (and (http2-client-p client)
        (%http2-connection client)))
