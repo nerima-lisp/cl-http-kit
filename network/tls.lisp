@@ -892,6 +892,7 @@ driver's transport callbacks."
 
   (defun make-http-tls-server-wrapper
       (&key certificate-chain private-key ticket-key-store alpn-protocols
+            (session-tickets-p t)
             (clock-function #'%tls-monotonic-time))
     "Return a server wrapper that adapts the cl-tls-kit TLS 1.3 driver."
     (unless (functionp clock-function)
@@ -915,11 +916,12 @@ driver's transport callbacks."
                            :invalid-ticket-key-store))
     #+sbcl
     (let ((shared-store
-           (or ticket-key-store
-               (handler-case (cl-tls-kit:make-tls13-server-ticket-key-store)
-                 (error ()
-                   (%tls-protocol-error "TLS ticket key store could not be created."
-                                        :invalid-ticket-key-store)))))
+           (when session-tickets-p
+             (or ticket-key-store
+                 (handler-case (cl-tls-kit:make-tls13-server-ticket-key-store)
+                   (error ()
+                     (%tls-protocol-error "TLS ticket key store could not be created."
+                                          :invalid-ticket-key-store))))))
           (server-alpn (copy-list alpn-protocols)))
       (lambda (stream &key timeout deadline &allow-other-keys)
         (unless (streamp stream)
@@ -948,6 +950,8 @@ driver's transport callbacks."
                                           private-key
                                           :ticket-key-store
                                           shared-store
+                                          :session-tickets
+                                          session-tickets-p
                                           :alpn-protocols
                                           server-alpn))
                                         (state

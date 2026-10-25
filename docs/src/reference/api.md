@@ -1037,9 +1037,11 @@ The wrapper rejects transport EOF without a peer close_notify instead of
 treating a truncated TLS stream as a completed HTTP response.
 The lambda list for `make-http-tls-server-wrapper` is
 `(make-http-tls-server-wrapper &key certificate-chain private-key
-ticket-key-store alpn-protocols clock-function)`. The certificate chain and
-private key are required; the clock defaults to a monotonic clock. It returns a
-callback invoked as
+ticket-key-store session-tickets-p alpn-protocols clock-function)`. The
+certificate chain and private key are required; the clock defaults to a
+monotonic clock. `session-tickets-p` defaults to true. Set it to NIL to prevent
+the cl-tls-kit driver from creating a ticket-key store, resumption secret, or
+`NewSessionTicket` message. It returns a callback invoked as
 `(funcall wrapper stream &key timeout deadline)`. The callback completes the
 TLS 1.3 server handshake and returns the negotiated TLS stream; `timeout` and
 `deadline` bound the handshake.

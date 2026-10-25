@@ -21,6 +21,8 @@ historical release behavior, not the current API contract; see the
 - add an HTTPS listener on SBCL with ALPN negotiation for HTTP/2 and HTTP/1.1,
   bounded connection and request resources, lifecycle callbacks, and graceful
   shutdown;
+- add `:session-tickets-p` to `make-http-tls-server-wrapper`, allowing server
+  ticket issuance to be disabled;
 
 ### Changed
 

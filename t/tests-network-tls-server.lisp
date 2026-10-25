@@ -276,6 +276,58 @@
         (ensure-equal :unexpected-record
                       (http-protocol-error-detail condition)))
       (close stream :abort t)))
+(deftest tls-server-wrapper-does-not-issue-session-tickets
+  (%tls-server-test-with-spy
+   'cl-tls-kit:make-tls13-server-ticket-key-store
+   (lambda (&rest arguments)
+     (declare (ignore arguments))
+     (error "Session ticket store creation is disabled."))
+   (lambda ()
+     (let* ((material (%tls-server-test-material))
+            (trust-anchor
+              (cl-tls-kit.x509:parse-certificate-der
+               (first (getf material :certificate-chain))))
+            (client-store (cl-tls-kit:make-tls13-ticket-store))
+            (listener (open-http-tcp-listener :host "127.0.0.1"))
+            (wrapper
+              (make-http-tls-server-wrapper
+               :certificate-chain (getf material :certificate-chain)
+               :private-key (getf material :private-key)
+               :session-tickets-p nil
+               :alpn-protocols '("h2" "http/1.1")))
+            (port (http-network-listener-port listener))
+            (server-failed-p nil)
+            (thread nil))
+       (unwind-protect
+            (progn
+              (setf thread
+                    (sb-thread:make-thread
+                     (lambda ()
+                       (handler-case
+                           (let ((raw (accept-http-tcp-stream listener :timeout 5))
+                                 (secure nil))
+                             (unwind-protect
+                                  (progn
+                                    (setf secure (funcall wrapper raw :timeout 5)
+                                          raw nil)
+                                    (write-sequence (ascii "tls-ok") secure)
+                                    (finish-output secure)
+                                    (close secure))
+                               (when (and raw (open-stream-p raw))
+                                 (close raw :abort t))))
+                         (error ()
+                           (setf server-failed-p t))))
+                     :name "TLS server wrapper without tickets"))
+              (%tls-server-test-client-connection
+               port client-store trust-anchor nil)
+              (sb-thread:join-thread thread)
+              (ensure-false server-failed-p)
+              (ensure-equal 0 (cl-tls-kit::%tls13-ticket-store-count client-store)))
+         (when thread
+           (close-http-tcp-listener listener)
+           (sb-thread:join-thread thread))
+         (close-http-tcp-listener listener)
+         (%tls-server-test-remove-material material))))))
 
   (progn
 (deftest tls-server-wrapper-sanitizes-peer-and-setup-failures
