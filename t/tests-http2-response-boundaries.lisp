@@ -647,7 +647,7 @@
               (ensure-equal (h2-preface) (subseq wire 0 (length (h2-preface))))
               (incf exchanges)
               (h2-response-wire (octets 0 255))))))
-    (dolist (options '((:on-body-chunk :invalid) (:collect-body-p :invalid)))
+    (dolist (options '((:on-body-chunk :invalid) (:on-response-headers :invalid) (:collect-body-p :invalid)))
       (let ((failure
               (handler-case
                   (apply #'http-kit/http2:send-http2-request client request options)
