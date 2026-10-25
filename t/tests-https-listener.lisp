@@ -1619,7 +1619,7 @@
                 (incf external-key-generation-count)
                 (make-array size
                             :element-type '(unsigned-byte 8)
-                            :initial-element 201))))
+                            :initial-element external-key-generation-count))))
            (owned-server nil)
            (external-server nil)
            (initial-owned-store nil)
