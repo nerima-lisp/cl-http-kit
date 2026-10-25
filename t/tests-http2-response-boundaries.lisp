@@ -107,32 +107,36 @@
            (ensure-true (eq callback-error observed-error))
            (ensure-true (http-kit/http2:http2-connection-open-p connection)))
       (http-kit/http2:close-http2-connection connection))))
-  (deftest http2-response-cancel-callbacks-use-default-code
+  (deftest http2-response-cancel-callbacks-use-default-and-custom-codes
   (dolist (sender
            (list #'http-kit/http2::%h2-send-http2-request-over-connection-serial
                  #'http-kit/http2:send-http2-request-over-connection))
-    (let* ((stream
-             (make-instance 'binary-session-stream
-                            :input (h2-frame 4 0 0 (octets))))
-           (connection (http-kit/http2:make-http2-connection :stream stream))
-           (request (make-http-request :method "GET"
-                                       :uri "https://example.test/cancel"))
-           (failure nil))
-      (unwind-protect
-           (progn
-             (handler-case
-                 (funcall sender
-                          connection request
-                          :on-cancel
-                          (lambda (cancel-function)
-                            (funcall cancel-function)
-                            nil))
-               (error (condition)
-                 (setf failure condition)))
-             (ensure-true (typep failure 'http-connection-error))
-             (ensure-equal '(:local-cancel 1 8)
-                           (http-connection-error-cause failure)))
-        (http-kit/http2:close-http2-connection connection)))))
+    (dolist (cancel-case '((nil 8) ((:error-code 7) 7)))
+      (destructuring-bind (cancel-arguments expected-error-code) cancel-case
+        (let* ((stream
+                 (make-instance 'binary-session-stream
+                                :input (h2-frame 4 0 0 (octets))))
+               (connection
+                 (http-kit/http2:make-http2-connection :stream stream))
+               (request
+                 (make-http-request :method "GET"
+                                    :uri "https://example.test/cancel"))
+               (failure nil))
+          (unwind-protect
+               (progn
+                 (handler-case
+                     (funcall sender
+                              connection request
+                              :on-cancel
+                              (lambda (cancel-function)
+                                (apply cancel-function cancel-arguments)
+                                nil))
+                   (error (condition)
+                     (setf failure condition)))
+                 (ensure-true (typep failure 'http-connection-error))
+                 (ensure-equal (list :local-cancel 1 expected-error-code)
+                               (http-connection-error-cause failure)))
+            (http-kit/http2:close-http2-connection connection)))))))
 
   (deftest http2-response-callbacks-cover-serial-and-scheduled-transport
     (let* ((input
