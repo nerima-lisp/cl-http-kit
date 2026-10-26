@@ -1085,7 +1085,14 @@ becomes readable again."
                                 (http3-client-peer-control-stream client)
                                 (http3-client-peer-qpack-encoder-stream client)
                                 (http3-client-peer-qpack-decoder-stream client)))
-                       pending-peer-streams discard-streams push-streams)
+                       pending-peer-streams discard-streams push-streams
+                       (remove nil
+                               (append
+                                (loop for entry being the hash-values
+                                      of (http3-client-request-streams client)
+                                      collect (%http3-request-stream-stream entry))
+                                (mapcar #'%http3-request-stream-stream
+                                        (http3-client-pending-request-streams client)))))
                       :test #'eq)
                    (copy-list (http3-client-close-pending-streams client))))
                (decoder

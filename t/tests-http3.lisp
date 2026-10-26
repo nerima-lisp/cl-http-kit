@@ -2474,7 +2474,7 @@
                          (http-kit/http3::http3-client-runnable-stream-ids client))
            (ensure-equal 0
                          (http-kit/http3::http3-client-request-stream-count client))
-           (ensure-false (http3-test-stream-closed-p request-stream)))
+           (ensure-true (http3-test-stream-closed-p request-stream)))
       (when (and client (http-kit/http3:http3-client-open-p client))
         (http-kit/http3:close-http3-client client)))))
 (deftest http3-client-native-scheduler-close-in-body-producer-stops-progress
@@ -2558,7 +2558,7 @@
                          request-frame-types)
            (ensure-true (plusp request-read-count))
            (ensure-equal 0 request-read-after-producer-count)
-           (ensure-false (http3-test-stream-closed-p request-stream))
+           (ensure-true (http3-test-stream-closed-p request-stream))
            (ensure-equal 0
                          (hash-table-count
                           (http-kit/http3::http3-client-request-streams client)))
@@ -14313,6 +14313,91 @@
                      (hash-table-count stream-prefixes))
        (ensure-equal prefix-sent-count-before
                      (hash-table-count stream-prefix-sent))))))
+(deftest http3-quic-adapter-close-closes-active-request-stream-prefix
+  (call-with-http3-coverage-adapter-fixture
+   (lambda (adapter)
+     (let* ((client
+              (http-kit/http3:http3-quic-adapter-http3-client adapter))
+            (stream-prefixes
+              (http-kit/http3::http3-quic-adapter-stream-prefixes adapter))
+            (stream-prefix-sent
+              (http-kit/http3::http3-quic-adapter-stream-prefix-sent adapter))
+            (request-opened (sb-thread:make-semaphore :count 0))
+            (poll-blocked (sb-thread:make-semaphore :count 0))
+            (release-poll (sb-thread:make-semaphore :count 0))
+            (poll-count 0)
+            (original-poll (symbol-function 'cl-quic-kit:client-poll))
+            (original-close (http-kit/http3::http3-client-close-stream client))
+            (closed-streams nil)
+            (request-stream nil)
+            (request-thread nil)
+            (request-finished nil)
+            (request-result nil)
+            (close-thread nil)
+            (close-finished nil)
+            (close-result nil))
+       (unwind-protect
+            (progn
+              (setf (http-kit/http3::http3-client-close-stream client)
+                    (lambda (stream &key condition)
+                      (push stream closed-streams)
+                      (funcall original-close stream :condition condition)))
+              (call-with-http3-quic-lifecycle-spies
+               (lambda (calls)
+                 (declare (ignore calls))
+                 (multiple-value-setq
+                     (request-thread request-finished request-result)
+                   (http3-test-start-native-call
+                    (lambda ()
+                      (http-kit/http3:send-http3-request
+                       client
+                       (make-http-request
+                        :method "GET"
+                        :uri "https://example.test/active-close")
+                       :timeout 2
+                       :on-stream-open
+                       (lambda (stream stream-id cancel)
+                         (declare (ignore stream-id cancel))
+                         (setf request-stream stream)
+                         (sb-thread:signal-semaphore request-opened))))))
+                 (ensure-true
+                  (sb-thread:wait-on-semaphore request-opened :timeout 3))
+                 (ensure-true
+                  (sb-thread:wait-on-semaphore poll-blocked :timeout 3))
+                 (ensure-true
+                  (nth-value 1 (gethash request-stream stream-prefixes)))
+                 (multiple-value-setq
+                     (close-thread close-finished close-result)
+                   (http3-test-start-native-call
+                    (lambda ()
+                      (http-kit/http3:close-http3-client client))))
+                 (ensure-true
+                  (http3-test-await-native-close-state client :closing))
+                 (sb-thread:signal-semaphore release-poll)
+                 (ensure-true
+                  (sb-thread:wait-on-semaphore close-finished :timeout 3))
+                 (ensure-true
+                  (sb-thread:wait-on-semaphore request-finished :timeout 3))
+                 (ensure-equal :response (first close-result))
+                 (ensure-equal :error (first request-result))
+                 (ensure-true
+                  (typep (second request-result) 'http-connection-error))
+                 (ensure-true
+                  (member request-stream closed-streams :test #'eq))
+                 (ensure-equal 0 (hash-table-count stream-prefixes))
+                 (ensure-equal 0 (hash-table-count stream-prefix-sent)))
+               :client-poll
+               (lambda (actual &optional at)
+                 (incf poll-count)
+                 (when (= poll-count 2)
+                   (sb-thread:signal-semaphore poll-blocked)
+                   (sb-thread:wait-on-semaphore release-poll :timeout 5))
+                 (funcall original-poll actual at))))
+         (sb-thread:signal-semaphore release-poll)
+         (http3-test-join-native-thread request-thread request-finished)
+         (http3-test-join-native-thread close-thread close-finished)
+         (setf (http-kit/http3::http3-client-close-stream client)
+               original-close))))))
 
 (deftest http3-quic-adapter-reports-cleanup-only-close-failure
   (let* ((quic (make-http3-quic-adapter-test-client))
