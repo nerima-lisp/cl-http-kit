@@ -146,27 +146,73 @@
     (values ciphertext-p pending)))
 (defun %tls-transport (stream)
   (let ((ciphertext-p nil)
-        (handshake-buffer (make-array 0 :element-type '(unsigned-byte 8))))
-    (list :read
-          (lambda (driver)
-            (declare (ignore driver))
-            (let ((wire (%tls-read-record
-                         stream nil :ciphertext-p ciphertext-p)))
-              (when (and wire
-                         (not ciphertext-p)
-                         (= (aref wire 0)
-                            cl-tls-kit:+tls-content-type-handshake+))
-                (multiple-value-setq (ciphertext-p handshake-buffer)
-                  (%tls-client-track-server-hello
-                   handshake-buffer (subseq wire 5))))
-              wire))
-          :write (lambda (driver bytes)
-                   (declare (ignore driver))
-                   (write-sequence bytes stream)
-                   (finish-output stream))
-          :close (lambda (driver)
-                   (declare (ignore driver))
-                   (close stream))))))
+        (application-read-p nil)
+        (handshake-buffer (make-array 0 :element-type '(unsigned-byte 8)))
+        (record-buffer (make-array 0 :element-type '(unsigned-byte 8)
+                                   :adjustable t :fill-pointer 0)))
+    (labels ((read-available-record ()
+               (loop
+                 (let ((filled (fill-pointer record-buffer)))
+                   (when (>= filled 5)
+                     (let* ((length (+ (ash (aref record-buffer 3) 8)
+                                       (aref record-buffer 4)))
+                            (limit
+                              (if (and ciphertext-p
+                                       (= (aref record-buffer 0)
+                                          cl-tls-kit:+tls-content-type-application-data+))
+                                  cl-tls-kit:+tls-ciphertext-limit+
+                                  cl-tls-kit:+tls-plaintext-limit+))
+                            (record-length (+ 5 length)))
+                       (when (> length limit)
+                         (%tls-protocol-error
+                          "The TLS record exceeds its length limit."
+                          :record-overflow))
+                       (when (>= filled record-length)
+                         (let ((wire (subseq record-buffer 0 record-length)))
+                           (setf (fill-pointer record-buffer) 0)
+                           (return (values wire :data)))))))
+                 (unless (listen stream)
+                   (return (values nil :would-block)))
+                 (let ((byte (read-byte stream nil :eof)))
+                   (when (eq byte :eof)
+                     (if (zerop (fill-pointer record-buffer))
+                         (return (values nil :eof))
+                         (%tls-protocol-error
+                          (if (< (fill-pointer record-buffer) 5)
+                              "The TLS transport ended in a record header."
+                              "The TLS transport ended in a record body.")
+                          :truncated-record)))
+                   (vector-push-extend byte record-buffer)))))
+      (list :read
+            (lambda (driver)
+              (declare (ignore driver))
+              (if application-read-p
+                  (multiple-value-bind (wire status)
+                      (read-available-record)
+                    (case status
+                      (:data wire)
+                      (:would-block :would-block)
+                      (:eof nil)))
+                  (let ((wire (%tls-read-record
+                               stream nil :ciphertext-p ciphertext-p)))
+                    (when (and wire
+                               (not ciphertext-p)
+                               (= (aref wire 0)
+                                  cl-tls-kit:+tls-content-type-handshake+))
+                      (multiple-value-setq (ciphertext-p handshake-buffer)
+                        (%tls-client-track-server-hello
+                         handshake-buffer (subseq wire 5))))
+                    wire)))
+            :enable-application-read
+            (lambda ()
+              (setf application-read-p t))
+            :write (lambda (driver bytes)
+                     (declare (ignore driver))
+                     (write-sequence bytes stream)
+                     (finish-output stream))
+            :close (lambda (driver)
+                     (declare (ignore driver))
+                     (close stream)))))))
 
 (defun %tls-key-exchange ()
   (list
@@ -268,10 +314,7 @@
                (%tls-stream-driver stream))
             (case status
               (:eof (return nil))
-              (:would-block
-               (%tls-protocol-error
-                "The TLS transport would block during a stream read."
-                :would-block))
+              (:would-block (sleep 0.001d0))
               (:data
                (setf (%tls-stream-input stream) plaintext
                      (%tls-stream-input-position stream) 0)
@@ -288,6 +331,58 @@
                "The TLS transport ended without close_notify."
                :missing-close-notify)
               (%tls-driver-error condition))))))
+
+  (defmethod http-kit/http2::%h2-reader-read-available
+      ((stream http-tls-stream) count timeout)
+    (check-type count (integer 0 *))
+    (check-type timeout (or null (real 0 *)))
+    (let* ((driver (%tls-stream-driver stream))
+           (empty (make-array 0 :element-type '(unsigned-byte 8)))
+           (deadline
+             (+ (%tls-monotonic-time)
+                (if timeout (min timeout 0.1d0) 0.1d0))))
+      (cond
+        ((typep driver 'http-tls-server-state)
+         (values empty :would-block nil))
+        ((zerop count)
+         (values empty :data nil))
+        (t
+         (loop
+           (let* ((input (%tls-stream-input stream))
+                  (position (%tls-stream-input-position stream))
+                  (length (length input)))
+             (when (< position length)
+               (let* ((end (+ position (min count (- length position))))
+                      (slice (subseq input position end)))
+                 (setf (%tls-stream-input-position stream) end)
+                 (return (values slice :data nil)))))
+           (handler-case
+               (multiple-value-bind (status plaintext)
+                   (cl-tls-kit:tls13-client-driver-read-application-data driver)
+                 (case status
+                   (:eof (return (values empty :eof t)))
+                   (:would-block
+                    (let ((remaining (- deadline (%tls-monotonic-time))))
+                      (if (plusp remaining)
+                          (sleep (min 0.001d0 remaining))
+                          (return (values empty :would-block nil)))))
+                   (:data
+                    (setf (%tls-stream-input stream) plaintext
+                          (%tls-stream-input-position stream) 0)
+                    (when (and (zerop (length plaintext))
+                               (>= (%tls-monotonic-time) deadline))
+                      (return (values empty :would-block nil))))
+                   (otherwise
+                    (%tls-protocol-error
+                     "The TLS driver returned an invalid read status."
+                     :invalid-read-status))))
+             (cl-tls-kit:tls13-client-driver-error (condition)
+               (if (eq (cl-tls-kit:tls13-client-driver-error-reason condition)
+                       :eof)
+                   (%tls-protocol-error
+                    "The TLS transport ended without close_notify."
+                    :missing-close-notify)
+                   (%tls-driver-error condition)))))))))
 
   (defmethod sb-gray:stream-read-sequence
       ((stream http-tls-stream) sequence &optional (start 0) end)
@@ -353,34 +448,36 @@ driver's transport callbacks."
     (unless (streamp stream)
       (%tls-protocol-error "TLS upgrade requires a Lisp stream." stream))
     #+sbcl
-    (let ((connected-p nil))
-      (unwind-protect
-           (let* ((provider (cl-tls-kit:make-cl-crypto-kit-provider))
-                  (trust-anchors (%tls-load-trust-anchors verify trust-anchors))
-                  (driver
-                    (cl-tls-kit:make-tls13-client-driver
-                     :provider provider
-                     :key-exchange (%tls-key-exchange)
-                     :transport (%tls-transport stream)
-                     :hostname (http-uri-host uri)
-                     :alpn alpn-protocols
-                     :supported-groups '(#x001d #x0017)
-                     :trust-anchors trust-anchors
-                     :verify-signature #'crypto-kit:verify-signature)))
-             (handler-case
-                 (%call-with-tls-deadline
-                  (lambda ()
-                    (cl-tls-kit:tls13-client-driver-connect driver))
-                  (http-deadline timeout :deadline deadline
-                                 :clock-function clock-function)
-                  clock-function)
-               (cl-tls-kit:tls13-client-driver-error (condition)
-                 (%tls-driver-error condition)))
-             (prog1 (%make-http-tls-stream driver stream)
-               (setf connected-p t)))
-        (unless connected-p
-          (http-kit::%with-http-cleanup
-            (close stream :abort t)))))
+(let ((connected-p nil))
+  (unwind-protect
+       (let* ((provider (cl-tls-kit:make-cl-crypto-kit-provider))
+              (trust-anchors (%tls-load-trust-anchors verify trust-anchors))
+              (transport (%tls-transport stream))
+              (driver
+                (cl-tls-kit:make-tls13-client-driver
+                 :provider provider
+                 :key-exchange (%tls-key-exchange)
+                 :transport transport
+                 :hostname (http-uri-host uri)
+                 :alpn alpn-protocols
+                 :supported-groups '(#x001d #x0017)
+                 :trust-anchors trust-anchors
+                 :verify-signature #'crypto-kit:verify-signature)))
+         (handler-case
+             (%call-with-tls-deadline
+              (lambda ()
+                (cl-tls-kit:tls13-client-driver-connect driver))
+              (http-deadline timeout :deadline deadline
+                             :clock-function clock-function)
+              clock-function)
+           (cl-tls-kit:tls13-client-driver-error (condition)
+             (%tls-driver-error condition)))
+         (funcall (getf transport :enable-application-read))
+         (prog1 (%make-http-tls-stream driver stream)
+           (setf connected-p t)))
+    (unless connected-p
+      (http-kit::%with-http-cleanup
+        (close stream :abort t)))))
     #-sbcl
     (%tls-unsupported :tls-native-client)))
 

@@ -7,10 +7,58 @@
   stream-id
   payload)
 
-(defstruct (%h2-reader (:constructor %make-h2-reader))
-  vector
-  position
-  stream)
+(progn
+  (defstruct (%h2-reader (:constructor %make-h2-reader))
+    vector
+    position
+    stream
+    (frame-header (make-array 9 :element-type '(unsigned-byte 8)))
+    (frame-header-position 0)
+    frame-metadata
+    frame-payload
+    (frame-payload-position 0)
+    stream-eof-p)
+
+  (defgeneric %h2-reader-read-available (stream count timeout))
+
+  (defmethod %h2-reader-read-available ((stream stream) count timeout)
+  (let ((buffer (make-array count :element-type (quote (unsigned-byte 8))))
+        (position 0)
+        (eof-p nil)
+        (timeout (if timeout (min timeout 0.1d0) 0.1d0)))
+    #+sbcl
+    (handler-case
+        (sb-ext:with-timeout timeout
+          (loop while (< position count)
+                do (let ((octet (read-byte stream nil :eof)))
+                     (if (eq octet :eof)
+                         (progn
+                           (setf eof-p t)
+                           (return))
+                         (progn
+                           (setf (aref buffer position) octet)
+                           (incf position)
+                           (unless (listen stream)
+                             (return)))))))
+      (sb-ext:timeout () nil))
+    #-sbcl
+    (loop while (< position count)
+          do (let ((octet (read-byte stream nil :eof)))
+               (if (eq octet :eof)
+                   (progn
+                     (setf eof-p t)
+                     (return))
+                   (progn
+                     (setf (aref buffer position) octet)
+                     (incf position)
+                     (unless (listen stream)
+                       (return))))))
+    (values (subseq buffer 0 position)
+            (cond
+              ((plusp position) :data)
+              (eof-p :eof)
+              (t :would-block))
+            eof-p))))
 
 (defun %h2-reader-for (input)
   (cond
@@ -157,7 +205,120 @@
 
 (defun %h2-read-frame
     (reader max-frame-size deadline clock-function
-     &key deadline-function on-first-byte on-header)
+     &key deadline-function on-first-byte on-header slice-p)
+  (when slice-p
+    (return-from %h2-read-frame
+      (let* ((now (funcall clock-function))
+       (active-deadline
+         (if deadline-function
+             (funcall deadline-function)
+             deadline))
+       (slice-deadline
+         (if active-deadline
+             (min active-deadline (+ now 0.1d0))
+             (+ now 0.1d0)))
+       (header (%h2-reader-frame-header reader))
+       (header-position (%h2-reader-frame-header-position reader))
+       (metadata (%h2-reader-frame-metadata reader))
+       (payload (%h2-reader-frame-payload reader))
+       (payload-position (%h2-reader-frame-payload-position reader)))
+  (labels ((fill-buffer (buffer position count)
+             (if (>= position count)
+                 (values position :data)
+                 (multiple-value-bind (octets status eof-p)
+                     (if (%h2-reader-stream reader)
+                         (%h2-reader-read-available
+                          (%h2-reader-stream reader)
+                          (- count position)
+                          (max 0 (- slice-deadline
+                                    (funcall clock-function))))
+                         (let* ((vector (%h2-reader-vector reader))
+                                (source-position (%h2-reader-position reader))
+                                (available
+                                  (min (- count position)
+                                       (- (length vector)
+                                          source-position))))
+                           (if (plusp available)
+                               (values
+                                (prog1
+                                    (subseq vector source-position
+                                            (+ source-position available))
+                                  (incf (%h2-reader-position reader)
+                                        available))
+                                :data nil)
+                               (values
+                                (make-array 0
+                                            :element-type (quote (unsigned-byte 8)))
+                                :eof t))))
+                   (when (plusp (length octets))
+                     (replace buffer octets :start1 position)
+                     (incf position (length octets)))
+                   (when eof-p
+                     (setf (%h2-reader-stream-eof-p reader) t))
+                   (values position status)))))
+    (when (< header-position 9)
+      (let ((first-byte-pending-p
+              (and on-first-byte (zerop header-position))))
+        (multiple-value-bind (new-position status)
+            (fill-buffer header header-position 9)
+          (declare (ignore status))
+          (setf header-position new-position
+                (%h2-reader-frame-header-position reader) new-position)
+          (when (and first-byte-pending-p (plusp new-position))
+            (funcall on-first-byte))))
+      (when (< header-position 9)
+        (if (%h2-reader-stream-eof-p reader)
+            (if (zerop header-position)
+                (return-from %h2-read-frame :eof)
+                (error 'http-protocol-error
+                       :message "The HTTP/2 input ended before a complete frame header was read."
+                       :operation :http2-read
+                       :detail 9))
+            (return-from %h2-read-frame :would-block)))
+      (let* ((length (%h2-u24 header 0))
+             (type (aref header 3))
+             (flags (aref header 4))
+             (stream-word (%h2-u32 header 5)))
+        (when (> length max-frame-size)
+          (error 'http-protocol-error
+                 :message "The HTTP/2 frame exceeds this transport's configured receive maximum."
+                 :operation :http2-read
+                 :detail (list length max-frame-size)))
+        (when (/= 0 (logand stream-word #x80000000))
+          (error 'http-protocol-error
+                 :message "The reserved HTTP/2 stream identifier bit is set."
+                 :operation :http2-read
+                 :detail stream-word))
+        (setf metadata (list length type flags stream-word)
+              payload (make-array length
+                                  :element-type (quote (unsigned-byte 8)))
+              payload-position 0
+              (%h2-reader-frame-metadata reader) metadata
+              (%h2-reader-frame-payload reader) payload)
+        (when on-header
+          (apply on-header metadata))))
+    (setf payload-position
+          (fill-buffer payload payload-position (length payload))
+          (%h2-reader-frame-payload-position reader) payload-position)
+    (when (< payload-position (length payload))
+      (if (%h2-reader-stream-eof-p reader)
+          (error 'http-protocol-error
+                 :message "The HTTP/2 input ended before a complete frame payload was read."
+                 :operation :http2-read
+                 :detail (length payload))
+          (return-from %h2-read-frame :would-block)))
+    (destructuring-bind (length type flags stream-id) metadata
+      (prog1
+          (%make-h2-frame :length length
+                          :type type
+                          :flags flags
+                          :stream-id stream-id
+                          :payload payload)
+        (setf (%h2-reader-frame-header-position reader) 0
+              (%h2-reader-frame-metadata reader) nil
+              (%h2-reader-frame-payload reader) nil
+              (%h2-reader-frame-payload-position reader) 0
+              (%h2-reader-stream-eof-p reader) nil)))))))
   (let ((header (%h2-reader-read reader 9 deadline clock-function
                                  :allow-eof t
                                  :deadline-function deadline-function
