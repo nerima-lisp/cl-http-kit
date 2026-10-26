@@ -37,6 +37,7 @@
           (max-body-bytes http-kit::*default-max-body-bytes*)
           (max-control-frames 100)
           (max-control-window 1.0d0)
+          (max-pending-information-callbacks 16)
           (clock-function #'http-kit::%monotonic-time))
   "Create a reusable HTTP/2 connection over an already negotiated stream.
 
@@ -58,6 +59,8 @@ SETTINGS, stream identifiers, HPACK decoder state, and control frames."
   (%h2-validate-limit :max-fields max-fields)
   (%h2-validate-limit :max-body-bytes max-body-bytes :allow-zero t)
   (%h2-validate-limit :max-control-frames max-control-frames :allow-zero t)
+  (%h2-validate-limit :max-pending-information-callbacks
+                      max-pending-information-callbacks :allow-zero t)
   (unless (and (realp max-control-window)
                (not (minusp max-control-window)))
     (error 'http-kit:http-protocol-error
@@ -78,6 +81,7 @@ SETTINGS, stream identifiers, HPACK decoder state, and control frames."
    :max-body-bytes max-body-bytes
    :max-control-frames max-control-frames
    :max-control-window max-control-window
+   :max-pending-information-callbacks max-pending-information-callbacks
    :clock-function clock-function
    :hpack-context
    (%h2-make-hpack-context :max-table-size +hpack-default-table-size+)))
@@ -1307,6 +1311,7 @@ concurrent streams should use SEND-HTTP2-REQUESTS-OVER-CONNECTION."
   local-retired-p
   callback-events
   callback-events-tail
+  (pending-information-callback-count 0)
   (pending-body-callback-count 0)
   body-limit-error-pending-p
   (response-headers-callback-complete-p t)
@@ -1501,6 +1506,8 @@ CONTINUATION frames must still be consumed contiguously from that queue."
   (defun %h2-scheduler-enqueue-callback-locked (entry event)
     (when (eq (first event) :response-headers)
       (setf (%h2-batch-entry-response-headers-callback-complete-p entry) nil))
+    (when (eq (first event) :information)
+      (incf (%h2-batch-entry-pending-information-callback-count entry)))
     (when (eq (first event) :body)
       (incf (%h2-batch-entry-pending-body-callback-count entry)))
     (let ((cell (list event))
@@ -1519,60 +1526,78 @@ CONTINUATION frames must still be consumed contiguously from that queue."
            (event (and tail (car tail)))
            (body-event (and event (eq (first event) :body) event)))
       (if body-event
-          (let ((queued-payload (third body-event)))
-            (loop for octet across payload
-                  do (vector-push-extend octet queued-payload))
+          (progn
+            (if (sixth body-event)
+                (setf (cdr (third body-event))
+                      (%h2-batch-entry-body-length entry))
+                (loop for octet across payload
+                      do (vector-push-extend octet (third body-event))))
             (incf (fourth body-event) flow-controlled-length)
             (setf (fifth body-event) end-stream-p))
           (let ((queued-payload
-                  (make-array 0 :element-type '(unsigned-byte 8)
-                              :adjustable t :fill-pointer 0)))
-            (loop for octet across payload
-                  do (vector-push-extend octet queued-payload))
+                  (if collect-body-p
+                      (cons (- (%h2-batch-entry-body-length entry)
+                               (length payload))
+                            (%h2-batch-entry-body-length entry))
+                      (let ((body
+                              (make-array 0 :element-type '(unsigned-byte 8)
+                                          :adjustable t :fill-pointer 0)))
+                        (loop for octet across payload
+                              do (vector-push-extend octet body))
+                        body))))
             (%h2-scheduler-enqueue-callback-locked
              entry (list :body callback queued-payload flow-controlled-length
                          end-stream-p collect-body-p))))
-      (incf (%http2-connection-scheduler-pending-callback-payload-bytes
-             connection)
-            (length payload))
+      (unless collect-body-p
+        (incf (%http2-connection-scheduler-pending-callback-payload-bytes
+               connection)
+              (length payload)))
       t))
 
   (defun %h2-scheduler-discard-callback-events-locked (connection entry)
-    (let ((queued-bytes
-            (loop for event in (%h2-batch-entry-callback-events entry)
-                  when (eq (first event) :body)
-                    sum (length (third event)))))
+    (let* ((events (%h2-batch-entry-callback-events entry))
+           (queued-bytes
+             (loop for event in events
+                   when (and (eq (first event) :body)
+                             (not (sixth event)))
+                     sum (length (third event))))
+           (queued-body-count
+             (count :body events :key #'first :test #'eq))
+           (queued-information-count
+             (count :information events :key #'first :test #'eq)))
       (decf (%http2-connection-scheduler-pending-callback-payload-bytes
              connection)
             queued-bytes)
+      (decf (%h2-batch-entry-pending-information-callback-count entry)
+            queued-information-count)
+      (decf (%h2-batch-entry-pending-body-callback-count entry)
+            queued-body-count)
       (setf (%h2-batch-entry-callback-events entry) nil
-            (%h2-batch-entry-callback-events-tail entry) nil
-            (%h2-batch-entry-pending-body-callback-count entry) 0)))
+            (%h2-batch-entry-callback-events-tail entry) nil)))
 
 (defun %h2-scheduler-queue-callback (connection entry event)
   (let ((queued-p nil)
         (overflow-condition nil)
-        (max-pending-information-events 16))
+        (max-pending-information-callbacks
+          (%http2-connection-max-pending-information-callbacks connection)))
     (%h2-with-scheduler-lock (connection)
-                             (unless (or (%h2-batch-entry-local-retired-p entry)
-                                         (%h2-batch-entry-error entry))
-                               (if (and (eq (first event) :information)
-                                        (>= (count :information
-                                                   (%h2-batch-entry-callback-events entry)
-                                                   :key #'first :test #'eq)
-                                            max-pending-information-events))
-                                   (setf overflow-condition
-                                         (make-condition
-                                          'http-kit:http-protocol-error
-                                          :message "The peer exceeded the pending informational response callback limit."
-                                          :operation :http2-read
-                                          :detail (list :information-callback-queue
-                                                        (%h2-batch-entry-stream-id entry)
-                                                        max-pending-information-events))
-                                         (%h2-batch-entry-error entry) overflow-condition)
-                                 (setf queued-p
-                                       (%h2-scheduler-enqueue-callback-locked entry event)))
-                               (%h2-scheduler-broadcast connection)))
+      (unless (or (%h2-batch-entry-local-retired-p entry)
+                  (%h2-batch-entry-error entry))
+        (if (and (eq (first event) :information)
+                 (>= (%h2-batch-entry-pending-information-callback-count entry)
+                     max-pending-information-callbacks))
+            (setf overflow-condition
+                  (make-condition
+                   'http-kit:http-protocol-error
+                   :message "The peer exceeded the pending informational response callback limit."
+                   :operation :http2-read
+                   :detail (list :information-callback-queue
+                                 (%h2-batch-entry-stream-id entry)
+                                 max-pending-information-callbacks))
+                  (%h2-batch-entry-error entry) overflow-condition)
+            (setf queued-p
+                  (%h2-scheduler-enqueue-callback-locked entry event)))
+        (%h2-scheduler-broadcast connection)))
     (when overflow-condition
       (%h2-scheduler-retire-entry
        connection entry overflow-condition
@@ -1581,22 +1606,26 @@ CONTINUATION frames must still be consumed contiguously from that queue."
 
 (defun %h2-scheduler-pop-callback (connection entry)
   (%h2-with-scheduler-lock (connection)
-                           (let ((events (%h2-batch-entry-callback-events entry)))
-                             (when (and events
-                                        (or (%h2-batch-entry-response-headers-callback-complete-p entry)
-                                            (member (first (first events))
-                                                    '(:information :response-headers)
-                                                    :test #'eq)))
-                               (let ((event (car events)))
-                                 (setf (%h2-batch-entry-callback-events entry) (cdr events))
-                                 (when (eq (first event) :body)
-                                   (decf
-                                    (%http2-connection-scheduler-pending-callback-payload-bytes
-                                     connection)
-                                    (length (third event))))
-                                 (unless (%h2-batch-entry-callback-events entry)
-                                   (setf (%h2-batch-entry-callback-events-tail entry) nil))
-                                 event)))))
+    (let ((events (%h2-batch-entry-callback-events entry)))
+      (when (and events
+                 (or (%h2-batch-entry-response-headers-callback-complete-p entry)
+                     (member (first (first events))
+                             '(:information :response-headers) :test #'eq)))
+        (let ((event (car events)))
+          (setf (%h2-batch-entry-callback-events entry) (cdr events))
+          (when (eq (first event) :body)
+            (if (sixth event)
+                (let ((body-range (third event)))
+                  (setf (third event)
+                        (subseq (%h2-batch-entry-body-vector entry)
+                                (car body-range) (cdr body-range))))
+                (decf
+                 (%http2-connection-scheduler-pending-callback-payload-bytes
+                  connection)
+                 (length (third event)))))
+          (unless (%h2-batch-entry-callback-events entry)
+            (setf (%h2-batch-entry-callback-events-tail entry) nil))
+          event)))))
 
 (defun %h2-scheduler-retire-entry
     (connection entry condition clock-function &optional
@@ -1642,13 +1671,22 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                  (return-stream-credit-p nil))
              (ecase (first event)
                (:information
-                (unless entry-error
-                  (handler-case
-                      (funcall (second event) (third event))
-                    (error (condition)
-                           (%h2-scheduler-retire-entry
-                            connection entry condition clock-function)
-                           (error condition)))))
+                (unwind-protect
+                     (unless entry-error
+                       (handler-case
+                           (funcall (second event) (third event))
+                         (error (condition)
+                                (%h2-scheduler-retire-entry
+                                 connection entry condition clock-function)
+                                (error condition))))
+                  (%h2-with-scheduler-lock (connection)
+                    (when (plusp
+                           (%h2-batch-entry-pending-information-callback-count
+                            entry))
+                      (decf
+                       (%h2-batch-entry-pending-information-callback-count
+                        entry))))
+                  (%h2-scheduler-publish-response-if-ready connection entry)))
                (:response-headers
                 (unless entry-error
                   (handler-case
@@ -1738,6 +1776,7 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                                       (null (%h2-batch-entry-error entry))
                                       (%h2-batch-entry-response-complete-p entry)
                                       (%h2-batch-entry-response-headers-callback-complete-p entry)
+                                      (zerop (%h2-batch-entry-pending-information-callback-count entry))
                                       (zerop (%h2-batch-entry-pending-body-callback-count entry))
                                       (%h2-batch-entry-pending-response entry))
                              (setf (%h2-batch-entry-response entry)
@@ -1848,6 +1887,8 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                         :operation :http2-control
                         :cause (list :goaway last-stream-id
                                      (%h2-u32 payload 4)))))
+              (%h2-scheduler-discard-callback-events-locked
+               connection entry)
                (when (%h2-batch-entry-local-retired-p entry)
                  (%h2-scheduler-remove-entry connection entry))))))
         ((= type +http2-rst-stream-type+)
@@ -2109,6 +2150,7 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                                                   entry (list :body-limit-error
                                                               body-limit-condition))))
                                              ((and callback
+                                                   (not collect-body-p)
                                                    (plusp (length payload))
                                                    (> (+ (%http2-connection-scheduler-pending-callback-payload-bytes
                                                           connection)

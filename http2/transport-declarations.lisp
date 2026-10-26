@@ -34,7 +34,8 @@
                        peer-connection-window-size
                        peer-stream-windows session-started-p
                        goaway-last-stream-id closed-p max-control-frames
-                       max-control-window control-frame-times)))
+                       max-control-window max-pending-information-callbacks
+                       control-frame-times)))
   stream
   (close-stream #'close)
   max-frame-size
@@ -59,6 +60,7 @@
   (closed-p nil)
   (max-control-frames 100)
   (max-control-window 1.0d0)
+  (max-pending-information-callbacks 16)
   (control-frame-times nil)
   #+sbcl (scheduler-lock (sb-thread:make-mutex :name "HTTP/2 scheduler"))
   #-sbcl (scheduler-lock nil)
