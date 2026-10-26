@@ -1215,9 +1215,7 @@
                   (case status
                     (:abort (sb-thread:join-thread coordinator))
                     (:timeout
-                     (loop for remaining = (- deadline (%http-server-now))
-                           while (plusp remaining)
-                           do (sleep remaining))
+                     (sleep (max 0.0d0 (- deadline (%http-server-now))))
                      (%http-server-force-close-connections server))))
                 (%http-server-force-close-connections server))))))
     (when event-error
