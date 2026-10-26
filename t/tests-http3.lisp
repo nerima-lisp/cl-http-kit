@@ -15835,6 +15835,150 @@
                 client)))
          (setf (http-kit/http3::http3-client-close-stream client)
                original-close-stream))))))
+(deftest http3-quic-adapter-start-rejects-foreign-bootstrap-owner
+  (let* ((quic (make-http3-quic-adapter-test-client))
+         (adapter
+           (http-kit/http3::%make-http3-quic-adapter
+            :quic-client quic))
+         (thread nil)
+         (finished nil)
+         (result nil))
+    (sb-thread:with-mutex
+        ((http-kit/http3::http3-quic-adapter-owner-lock adapter))
+      (setf (http-kit/http3::http3-quic-adapter-owner-thread adapter)
+            sb-thread:*current-thread*))
+    (unwind-protect
+         (progn
+           (multiple-value-setq (thread finished result)
+             (http3-test-start-native-call
+              (lambda ()
+                (http-kit/http3:http3-quic-adapter-start adapter))))
+           (http3-test-join-native-thread thread finished)
+           (ensure-equal :error (first result))
+           (ensure-true
+            (typep (second result) 'http-kit:http-connection-error))
+           (ensure-false
+            (http-kit/http3::http3-quic-adapter-started-p adapter)))
+      (when thread
+        (http3-test-join-native-thread thread finished))
+      (sb-thread:with-mutex
+          ((http-kit/http3::http3-quic-adapter-owner-lock adapter))
+        (setf (http-kit/http3::http3-quic-adapter-owner-thread adapter) nil))
+      (http-kit/http3:close-http3-quic-adapter adapter))))
+(deftest http3-quic-adapter-start-is-idempotent-after-owner-handoff
+  (let* ((quic (make-http3-quic-adapter-test-client))
+         (adapter
+           (http-kit/http3::%make-http3-quic-adapter
+            :quic-client quic))
+         (owner-call
+           'http-kit/http3::%http3-quic-adapter-call-with-owner)
+         (original-owner-call (symbol-function owner-call))
+         (start-second (sb-thread:make-semaphore :count 0))
+         (second-entered (sb-thread:make-semaphore :count 0))
+         (release-second (sb-thread:make-semaphore :count 0))
+         (second-thread nil)
+         (second-finished nil)
+         (second-result nil)
+         (first-thread nil)
+         (first-finished nil)
+         (first-result nil))
+    (unwind-protect
+         (progn
+           (setf (symbol-function owner-call)
+                 (lambda (candidate thunk)
+                   (if (eq sb-thread:*current-thread* second-thread)
+                       (progn
+                         (sb-thread:signal-semaphore second-entered)
+                         (sb-thread:wait-on-semaphore release-second)
+                         (funcall original-owner-call candidate thunk))
+                       (funcall original-owner-call candidate thunk))))
+           (call-with-http3-quic-lifecycle-spies
+            (lambda (calls)
+              (multiple-value-setq
+                  (second-thread second-finished second-result)
+                (http3-test-start-native-call
+                 (lambda ()
+                   (sb-thread:wait-on-semaphore start-second)
+                   (http-kit/http3:http3-quic-adapter-start adapter))))
+              (sb-thread:signal-semaphore start-second)
+              (ensure-true
+               (sb-thread:wait-on-semaphore second-entered :timeout 3))
+              (multiple-value-setq
+                  (first-thread first-finished first-result)
+                (http3-test-start-native-call
+                 (lambda ()
+                   (http-kit/http3:http3-quic-adapter-start adapter))))
+              (http3-test-join-native-thread first-thread first-finished)
+              (ensure-equal :response (first first-result))
+              (ensure-true (eq adapter (second first-result)))
+              (sb-thread:signal-semaphore release-second)
+              (http3-test-join-native-thread second-thread second-finished)
+              (ensure-equal :response (first second-result))
+              (ensure-true (eq adapter (second second-result)))
+              (ensure-equal
+               1
+               (length (gethash 'cl-quic-kit:client-start calls)))
+              (ensure-true
+               (http-kit/http3::http3-quic-adapter-started-p adapter)))))
+      (sb-thread:signal-semaphore release-second)
+      (when first-thread
+        (http3-test-join-native-thread first-thread first-finished))
+      (when second-thread
+        (http3-test-join-native-thread second-thread second-finished))
+      (setf (symbol-function owner-call) original-owner-call)
+      (http-kit/http3:close-http3-quic-adapter adapter))))
+(deftest http3-quic-adapter-start-rechecks-close-before-owner-entry
+  (let* ((quic (make-http3-quic-adapter-test-client))
+         (adapter
+           (http-kit/http3::%make-http3-quic-adapter
+            :quic-client quic))
+         (owner-call
+           'http-kit/http3::%http3-quic-adapter-call-with-owner)
+         (original-owner-call (symbol-function owner-call))
+         (begin-start (sb-thread:make-semaphore :count 0))
+         (owner-entry (sb-thread:make-semaphore :count 0))
+         (release-start (sb-thread:make-semaphore :count 0))
+         (start-thread nil)
+         (finished nil)
+         (result nil))
+    (unwind-protect
+         (progn
+           (setf (symbol-function owner-call)
+                 (lambda (candidate thunk)
+                   (if (eq sb-thread:*current-thread* start-thread)
+                       (progn
+                         (sb-thread:signal-semaphore owner-entry)
+                         (sb-thread:wait-on-semaphore release-start)
+                         (funcall original-owner-call candidate thunk))
+                       (funcall original-owner-call candidate thunk))))
+           (call-with-http3-quic-lifecycle-spies
+            (lambda (calls)
+              (multiple-value-setq (start-thread finished result)
+                (http3-test-start-native-call
+                 (lambda ()
+                   (sb-thread:wait-on-semaphore begin-start)
+                   (http-kit/http3:http3-quic-adapter-start adapter))))
+              (sb-thread:signal-semaphore begin-start)
+              (ensure-true
+               (sb-thread:wait-on-semaphore owner-entry :timeout 3))
+              (ensure-true
+               (http-kit/http3:close-http3-quic-adapter adapter))
+              (sb-thread:signal-semaphore release-start)
+              (http3-test-join-native-thread start-thread finished)
+              (ensure-equal :error (first result))
+              (ensure-true (typep (second result) 'http-protocol-error))
+              (ensure-false
+               (http-kit/http3::http3-quic-adapter-started-p adapter))
+              (ensure-false (gethash 'cl-quic-kit:client-start calls))
+              (ensure-equal
+               1
+               (length (gethash 'cl-quic-kit:client-close calls))))))
+      (sb-thread:signal-semaphore release-start)
+      (when start-thread
+        (http3-test-join-native-thread start-thread finished))
+      (setf (symbol-function owner-call) original-owner-call)
+      (unless (http-kit/http3::http3-quic-adapter-closed-p adapter)
+        (http-kit/http3:close-http3-quic-adapter adapter)))))
 (deftest http3-quic-adapter-poll-waits-for-close-owner
   (call-with-http3-coverage-adapter-fixture
    (lambda (adapter)
