@@ -147,7 +147,12 @@
                  #'http-kit/http2:send-http2-request-over-connection))
     (dolist (cancel-case '((nil 8) ((:error-code 7) 7)))
       (destructuring-bind (cancel-arguments expected-error-code) cancel-case
-        (let* ((stream
+        (let* ((expected-stream-id
+                 (if (eq sender
+                         #'http-kit/http2::%h2-send-http2-request-over-connection-serial)
+                     1
+                     nil))
+               (stream
                  (make-instance 'binary-session-stream
                                 :input (h2-frame 4 0 0 (octets))))
                (connection
@@ -168,18 +173,24 @@
                    (error (condition)
                      (setf failure condition)))
                  (ensure-true (typep failure 'http-connection-error))
-                 (ensure-equal (list :local-cancel 1 expected-error-code)
+                 (ensure-equal
+                  (list :local-cancel expected-stream-id expected-error-code)
                                (http-connection-error-cause failure))
-                 (let ((reset-frame
-                         (find-if
-                          (lambda (frame)
-                            (and (= 3 (http-kit/http2::%h2-frame-type frame))
-                                 (= 1
-                                    (http-kit/http2::%h2-frame-stream-id frame))))
-                          (h2-output-frames stream))))
-                   (ensure-true reset-frame)
-                   (ensure-equal (octets 0 0 0 expected-error-code)
-                                 (http-kit/http2::%h2-frame-payload reset-frame))))
+                 (if expected-stream-id
+                     (let ((reset-frame
+                             (find-if
+                              (lambda (frame)
+                                (and (= 3 (http-kit/http2::%h2-frame-type frame))
+                                     (= 1
+                                        (http-kit/http2::%h2-frame-stream-id
+                                         frame))))
+                              (h2-output-frames stream))))
+                       (ensure-true reset-frame)
+                       (ensure-equal (octets 0 0 0 expected-error-code)
+                                     (http-kit/http2::%h2-frame-payload
+                                      reset-frame)))
+                     (ensure-equal 0
+                                   (length (binary-session-output stream)))))
             (http-kit/http2:close-http2-connection connection)))))))
   (deftest http2-serial-cancel-after-bodyless-response-does-not-send-rst
     (let* ((input
@@ -473,7 +484,7 @@
                (error (condition)
                  (setf failure condition)))
              (ensure-true (typep failure 'http-connection-error))
-             (ensure-equal '(:local-cancel 1 8)
+             (ensure-equal '(:local-cancel nil 8)
                            (http-connection-error-cause failure))
              (ensure-true (http-kit/http2:http2-connection-open-p connection)))
         (http-kit/http2:close-http2-connection connection)))

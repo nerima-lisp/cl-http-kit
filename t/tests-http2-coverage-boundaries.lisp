@@ -2026,7 +2026,11 @@
                    connection)
                   (http-kit/http2::%http2-connection-max-fields connection)
                   (http-kit/http2::%http2-connection-max-body-bytes connection)
-                  nil clock nil nil nil nil t reader writer))
+                  nil clock nil nil nil nil t reader writer
+                  (lambda () nil)
+                  (lambda () (error "Unexpected request cancellation."))
+                  (lambda (opened-entry)
+                    (declare (ignore opened-entry)))))
            (ensure-true first-capacity)
            (ensure-false second-capacity)
            (ensure-equal 0 entries-at-second-check)
