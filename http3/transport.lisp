@@ -1158,12 +1158,17 @@ becomes readable again."
                 (remember-failure caught-condition))))
           (dolist (entry cancel-pairs)
             (try-cancel entry))
-          (let ((failed-streams nil))
-            (dolist (stream streams)
-              (setf failed-streams (try-close stream failed-streams)))
-            (%h3-with-scheduler-lock (client)
-              (setf (http3-client-close-pending-streams client)
-                    (nreverse failed-streams))))
+          (let ((failed-streams nil)
+                (remaining streams))
+            (unwind-protect
+                 (loop while remaining
+                       for stream = (car remaining)
+                       do (setf failed-streams (try-close stream failed-streams)
+                                remaining (cdr remaining)))
+              ;; Keep unattempted streams available if a callback exits nonlocally.
+              (%h3-with-scheduler-lock (client)
+                (setf (http3-client-close-pending-streams client)
+                      (append (nreverse failed-streams) remaining)))))
           (when first-failure
             (error first-failure))
           t))))

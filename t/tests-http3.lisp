@@ -15762,6 +15762,79 @@
                original-poll-function
                (http-kit/http3::http3-client-write-stream client)
                original-write-stream))))))
+
+(deftest http3-quic-adapter-close-clears-prefixes-and-closes-quic-after-throw
+  (call-with-http3-coverage-adapter-fixture
+   (lambda (adapter)
+     (let* ((client
+              (http-kit/http3:http3-quic-adapter-http3-client adapter))
+            (quic
+              (http-kit/http3::http3-quic-adapter-quic-client adapter))
+            (original-close-stream
+              (http-kit/http3::http3-client-close-stream client))
+            (original-client-close
+              (symbol-function 'cl-quic-kit:client-close))
+            (close-stream-calls 0)
+            (client-close-calls 0)
+            (outcome nil))
+       (ensure-true
+        (> (hash-table-count
+            (http-kit/http3::http3-quic-adapter-stream-prefixes adapter))
+           1))
+       (unwind-protect
+            (progn
+              (setf (http-kit/http3::http3-client-close-stream client)
+                    (lambda (stream &key condition)
+                      (incf close-stream-calls)
+                      (funcall original-close-stream stream :condition condition)
+                      (throw 'http3-adapter-close-nonlocal-exit :thrown)))
+              (call-with-http3-quic-lifecycle-spies
+               (lambda (calls)
+                 (declare (ignore calls))
+                 (setf outcome
+                       (catch 'http3-adapter-close-nonlocal-exit
+                         (http-kit/http3:close-http3-quic-adapter adapter)
+                         :returned)))
+               :client-close
+               (lambda (&rest arguments)
+                 (incf client-close-calls)
+                 (apply original-client-close arguments)))
+              (ensure-equal :thrown outcome)
+              (ensure-equal 1 close-stream-calls)
+              (ensure-equal 1 client-close-calls)
+              (ensure-false
+               (http-kit/http3::http3-client-scheduler-close-owner-active-p client))
+              (let ((failure
+                      (handler-case
+                          (progn
+                            (http-kit/http3:attach-http3-peer-qpack-encoder-stream
+                             client (make-http3-test-stream :kind :peer))
+                            nil)
+                        (http-kit:http-connection-error (condition) condition))))
+                (ensure-true
+                 (typep failure 'http-kit:http-connection-error))
+                (ensure-equal
+                 nil
+                 (http-kit/http3:http3-client-peer-qpack-encoder-stream client)))
+              (ensure-equal
+               0
+               (hash-table-count
+                (http-kit/http3::http3-quic-adapter-stream-prefixes adapter)))
+              (ensure-equal
+               0
+               (hash-table-count
+                (http-kit/http3::http3-quic-adapter-stream-prefix-sent adapter)))
+              (ensure-true (cl-quic-kit:quic-client-closed-p quic))
+              (ensure-true
+               (http-kit/http3::http3-quic-adapter-closed-p adapter))
+              (ensure-equal
+               :closed
+               (http-kit/http3::http3-client-scheduler-close-state client))
+              (ensure-false
+               (http-kit/http3::http3-client-scheduler-close-owner-active-p
+                client)))
+         (setf (http-kit/http3::http3-client-close-stream client)
+               original-close-stream))))))
 (deftest http3-quic-adapter-poll-waits-for-close-owner
   (call-with-http3-coverage-adapter-fixture
    (lambda (adapter)

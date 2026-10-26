@@ -826,15 +826,39 @@ settings to be selected without exposing QUIC implementation details."
                   (cleanup-failure
                    (error cleanup-failure))
                   (quic-failure
-                   (error quic-failure))))
-           (when http3-client
-             (%h3-scheduler-finish-connection-close
-              http3-client
-              (or cleanup-failure
-                  quic-failure
-                  (unless quic-close-succeeded-p
-                    (make-condition
-                     'http-kit:http-connection-error
-                     :message "Closing the HTTP/3 QUIC connection did not complete."
-                     :operation :http3-close)))))))))
-  t))
+                   (error quic-failure)))
+                t)
+           (unwind-protect
+                (unwind-protect
+                     (unless quic-close-attempted-p
+                       (setf quic-close-attempted-p t)
+                       (handler-case
+                           (%http3-quic-adapter-call-with-owner
+                            adapter
+                            (lambda ()
+                              (cl-quic-kit:client-close
+                               (http3-quic-adapter-quic-client adapter)
+                               :error-code error-code :reason reason)
+                              (setf quic-close-succeeded-p t
+                                    (http3-quic-adapter-closed-p adapter) t)))
+                         (error (condition)
+                           (setf quic-failure condition)
+                           (warn "Closing the HTTP/3 QUIC adapter during nonlocal cleanup failed: ~A"
+                                 condition))))
+                  (let ((stream-prefixes
+                          (http3-quic-adapter-stream-prefixes adapter))
+                        (stream-prefix-sent
+                          (http3-quic-adapter-stream-prefix-sent adapter)))
+                    (when stream-prefixes (clrhash stream-prefixes))
+                    (when stream-prefix-sent (clrhash stream-prefix-sent))))
+             (when http3-client
+               (%h3-scheduler-finish-connection-close
+                http3-client
+                (or cleanup-failure
+                    quic-failure
+                    (unless quic-close-succeeded-p
+                      (make-condition
+                       'http-kit:http-connection-error
+                       :message "Closing the HTTP/3 QUIC connection did not complete."
+                       :operation :http3-close)))))))))))
+  t)
