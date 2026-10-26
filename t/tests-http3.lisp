@@ -5892,6 +5892,49 @@
                        quic stream limits)))
              (ensure-true (cl-quic-kit:client-stream-write-pending-p quic stream)))
         (cl-quic-kit:client-close quic)))))
+(deftest http3-quic-adapter-write-wait-signals-scheduler-close-condition
+  (call-with-http3-coverage-adapter-fixture
+   (lambda (adapter)
+     (let* ((quic
+              (http-kit/http3::http3-quic-adapter-quic-client adapter))
+            (client
+              (http-kit/http3:http3-quic-adapter-http3-client adapter))
+            (stream (cl-quic-kit:client-open-stream quic nil))
+            (failure nil))
+       (unwind-protect
+            (progn
+              (cl-quic-kit:client-receive-frame
+               quic
+               (cl-quic-kit:make-frame :max-data :maximum 0)
+               :level :1-rtt)
+              (cl-quic-kit:client-receive-frame
+               quic
+               (cl-quic-kit:make-frame
+                :max-stream-data
+                :stream-id (cl-quic-kit:stream-id stream)
+                :maximum 0)
+               :level :1-rtt)
+              (cl-quic-kit:client-write-stream quic stream (octets 1))
+              (ensure-true
+               (cl-quic-kit:client-stream-write-pending-p quic stream))
+              (setf (http-kit/http3::http3-client-scheduler-close-state client)
+                    :closed)
+              (setf failure
+                    (handler-case
+                        (progn
+                          (http-kit/http3::%http3-quic-adapter-await-stream-write
+                           quic stream :adapter adapter)
+                          nil)
+                      (error (condition) condition)))
+              (ensure-true
+               (typep failure (find-symbol "HTTP-CONNECTION-ERROR" :http-kit)))
+              (ensure-equal "The HTTP/3 QUIC connection was closed."
+                            (http-kit:http-error-message failure))
+              (ensure-equal :http3-request
+                            (http-kit:http-error-operation failure))
+              (ensure-true
+               (cl-quic-kit:client-stream-write-pending-p quic stream)))
+         (setf (http-kit/http3::http3-client-scheduler-close-state client) nil))))))
 
 (deftest http3-quic-adapter-expired-peer-control-deadlines
   (dolist (limits '((:timeout 0) (:deadline 0)))
