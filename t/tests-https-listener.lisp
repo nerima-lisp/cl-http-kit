@@ -2048,7 +2048,16 @@
                (ensure-equal 1 (getf deferred-event :worker-count))
                (ensure-true
                 (getf deferred-event
-                      :ticket-key-store-destruction-deferred-p)))
+                      :ticket-key-store-destruction-deferred-p))
+               (ensure-false
+                (http-kit::%http-server-emit-event-once
+                 server :shutdown-deferred deferred-event))
+               (ensure-equal
+                1
+                (count :listener-shutdown-deferred
+                       (%https-listener-events context)
+                       :key (lambda (event) (getf event :type))
+                       :test (function eq))))
              (ensure-true
               (loop for worker being the hash-keys of
                     (http-kit::http-server-workers server)
