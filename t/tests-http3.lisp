@@ -15712,6 +15712,59 @@
             (ensure-true
              (http-kit/http3::http3-quic-adapter-closed-p adapter))
             (ensure-true (cl-quic-kit:quic-client-closed-p quic)))))))))
+(deftest http3-quic-adapter-processes-peer-control-fin-during-control-write
+  (call-with-http3-coverage-adapter-fixture
+   (lambda (adapter)
+     (let* ((quic
+              (http-kit/http3::http3-quic-adapter-quic-client adapter))
+            (client
+              (http-kit/http3:http3-quic-adapter-http3-client adapter))
+            (poll (symbol-function 'cl-quic-kit:client-poll))
+            (pending-name 'cl-quic-kit:client-stream-write-pending-p)
+            (original-pending (symbol-function pending-name))
+            (poll-count 0))
+       (unwind-protect
+            (progn
+              (setf (symbol-function pending-name)
+                    (lambda (&rest arguments)
+                      (declare (ignore arguments))
+                      t))
+              (call-with-http3-quic-lifecycle-spies
+               (lambda (calls)
+                 (declare (ignore calls))
+                 (let ((failure
+                         (http3-boundary-error
+                          (lambda ()
+                            (http-kit/http3:advertise-http3-max-push-id
+                             client 0)))))
+                   (ensure-true
+                    (typep failure
+                           'http-kit/http3::http3-connection-protocol-error))
+                   (when (typep failure
+                                'http-kit/http3::http3-connection-protocol-error)
+                     (ensure-equal
+                      #x104
+                      (http-kit/http3::http3-connection-protocol-error-quic-error-code
+                       failure)))))
+               :client-poll
+               (lambda (actual &optional at)
+                 (prog1 (funcall poll actual at)
+                   (incf poll-count)
+                   (when (= poll-count 1)
+                     (cl-quic-kit:client-receive-frame
+                      actual
+                      (cl-quic-kit:make-frame
+                       :stream :stream-id 3 :offset 3 :data (octets)
+                       :fin t :len-present t)
+                      :level :1-rtt)))))
+              (ensure-equal 1 poll-count)
+              (ensure-true
+               (http-kit/http3:http3-client-peer-control-fin-p client))
+              (ensure-false
+               (http-kit/http3::http3-quic-adapter-processing-peer-critical-streams-p
+                adapter)))
+         (setf (symbol-function pending-name) original-pending))))))
+
 (deftest http3-quic-adapter-times-out-after-control-write-poll-crosses-deadline
   (call-with-http3-coverage-adapter-fixture
    (lambda (adapter)
