@@ -563,8 +563,8 @@ huffman-p)`.
 
 `make-http2-connection (&key stream close-stream max-frame-size
 max-header-bytes max-fields max-body-bytes max-control-frames
-max-control-window clock-function)` creates a connection over an already
-negotiated binary stream.
+max-control-window max-pending-information-callbacks clock-function)` creates a
+connection over an already negotiated binary stream.
 `send-http2-request-over-connection (connection request &key timeout deadline
 max-header-bytes max-fields max-body-bytes clock-function
 request-body-function request-body-length on-body-chunk on-information
@@ -587,6 +587,18 @@ connection to the high-level client transport protocol.
 `http2-client-connection (client)` returns the reusable connection owned by a
 stream-backed client, when present. These functions accept `max-fields`; the
 default per decoded header or trailer section is 256.
+
+The connection-wide pending streaming body callback budget is 65,535 bytes.
+Only body bytes waiting for `on-body-chunk` delivery count toward it. Collected
+bodies are already bounded by `max-body-bytes`, so their pending callbacks refer
+to ranges in the body buffer and do not use this budget. If streaming callback
+bytes exceed the budget, the affected stream is cancelled with `RST_STREAM` and
+error code `CANCEL`.
+
+`max-pending-information-callbacks` sets the per-stream limit for unfinished
+informational response callbacks, including queued and running callbacks. It
+defaults to 16. If another informational response would exceed the limit, that
+stream fails with a stream error.
 
 `cancel-http2-stream` emits `RST_STREAM` for an opened client stream.
 `ping-http2-connection` sends a PING and waits for the matching acknowledgement.
@@ -2229,16 +2241,8 @@ retained.
 invokes cancellation handlers for its active requests. It returns true only on
 the first call. A send using a cancelled token signals
 `HTTP-CLIENT-REQUEST-CANCELLED`. The token may be shared by concurrent requests.
-Cancellation callbacks are removed when each transport operation completes.
-Active-I/O cancellation depends on the selected transport: the direct HTTP/1.1
-stream transport closes its stream, HTTP/2 sends `RST_STREAM` but a caller
-blocked in a synchronous frame read waits for that read or its deadline, and
-HTTP/3 requires a backend `cancel-stream` callback. The built-in cl-quic-kit
-adapter currently has no such callback. On that adapter, cancellation signals
-`http-protocol-error` with operation `:http3-transport` and detail `:unsupported`
-after marking the token cancelled; it does not interrupt active I/O. Custom
-transports receive `:on-cancel` and must use it to register a function that
-interrupts the active operation.
+Custom transports receive `:on-cancel` and must use it to register a function
+that interrupts the active operation.
 COOKIE-SAME-SITE-P and COOKIE-TOP-LEVEL-NAVIGATION-P supply the request context
 for SameSite cookie selection. COOKIE-PARTITION-KEY supplies the canonical
 top-level-site identifier for Partitioned cookie acceptance and selection.
