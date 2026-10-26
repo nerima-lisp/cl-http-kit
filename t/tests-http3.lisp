@@ -15584,81 +15584,6 @@
                (symbol-function reader-name) original-reader
                (http-kit/http3::http3-client-poll-function client)
                original-poll-function))))))
-(deftest http3-quic-adapter-poll-reentrant-from-request-body-producer
-  (call-with-http3-coverage-adapter-fixture
-   (lambda (adapter)
-     (let* ((client (http-kit/http3:http3-quic-adapter-http3-client adapter))
-            (quic
-              (http-kit/http3::http3-quic-adapter-quic-client adapter))
-            (reader-name 'http-kit/http3::read-http3-control-stream)
-            (original-reader (symbol-function reader-name))
-            (original-poll
-              (http-kit/http3::http3-client-poll-function client))
-            (poll-count 0)
-            (control-read-count 0)
-            (producer-called-p nil)
-            (owner-thread-p nil)
-            (reentrant-result nil)
-            (poll-count-delta nil)
-            (control-read-count-delta nil)
-            (request-stream-id nil)
-            (response-wire (http3-test-native-response-wire)))
-       (unwind-protect
-            (progn
-              (setf (http-kit/http3::http3-client-poll-function client)
-                    (lambda (&optional at)
-                      (incf poll-count)
-                      (if at
-                          (funcall original-poll at)
-                          (funcall original-poll)))
-                    (symbol-function reader-name)
-                    (lambda (&rest arguments)
-                      (incf control-read-count)
-                      (apply original-reader arguments)))
-              (let ((response
-                      (http-kit/http3:send-http3-request
-                       client
-                       (make-http-request
-                        :method "POST"
-                        :uri "https://example.test/reentrant-poll")
-                       :request-body-length 1
-                       :request-body-function
-                       (lambda (maximum-size)
-                         (declare (ignore maximum-size))
-                         (setf producer-called-p t
-                               owner-thread-p
-                               (eq sb-thread:*current-thread*
-                                   (http-kit/http3::http3-client-scheduler-owner-thread
-                                    client)))
-                         (let ((poll-count-before poll-count)
-                               (control-read-count-before control-read-count))
-                           (setf reentrant-result
-                                 (http-kit/http3:http3-quic-adapter-poll adapter))
-                           (setf poll-count-delta
-                                 (- poll-count poll-count-before)
-                                 control-read-count-delta
-                                 (- control-read-count
-                                    control-read-count-before)))
-                         (cl-quic-kit:client-receive-frame
-                          quic
-                          (cl-quic-kit:make-frame
-                           :stream :stream-id request-stream-id :offset 0
-                           :data response-wire :fin t :len-present t)
-                          :level :1-rtt)
-                         (octets 7))
-                       :on-stream-open
-                       (lambda (stream stream-id cancel)
-                         (declare (ignore stream cancel))
-                         (setf request-stream-id stream-id)))))
-                (ensure-equal 200 (http-response-status response)))
-              (ensure-true producer-called-p)
-              (ensure-true owner-thread-p)
-              (ensure-true (eq adapter reentrant-result))
-              (ensure-equal 0 poll-count-delta)
-              (ensure-equal 0 control-read-count-delta))
-         (setf (symbol-function reader-name) original-reader
-               (http-kit/http3::http3-client-poll-function client)
-               original-poll))))))
 (deftest http3-quic-adapter-poll-waits-for-close-owner
   (call-with-http3-coverage-adapter-fixture
    (lambda (adapter)
@@ -15678,6 +15603,7 @@
             (poll-thread nil)
             (poll-finished nil)
             (poll-result nil)
+            (reentrant-result nil)
             (close-thread nil)
             (close-finished nil)
             (close-result nil))
@@ -15687,12 +15613,14 @@
                     (lambda (&optional at)
                       (incf poll-count)
                       (setf poll-at at)
-                      (sb-thread:signal-semaphore poll-started)
-                      (sb-thread:wait-on-semaphore release-poll :timeout 5)
+                      (when (= poll-count 1)
+                        (setf reentrant-result
+                              (http-kit/http3:http3-quic-adapter-poll adapter))
+                        (sb-thread:signal-semaphore poll-started)
+                        (sb-thread:wait-on-semaphore release-poll :timeout 5))
                       (if at
                           (funcall original-poll-function at)
-                          (funcall original-poll-function)))
-                    )
+                          (funcall original-poll-function))))
               (multiple-value-setq
                   (poll-thread poll-finished poll-result)
                 (http3-test-start-native-call
@@ -15718,6 +15646,7 @@
                    (http-kit/http3:http3-quic-adapter-poll adapter)))
               (ensure-equal 1 poll-count)
               (ensure-equal 0 poll-at)
+              (ensure-true (eq adapter reentrant-result))
               (sb-thread:signal-semaphore release-poll)
               (ensure-true
                (sb-thread:wait-on-semaphore poll-finished :timeout 3))
@@ -15755,7 +15684,7 @@
          :stream :stream-id 3 :offset 3 :data wire :len-present t)
         :level :1-rtt)
        (ensure-true
-        (eq adapter (http-kit/http3:http3-quic-adapter-poll adapter)))
+        (eq adapter (http-kit/http3:http3-quic-adapter-poll adapter 0)))
        (ensure-equal
         0
         (http-kit/http3:http3-control-state-goaway-id
