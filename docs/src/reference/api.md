@@ -795,6 +795,12 @@ caller-supplied OPEN-STREAM, WRITE-STREAM, and READ-STREAM callbacks. The
 callbacks receive stream type, timeout, deadline, and FIN options as
 appropriate. MAX-HEADER-BYTES and MAX-FIELDS bound decoded response field
 sections. CLOSE-HTTP3-CLIENT closes the control stream.
+
+An HTTP/3 write that omits both TIMEOUT and DEADLINE may wait for peer
+flow-control credit while the client remains open. CLOSE-HTTP3-CLIENT
+interrupts that wait with `http-kit:http-connection-error`, allowing the
+close to finish.
+
 ATTACH-HTTP3-PEER-CONTROL-STREAM accepts one incoming control stream while the
 client is open. Closing retains the attachment identity; a closed client
 rejects both an initial attachment and a replacement. Rejected streams remain

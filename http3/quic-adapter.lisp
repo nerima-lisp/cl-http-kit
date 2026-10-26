@@ -153,7 +153,9 @@
 (progn
   (defun %http3-quic-adapter-await-stream-write
       (quic-client stream &key timeout deadline adapter)
-    (let ((end (%http3-quic-adapter-deadline timeout deadline)))
+    (let* ((end (%http3-quic-adapter-deadline timeout deadline))
+           (http3-client
+             (and adapter (http3-quic-adapter-http3-client adapter))))
       (loop
         (cl-quic-kit:client-flush quic-client)
         (unless (cl-quic-kit:client-stream-write-pending-p quic-client stream)
@@ -161,10 +163,20 @@
         (when (and end (>= (%http3-quic-adapter-now) end))
           (%http3-quic-adapter-timeout
            "Timed out waiting for HTTP/3 request body flow control."))
+        (when http3-client
+          (let ((condition
+                  (%h3-scheduler-write-close-condition http3-client)))
+            (when condition
+              (error condition))))
         (cl-quic-kit:client-poll quic-client)
         (when (and end (>= (%http3-quic-adapter-now) end))
           (%http3-quic-adapter-timeout
            "Timed out waiting for HTTP/3 request body flow control."))
+        (when http3-client
+          (let ((condition
+                  (%h3-scheduler-write-close-condition http3-client)))
+            (when condition
+              (error condition))))
         (when adapter
           (%http3-quic-adapter-process-peer-control-stream
            adapter :timeout timeout :deadline deadline))

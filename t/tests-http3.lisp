@@ -16395,6 +16395,232 @@
          (eq cause
              (http-message-kit:http-connection-error-cause failure))))
       (http-kit/http3:close-http3-client client))))
+#+sbcl
+(deftest http3-client-close-interrupts-quic-flow-control-write
+  (http-kit/http3::%http3-quic-adapter-configure-protection)
+  (dolist (wait-path (list :quic-adapter :transport))
+    (let* ((writes nil)
+           (connection
+             (cl-quic-kit:make-quic-connection
+              :now-fn (constantly 0)
+              :io-write
+              (lambda (ignored bytes)
+                (declare (ignore ignored))
+                (push bytes writes))))
+           (quic
+             (let ((client
+                     (cl-quic-kit:make-quic-client
+                      :connection connection
+                      :hostname "example.test"
+                      :local-connection-id (octets 1 2 3 4)
+                      :destination-connection-id (octets 5 6 7 8)
+                      :now-fn (constantly 0))))
+               (cl-quic-kit:client-start client)
+               (cl-quic-kit:connection-set-state connection :established)
+               (cl-quic-kit:client-receive-frame
+                client
+                (cl-quic-kit:make-frame :max-data :maximum 0)
+                :level :1-rtt)
+               client))
+           (write-started (sb-thread:make-semaphore :count 0))
+           (release-write (sb-thread:make-semaphore :count 0))
+           (poll-started (sb-thread:make-semaphore :count 0))
+           (release-poll (sb-thread:make-semaphore :count 0))
+           (grant-credit-p nil)
+           (unblock-stream nil)
+           (poll-started-p nil)
+           (poll-symbol (find-symbol "CLIENT-POLL" :cl-quic-kit))
+           (original-poll (symbol-function poll-symbol))
+           (gated-poll
+             (lambda (&optional at)
+               (unless poll-started-p
+                 (setf poll-started-p t)
+                 (sb-thread:signal-semaphore poll-started)
+                 (sb-thread:wait-on-semaphore release-poll))
+               (when grant-credit-p
+                 (setf grant-credit-p nil)
+                 (cl-quic-kit:client-receive-frame
+                  quic
+                  (cl-quic-kit:make-frame :max-data :maximum 4096)
+                  :level :1-rtt)
+                 (when unblock-stream
+                   (cl-quic-kit:client-receive-frame
+                    quic
+                    (cl-quic-kit:make-frame
+                     :max-stream-data
+                     :stream-id (cl-quic-kit:stream-id unblock-stream)
+                     :maximum 4096)
+                    :level :1-rtt)))
+               (funcall original-poll quic at)))
+           (adapter
+             (http-kit/http3::%make-http3-quic-adapter
+              :quic-client quic))
+           (client
+             (http-kit/http3:make-http3-client
+              :open-stream
+              (lambda (request &key stream-type timeout deadline)
+                (declare (ignore request timeout deadline))
+                (cl-quic-kit:client-open-stream
+                 quic nil :stream-type stream-type))
+              :write-stream
+              (lambda (stream octets &key fin-p timeout deadline)
+                (declare (ignore stream octets fin-p timeout deadline)))
+              :read-stream
+              (lambda (stream &key timeout deadline)
+                (declare (ignore stream timeout deadline))
+                (values nil t))
+              :close-stream
+              (lambda (stream &key condition)
+                (cl-quic-kit:client-close-stream
+                 quic stream :condition condition))
+              :close-connection
+              (lambda (&key error-code reason)
+                (cl-quic-kit:client-close
+                 quic :error-code error-code :reason reason))
+              :poll-function gated-poll
+              :try-read-stream
+              (lambda (stream &key timeout deadline)
+                (declare (ignore stream timeout deadline))
+                (values nil nil :would-block))
+              :stream-write-pending-p
+              (lambda (stream)
+                (declare (ignore stream))
+                nil)
+              :serialize
+              (lambda (thunk)
+                (http-kit/http3::%http3-quic-adapter-call-with-owner
+                 adapter thunk))))
+           (control-stream
+             (http-kit/http3::http3-client-control-stream client))
+           (owner-thread nil)
+           (owner-finished nil)
+           (owner-result nil)
+           (close-thread nil)
+           (close-finished nil)
+           (close-result nil))
+      (setf unblock-stream control-stream
+            (http-kit/http3::http3-quic-adapter-http3-client adapter) client
+            (http-kit/http3::http3-client-write-stream client)
+            (lambda (stream octets &key fin-p timeout deadline)
+              (cl-quic-kit:client-write-stream
+               quic stream octets :fin-p fin-p
+               :timeout timeout :deadline deadline)
+              (sb-thread:signal-semaphore write-started)
+              (sb-thread:wait-on-semaphore release-write)
+              (when (eq wait-path :quic-adapter)
+                (http-kit/http3::%http3-quic-adapter-await-stream-write
+                 quic stream :timeout timeout :deadline deadline
+                 :adapter adapter)))
+            (http-kit/http3::http3-client-poll-function client) gated-poll
+            (http-kit/http3::http3-client-stream-write-pending-p client)
+            (lambda (stream)
+              (cl-quic-kit:client-stream-write-pending-p quic stream)))
+      (unwind-protect
+           (progn
+             (cl-quic-kit:client-receive-frame
+              quic
+              (cl-quic-kit:make-frame
+               :max-stream-data
+               :stream-id (cl-quic-kit:stream-id control-stream)
+               :maximum 0)
+              :level :1-rtt)
+             (when (eq wait-path :quic-adapter)
+               (setf (symbol-function poll-symbol)
+                     (lambda (poll-client &optional at)
+                       (if (eq poll-client quic)
+                           (funcall gated-poll at)
+                           (funcall original-poll poll-client at)))))
+             (multiple-value-setq (owner-thread owner-finished owner-result)
+               (http3-test-start-native-call
+                (lambda ()
+                  (http-kit/http3:advertise-http3-max-push-id client 1))))
+             (let ((started
+                     (sb-thread:wait-on-semaphore write-started :timeout 3)))
+               (unless started
+                 (format *error-output*
+                         "~&close-write diagnostic: write-started result=~S condition=~S alive=~S~%"
+                         (first owner-result)
+                         (and (eq :error (first owner-result))
+                              (type-of (second owner-result)))
+                         (and owner-thread
+                              (sb-thread:thread-alive-p owner-thread))))
+               (ensure-true started))
+             (let ((pending
+                     (cl-quic-kit:client-stream-write-pending-p
+                      quic control-stream)))
+               (unless pending
+                 (format *error-output*
+                         "~&close-write diagnostic: pending=false result=~S stream-id=~S~%"
+                         (first owner-result)
+                         (cl-quic-kit:stream-id control-stream)))
+               (ensure-true pending))
+             (sb-thread:signal-semaphore release-write)
+             (let ((started
+                     (sb-thread:wait-on-semaphore poll-started :timeout 3)))
+               (unless started
+                 (format *error-output*
+                         "~&close-write diagnostic: poll-started result=~S condition=~S alive=~S pending=~S send-offset=~S writes=~D owner=~S~%"
+                         (first owner-result)
+                         (and (eq :error (first owner-result))
+                              (type-of (second owner-result)))
+                         (and owner-thread
+                              (sb-thread:thread-alive-p owner-thread))
+                         (cl-quic-kit:client-stream-write-pending-p
+                          quic control-stream)
+                         (cl-quic-kit:stream-send-offset control-stream)
+                         (length writes)
+                         (sb-thread:with-mutex
+                             ((http-kit/http3::http3-client-scheduler-lock
+                               client))
+                           (http-kit/http3::http3-client-scheduler-owner-thread
+                            client))))
+               (ensure-true started))
+             (ensure-true
+              (eq owner-thread
+                  (sb-thread:with-mutex
+                      ((http-kit/http3::http3-client-scheduler-lock client))
+                    (http-kit/http3::http3-client-scheduler-owner-thread
+                     client))))
+             (ensure-true
+              (cl-quic-kit:client-stream-write-pending-p quic control-stream))
+             (ensure-equal 0 (cl-quic-kit:stream-send-offset control-stream))
+             (multiple-value-setq (close-thread close-finished close-result)
+               (http3-test-start-native-call
+                (lambda ()
+                  (http-kit/http3:close-http3-client client))))
+             (ensure-true
+              (http3-test-await-native-close-state client :closing))
+             (sb-thread:signal-semaphore release-poll)
+             (ensure-true
+              (sb-thread:wait-on-semaphore close-finished :timeout 3))
+             (ensure-true
+              (sb-thread:wait-on-semaphore owner-finished :timeout 3))
+             (ensure-equal :error (first owner-result))
+             (ensure-true
+              (typep (second owner-result)
+                     (find-symbol "HTTP-CONNECTION-ERROR" :http-kit)))
+             (ensure-equal "The HTTP/3 client was closed."
+                           (http-kit:http-error-message (second owner-result)))
+             (ensure-equal :http3-request
+                           (http-kit:http-error-operation (second owner-result)))
+             (ensure-equal :response (first close-result)))
+        (setf grant-credit-p t)
+        (sb-thread:signal-semaphore release-write)
+        (sb-thread:signal-semaphore release-poll)
+        (when owner-thread
+          (sb-thread:wait-on-semaphore owner-finished :timeout 3))
+        (when close-thread
+          (sb-thread:wait-on-semaphore close-finished :timeout 3))
+        (setf (symbol-function poll-symbol) original-poll)
+        (http3-test-join-native-thread owner-thread owner-finished)
+        (http3-test-join-native-thread close-thread close-finished)
+        (when (and client
+                   (http-kit/http3:http3-client-open-p client)
+                   (not (and close-thread
+                             (sb-thread:thread-alive-p close-thread))))
+          (http-kit/http3:close-http3-client client))
+        (cl-quic-kit:client-close quic)))))
+
 
 
 

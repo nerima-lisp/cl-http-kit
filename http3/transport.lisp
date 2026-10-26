@@ -467,7 +467,7 @@ system supplies the HTTP/3 stream and codec layer."
 (progn
   (defun %h3-write-stream-callback
       (write-stream poll-function stream-write-pending-p stream octets
-       &key fin-p timeout deadline)
+       &key client fin-p timeout deadline)
     (funcall write-stream stream octets
              :fin-p fin-p :timeout timeout :deadline deadline)
     (when stream-write-pending-p
@@ -477,6 +477,11 @@ system supplies the HTTP/3 stream and codec layer."
               do (when effective-deadline
                    (http-kit::%check-deadline
                     effective-deadline #'http-kit::%monotonic-time :write))
+                 (when client
+                   (let ((condition
+                           (%h3-scheduler-write-close-condition client)))
+                     (when condition
+                       (error condition))))
                  (funcall poll-function)
                  (sleep 0.005))))
     stream)
@@ -486,7 +491,8 @@ system supplies the HTTP/3 stream and codec layer."
      (http3-client-write-stream client)
      (http3-client-poll-function client)
      (http3-client-stream-write-pending-p client)
-     stream octets :fin-p fin-p :timeout timeout :deadline deadline))
+     stream octets :client client :fin-p fin-p
+     :timeout timeout :deadline deadline))
   (defun %call-http3-serialized (client thunk)
     (funcall (http3-client-serialize client) thunk)))
 
@@ -2659,6 +2665,24 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
   (defun %h3-scheduler-close-started-p (client)
     (%h3-with-scheduler-lock (client)
       (not (null (http3-client-scheduler-close-state client)))))
+
+  (defun %h3-scheduler-write-close-condition (client)
+    (%h3-with-scheduler-lock (client)
+      (let ((close-state (http3-client-scheduler-close-state client)))
+        (cond
+          ((member close-state '(:closing :http3-closed) :test #'eq)
+           (make-condition
+            'http-kit:http-connection-error
+            :message "The HTTP/3 client was closed."
+            :operation :http3-request))
+          ((eq close-state :closed)
+           (make-condition
+            'http-kit:http-connection-error
+            :message "The HTTP/3 QUIC connection was closed."
+            :operation :http3-request))
+          ((typep close-state 'condition)
+           close-state)
+          (t nil)))))
 
   (defun %h3-scheduler-begin-connection-close (client)
     (let ((thread (%h3-scheduler-current-thread))
