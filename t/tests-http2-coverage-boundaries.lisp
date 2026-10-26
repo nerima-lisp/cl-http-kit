@@ -1416,6 +1416,7 @@
                               (incf callback-count)
                               (http-kit/http2:cancel-http2-stream connection 1))
                       (octets 97) 1 nil nil)))
+    (write-sequence (h2-preface) stream)
     (http-kit/http2::%h2-scheduler-run-entry-callbacks
      connection entry clock)
     (ensure-equal 1 callback-count)
