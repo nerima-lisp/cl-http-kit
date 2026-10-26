@@ -4236,7 +4236,7 @@
                 (concatenate-octets
                  (binary-session-input stream)
                  (h2-frame 0 1 1 (octets 66)))))
-      result))
+      result)))
 
   (deftest http2-public-connection-collects-body-over-initial-flow-window
     (let* ((full-frame-body
@@ -4271,9 +4271,7 @@
              (ensure-equal 65 (aref body 0))
              (ensure-equal 66 (aref body (1- (length body))))
              (ensure-true (h2-window-update-peer-extra-data-sent-p stream)))
-        (http-kit/http2:close-http2-connection connection))))
-
-  (deftest http2-response-headers-end-stream-cancel-preserves-response
+        (http-kit/http2:close-http2-connection connection)))) (deftest http2-response-headers-end-stream-cancel-preserves-response
     (let* ((headers-entered (sb-thread:make-semaphore :count 0))
            (release-headers (sb-thread:make-semaphore :count 0))
            (release-signaled-p nil)
@@ -4346,9 +4344,7 @@
           (unless release-signaled-p
             (sb-thread:signal-semaphore release-headers))
           (sb-thread:join-thread first-thread))
-        (http-kit/http2:close-http2-connection connection))))
-
-  (deftest http2-response-headers-callback-success-body-limit-is-stream-local
+        (http-kit/http2:close-http2-connection connection)))) (deftest http2-response-headers-callback-success-body-limit-is-stream-local
     (let* ((headers-entered (sb-thread:make-semaphore :count 0))
            (release-headers (sb-thread:make-semaphore :count 0))
            (release-signaled-p nil)
@@ -4431,9 +4427,7 @@
           (unless release-signaled-p
             (sb-thread:signal-semaphore release-headers))
           (sb-thread:join-thread first-thread))
-        (http-kit/http2:close-http2-connection connection))))
-
-  (deftest http2-cancel-keeps-completed-response-entry
+        (http-kit/http2:close-http2-connection connection)))) (deftest http2-cancel-keeps-completed-response-entry
     (let* ((stream (make-instance 'binary-session-stream :input (octets)))
            (connection (http-kit/http2:make-http2-connection :stream stream))
            (entry
@@ -4452,9 +4446,7 @@
               (http-kit/http2::%http2-connection-scheduler-entries connection))
              (ensure-false
               (http-kit/http2::%h2-batch-entry-local-retired-p entry)))
-        (http-kit/http2:close-http2-connection connection))))
-
-  (deftest http2-cancel-after-body-sent-preserves-completed-response
+        (http-kit/http2:close-http2-connection connection)))) (deftest http2-cancel-after-body-sent-preserves-completed-response
     (let* ((stream (make-instance 'binary-session-stream :input (octets)))
            (connection (http-kit/http2:make-http2-connection :stream stream))
            (entry
@@ -4476,7 +4468,7 @@
              (ensure-false
               (http-kit/http2::%h2-batch-entry-request-body-abandoned-p entry))
              (ensure-equal 0 (length (binary-session-output stream))))
-        (http-kit/http2:close-http2-connection connection)))))
+        (http-kit/http2:close-http2-connection connection))))
 
   (deftest http2-cancel-does-not-preserve-entry-without-completed-response
     (let* ((stream (make-instance 'binary-session-stream :input (octets)))
