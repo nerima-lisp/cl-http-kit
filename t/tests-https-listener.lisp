@@ -1165,15 +1165,10 @@
         (setf (%https-listener-client-stream-client-hello-sent-p stream) t)
         (sb-thread:condition-broadcast
          (%https-listener-client-stream-waitqueue stream))
-        (let ((deadline (+ (get-internal-real-time)
-                           (* 10 internal-time-units-per-second))))
-          (loop until (%https-listener-client-stream-release-p stream)
-                do (when (>= (get-internal-real-time) deadline)
-                     (error "Timed out waiting to release the TLS client stream."))
-                   (sb-thread:condition-wait
-                    (%https-listener-client-stream-waitqueue stream)
-                    (%https-listener-client-stream-lock stream)
-                    :timeout 0.1))))
+        (loop until (%https-listener-client-stream-release-p stream)
+              do (sb-thread:condition-wait
+                  (%https-listener-client-stream-waitqueue stream)
+                  (%https-listener-client-stream-lock stream))))
       (when (< record-end (length bytes))
         (write-sequence bytes transport :start record-end))))
 
