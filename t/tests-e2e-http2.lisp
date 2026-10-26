@@ -751,7 +751,9 @@
                                                  (http-kit/http2::%h2-frame-stream-id frame)
                                                  request-streams)))
                                      (wait-for-callers 3)
-                                     (setf both-requests-before-response-p t)
+                                     (setf both-requests-before-response-p t
+                                           deadline
+                                           (+ (http-kit::%monotonic-time) 5))
                                      (let* ((information-headers
                                               (http-kit/http2::%h2-encode-header-block
                                                '((":status" . "103"))))
@@ -890,7 +892,9 @@
                                          (ascii "late-timeout-body"))
                                         server-stream)
                                        (finish-output server-stream)
-                                       (setf late-data-sent-p t)
+                                       (setf late-data-sent-p t
+                                             deadline
+                                             (+ (http-kit::%monotonic-time) 5))
                                        (loop until late-data-flow-credit-seen-p
                                              for frame =
                                                (http-kit/http2::%h2-read-frame
