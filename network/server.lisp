@@ -66,6 +66,7 @@
 (defstruct (%http-server-connection
              (:constructor %make-http-server-connection))
   raw-stream
+  raw-socket
   tls-stream
   ticket-key-store
   (handshake-p t)
@@ -396,13 +397,27 @@
   #-sbcl
   (declare (ignore server)))
 
-(defun %http-server-wait-for-listener-wakeup (server)
+(defun %http-server-wait-for-listener-wakeup (server &optional deadline)
   #+sbcl
-  (sb-thread:condition-wait
-   (http-server-waitqueue server)
-   (http-server-lock server))
+  (flet ((wait ()
+           (if deadline
+               (let ((remaining (- deadline (%http-server-now))))
+                 (when (plusp remaining)
+                   (sb-thread:condition-wait
+                    (http-server-waitqueue server)
+                    (http-server-lock server)
+                    :timeout remaining)))
+             (sb-thread:condition-wait
+              (http-server-waitqueue server)
+              (http-server-lock server)))))
+    (if (sb-thread:holding-mutex-p (http-server-lock server))
+        (wait)
+      (%with-http-server-lock (server)
+        (wait))))
   #-sbcl
-  (declare (ignore server)))
+  (declare (ignore server deadline))
+  #-sbcl
+  nil)
 
 (defun %http-server-close-listener-object (listener)
   (when listener
@@ -563,10 +578,16 @@
         (let ((store (%http-server-connection-ticket-key-store connection)))
           (when store
             (setf (%http-server-connection-ticket-key-store connection) nil)
-            (decf (gethash store
-                           (http-server-ticket-key-store-users server)))
-            (setf store-to-destroy
-                  (%http-server-take-retired-ticket-key-store server store))))
+            (multiple-value-bind (users tracked-p)
+                (gethash store (http-server-ticket-key-store-users server))
+              (when tracked-p
+                (decf users)
+                (setf (gethash store
+                               (http-server-ticket-key-store-users server))
+                      users)
+                (setf store-to-destroy
+                      (%http-server-take-retired-ticket-key-store
+                       server store))))))
         (decf (http-server-connection-count server))
         (%http-server-broadcast server)))
     (%http-server-destroy-ticket-key-stores
@@ -578,6 +599,8 @@
   (let* ((connection
            (%make-http-server-connection
             :raw-stream raw-stream
+            :raw-socket
+            (http-kit/network::%network-stream-socket raw-stream)
             :peer-address peer-address
             :peer-port peer-port
             :handshake-deadline
@@ -601,12 +624,14 @@
     (values connection rejection)))
 
 (defun %http-server-close-connection-stream (server connection &key (abort t))
-  (let ((stream nil))
+  (let ((stream nil)
+        (socket nil))
     (%with-http-server-lock (server)
       (cond
         ((%http-server-connection-closing-p connection)
          (when abort
            (setf stream (%http-server-connection-raw-stream connection)
+                 socket (%http-server-connection-raw-socket connection)
                  (%http-server-connection-closed-p connection) t)))
         ((%http-server-connection-closed-p connection)
          nil)
@@ -615,7 +640,10 @@
                stream (or (%http-server-connection-tls-stream connection)
                           (%http-server-connection-raw-stream connection)))
          (when abort
-           (setf (%http-server-connection-closed-p connection) t)))))
+           (setf socket (%http-server-connection-raw-socket connection)
+                 (%http-server-connection-closed-p connection) t)))))
+    (when (and abort socket)
+      (http-kit/network::%network-shutdown-socket socket))
     (when stream
       (unless (and abort (not (open-stream-p stream)))
         (handler-case
@@ -634,6 +662,7 @@
         (setf (%http-server-connection-closing-p connection) nil
               (%http-server-connection-closed-p connection) t
               (%http-server-connection-raw-stream connection) nil
+              (%http-server-connection-raw-socket connection) nil
               (%http-server-connection-tls-stream connection) nil)))
     nil))
 
@@ -804,7 +833,21 @@
                    (lambda ()
                      (%with-http-server-lock (server)
                        nil)
-                     (%http-server-run-connection server connection))
+                     (unwind-protect
+                          (%http-server-run-connection server connection)
+                       (%with-http-server-lock (server)
+                         (remhash sb-thread:*current-thread*
+                                  (http-server-workers server))
+                         (%http-server-broadcast server))
+                       (when (%with-http-server-lock (server)
+                               (and (http-server-shutdown-p server)
+                                    (eq (http-server-state server) :stopping)
+                                    (let ((supervisor
+                                            (http-server-supervisor server)))
+                                      (or (null supervisor)
+                                          (not (sb-thread:thread-alive-p
+                                                supervisor))))))
+                         (%http-server-ensure-shutdown-coordinator server))))
                    :name "http server connection"))
             (setf (gethash worker (http-server-workers server)) t)
             (%http-server-broadcast server))
@@ -912,8 +955,12 @@
     nil))
 
 (defun %http-server-supervisor-exited (server)
-  (let ((unexpected-p nil))
+  (let ((unexpected-p nil)
+        (shutdown-p nil))
     (%with-http-server-lock (server)
+      (when (eq (http-server-supervisor server)
+                sb-thread:*current-thread*)
+        (setf (http-server-supervisor server) nil))
       (when (eq (http-server-state server) :running)
         (setf (http-server-state server) :failed
               (http-server-shutdown-p server) t
@@ -927,8 +974,11 @@
           (setf (http-server-stop-deadline server)
                 (+ (%http-server-now)
                    (http-server-graceful-timeout server)))))
+      (setf shutdown-p
+            (and (http-server-shutdown-p server)
+                 (eq (http-server-state server) :stopping)))
       (%http-server-broadcast server))
-    (when unexpected-p
+    (when (or unexpected-p shutdown-p)
       (%http-server-ensure-shutdown-coordinator server))
     nil))
 
@@ -973,28 +1023,40 @@
   (defun %http-server-shutdown-coordinator (server)
     (let ((coordinator sb-thread:*current-thread*)
           (supervisor nil)
+          (supervisor-alive-p nil)
           (listener nil))
       (unwind-protect
-           (progn
+           (let* ((deadline
+                    (or (%http-server-stop-deadline server)
+                        (+ (%http-server-now)
+                           (http-server-graceful-timeout server))))
+                  (cleanup-deadline (+ deadline 1.0d0)))
              (%with-http-server-lock (server)
                (setf supervisor (http-server-supervisor server)))
              (when (and supervisor (not (eq supervisor coordinator)))
-               (sb-thread:join-thread supervisor))
+               (let ((remaining (- cleanup-deadline (%http-server-now))))
+                 (when (plusp remaining)
+                   (sb-thread:join-thread supervisor
+                                          :timeout remaining
+                                          :default nil))))
+             (setf supervisor-alive-p
+                   (and supervisor
+                        (not (eq supervisor coordinator))
+                        (sb-thread:thread-alive-p supervisor)))
+             (loop while (and (http-server-listener-wake-in-progress-p server)
+                              (< (%http-server-now) cleanup-deadline))
+                   do (%http-server-wait-for-listener-wakeup
+                       server cleanup-deadline))
              (%with-http-server-lock (server)
-               (loop while (http-server-listener-wake-in-progress-p server)
-                     do (%http-server-wait-for-listener-wakeup server))
                (setf listener (http-server-listener server)))
              (%http-server-close-listener-object listener)
              (%with-http-server-lock (server)
                (when (eq listener (http-server-listener server))
                  (setf (http-server-listener server) nil
                        (http-server-listener-wakeup-p server) nil)))
-             (let ((deadline (or (%http-server-stop-deadline server)
-                                 (+ (%http-server-now)
-                                    (http-server-graceful-timeout server)))))
-               (unless (%http-server-wait-for-connections server deadline)
-                 (%http-server-force-close-connections server)
-                 (%http-server-wait-for-connections server nil)))
+             (unless (%http-server-wait-for-connections server deadline)
+               (%http-server-force-close-connections server)
+               (%http-server-wait-for-connections server cleanup-deadline))
              (let ((workers
                      (%with-http-server-lock
                          (server)
@@ -1002,37 +1064,76 @@
                              (http-server-workers server)
                              collect worker))))
                (dolist (worker workers)
-                 (sb-thread:join-thread worker)
-                 (%with-http-server-lock (server)
-                   (remhash worker (http-server-workers server)))))
-             (if (%http-server-release-owned-ticket-key-store server)
-                 (progn
-                   (%http-server-emit-event-once
-                    server :stopped
-                    (list :type :listener-stopped :phase :shutdown))
+                 (unless (eq worker coordinator)
+                   (let ((remaining (- cleanup-deadline (%http-server-now))))
+                     (when (plusp remaining)
+                       (sb-thread:join-thread worker
+                                              :timeout remaining
+                                              :default nil))))
+                 (unless (sb-thread:thread-alive-p worker)
                    (%with-http-server-lock (server)
-                     (setf (http-server-supervisor server) nil)
-                     (setf (http-server-start-token server) nil
-                           (http-server-listener-wake-in-progress-p server) nil)
-                     (unless (eq (http-server-state server) :failed)
-                       (setf (http-server-state server) :stopped))
-                     (when (eq coordinator
-                               (http-server-shutdown-coordinator server))
-                       (setf (http-server-shutdown-coordinator server) nil))
-                     (%http-server-broadcast server)))
-                 (%with-http-server-lock (server)
-                   (setf (http-server-supervisor server) nil)
-                   (setf (http-server-start-token server) nil
-                         (http-server-listener-wake-in-progress-p server) nil
-                         (http-server-shutdown-p server) nil
-                         (http-server-stop-deadline server) nil)
-                   (unless (eq (http-server-state server) :failed)
-                     (setf (http-server-state server) :stopping))
-                   (%http-server-broadcast server))))
+                     (remhash worker (http-server-workers server))))))
+             (let ((stores-released-p
+                     (%http-server-release-owned-ticket-key-store server))
+                   (workers-alive-p
+                     (%with-http-server-lock (server)
+                       (loop for worker being the hash-keys of
+                             (http-server-workers server)
+                             thereis (sb-thread:thread-alive-p worker)))))
+               (cond
+                 ((and stores-released-p
+                       (not workers-alive-p)
+                       (not supervisor-alive-p))
+                  (%http-server-emit-event-once
+                   server :stopped
+                   (list :type :listener-stopped :phase :shutdown))
+                  (%with-http-server-lock (server)
+                    (setf (http-server-supervisor server) nil
+                          (http-server-start-token server) nil
+                          (http-server-listener-wake-in-progress-p server) nil)
+                    (unless (eq (http-server-state server) :failed)
+                      (setf (http-server-state server) :stopped))
+                    (when (eq coordinator
+                              (http-server-shutdown-coordinator server))
+                      (setf (http-server-shutdown-coordinator server) nil))
+                    (%http-server-broadcast server)))
+                 (stores-released-p
+                  (%with-http-server-lock (server)
+                    (unless supervisor-alive-p
+                      (setf (http-server-supervisor server) nil))
+                    (setf (http-server-start-token server) nil
+                          (http-server-listener-wake-in-progress-p server) nil)
+                    (unless (eq (http-server-state server) :failed)
+                      (setf (http-server-state server) :stopping))
+                    (%http-server-broadcast server)))
+                 (t
+                  (%with-http-server-lock (server)
+                    (unless supervisor-alive-p
+                      (setf (http-server-supervisor server) nil
+                            (http-server-shutdown-p server) nil
+                            (http-server-stop-deadline server) nil))
+                    (setf (http-server-start-token server) nil
+                          (http-server-listener-wake-in-progress-p server) nil)
+                    (unless (eq (http-server-state server) :failed)
+                      (setf (http-server-state server) :stopping))
+                    (%http-server-broadcast server))))))
         (%with-http-server-lock (server)
           (when (eq coordinator (http-server-shutdown-coordinator server))
             (setf (http-server-shutdown-coordinator server) nil))
-          (%http-server-broadcast server)))
+          (%http-server-broadcast server))
+        (when (%with-http-server-lock (server)
+                (and (http-server-shutdown-p server)
+                     (eq (http-server-state server) :stopping)
+                     (null (http-server-ticket-key-store-cleanup-error server))
+                     (zerop (http-server-connection-count server))
+                     (let ((supervisor
+                             (http-server-supervisor server)))
+                       (or (null supervisor)
+                           (not (sb-thread:thread-alive-p supervisor))))
+                     (loop for worker being the hash-keys of
+                           (http-server-workers server)
+                           never (sb-thread:thread-alive-p worker))))
+          (%http-server-ensure-shutdown-coordinator server)))
       server))
   #-sbcl
   (defun %http-server-shutdown-coordinator (server)
@@ -1213,7 +1314,9 @@
                                            :default nil)
                   (declare (ignore result))
                   (case status
-                    (:abort (sb-thread:join-thread coordinator))
+                    (:abort
+                     (%http-server-force-close-connections server)
+                     (sb-thread:join-thread coordinator))
                     (:timeout
                      (sleep (max 0.0d0 (- deadline (%http-server-now))))
                      (%http-server-force-close-connections server))))

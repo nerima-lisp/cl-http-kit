@@ -2002,6 +2002,7 @@
   (%with-https-listener-test-stubs (context)
     (let* ((handler-entered (sb-thread:make-semaphore :count 0))
            (release-handler (sb-thread:make-semaphore :count 0))
+           (ticket-store nil)
            (server nil))
       (unwind-protect
            (progn
@@ -2022,6 +2023,9 @@
                     (lambda (event)
                       (%https-listener-record-event context event))))
              (start-http-server server)
+             (setf ticket-store
+                   (http-kit::http-server-ticket-key-store server))
+             (ensure-true ticket-store)
              (let ((client (%https-listener-connect server)))
                (close-http-tcp-stream client))
              (ensure-true
@@ -2032,6 +2036,15 @@
               1
               (hash-table-count (http-kit::http-server-workers server)))
              (ensure-equal 1 (%https-listener-connection-count server))
+             (%https-listener-wait
+              (lambda ()
+                (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p
+                 ticket-store))
+              3)
+             (ensure-equal :stopping (http-kit::http-server-state server))
+             (ensure-true
+              (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p
+               ticket-store))
              (ensure-false
               (%https-listener-event-present-p
                context :listener-stopped nil))
@@ -2728,14 +2741,12 @@
 (deftest https-listener-bounds-blocked-close-notify-by-stop-deadline
   (let* ((material (%tls-server-test-material))
          (close-notify-entered (sb-thread:make-semaphore :count 0))
-         (close-notify-transport nil)
-         (force-close-at nil)
-         (force-close-deadline nil)
+         (release-close-notify (sb-thread:make-semaphore :count 0))
+         (close-notify-returned (sb-thread:make-semaphore :count 0))
+         (close-notify-error nil)
+         (close-notify-write-state-p nil)
          (original-close-notify
            (fdefinition 'http-kit/tls::%tls-server-send-close-notify))
-         (original-force-close
-           (fdefinition 'http-kit::%http-server-force-close-connections))
-         (graceful-timeout 0.1)
          (server
            (make-http-server
             :host "127.0.0.1"
@@ -2748,43 +2759,51 @@
             :handshake-timeout 5
             :request-timeout 5
             :idle-timeout 5
-            :graceful-timeout graceful-timeout))
+            :graceful-timeout 5))
          (transport nil)
-         (tls-stream nil))
+         (client-socket nil)
+         (tls-stream nil)
+         (ticket-store nil)
+         (server-socket nil)
+         (buffer-full-p nil)
+         (stop-elapsed nil))
     (unwind-protect
          (progn
            (sb-ext:without-package-locks
              (setf (fdefinition 'http-kit/tls::%tls-server-send-close-notify)
                    (lambda (state)
-                     (setf close-notify-transport
-                           (http-kit/tls::http-tls-server-state-transport-stream
-                            state))
                      (sb-thread:signal-semaphore close-notify-entered)
-                     (let ((deadline
-                             (+ (get-internal-real-time)
-                                (* 5 internal-time-units-per-second))))
-                       (loop while (open-stream-p close-notify-transport)
-                             do (when (>= (get-internal-real-time) deadline)
-                                  (error "Timed out waiting for TLS transport abort."))
-                                (sleep 0.005)))
-                     t)))
-           (sb-ext:without-package-locks
-             (setf (fdefinition
-                    'http-kit::%http-server-force-close-connections)
-                   (lambda (candidate)
-                     (unless force-close-at
-                       (setf force-close-deadline
-                             (http-kit::%http-server-stop-deadline candidate)
-                             force-close-at (http-kit::%http-server-now)))
-                     (funcall original-force-close candidate))))
+                     (setf close-notify-write-state-p
+                           (http-kit/tls::http-tls-server-state-write-state
+                            state))
+                     (unless (sb-thread:wait-on-semaphore
+                              release-close-notify :timeout 5)
+                       (error "Timed out waiting to release close_notify."))
+                     (unwind-protect
+                          (handler-case
+                              (funcall original-close-notify state)
+                            (error (condition)
+                              (setf close-notify-error condition)
+                              (error condition)))
+                       (sb-thread:signal-semaphore close-notify-returned)))))
            (start-http-server server)
-           (setf transport
-                 (open-http-tcp-stream
-                  (make-http-request
-                   :method "GET"
-                   :uri (format nil "http://127.0.0.1:~D/"
-                                (http-server-port server)))
-                  :timeout 5))
+           (setf ticket-store (http-kit::http-server-ticket-key-store server)
+                 client-socket
+                 (make-instance 'sb-bsd-sockets:inet-socket
+                                :type :stream
+                                :protocol :tcp))
+           (sb-bsd-sockets:socket-connect client-socket #(127 0 0 1)
+                                           (http-server-port server))
+           (setf (sb-bsd-sockets:sockopt-receive-buffer client-socket) 4096
+                 transport
+                 (sb-bsd-sockets:socket-make-stream
+                  client-socket
+                  :input t
+                  :output t
+                  :element-type '(unsigned-byte 8)
+                  :buffering :full
+                  :timeout 5)
+                 client-socket nil)
            (setf tls-stream
                  (funcall
                   (%https-listener-real-tls-upgrader material)
@@ -2793,29 +2812,152 @@
                    (format nil "https://localhost:~D/"
                            (http-server-port server)))
                   :timeout 5))
+           (ensure-true ticket-store)
            (write-sequence
             (ascii "GET / HTTP/1.1|CRLF|Host: localhost|CRLF|Connection: close|CRLF||CRLF|")
             tls-stream)
            (finish-output tls-stream)
            (ensure-true
             (sb-thread:wait-on-semaphore close-notify-entered :timeout 5))
-           (ensure-equal server (stop-http-server server))
-           (ensure-false (open-stream-p close-notify-transport))
-           ;; A blocked close_notify must be released only after the stored
-           ;; stop deadline causes the coordinator to abort the raw transport.
-           (ensure-true force-close-at)
-           (ensure-true force-close-deadline)
-           (ensure-true (>= force-close-at force-close-deadline)))
+           (setf server-socket
+                 (http-kit::%http-server-connection-raw-socket
+                  (first
+                   (http-kit::%http-server-connection-snapshot server))))
+           (ensure-true server-socket)
+           (let ((previous-mode
+                   (sb-bsd-sockets:non-blocking-mode server-socket))
+                 (payload
+                   (make-array 4096
+                               :element-type '(unsigned-byte 8)
+                               :initial-element 0))
+                 (single-byte
+                   (make-array 1
+                               :element-type '(unsigned-byte 8)
+                               :initial-element 0))
+                 (no-progress-count 0))
+             (unwind-protect
+                  (progn
+                    (setf (sb-bsd-sockets:sockopt-send-buffer server-socket) 4096
+                          (sb-bsd-sockets:non-blocking-mode server-socket) t)
+                    (loop repeat 8192
+                          for sent =
+                            (sb-bsd-sockets:socket-send
+                             server-socket payload (length payload))
+                          do (if (and sent (plusp sent))
+                                 (setf no-progress-count 0)
+                               (progn
+                                 (incf no-progress-count)
+                                 (sleep 0.001d0)
+                                 (when (>= no-progress-count 100)
+                                   (return)))))
+                    (setf no-progress-count 0)
+                    (loop repeat 10000
+                          for sent =
+                            (sb-bsd-sockets:socket-send
+                             server-socket single-byte 1)
+                          do (if (and sent (plusp sent))
+                                 (setf no-progress-count 0)
+                               (progn
+                                 (incf no-progress-count)
+                                 (sleep 0.001d0)
+                                 (when (>= no-progress-count 100)
+                                   (setf buffer-full-p t)
+                                   (return)))))
+                    (ensure-true buffer-full-p))
+               (setf (sb-bsd-sockets:non-blocking-mode server-socket)
+                     previous-mode)))
+           (sb-thread:signal-semaphore release-close-notify)
+           (ensure-true close-notify-write-state-p)
+           (ensure-false close-notify-error)
+           (ensure-false
+            (sb-thread:wait-on-semaphore close-notify-returned :timeout 0.05))
+           (let ((started-at (get-internal-real-time)))
+             (stop-http-server server :graceful-timeout 0.1)
+             (setf stop-elapsed
+                   (/ (- (get-internal-real-time) started-at)
+                      internal-time-units-per-second)))
+           (ensure-true (< stop-elapsed 0.15))
+           (ensure-true
+            (sb-thread:wait-on-semaphore close-notify-returned :timeout 2))
+           (%https-listener-wait
+            (lambda ()
+              (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p
+               ticket-store))
+            5)
+           (%https-listener-wait
+            (lambda ()
+              (eq :stopped (http-kit::http-server-state server)))
+            5)
+           (ensure-true
+            (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p ticket-store)))
+      (sb-thread:signal-semaphore release-close-notify)
       (sb-ext:without-package-locks
         (setf (fdefinition 'http-kit/tls::%tls-server-send-close-notify)
-              original-close-notify
-              (fdefinition 'http-kit::%http-server-force-close-connections)
-              original-force-close))
+              original-close-notify))
       (when (and tls-stream (open-stream-p tls-stream))
         (close tls-stream :abort t))
       (when (and transport (open-stream-p transport))
         (close-http-tcp-stream transport))
+      (when client-socket
+        (http-kit::%with-http-cleanup
+          (sb-bsd-sockets:socket-close client-socket)))
       (unless (eq :stopped (http-kit::http-server-state server))
+        (stop-http-server server :graceful-timeout 1))
+      (%tls-server-test-remove-material material))))
+#+sbcl
+(deftest https-listener-stays-stopping-while-supervisor-callback-is-blocked
+  (let* ((material (%tls-server-test-material))
+         (supervisor-entered (sb-thread:make-semaphore :count 0))
+         (release-supervisor (sb-thread:make-semaphore :count 0))
+         (server
+           (make-http-server
+            :host "127.0.0.1"
+            :port 0
+            :handler (lambda (request)
+                       (declare (ignore request))
+                       (make-http-response :status 204))
+            :certificate-chain (getf material :certificate-chain)
+            :private-key (getf material :private-key)
+            :on-event
+            (lambda (event)
+              (when (eq (getf event :type) :listener-started)
+                (sb-thread:signal-semaphore supervisor-entered)
+                (unless (sb-thread:wait-on-semaphore
+                         release-supervisor :timeout 5)
+                  (error "Timed out waiting to release the supervisor."))))))
+         (supervisor nil)
+         (ticket-store nil))
+    (unwind-protect
+         (progn
+           (start-http-server server)
+           (ensure-true
+            (sb-thread:wait-on-semaphore supervisor-entered :timeout 5))
+           (setf supervisor (http-kit::http-server-supervisor server)
+                 ticket-store (http-kit::http-server-ticket-key-store server))
+           (ensure-true supervisor)
+           (ensure-true ticket-store)
+           (stop-http-server server :graceful-timeout 0.1)
+           (%https-listener-wait
+            (lambda ()
+              (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p
+               ticket-store))
+            5)
+           (ensure-equal :stopping (http-kit::http-server-state server))
+           (ensure-true (sb-thread:thread-alive-p supervisor))
+           (ensure-equal server (start-http-server server))
+           (ensure-equal :stopping (http-kit::http-server-state server))
+           (sb-thread:signal-semaphore release-supervisor)
+           (%https-listener-wait
+            (lambda ()
+              (eq :stopped (http-kit::http-server-state server)))
+            5)
+           (ensure-false (sb-thread:thread-alive-p supervisor))
+           (ensure-false (http-kit::http-server-supervisor server)))
+      (sb-thread:signal-semaphore release-supervisor)
+      (when (and supervisor (sb-thread:thread-alive-p supervisor))
+        (sb-thread:join-thread supervisor :timeout 5 :default nil))
+      (when (and server
+                 (not (eq :stopped (http-kit::http-server-state server))))
         (stop-http-server server :graceful-timeout 1))
       (%tls-server-test-remove-material material))))
 #+sbcl
