@@ -152,35 +152,29 @@
 
 (progn
   (defun %http3-quic-adapter-await-stream-write
-      (quic-client stream &key timeout deadline adapter)
-    (let* ((end (%http3-quic-adapter-deadline timeout deadline))
-           (http3-client
-             (and adapter (http3-quic-adapter-http3-client adapter))))
-      (loop
-        (cl-quic-kit:client-flush quic-client)
-        (unless (cl-quic-kit:client-stream-write-pending-p quic-client stream)
-          (return quic-client))
-        (when (and end (>= (%http3-quic-adapter-now) end))
-          (%http3-quic-adapter-timeout
-           "Timed out waiting for HTTP/3 request body flow control."))
-        (when http3-client
-          (let ((condition
-                  (%h3-scheduler-write-close-condition http3-client)))
-            (when condition
-              (error condition))))
-        (cl-quic-kit:client-poll quic-client)
-        (when (and end (>= (%http3-quic-adapter-now) end))
-          (%http3-quic-adapter-timeout
-           "Timed out waiting for HTTP/3 request body flow control."))
-        (when http3-client
-          (let ((condition
-                  (%h3-scheduler-write-close-condition http3-client)))
-            (when condition
-              (error condition))))
-        (when adapter
-          (%http3-quic-adapter-process-peer-control-stream
-           adapter :timeout timeout :deadline deadline))
-        (sleep 0.005))))
+    (quic-client stream &key timeout deadline adapter)
+  (let* ((end (%http3-quic-adapter-deadline timeout deadline))
+         (http3-client
+           (and adapter (http3-quic-adapter-http3-client adapter))))
+    (%h3-owner-wait
+     http3-client
+     (lambda ()
+       (when (and end (>= (%http3-quic-adapter-now) end))
+         (%http3-quic-adapter-timeout
+          "Timed out waiting for HTTP/3 request body flow control.")))
+     (lambda ()
+       (cl-quic-kit:client-poll quic-client)
+       (when adapter
+         (%http3-quic-adapter-process-peer-control-stream
+          adapter :timeout timeout :deadline deadline))
+       (sleep 0.005)
+       t)
+     :ready-step
+     (lambda ()
+       (cl-quic-kit:client-flush quic-client)
+       (unless (cl-quic-kit:client-stream-write-pending-p quic-client stream)
+         (values t quic-client)))))
+  quic-client)
 
   (defun %http3-quic-adapter-process-peer-control-stream
     (adapter &key timeout deadline)
@@ -220,33 +214,34 @@
 
 (defun %http3-quic-adapter-read
     (quic-client http3-client stream &key timeout deadline poll-interval adapter)
-  (declare (ignore http3-client))
-  (let ((end (%http3-quic-adapter-deadline timeout deadline)))
-    (loop
-      (when (and end (>= (%http3-quic-adapter-now) end))
-        (%http3-quic-adapter-timeout
-         "Timed out waiting for HTTP/3 QUIC stream data."))
-      (unless (and adapter
-                   (http3-quic-adapter-processing-peer-critical-streams-p
-                    adapter))
-        (cl-quic-kit:client-poll quic-client)
-        (when (and end (>= (%http3-quic-adapter-now) end))
-          (%http3-quic-adapter-timeout
-           "Timed out waiting for HTTP/3 QUIC stream data."))
-        (when adapter
-          (%http3-quic-adapter-process-peer-control-stream
-           adapter :timeout timeout :deadline deadline)))
-      (when (and end (>= (%http3-quic-adapter-now) end))
-        (%http3-quic-adapter-timeout
-         "Timed out waiting for HTTP/3 QUIC stream data."))
-      (multiple-value-bind (chunk fin-p)
-          (cl-quic-kit:client-read-stream quic-client stream
-                                          :timeout timeout
-                                          :deadline deadline)
-        (when (or (plusp (length chunk)) fin-p)
-          (return (values chunk fin-p))))
-      (when (plusp poll-interval)
-        (sleep poll-interval)))))
+  (let* ((end (%http3-quic-adapter-deadline timeout deadline))
+         (check-deadline
+           (lambda ()
+             (when (and end (>= (%http3-quic-adapter-now) end))
+               (%http3-quic-adapter-timeout
+                "Timed out waiting for HTTP/3 QUIC stream data.")))))
+    (%h3-owner-wait
+     http3-client
+     check-deadline
+     (lambda ()
+       (unless (and adapter
+                    (http3-quic-adapter-processing-peer-critical-streams-p
+                     adapter))
+         (cl-quic-kit:client-poll quic-client)
+         (funcall check-deadline)
+         (when adapter
+           (%http3-quic-adapter-process-peer-control-stream
+            adapter :timeout timeout :deadline deadline))
+         (funcall check-deadline))
+       (multiple-value-bind (chunk fin-p)
+           (cl-quic-kit:client-read-stream
+            quic-client stream :timeout timeout :deadline deadline)
+         (if (or (plusp (length chunk)) fin-p)
+             (values nil chunk fin-p)
+             (progn
+               (when (plusp poll-interval)
+                 (sleep poll-interval))
+               t)))))))
 
 (defvar *http3-quic-adapter-handshake-sleep-function* #'sleep)
 
@@ -255,37 +250,52 @@
 (defun %http3-quic-adapter-await-established
     (quic-client &key timeout deadline)
   (let ((end (%http3-quic-adapter-deadline timeout deadline)))
-    (loop repeat 3000
-        for state = (cl-quic-kit:connection-state
-                     (cl-quic-kit:quic-client-connection quic-client))
-        do (when (eq state :established)
-             (return quic-client))
-           (when (and end (>= (%http3-quic-adapter-now) end))
-             (%http3-quic-adapter-timeout
-              "Timed out waiting for the QUIC TLS handshake."))
-           (when (cl-quic-kit:quic-client-closed-p quic-client)
-             (let ((detail (%http3-quic-adapter-close-detail quic-client)))
-               (%http3-quic-adapter-error
-                (format nil
-                        "The QUIC client closed before the TLS handshake completed: ~S."
-                        detail)
-                detail)))
-           (handler-case
-               (cl-quic-kit:client-poll quic-client)
-             (cl-tls-kit:tls13-client-driver-error (condition)
-               (let ((reason (cl-tls-kit:tls13-client-driver-error-reason
-                              condition)))
-                 (%http3-quic-adapter-error
-                  (format nil
-                          "The TLS 1.3 client driver rejected the QUIC handshake: ~S."
-                          reason)
-                  reason))))
-           (funcall *http3-quic-adapter-handshake-sleep-function* 0.005)
-        finally
-           (%http3-quic-adapter-error
-            "The QUIC TLS handshake did not complete."
-            (cl-quic-kit:connection-state
-             (cl-quic-kit:quic-client-connection quic-client))))))
+    (let ((iteration-count 0)
+          (state nil))
+      (%h3-owner-wait
+       nil
+       (lambda ()
+         (when (and end (>= (%http3-quic-adapter-now) end))
+           (%http3-quic-adapter-timeout
+            "Timed out waiting for the QUIC TLS handshake.")))
+       (lambda ()
+         (setf state
+               (cl-quic-kit:connection-state
+                (cl-quic-kit:quic-client-connection quic-client)))
+         (cond
+           ((>= iteration-count 3000)
+            (%http3-quic-adapter-error
+             "The QUIC TLS handshake did not complete."
+             state))
+           ((eq state :established)
+            (values nil quic-client))
+           ((cl-quic-kit:quic-client-closed-p quic-client)
+            (let ((detail (%http3-quic-adapter-close-detail quic-client)))
+              (%http3-quic-adapter-error
+               (format nil
+                       "The QUIC client closed before the TLS handshake completed: ~S."
+                       detail)
+               detail)))
+           (t
+            (incf iteration-count)
+            (handler-case
+                (cl-quic-kit:client-poll quic-client)
+              (cl-tls-kit:tls13-client-driver-error (condition)
+                (let ((reason
+                        (cl-tls-kit:tls13-client-driver-error-reason condition)))
+                  (%http3-quic-adapter-error
+                   (format nil
+                           "The TLS 1.3 client driver rejected the QUIC handshake: ~S."
+                           reason)
+                   reason))))
+            (funcall *http3-quic-adapter-handshake-sleep-function* 0.005)
+            t)))
+       :ready-step
+       (lambda ()
+         (when (eq (cl-quic-kit:connection-state
+                    (cl-quic-kit:quic-client-connection quic-client))
+                   :established)
+           (values t quic-client)))))))
 
 (defun %http3-quic-adapter-await-peer-control-data
     (quic-client &key timeout deadline adapter)
@@ -294,49 +304,58 @@
         (pending-streams
           (and adapter
                (http3-quic-adapter-pending-peer-unidirectional-streams
-                adapter))))
+                adapter)))
+        (iteration-count 0)
+        (state nil))
     (cl-quic-kit:client-flush quic-client)
-    (loop repeat 3000
-        for state = (cl-quic-kit:connection-state
-                     (cl-quic-kit:quic-client-connection quic-client))
-        do (loop for stream =
-                   (cl-quic-kit:client-accept-peer-stream
-                    quic-client :type :unidirectional)
-                  while stream
-                  do (unless (member stream pending-streams
-                          :test (function eq))
-                       (progn
-                         (when (>= (length pending-streams)
-                                   (if adapter
-                                       (http3-quic-adapter-max-peer-unidirectional-streams adapter)
-                                       +http3-default-max-peer-unidirectional-streams+))
-                           (%http3-quic-adapter-error
-                            "The HTTP/3 peer unidirectional-stream limit was exceeded."
-                            :h3-excessive-load))
-                         (setf pending-streams
-                               (append pending-streams (list stream))))))
-           (when adapter
-             (setf (http3-quic-adapter-pending-peer-unidirectional-streams
-                    adapter)
-                   pending-streams))
-           (when (some (lambda (stream)
-                         (or (plusp (cl-quic-kit:stream-readable-bytes stream))
-                             (cl-quic-kit:stream-finished-p stream)))
-                       pending-streams)
-             (return quic-client))
-           (when (and end (>= (%http3-quic-adapter-now) end))
-             (%http3-quic-adapter-timeout
-              "Timed out waiting for peer HTTP/3 control data."))
-           (when (cl-quic-kit:quic-client-closed-p quic-client)
-             (%http3-quic-adapter-error
-              "The QUIC client closed before peer HTTP/3 control data arrived."
-              (%http3-quic-adapter-close-detail quic-client)))
-           (cl-quic-kit:client-poll quic-client)
-           (funcall *http3-quic-adapter-peer-control-sleep-function* 0.005)
-        finally
-           (%http3-quic-adapter-error
-            "The peer HTTP/3 control stream did not become readable."
-            state))))
+    (%h3-owner-wait
+     nil
+     (lambda ()
+       (when (and end (>= (%http3-quic-adapter-now) end))
+         (%http3-quic-adapter-timeout
+          "Timed out waiting for peer HTTP/3 control data.")))
+     (lambda ()
+       (when (cl-quic-kit:quic-client-closed-p quic-client)
+         (%http3-quic-adapter-error
+          "The QUIC client closed before peer HTTP/3 control data arrived."
+          (%http3-quic-adapter-close-detail quic-client)))
+       (incf iteration-count)
+       (cl-quic-kit:client-poll quic-client)
+       (funcall *http3-quic-adapter-peer-control-sleep-function* 0.005)
+       t)
+     :ready-step
+     (lambda ()
+       (setf state
+             (cl-quic-kit:connection-state
+              (cl-quic-kit:quic-client-connection quic-client)))
+       (when (>= iteration-count 3000)
+         (%http3-quic-adapter-error
+          "The peer HTTP/3 control stream did not become readable."
+          state))
+       (loop for stream =
+               (cl-quic-kit:client-accept-peer-stream
+                quic-client :type :unidirectional)
+             while stream
+             do (unless (member stream pending-streams :test #'eq)
+                  (when (>= (length pending-streams)
+                            (if adapter
+                                (http3-quic-adapter-max-peer-unidirectional-streams
+                                 adapter)
+                                +http3-default-max-peer-unidirectional-streams+))
+                    (%http3-quic-adapter-error
+                     "The HTTP/3 peer unidirectional-stream limit was exceeded."
+                     :h3-excessive-load))
+                  (setf pending-streams
+                        (append pending-streams (list stream)))))
+       (when adapter
+         (setf (http3-quic-adapter-pending-peer-unidirectional-streams
+                adapter)
+               pending-streams))
+       (when (some (lambda (stream)
+                     (or (plusp (cl-quic-kit:stream-readable-bytes stream))
+                         (cl-quic-kit:stream-finished-p stream)))
+                   pending-streams)
+         (values t quic-client))))))
 
 (defun %http3-quic-adapter-await-peer-settings
     (quic-client http3-client &key timeout deadline
@@ -419,68 +438,92 @@
                                 (list (cons (car push-entry) stream))))))))
                  kind)))
       (cl-quic-kit:client-flush quic-client)
-      (loop repeat 3000
-          for state = (cl-quic-kit:connection-state
-                       (cl-quic-kit:quic-client-connection quic-client))
-          do (when (http3-control-state-settings-received-p
-                    (http3-client-peer-control-state http3-client))
-               (preserve-pending-prefixes)
-               (return http3-client))
-             (when (and end (>= (%http3-quic-adapter-now) end))
-               (%http3-quic-adapter-timeout
-                "Timed out waiting for peer HTTP/3 SETTINGS."))
-             (when (cl-quic-kit:quic-client-closed-p quic-client)
-               (%http3-quic-adapter-error
-                "The QUIC client closed before peer HTTP/3 SETTINGS arrived."
-                (%http3-quic-adapter-close-detail quic-client)))
-             (funcall poll quic-client)
-             (accept-peer-streams)
-             (unless (http3-client-peer-control-stream http3-client)
-               (dolist (stream pending-streams)
-                 (when (or (plusp (cl-quic-kit:stream-readable-bytes stream))
-                           (cl-quic-kit:stream-finished-p stream))
-                   (multiple-value-bind (chunk fin-p)
-                       (cl-quic-kit:client-read-stream quic-client stream)
-                     (let* ((previous (gethash stream prefix-buffers))
-                            (empty (make-array 0 :element-type '(unsigned-byte 8)))
-                            (buffer
+      (let ((iteration-count 0)
+            (state nil))
+        (%h3-owner-wait
+         http3-client
+         (lambda ()
+           (when (and end (>= (%http3-quic-adapter-now) end))
+             (%http3-quic-adapter-timeout
+              "Timed out waiting for peer HTTP/3 SETTINGS.")))
+         (lambda ()
+           (setf state
+                 (cl-quic-kit:connection-state
+                  (cl-quic-kit:quic-client-connection quic-client)))
+           (cond
+             ((>= iteration-count 3000)
+              (%http3-quic-adapter-error
+               "The peer HTTP/3 SETTINGS did not arrive."
+               state))
+             ((http3-control-state-settings-received-p
+               (http3-client-peer-control-state http3-client))
+              (preserve-pending-prefixes)
+              (values nil http3-client))
+             ((cl-quic-kit:quic-client-closed-p quic-client)
+              (%http3-quic-adapter-error
+               "The QUIC client closed before peer HTTP/3 SETTINGS arrived."
+               (%http3-quic-adapter-close-detail quic-client)))
+             (t
+              (incf iteration-count)
+              (funcall poll quic-client)
+              (accept-peer-streams)
+              (unless (http3-client-peer-control-stream http3-client)
+                (dolist (stream pending-streams)
+                  (when (or (plusp (cl-quic-kit:stream-readable-bytes stream))
+                            (cl-quic-kit:stream-finished-p stream))
+                    (multiple-value-bind (chunk fin-p)
+                        (cl-quic-kit:client-read-stream quic-client stream)
+                      (let* ((previous (gethash stream prefix-buffers))
+                             (empty (make-array 0 :element-type '(unsigned-byte 8)))
+                             (buffer
+                               (progn
+                                 (%h3-check-state-bytes
+                                  http3-client
+                                  (+ (loop for input being the hash-values of prefix-buffers
+                                           sum (length (or (first input) #())))
+                                     (length (or chunk empty))))
+                                 (%http3-concatenate-octets
+                                  (if previous (first previous) empty)
+                                  (or chunk empty)))))
+                        (multiple-value-bind (stream-type position)
+                            (http3-varint-decode buffer :allow-incomplete-p t)
+                          (declare (ignore position))
+                          (if (or stream-type fin-p)
                               (progn
-                                (%h3-check-state-bytes
-                                 http3-client
-                                 (+ (loop for input being the hash-values of prefix-buffers
-                                          sum (length (or (first input) #())))
-                                    (length (or chunk empty))))
-                                (%http3-concatenate-octets
-                                 (if previous (first previous) empty)
-                                 (or chunk empty)))))
-                       (multiple-value-bind (stream-type position)
-                           (http3-varint-decode buffer :allow-incomplete-p t)
-                         (declare (ignore position))
-                         (if (or stream-type fin-p)
-                             (progn
-                               (remhash stream prefix-buffers)
-                               (classify-peer-stream stream buffer fin-p)
-                               (setf pending-streams
-                                     (remove stream pending-streams :test #'eq)))
-                             (setf (gethash stream prefix-buffers)
-                                   (list buffer fin-p)))))))))
-             (when adapter
-               (setf (http3-quic-adapter-pending-peer-unidirectional-streams
-                      adapter)
-                     pending-streams))
-             (let ((control (http3-client-peer-control-stream http3-client)))
-               (when (and control
-                          (or (assoc control
-                                     (http3-client-prefetched-stream-inputs
-                                      http3-client))
-                              (plusp (cl-quic-kit:stream-readable-bytes control))
-                              (cl-quic-kit:stream-finished-p control)))
-                 (read-http3-control-stream http3-client :deadline end)))
-             (funcall *http3-quic-adapter-peer-control-sleep-function* 0.005)
-          finally
-             (%http3-quic-adapter-error
-              "The peer HTTP/3 SETTINGS did not arrive."
-              state)))))
+                                (remhash stream prefix-buffers)
+                                (classify-peer-stream stream buffer fin-p)
+                                (setf pending-streams
+                                      (remove stream pending-streams :test #'eq)))
+                              (setf (gethash stream prefix-buffers)
+                                    (list buffer fin-p)))))))))
+              (when adapter
+                (setf (http3-quic-adapter-pending-peer-unidirectional-streams
+                       adapter)
+                      pending-streams))
+              (let ((control (http3-client-peer-control-stream http3-client)))
+                (when (and control
+                           (or (assoc control
+                                      (http3-client-prefetched-stream-inputs
+                                       http3-client))
+                               (plusp (cl-quic-kit:stream-readable-bytes control))
+                               (cl-quic-kit:stream-finished-p control)))
+                  (read-http3-control-stream http3-client :deadline end)))
+              (funcall *http3-quic-adapter-peer-control-sleep-function* 0.005)
+              t)))
+         :ready-step
+         (lambda ()
+           (setf state
+                 (cl-quic-kit:connection-state
+                  (cl-quic-kit:quic-client-connection quic-client)))
+           (cond
+             ((>= iteration-count 3000)
+              (%http3-quic-adapter-error
+               "The peer HTTP/3 SETTINGS did not arrive."
+               state))
+             ((http3-control-state-settings-received-p
+               (http3-client-peer-control-state http3-client))
+              (preserve-pending-prefixes)
+              (values t http3-client)))))))))
 
 (defun %http3-quic-adapter-initialize (adapter initialize)
   (let ((initialized-p nil)

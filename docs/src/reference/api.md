@@ -1,8 +1,8 @@
 # API Reference
 
-This page documents selected exports from the registered ASDF systems. Package
-definition files remain authoritative for lower-level and auxiliary exports
-not described here.
+This page documents a selected set of primary exports from the registered ASDF
+systems. Package definition files remain authoritative for lower-level and
+auxiliary exports not described here.
 
 The registered systems in this checkout declare version 0.4.1. This reference
 describes the current checkout and may include unreleased changes.
@@ -796,10 +796,11 @@ callbacks receive stream type, timeout, deadline, and FIN options as
 appropriate. MAX-HEADER-BYTES and MAX-FIELDS bound decoded response field
 sections. CLOSE-HTTP3-CLIENT closes the control stream.
 
-An HTTP/3 write that omits both TIMEOUT and DEADLINE may wait for peer
-flow-control credit while the client remains open. CLOSE-HTTP3-CLIENT
-interrupts that wait with `http-kit:http-connection-error`, allowing the
-close to finish.
+With the QUIC adapter, a WRITE-STREAM callback that omits both TIMEOUT and
+DEADLINE may wait for peer flow-control credit. READ-HTTP3-CONTROL-STREAM may
+likewise wait for peer control-stream data when both are omitted. Both waits can
+remain pending while the client is open. CLOSE-HTTP3-CLIENT interrupts either
+wait with `http-kit:http-connection-error`, allowing close to finish.
 
 ATTACH-HTTP3-PEER-CONTROL-STREAM accepts one incoming control stream while the
 client is open. Closing retains the attachment identity; a closed client

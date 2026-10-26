@@ -465,26 +465,46 @@ system supplies the HTTP/3 stream and codec layer."
              (error condition)))))
 
 (progn
+  (defun %h3-owner-wait (client check-deadline wait-step &key ready-step)
+  (labels ((check-close ()
+             (when client
+               (let ((condition (%h3-scheduler-owner-close-condition client)))
+                 (when condition
+                   (error condition))))))
+    (loop
+      (check-close)
+      (when ready-step
+        (let ((result (multiple-value-list (funcall ready-step))))
+          (when (first result)
+            (return (values-list (rest result))))))
+      (funcall check-deadline)
+      (let ((result (multiple-value-list (funcall wait-step))))
+        (check-close)
+        (unless (first result)
+          (return (values-list (rest result))))))))
   (defun %h3-write-stream-callback
-      (write-stream poll-function stream-write-pending-p stream octets
-       &key client fin-p timeout deadline)
-    (funcall write-stream stream octets
-             :fin-p fin-p :timeout timeout :deadline deadline)
-    (when stream-write-pending-p
-      (let ((effective-deadline
-              (http-kit:http-deadline timeout :deadline deadline)))
-        (loop while (funcall stream-write-pending-p stream)
-              do (when effective-deadline
-                   (http-kit::%check-deadline
-                    effective-deadline #'http-kit::%monotonic-time :write))
-                 (when client
-                   (let ((condition
-                           (%h3-scheduler-write-close-condition client)))
-                     (when condition
-                       (error condition))))
-                 (funcall poll-function)
-                 (sleep 0.005))))
-    stream)
+    (write-stream poll-function stream-write-pending-p stream octets
+     &key client fin-p timeout deadline)
+  (funcall write-stream stream octets
+           :fin-p fin-p :timeout timeout :deadline deadline)
+  (when stream-write-pending-p
+    (let ((effective-deadline
+            (http-kit:http-deadline timeout :deadline deadline)))
+      (%h3-owner-wait
+       client
+       (lambda ()
+         (when effective-deadline
+           (http-kit::%check-deadline
+            effective-deadline (function http-kit::%monotonic-time) :write)))
+       (lambda ()
+         (funcall poll-function)
+         (sleep 0.005)
+         t)
+       :ready-step
+       (lambda ()
+         (unless (funcall stream-write-pending-p stream)
+           (values t stream))))))
+  stream)
   (defun %h3-write-stream
       (client stream octets &key fin-p timeout deadline)
     (%h3-write-stream-callback
@@ -1391,7 +1411,11 @@ HTTP3-CLIENT-PEER-CONTROL-STATE."
         (setf (http3-client-peer-control-buffer client) buffer)
         (values events ended-p)))))
 (defun read-http3-control-stream (client &key timeout deadline)
-  "Read and apply one chunk from CLIENT’s peer control stream."
+  "Read and apply one chunk from CLIENT’s peer control stream.
+
+With the QUIC adapter, omitting TIMEOUT and DEADLINE may wait for peer data
+while the client remains open. CLOSE-HTTP3-CLIENT interrupts that wait with
+HTTP-KIT:HTTP-CONNECTION-ERROR."
   (unless (http3-client-p client)
     (%h3-transport-error
      "READ-HTTP3-CONTROL-STREAM requires an HTTP/3 client."
@@ -2666,21 +2690,21 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
     (%h3-with-scheduler-lock (client)
       (not (null (http3-client-scheduler-close-state client)))))
 
-  (defun %h3-scheduler-write-close-condition (client)
+  (defun %h3-scheduler-owner-close-condition (client)
     (%h3-with-scheduler-lock (client)
       (let ((close-state (http3-client-scheduler-close-state client)))
         (cond
-          ((member close-state '(:closing :http3-closed) :test #'eq)
+          ((member close-state (list :closing :http3-closed) :test (function eq))
            (make-condition
-            'http-kit:http-connection-error
+            (quote http-kit:http-connection-error)
             :message "The HTTP/3 client was closed."
             :operation :http3-request))
           ((eq close-state :closed)
            (make-condition
-            'http-kit:http-connection-error
+            (quote http-kit:http-connection-error)
             :message "The HTTP/3 QUIC connection was closed."
             :operation :http3-request))
-          ((typep close-state 'condition)
+          ((typep close-state (quote condition))
            close-state)
           (t nil)))))
 
@@ -3672,40 +3696,66 @@ validated informational response in wire order."
   (let ((normal-exit-p nil))
     (unwind-protect
          (progn
-           (loop
-             (unless
-                 (%h3-with-scheduler-lock (client)
-                   (and (null (http3-client-scheduler-close-state client))
+           (handler-case
+               (%h3-owner-wait
+                client
+                (lambda ()
+                  (unless (%h3-with-scheduler-lock
+                           (client)
+                           (or (%http3-request-stream-done-p owner-entry)
+                               (%http3-request-stream-failure owner-entry)))
+                    (http-kit::%check-deadline
+                     (%http3-request-stream-deadline owner-entry)
+                     (function http-kit::%monotonic-time) :read)))
+                (lambda ()
+                  (if (%h3-with-scheduler-lock
+                          (client)
                         (not (or (%http3-request-stream-done-p owner-entry)
-                                 (%http3-request-stream-failure owner-entry)))))
-               (return))
-             (let ((progress-p nil))
-               (handler-case
-                   (progn
-                     (funcall (http3-client-poll-function client))
-                     (when (%h3-scheduler-poll-critical-streams client)
-                       (setf progress-p t))
-                     (%h3-with-scheduler-lock (client)
-                       (incf (http3-client-scheduler-poll-generation client))
-                       (%h3-scheduler-broadcast client))
-                     (unless (%h3-scheduler-close-started-p client)
-                       (%h3-scheduler-start-pending client)
-                       (unless (%h3-scheduler-close-started-p client)
-                         (let* ((stream-id (%h3-scheduler-next-runnable-id client))
-                                (entry (and stream-id
-                                            (gethash stream-id
-                                                     (http3-client-request-streams
-                                                      client)))))
-                           (when (and entry
-                                      (%h3-scheduler-progress-entry client entry))
-                             (setf progress-p t))))))
-                 (error (condition)
-                   (unless (%h3-scheduler-close-started-p client)
-                     (if (typep condition 'http3-connection-protocol-error)
-                         (%h3-scheduler-fail-connection client condition)
-                         (%h3-scheduler-fail-active client condition)))))
-               (unless progress-p
-                 (sleep 0.001))))
+                                 (%http3-request-stream-failure owner-entry))))
+                      (let ((progress-p nil))
+                        (handler-case
+                            (progn
+                              (funcall (http3-client-poll-function client))
+                              (when (%h3-scheduler-poll-critical-streams client)
+                                (setf progress-p t))
+                              (%h3-with-scheduler-lock (client)
+                                (incf
+                                 (http3-client-scheduler-poll-generation client))
+                                (%h3-scheduler-broadcast client))
+                              (unless (%h3-scheduler-close-started-p client)
+                                (%h3-scheduler-start-pending client)
+                                (unless (%h3-scheduler-close-started-p client)
+                                  (let* ((stream-id
+                                           (%h3-scheduler-next-runnable-id client))
+                                         (entry
+                                           (and stream-id
+                                                (gethash
+                                                 stream-id
+                                                 (http3-client-request-streams
+                                                  client)))))
+                                    (when (and entry
+                                               (%h3-scheduler-progress-entry
+                                                client entry))
+                                      (setf progress-p t))))))
+                          (error (condition)
+                            (unless (%h3-scheduler-close-started-p client)
+                              (if (typep condition
+                                         (quote http3-connection-protocol-error))
+                                  (%h3-scheduler-fail-connection client condition)
+                                  (%h3-scheduler-fail-active client condition)))))
+                        (unless progress-p
+                          (sleep 0.001))
+                        (%h3-with-scheduler-lock
+                            (client)
+                          (not (or (%http3-request-stream-done-p owner-entry)
+                                   (%http3-request-stream-failure owner-entry)))))
+                      nil)))
+             (error (condition)
+               (unless (%h3-scheduler-close-started-p client)
+                 (if (typep condition
+                            (quote http3-connection-protocol-error))
+                     (%h3-scheduler-fail-connection client condition)
+                     (%h3-scheduler-fail-active client condition)))))
            (setf normal-exit-p t))
       (unwind-protect
            (unwind-protect
@@ -3717,12 +3767,14 @@ validated informational response in wire order."
                   (%h3-scheduler-fail-entry
                    client owner-entry
                    (make-condition
-                    'http-kit:http-connection-error
+                    (quote http-kit:http-connection-error)
                     :message "The HTTP/3 scheduler owner exited before its request completed."
                     :operation :http3-request
-                    :request-sent-p (%http3-request-stream-started-p owner-entry))))
+                    :request-sent-p
+                    (%http3-request-stream-started-p owner-entry))))
              (%h3-with-scheduler-lock (client)
-               (let ((close-state (http3-client-scheduler-close-state client)))
+               (let ((close-state
+                       (http3-client-scheduler-close-state client)))
                  (cond
                    ((eq close-state :closed)
                     (%h3-scheduler-clear-closed-state-locked client))
@@ -3730,7 +3782,7 @@ validated informational response in wire order."
                     (%h3-scheduler-fail-closed-state-locked
                      client
                      (make-condition
-                      'http-kit:http-connection-error
+                      (quote http-kit:http-connection-error)
                       :message "The HTTP/3 client was closed."
                       :operation :http3-request)))
                    ((and close-state (not (eq close-state :closing)))
@@ -3741,7 +3793,7 @@ validated informational response in wire order."
                     (%h3-scheduler-current-thread))
             (setf (http3-client-scheduler-owner-thread client) nil))
           (%h3-scheduler-broadcast client)))))
-  client))
+    client))
 (defun %h3-scheduler-poll-once (client &optional at)
   #+sbcl
   (let ((thread (%h3-scheduler-current-thread))
