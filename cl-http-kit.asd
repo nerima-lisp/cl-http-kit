@@ -120,7 +120,7 @@
   :license "MIT"
   :version "0.4.1"
   :depends-on ("cl-http-kit/network" "cl-http-kit/http2"
-               (:version "cl-tls-kit" "0.1.0")
+               (:version "cl-tls-kit" "0.5.0")
                "cl-crypto-kit")
   :pathname "network"
   :serial t
@@ -231,6 +231,7 @@
                (:file "tests-network-tls-server")
                (:file "tests-https-listener")
                (:file "tests-https-listener-coverage")
+               (:file "tests-https-listener-shutdown-coverage")
                (:file "runner"))
   :perform (asdf:test-op (op c)
              (declare (ignore op c))

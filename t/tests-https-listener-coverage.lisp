@@ -246,8 +246,8 @@
         (%https-listener-test-call-with-function-stubs
          (list
           (cons 'http-kit::%http-server-wait-for-listener-wakeup
-                (lambda (target)
-                  (declare (ignore target))
+                (lambda (target &optional deadline)
+                  (declare (ignore target deadline))
                   (setf waited t
                         (http-kit::http-server-listener-wake-in-progress-p server)
                         nil))))
@@ -299,7 +299,7 @@
               (http-kit::http-server-supervisor server) supervisor
               (http-kit::http-server-listener server) listener
               (http-kit::http-server-shutdown-coordinator server) :other
-              (http-kit::http-server-stop-deadline server) 0.0d0
+              (http-kit::http-server-stop-deadline server) (http-kit::%http-server-now)
               (http-kit::http-server-connection-count server) 1
               (gethash worker (http-kit::http-server-workers server)) t
               (gethash connection (http-kit::http-server-connections server)) t)
@@ -308,8 +308,7 @@
           (cons 'http-kit/network:close-http-tcp-listener
                 (lambda (target)
                   (declare (ignore target))
-                  (setf (http-kit::http-server-listener server) replacement
-                        (http-kit::http-server-supervisor server) :replaced)
+                  (setf (http-kit::http-server-listener server) replacement)
                   nil))
           (cons 'http-kit::%http-server-force-close-connections
                 (lambda (target)
@@ -321,7 +320,7 @@
         (ensure-false (open-stream-p stream))
         (ensure-equal :failed (http-kit::http-server-state server))
         (ensure-equal replacement (http-kit::http-server-listener server))
-        (ensure-equal :replaced (http-kit::http-server-supervisor server))
+        (ensure-false (http-kit::http-server-supervisor server))
         (ensure-equal 0 (http-kit::http-server-connection-count server))
         (ensure-false (gethash worker (http-kit::http-server-workers server)))
         (ensure-equal :other
@@ -342,7 +341,9 @@
                 (progn
                   (http-kit::%http-server-shutdown-coordinator server)
                   nil)
-              (error () t)))))
+              (error (condition)
+                (declare (ignore condition))
+                t)))))
         (ensure-false
          (http-kit::http-server-shutdown-coordinator server)))))
 

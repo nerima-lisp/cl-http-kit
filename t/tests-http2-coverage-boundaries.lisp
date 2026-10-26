@@ -2676,4 +2676,71 @@
                             reader 16384 nil nil))))
       (http-kit/http2:close-http2-connection connection))))
 
-
+#+sbcl
+(progn
+  (deftest http2-coverage-scheduler-condition-wait-reacquires-lock
+    (let* ((connection
+             (http-kit/http2:make-http2-connection
+              :stream
+              (make-instance 'binary-session-stream :input (octets))))
+           (lock
+             (http-kit/http2::%http2-connection-scheduler-lock connection))
+           (wait-symbol
+             'http-kit/http2::%h2-scheduler-condition-wait)
+           (original-wait (symbol-function wait-symbol))
+           (clock-active-p nil)
+           (clock-values nil)
+           (clock-function
+             (lambda ()
+               (if clock-active-p
+                   (or (pop clock-values) 2)
+                   0)))
+           (wait-count 0)
+           (lock-reacquired-p nil)
+           (result nil))
+      (unwind-protect
+           (progn
+             (http-kit/http2::%h2-with-scheduler-lock (connection)
+               (setf
+                (http-kit/http2::%http2-connection-scheduler-reader-active-p
+                 connection)
+                t))
+             (unwind-protect
+                  (progn
+                    (setf (symbol-function wait-symbol)
+                          (lambda (wait-connection deadline wait-clock-function)
+                            (incf wait-count)
+                            (ensure-true (sb-thread:holding-mutex-p lock))
+                            (setf clock-active-p t
+                                  clock-values (list 0 1 2))
+                            (handler-case
+                                (funcall original-wait
+                                         wait-connection deadline
+                                         wait-clock-function)
+                              (http-kit:http-timeout (condition)
+                                (setf lock-reacquired-p
+                                      (sb-thread:holding-mutex-p lock))
+                                (error condition)))))
+                    (setf result
+                          (handler-case
+                              (progn
+                                (http-kit/http2:send-http2-request-over-connection
+                                 connection
+                                 (make-http-request
+                                  :method "GET"
+                                  :uri "https://example.com/scheduler-wait")
+                                 :deadline 1
+                                 :clock-function clock-function)
+                                :returned)
+                            (http-kit:http-timeout () :timed-out))))
+               (setf (symbol-function wait-symbol) original-wait))
+             (ensure-equal :timed-out result)
+             (ensure-equal 1 wait-count)
+             (ensure-true lock-reacquired-p))
+        (http-kit/http2::%h2-with-scheduler-lock (connection)
+          (setf (http-kit/http2::%http2-connection-scheduler-reader-active-p
+                 connection)
+                nil)
+          (http-kit/http2::%h2-scheduler-broadcast connection))
+        (http-kit/http2:close-http2-connection connection))))
+)

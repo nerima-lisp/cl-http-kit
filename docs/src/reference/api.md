@@ -4,7 +4,8 @@ This page documents the primary exported symbols of the registered ASDF
 systems. Package definition files remain authoritative for lower-level and
 auxiliary exports not described here.
 
-The registered systems in this checkout are version 0.4.1.
+The registered systems in this checkout declare version 0.4.1. This reference
+describes the current checkout and may include unreleased changes.
 
 ## Core package
 
@@ -971,8 +972,15 @@ after its request deadline does not send a response. The graceful timeout bounds
 shutdown from its start until remaining connections are closed.
 
 `on-event` receives a sanitized plist with `:type` and `:phase`. Listener
-events use `:listener-started`, `:listener-stopping`, and `:listener-stopped`;
-the start event also includes `:host` and `:port`. Connection events use
+events use `:listener-started`, `:listener-stopping`, `:listener-stopped`, and
+`:listener-shutdown-deferred`; the start event also includes `:host` and
+`:port`. The shutdown-deferred event is emitted once when a tracked worker
+remains or owned ticket-key-store destruction is deferred. Its payload
+contains `:type :listener-shutdown-deferred`, `:phase :shutdown`,
+`:worker-count` (the number of live workers), and
+`:ticket-key-store-destruction-deferred-p` (whether owned store destruction
+is still deferred). This informational event does not set
+`http-server-failure`. Connection events use
 `:connection-accepted`, `:connection-rejected`, `:alpn-selected`, and
 `:connection-closed`; they include `:peer-address` and `:peer-port`, with
 `:reason-code` on rejection and `:protocol` on ALPN selection and close.
@@ -987,24 +995,39 @@ including when PORT was zero. `stop-http-server` stops accepting new
 connections and asks active HTTP/2 sessions to send GOAWAY at their next
 frame-processing point. Active responses can drain until the configured
 graceful timeout; sessions still waiting for a frame are closed when it
-expires. If a synchronous handler is still running, `stop-http-server` may
-return while shutdown remains in progress. The server does not cancel handler
-code and emits `:listener-stopped` only after every connection worker exits. It
-is safe to call more than once. `http-server-p` identifies a server handle;
-`http-server-port` returns its bound port and `http-server-failure`
+expires. Connections forced closed after the deadline may close the underlying
+TLS connection without sending `close_notify`. The peer may then be unable to
+determine whether all data arrived. If a synchronous handler is still running,
+`stop-http-server` may return while shutdown remains in progress. A tracked
+worker or deferred owned ticket-key-store destruction can keep shutdown
+pending after it returns; `:listener-shutdown-deferred` reports this state.
+The server does not cancel handler code and emits `:listener-stopped` only
+after every connection worker exits and owned store cleanup completes. It is
+safe to call more than once.
+`http-server-p` identifies a server handle, and `http-server-failure`
 returns a fatal server failure, if one occurred. `http-server-error-reason-code`
 and `http-server-error-phase` expose safe error metadata, while
 `http-server-callback-error-callback` identifies whether `:on-event` or
 `:on-error` failed.
 
-Each server creates its own ticket-key store by default. Pass a store created
-with `cl-tls-kit:make-tls13-server-ticket-key-store` to multiple server
-instances to share their TLS 1.3 session-ticket keys. Each instance still
-enforces its own connection and handshake limits. A server automatically
-rotates only a store it created, on the first TLS connection after each
-12-hour interval. The caller that supplies a store is responsible for rotating
-it with `cl-tls-kit:rotate-tls13-server-ticket-key-store` and coordinating
-that rotation across every server that shares the store.
+Each server creates and owns a ticket-key store by default. Its first 12-hour
+rotation interval starts when the server is created. On the first TLS
+connection after each interval, the server replaces its owned store
+and, after all connections using it finish, zeroizes the previous store's keys
+and destroys the store. TLS session tickets encrypted with the previous store
+cannot resume after rotation. During shutdown, the server zeroizes and destroys
+each owned store as soon as no active connection uses it. If a worker releases
+the last connection using a store, the server may destroy it before that worker
+exits.
+
+Pass a store created with `cl-tls-kit:make-tls13-server-ticket-key-store` to
+multiple server instances to share their TLS 1.3 session-ticket keys. Each
+instance still enforces its own connection and handshake limits. A server does
+not rotate or destroy a supplied store. The caller must rotate it with
+`cl-tls-kit:rotate-tls13-server-ticket-key-store`, coordinate that rotation
+across every server that shares the store. Call `stop-http-server` on each
+server and wait for `:listener-stopped` from every server before destroying the
+store.
 
 ## TLS package
 
@@ -1021,27 +1044,42 @@ PASSWORD are reserved for a future client-certificate integration and currently
 signal an unsupported-feature condition when supplied. The client wrapper
 preserves the binary-stream boundary and applies handshake deadlines.
 :OPTIONAL applies the same certificate-chain, hostname, and trust checks as
-:REQUIRED. Certificate verification remains enabled for every supported value.
-TRUST-ANCHORS accepts parsed X.509 certificate objects. When anchors are not
-supplied and VERIFY is :OPTIONAL or :REQUIRED, the upgrader loads PEM
-certificates from the CA file selected by cl-tls-kit. SSL_CERT_FILE takes
+:REQUIRED when trust anchors are available. Certificate verification remains
+enabled for every supported value. TRUST-ANCHORS accepts parsed X.509
+certificate objects. When anchors are not supplied and VERIFY is :OPTIONAL or
+:REQUIRED, the upgrader loads PEM certificates from the CA file selected by
+cl-tls-kit. If no default CA file is available, :OPTIONAL passes no trust
+anchors to the driver, while :REQUIRED signals :tls-trust-store with detail
+:not-found before starting the handshake. SSL_CERT_FILE takes
 precedence over NIX_SSL_CERT_FILE, followed by an existing platform CA file.
 The wrapper rejects transport EOF without a peer close_notify instead of
 treating a truncated TLS stream as a completed HTTP response.
 The lambda list for `make-http-tls-server-wrapper` is
 `(make-http-tls-server-wrapper &key certificate-chain private-key
-ticket-key-store alpn-protocols clock-function)`. The certificate chain and
-private key are required; the clock defaults to a monotonic clock. It returns a
-callback invoked as
+ticket-key-store session-tickets-p alpn-protocols clock-function)`. The
+certificate chain and private key are required; the clock defaults to a
+monotonic clock. `session-tickets-p` defaults to true. Set it to NIL to prevent
+the cl-tls-kit driver from creating a ticket-key store, resumption secret, or
+`NewSessionTicket` message. It returns a callback invoked as
 `(funcall wrapper stream &key timeout deadline)`. The callback completes the
 TLS 1.3 server handshake and returns the negotiated TLS stream; `timeout` and
-`deadline` bound the handshake.
+`deadline` bound the handshake. When session tickets are enabled and no
+`ticket-key-store` is supplied, each callback creates a driver-owned store for
+that connection. Closing the returned TLS stream, normally or with `:abort`,
+closes its driver and destroys that store; a handshake or setup failure also
+closes the driver. A supplied store remains caller-owned when a connection
+closes. To resume sessions across connections handled by this wrapper, pass the
+same store with `:ticket-key-store` on each invocation and destroy it only after
+all connections using it have closed. The HTTPS listener instead owns one
+default store shared by its connections.
 HTTP-TLS-SELECTED-ALPN-PROTOCOL returns the protocol negotiated on an upgraded
-client or server stream, or NIL when no protocol was negotiated. The HTTPS
-listener accepts only `h2` and `http/1.1`.
+client or server stream, or NIL when no protocol was negotiated.
 
 The TLS package is TLS 1.3 only through cl-tls-kit. TLS 1.2 and OCSP/CRL are
 outside the current boundary.
+The TLS server wrapper ignores the record `legacy_record_version` as required
+by RFC 8446 section 5.1 while continuing to validate record content types and
+lengths.
 
 ## Observability package
 
@@ -2007,7 +2045,9 @@ Retry-After.
 
 ### `http-client-wall-clock-function`
 
-Return the configured monotonic timing function.
+Return the configured monotonic timing function used for deadlines. The
+accessor's `wall-clock` name is historical; this function does not return
+wall-clock time.
 
 ### `http-client-sleep-function`
 

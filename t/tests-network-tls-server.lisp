@@ -276,6 +276,197 @@
         (ensure-equal :unexpected-record
                       (http-protocol-error-detail condition)))
       (close stream :abort t)))
+(deftest tls-server-wrapper-does-not-issue-session-tickets
+  (%tls-server-test-with-spy
+   'cl-tls-kit:make-tls13-server-ticket-key-store
+   (lambda (&rest arguments)
+     (declare (ignore arguments))
+     (error "Session ticket store creation is disabled."))
+   (lambda ()
+     (let* ((material (%tls-server-test-material))
+            (trust-anchor
+              (cl-tls-kit.x509:parse-certificate-der
+               (first (getf material :certificate-chain))))
+            (client-store (cl-tls-kit:make-tls13-ticket-store))
+            (listener (open-http-tcp-listener :host "127.0.0.1"))
+            (wrapper
+              (make-http-tls-server-wrapper
+               :certificate-chain (getf material :certificate-chain)
+               :private-key (getf material :private-key)
+               :session-tickets-p nil
+               :alpn-protocols '("h2" "http/1.1")))
+            (port (http-network-listener-port listener))
+            (server-failed-p nil)
+            (thread nil))
+       (unwind-protect
+            (progn
+              (setf thread
+                    (sb-thread:make-thread
+                     (lambda ()
+                       (handler-case
+                           (let ((raw (accept-http-tcp-stream listener :timeout 5))
+                                 (secure nil))
+                             (unwind-protect
+                                  (progn
+                                    (setf secure (funcall wrapper raw :timeout 5)
+                                          raw nil)
+                                    (write-sequence (ascii "tls-ok") secure)
+                                    (finish-output secure)
+                                    (close secure))
+                               (when (and raw (open-stream-p raw))
+                                 (close raw :abort t))))
+                         (error ()
+                           (setf server-failed-p t))))
+                     :name "TLS server wrapper without tickets"))
+              (%tls-server-test-client-connection
+               port client-store trust-anchor nil)
+              (sb-thread:join-thread thread)
+              (ensure-false server-failed-p)
+              (ensure-equal 0 (cl-tls-kit::%tls13-ticket-store-count client-store)))
+         (when thread
+           (close-http-tcp-listener listener)
+           (sb-thread:join-thread thread))
+         (close-http-tcp-listener listener)
+         (%tls-server-test-remove-material material))))))
+(deftest tls-server-wrapper-destroys-driver-owned-ticket-stores
+         (let* ((material (%tls-server-test-material))
+                (shared-store (cl-tls-kit:make-tls13-server-ticket-key-store))
+                (original-maker (fdefinition 'cl-tls-kit:make-tls13-server-driver)))
+           (labels ((exercise-close (abort-p supplied-store-p)
+                                    (let* ((raw (make-instance '%tls-server-test-stream
+                                                               :input (octets)))
+                                           (wrapper
+                                            (if supplied-store-p
+                                                (make-http-tls-server-wrapper
+                                                 :certificate-chain (getf material :certificate-chain)
+                                                 :private-key (getf material :private-key)
+                                                 :ticket-key-store shared-store
+                                                 :alpn-protocols '("h2"))
+                                              (make-http-tls-server-wrapper
+                                               :certificate-chain (getf material :certificate-chain)
+                                               :private-key (getf material :private-key)
+                                               :alpn-protocols '("h2"))))
+                                           (secure nil)
+                                           (driver nil)
+                                           (driver-store nil))
+                                      (unwind-protect
+                                          (%tls-server-test-with-spy
+                                           'http-kit/tls::%tls-server-handshake
+                                           (lambda (state)
+                                             (setf (http-kit/tls::http-tls-server-state-handshake-complete-p
+                                                    state)
+                                                   t)
+                                             state)
+                                           (lambda ()
+                                             (setf secure (funcall wrapper raw)
+                                                   raw nil
+                                                   driver
+                                                   (http-kit/tls::http-tls-server-state-driver
+                                                    (http-kit/tls::%tls-stream-driver secure))
+                                                   driver-store
+                                                   (cl-tls-kit::tls13-server-driver-ticket-key-store
+                                                    driver))
+                                             (ensure-true driver-store)
+                                             (ensure-equal (not supplied-store-p)
+                                                           (cl-tls-kit::tls13-server-driver-ticket-key-store-owned-p
+                                                            driver))
+                                             (ensure-equal (if supplied-store-p shared-store driver-store)
+                                                           driver-store)
+                                             (close secure :abort abort-p)
+                                             (ensure-equal (not supplied-store-p)
+                                                           (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p
+                                                            driver-store))))
+                                        (when secure
+                                          (http-kit::%with-http-cleanup
+                                           (close secure :abort t)))
+                                        (when (and raw (open-stream-p raw))
+                                          (close raw :abort t))))))
+             (unwind-protect
+                 (progn
+                   (dolist (abort-p '(nil t))
+                     (exercise-close abort-p nil)
+                     (exercise-close abort-p t))
+                   (let* ((raw (make-instance '%tls-server-test-stream
+                                              :input (octets)))
+                          (wrapper
+                           (make-http-tls-server-wrapper
+                            :certificate-chain (getf material :certificate-chain)
+                            :private-key (getf material :private-key)
+                            :alpn-protocols '("h2")))
+                          (driver nil)
+                          (driver-store nil)
+                          (condition nil))
+                     (unwind-protect
+                         (%tls-server-test-with-spy
+                          'cl-tls-kit:make-tls13-server-driver
+                          (lambda (&rest arguments)
+                            (setf driver (apply original-maker arguments)
+                                  driver-store
+                                  (cl-tls-kit::tls13-server-driver-ticket-key-store
+                                   driver))
+                            driver)
+                          (lambda ()
+                            (setf condition
+                                  (%tls-server-test-condition
+                                   (lambda () (funcall wrapper raw :timeout 2))))
+                            (ensure-equal :handshake-failed
+                                          (http-protocol-error-detail condition))
+                            (ensure-true driver-store)
+                            (ensure-true
+                             (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p
+                              driver-store))
+                            (ensure-false (open-stream-p raw))))
+                       (when (open-stream-p raw)
+                         (close raw :abort t))))
+                   (cl-tls-kit:destroy-tls13-server-ticket-key-store shared-store)
+                   (%tls-server-test-remove-material material))))))
+(deftest tls-server-wrapper-closes-driver-after-close-notify-failure
+  (let* ((material (%tls-server-test-material))
+         (transport (make-instance '%tls-server-test-stream :input (octets)))
+         (wrapper
+           (make-http-tls-server-wrapper
+            :certificate-chain (getf material :certificate-chain)
+            :private-key (getf material :private-key)
+            :alpn-protocols '("h2")))
+         (secure nil)
+         (driver nil)
+         (driver-store nil)
+         (close-failed-p nil))
+    (unwind-protect
+         (%tls-server-test-with-spy
+          'http-kit/tls::%tls-server-handshake
+          (lambda (state)
+            (setf (http-kit/tls::http-tls-server-state-handshake-complete-p state) t)
+            state)
+          (lambda ()
+            (setf secure (funcall wrapper transport :timeout 2)
+                  driver
+                  (http-kit/tls::http-tls-server-state-driver
+                   (http-kit/tls::%tls-stream-driver secure))
+                  driver-store
+                  (cl-tls-kit::tls13-server-driver-ticket-key-store driver))
+            (ensure-true driver-store)
+            (ensure-true
+             (cl-tls-kit::tls13-server-driver-ticket-key-store-owned-p driver))
+            (%tls-server-test-with-spy
+             'http-kit/tls::%tls-server-send-close-notify
+             (lambda (state)
+               (declare (ignore state))
+               (error "Injected TLS close_notify failure."))
+             (lambda ()
+               (handler-case
+                   (close secure)
+                 (error ()
+                   (setf close-failed-p t)))))
+            (ensure-true close-failed-p)
+            (ensure-true
+             (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p driver-store))
+            (ensure-false (open-stream-p transport))))
+      (when secure
+        (http-kit::%with-http-cleanup (close secure :abort t)))
+      (when (open-stream-p transport)
+        (close transport :abort t))
+      (%tls-server-test-remove-material material))))
 
   (progn
 (deftest tls-server-wrapper-sanitizes-peer-and-setup-failures
@@ -350,15 +541,12 @@
    'cl-tls-kit:make-tls13-server-ticket-key-store
    (lambda (&rest arguments)
      (declare (ignore arguments))
-     (error "Injected ticket key store construction failure."))
+     (error "Unexpected wrapper-level ticket key store creation."))
    (lambda ()
-     (let ((condition
-             (%tls-server-test-condition
-              (lambda ()
-                (make-http-tls-server-wrapper
-                 :certificate-chain (list t) :private-key t)))))
-       (ensure-equal :invalid-ticket-key-store
-                     (http-protocol-error-detail condition)))))
+     (let ((wrapper
+             (make-http-tls-server-wrapper
+              :certificate-chain (list t) :private-key t)))
+       (ensure-true (functionp wrapper)))))
   (let* ((wrapper (make-http-tls-server-wrapper
                    :certificate-chain (list t) :private-key t))
          (condition
@@ -1176,7 +1364,171 @@
         (close server-stream :abort t)
         (%tls-server-test-remove-material material))))
 
-  )
+
+
+  (deftest tls-server-wrapper-reports-driver-store-destroy-failure-after-handshake-error
+           (let* ((material (%tls-server-test-material))
+                  (raw (make-instance '%tls-server-test-stream :input (octets)))
+                  (wrapper
+                   (make-http-tls-server-wrapper
+                    :certificate-chain (getf material :certificate-chain)
+                    :private-key (getf material :private-key)
+                    :alpn-protocols '("h2")))
+                  (original-driver-maker
+                   (fdefinition 'cl-tls-kit:make-tls13-server-driver))
+                  (original-destroy
+                   (fdefinition 'cl-tls-kit:destroy-tls13-server-ticket-key-store))
+                  (destroy-condition
+                   (make-condition 'simple-error
+                                   :format-control "Injected ticket store destroy failure."
+                                   :format-arguments nil))
+                  (driver nil)
+                  (driver-store nil)
+                  (primary-condition nil)
+                  (cleanup-warning nil))
+             (unwind-protect
+                 (progn
+                   (progn
+                     (%tls-server-test-with-spy
+                      'cl-tls-kit:destroy-tls13-server-ticket-key-store
+                      (lambda (store)
+                        (if (eq store driver-store)
+                            (error destroy-condition)
+                          (funcall original-destroy store)))
+                      (lambda ()
+                        (handler-bind
+                            ((http-kit/tls::tls-server-cleanup-warning
+                              (lambda (warning)
+                                (progn
+                                  (setf cleanup-warning warning)
+                                  (ensure-equal "TLS server driver cleanup failed."
+                                                (format nil "~A" warning)))
+                                (muffle-warning warning))))
+                          (%tls-server-test-with-spy
+                           'cl-tls-kit:make-tls13-server-driver
+                           (lambda (&rest arguments)
+                             (setf driver (apply original-driver-maker arguments)
+                                   driver-store
+                                   (cl-tls-kit::tls13-server-driver-ticket-key-store driver))
+                             driver)
+                           (lambda ()
+                             (handler-case
+                                 (funcall wrapper raw :timeout 2)
+                               (error (condition)
+                                      (setf primary-condition condition))))))))
+                     (ensure-true driver-store)
+                     (ensure-true
+                      (cl-tls-kit::tls13-server-driver-ticket-key-store-owned-p driver))
+                     (ensure-true (typep primary-condition 'http-protocol-error))
+                     (ensure-equal :handshake-failed
+                                   (http-protocol-error-detail primary-condition))
+                     (progn
+                       (ensure-true cleanup-warning)
+                       (let ((warning-output (make-string-output-stream)))
+                         (close warning-output)
+                         (%tls-server-test-with-spy
+                          'cl-tls-kit:destroy-tls13-server-ticket-key-store
+                          (lambda (store)
+                            (if (eq store driver-store)
+                                (error destroy-condition)
+                              (funcall original-destroy store)))
+                          (lambda ()
+                            (let ((*error-output* warning-output))
+                              (ensure-false
+                               (http-kit/tls::%tls-server-cleanup-driver-close driver)))))))
+                     (ensure-true
+                      (eq destroy-condition
+                          (http-kit/tls::tls-server-cleanup-warning-cause cleanup-warning)))
+                     (ensure-false (open-stream-p raw)))
+                   (when driver-store
+                     (funcall original-destroy driver-store))
+                   (when (open-stream-p raw)
+                     (close raw :abort t))
+                   (%tls-server-test-remove-material material)))))
+
+  (deftest tls-server-wrapper-reports-driver-store-destroy-failure-after-close-notify-error
+           (let* ((material (%tls-server-test-material))
+                  (transport (make-instance '%tls-server-test-stream :input (octets)))
+                  (wrapper
+                   (make-http-tls-server-wrapper
+                    :certificate-chain (getf material :certificate-chain)
+                    :private-key (getf material :private-key)
+                    :alpn-protocols '("h2")))
+                  (close-condition
+                   (make-condition 'simple-error
+                                   :format-control "Injected TLS close_notify failure."
+                                   :format-arguments nil))
+                  (destroy-condition
+                   (make-condition 'simple-error
+                                   :format-control "Injected ticket store destroy failure."
+                                   :format-arguments nil))
+                  (original-destroy
+                   (fdefinition 'cl-tls-kit:destroy-tls13-server-ticket-key-store))
+                  (secure nil)
+                  (driver nil)
+                  (driver-store nil)
+                  (primary-condition nil)
+                  (cleanup-warning nil))
+             (unwind-protect
+                 (progn
+                   (%tls-server-test-with-spy
+                    'http-kit/tls::%tls-server-handshake
+                    (lambda (state)
+                      (setf (http-kit/tls::http-tls-server-state-handshake-complete-p state)
+                            t)
+                      state)
+                    (lambda ()
+                      (setf secure (funcall wrapper transport :timeout 2)
+                            driver
+                            (http-kit/tls::http-tls-server-state-driver
+                             (http-kit/tls::%tls-stream-driver secure))
+                            driver-store
+                            (cl-tls-kit::tls13-server-driver-ticket-key-store driver))))
+                   (ensure-true driver-store)
+                   (ensure-true
+                    (cl-tls-kit::tls13-server-driver-ticket-key-store-owned-p driver))
+                   (progn
+                     (%tls-server-test-with-spy
+                      'cl-tls-kit:destroy-tls13-server-ticket-key-store
+                      (lambda (store)
+                        (if (eq store driver-store)
+                            (error destroy-condition)
+                          (funcall original-destroy store)))
+                      (lambda ()
+                        (handler-bind
+                            ((http-kit/tls::tls-server-cleanup-warning
+                              (lambda (warning)
+                                (setf cleanup-warning warning)
+                                (muffle-warning warning))))
+                          (%tls-server-test-with-spy
+                           'http-kit/tls::%tls-server-send-close-notify
+                           (lambda (state)
+                             (declare (ignore state))
+                             (error close-condition))
+                           (lambda ()
+                             (handler-case
+                                 (close secure)
+                               (error (condition)
+                                      (setf primary-condition condition))))))))
+                     (ensure-true (eq close-condition primary-condition))
+                     (ensure-true cleanup-warning)
+                     (ensure-true
+                      (eq destroy-condition
+                          (http-kit/tls::tls-server-cleanup-warning-cause cleanup-warning)))
+                     (ensure-false
+                      (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p driver-store))
+                     (ensure-false (open-stream-p transport)))
+                   (when secure
+                     (http-kit::%with-http-cleanup
+                      (close secure :abort t)))
+                   (when (and driver-store
+                              (not (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p
+                                    driver-store)))
+                     (funcall original-destroy driver-store))
+                   (when (open-stream-p transport)
+                     (close transport :abort t))
+                   (%tls-server-test-remove-material material)))))
+)
 
 #+sbcl
 (deftest tls-server-bounds-handshake-buffer-growth-for-one-byte-fragments

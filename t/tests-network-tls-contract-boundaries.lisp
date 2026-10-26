@@ -2043,16 +2043,54 @@
   (deftest network-tls-contract-server-record-stream-boundaries
     (let* ((raw (make-instance 'network-tls-contract-stream :input (octets)))
            (state (http-kit/tls::%make-http-tls-server-state
-                   :driver nil :provider nil :transport-stream raw))
-           (legacy-handshake (octets 22 3 1 0 1 1)))
-      (ensure-equal nil (http-kit/tls::%tls-server-process-record state legacy-handshake))
-      (ensure-false (http-kit/tls::http-tls-server-state-client-hello-received-p state))
-      (setf (http-kit/tls::http-tls-server-state-client-hello-received-p state) t)
+                   :driver :test-driver :provider nil :transport-stream raw))
+           (hello (cl-tls-kit:make-tls13-client-hello
+                   #x0303
+                   (make-array 32 :element-type '(unsigned-byte 8)
+                                  :initial-element 1)
+                   (octets) #(#x1301) nil))
+           (handshake-wire (cl-tls-kit:encode-handshake 1 hello))
+           (handshake-length (length handshake-wire))
+           (legacy-handshake-record
+             (concatenate '(vector (unsigned-byte 8))
+                          (vector 22 #x00 #x00
+                                  (ldb (byte 8 8) handshake-length)
+                                  (ldb (byte 8 0) handshake-length))
+                          handshake-wire)))
+      (%network-tls-contract-with-spy
+       'cl-tls-kit:tls13-server-driver-step
+       (lambda (original)
+         (declare (ignore original))
+         (lambda (driver wire &key level)
+           (ensure-equal :test-driver driver)
+           (ensure-octets-equal handshake-wire wire)
+           (ensure-equal :initial level)
+           (values driver nil)))
+       (lambda ()
+         (ensure-equal nil
+                       (let* ((reader-stream
+                                (make-instance 'network-tls-contract-stream
+                                               :input legacy-handshake-record))
+                              (reader-state
+                                (http-kit/tls::%make-http-tls-server-state
+                                 :driver nil :provider nil :transport-stream reader-stream)))
+                         (unwind-protect
+                              (let ((wire
+                                      (http-kit/tls::%tls-server-read-record
+                                       reader-state)))
+                                (ensure-octets-equal legacy-handshake-record wire)
+                                (ensure-equal
+                                 (length legacy-handshake-record)
+                                 (http-kit/test-core::binary-test-input-position reader-stream))
+                                (http-kit/tls::%tls-server-process-record state wire))
+                           (close reader-stream :abort t))))))
+      (ensure-true
+       (http-kit/tls::http-tls-server-state-client-hello-received-p state))
       (%network-tls-contract-protocol
-       (lambda () (http-kit/tls::%tls-server-process-record state legacy-handshake))
-       :tls :invalid-record-version)
-      (setf (http-kit/tls::http-tls-server-state-client-hello-received-p state) nil
-            (http-kit/tls::http-tls-server-state-early-data-offered-p state) t)
+       (lambda ()
+         (http-kit/tls::%tls-server-process-record state (octets 99 3 1 0 1 1)))
+       :tls :unexpected-record)
+      (setf (http-kit/tls::http-tls-server-state-early-data-offered-p state) t)
       (%network-tls-contract-protocol
        (lambda ()
          (http-kit/tls::%tls-server-process-record state (octets 23 3 3 0 1 41)))
@@ -2062,14 +2100,15 @@
             (http-kit/tls::http-tls-server-state-early-data-offered-p state) nil
             (http-kit/tls::http-tls-server-state-read-state state) :read-keys)
       (%network-tls-contract-protocol
-       (lambda () (http-kit/tls::%tls-server-process-record state (octets 22 3 3 0 0)))
+       (lambda ()
+         (http-kit/tls::%tls-server-process-record state (octets 22 3 3 0 0)))
        :tls :unexpected-record)
       (setf (http-kit/tls::http-tls-server-state-read-state state) nil)
       (%network-tls-contract-protocol
        (lambda ()
          (http-kit/tls::%tls-server-dispatch-plaintext
-          state (cl-tls-kit:make-tls-plaintext cl-tls-kit:+tls-content-type-alert+
-                                               (octets 1 0))))
+          state (cl-tls-kit:make-tls-plaintext
+                 cl-tls-kit:+tls-content-type-alert+ (octets 1 0))))
        :tls :handshake-failed)
       (close raw :abort t))
     (let* ((raw (make-instance 'network-tls-contract-stream :input (octets)))

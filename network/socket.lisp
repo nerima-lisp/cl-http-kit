@@ -111,6 +111,29 @@
     address-family
     closed-p)
 
+  (defvar *network-stream-sockets*
+    (make-hash-table :test #'eq :weakness :key))
+
+  (defvar *network-stream-sockets-lock*
+    (sb-thread:make-mutex :name "network stream sockets"))
+
+  (defun %network-record-stream-socket (stream socket)
+    (sb-thread:with-mutex (*network-stream-sockets-lock*)
+      (setf (gethash stream *network-stream-sockets*) socket))
+    stream)
+
+  (defun %network-stream-socket (stream)
+    (sb-thread:with-mutex (*network-stream-sockets-lock*)
+      (gethash stream *network-stream-sockets*)))
+
+  (defun %network-shutdown-socket (socket)
+    (when socket
+      (handler-case
+          (progn
+            (sb-bsd-sockets:socket-shutdown socket :direction :io)
+            t)
+        (error () nil))))
+
   (defun %network-listener-error (operation &optional detail)
     (error 'http-protocol-error
            :message (format nil "The native TCP listener ~A operation is invalid."
@@ -265,6 +288,7 @@ stream's read timeout after a connection is accepted."
                             :buffering :full))))
                (multiple-value-bind (peer-address peer-port)
                    (sb-bsd-sockets:socket-peername socket)
+                 (%network-record-stream-socket stream socket)
                  (setf retained-p t)
                  (values stream
                          (%network-address-text
