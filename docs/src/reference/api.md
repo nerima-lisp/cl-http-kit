@@ -1015,9 +1015,10 @@ rotation interval starts when the server is created. On the first TLS
 connection after each interval, the server replaces its owned store
 and, after all connections using it finish, zeroizes the previous store's keys
 and destroys the store. TLS session tickets encrypted with the previous store
-cannot resume after rotation. The server also zeroizes its owned store's keys
-and destroys the store after shutdown completes, once all connection workers
-have exited.
+cannot resume after rotation. During shutdown, the server zeroizes and destroys
+each owned store as soon as no active connection uses it. If a worker releases
+the last connection using a store, the server may destroy it before that worker
+exits.
 
 Pass a store created with `cl-tls-kit:make-tls13-server-ticket-key-store` to
 multiple server instances to share their TLS 1.3 session-ticket keys. Each
