@@ -121,6 +121,7 @@
     pending-request-streams
     runnable-stream-ids
     scheduler-owner-thread
+    (scheduler-poll-generation 0 :type integer)
     scheduler-close-state
     scheduler-close-owner-active-p
     scheduler-close-owner-thread
@@ -3561,6 +3562,9 @@ validated informational response in wire order."
                      (funcall (http3-client-poll-function client))
                      (when (%h3-scheduler-poll-critical-streams client)
                        (setf progress-p t))
+                     (%h3-with-scheduler-lock (client)
+                       (incf (http3-client-scheduler-poll-generation client))
+                       (%h3-scheduler-broadcast client))
                      (unless (%h3-scheduler-close-started-p client)
                        (%h3-scheduler-start-pending client)
                        (unless (%h3-scheduler-close-started-p client)
@@ -3615,6 +3619,62 @@ validated informational response in wire order."
             (setf (http3-client-scheduler-owner-thread client) nil))
           (%h3-scheduler-broadcast client)))))
   client))
+(defun %h3-scheduler-poll-once (client &optional at)
+  #+sbcl
+  (let ((thread (%h3-scheduler-current-thread))
+        (generation
+          (%h3-with-scheduler-lock (client)
+            (http3-client-scheduler-poll-generation client))))
+    (loop
+      for status =
+        (%h3-with-scheduler-lock (client)
+          (cond
+            ((/= generation
+                 (http3-client-scheduler-poll-generation client))
+             :completed)
+            ((http3-client-scheduler-close-state client)
+             :closing)
+            ((eq thread (http3-client-scheduler-owner-thread client))
+             :reentrant)
+            ((null (http3-client-scheduler-owner-thread client))
+             (setf (http3-client-scheduler-owner-thread client) thread)
+             :owned)
+            (t
+             (%h3-scheduler-condition-wait
+              client nil (function http-kit::%monotonic-time))
+             :wait)))
+      do (case status
+           (:owned (return))
+           ((:completed :closing :reentrant)
+            (return-from %h3-scheduler-poll-once client))))
+    (unwind-protect
+         (handler-case
+             (progn
+               (if at
+                   (funcall (http3-client-poll-function client) at)
+                   (funcall (http3-client-poll-function client)))
+               (%h3-scheduler-poll-critical-streams client)
+               (%h3-with-scheduler-lock (client)
+                 (incf (http3-client-scheduler-poll-generation client))
+                 (%h3-scheduler-broadcast client))
+               client)
+           (http3-connection-protocol-error (condition)
+             (%h3-with-scheduler-lock (client)
+               (unless (http3-client-scheduler-close-state client)
+                 (setf (http3-client-scheduler-close-state client) condition))
+               (%h3-scheduler-broadcast client))
+             (error condition)))
+      (%h3-with-scheduler-lock (client)
+        (when (eq thread (http3-client-scheduler-owner-thread client))
+          (setf (http3-client-scheduler-owner-thread client) nil))
+        (%h3-scheduler-broadcast client))))
+  #-sbcl
+  (progn
+    (if at
+        (funcall (http3-client-poll-function client) at)
+        (funcall (http3-client-poll-function client)))
+    (%h3-scheduler-poll-critical-streams client)
+    client))
 
 (defun %h3-scheduler-wait-entry (client entry)
   (handler-case

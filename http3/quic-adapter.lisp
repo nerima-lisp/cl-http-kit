@@ -565,8 +565,8 @@ to be selected without exposing QUIC implementation details."
                                                      (%http3-quic-adapter-await-peer-control-data
                                                       quic-client :timeout timeout :deadline deadline
                                                       :adapter adapter))
-                                                   :poll-function (lambda ()
-                                                     (cl-quic-kit:client-poll quic-client))
+                                                   :poll-function (lambda (&optional at)
+                                                     (cl-quic-kit:client-poll quic-client at))
                                                    :try-read-stream
                                                    (lambda (stream &key timeout deadline)
                                                      (declare (ignore timeout deadline))
@@ -651,22 +651,25 @@ to be selected without exposing QUIC implementation details."
   (unless (http3-quic-adapter-closed-p adapter)
     (http3-quic-adapter-start adapter)
     (handler-case
-        (progn
-          (cl-quic-kit:client-poll
-           (http3-quic-adapter-quic-client adapter) at)
-          (%http3-quic-adapter-process-peer-control-stream adapter))
+        (let ((client (http3-quic-adapter-http3-client adapter)))
+          (if (and client (%h3-native-scheduler-p client))
+              (%h3-scheduler-poll-once client at)
+            (progn
+              (cl-quic-kit:client-poll
+               (http3-quic-adapter-quic-client adapter) at)
+              (%http3-quic-adapter-process-peer-control-stream adapter))))
       (http3-connection-protocol-error (condition)
-        (http-kit::%with-http-cleanup
-          (close-http3-client
-           (http3-quic-adapter-http3-client adapter)
-           :condition condition))
-        (http-kit::%with-http-cleanup
-          (close-http3-quic-adapter
-           adapter
-           :error-code
-           (http3-connection-protocol-error-quic-error-code condition)
-           :reason (http-kit:http-error-message condition)))
-        (error condition))))
+                                       (http-kit::%with-http-cleanup
+                                        (close-http3-client
+                                         (http3-quic-adapter-http3-client adapter)
+                                         :condition condition))
+                                       (http-kit::%with-http-cleanup
+                                        (close-http3-quic-adapter
+                                         adapter
+                                         :error-code
+                                         (http3-connection-protocol-error-quic-error-code condition)
+                                         :reason (http-kit:http-error-message condition)))
+                                       (error condition))))
   adapter)
 
 (defun close-http3-quic-adapter (adapter &key (error-code :no-error) reason)
