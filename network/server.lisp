@@ -292,7 +292,6 @@
                        (cons (http-server-ticket-key-store server)
                              (http-server-retired-ticket-key-stores server)))
                :test (function eq))
-              (http-server-ticket-key-store server) nil
               (http-server-tls-wrapper server) nil
               (http-server-ticket-key-rotation-deadline server) nil)
         (dolist (store stores)
