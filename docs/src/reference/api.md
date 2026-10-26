@@ -579,7 +579,9 @@ caps active client request streams on this connection. The cap applies when the
 peer has not advertised
 `SETTINGS_MAX_CONCURRENT_STREAMS`; a lower peer limit also constrains stream
 admission. A batch larger than the effective limit runs in successive waves
-under the same deadline.
+under the same deadline. A single request waits for an active stream slot when
+the effective limit is full; its deadline and cancellation token remain active
+while it waits.
 
 On SBCL, when `collect-body-p` is NIL and `on-body-chunk` is supplied, the
 scheduler returns connection-level flow-control credit after it receives and
@@ -668,9 +670,6 @@ A concurrent call that cannot share an active entry uses a request-scoped
 connection. The manager does not set a stream limit itself: `open-connection`
 must construct each returned connection with its desired
 `max-concurrent-streams` value.
-There is no separate cap on total open connections. Enforcing one would require
-the manager to define how concurrent calls wait or fail when all sockets are in
-use, so `max-connections` remains a retained-cache limit.
 By default, the cache key includes the request scheme, host, port, proxy plan,
 and proxy.
 Supplying `connection-key` to a send function replaces that default; keys are
