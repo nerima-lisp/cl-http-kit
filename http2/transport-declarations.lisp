@@ -27,7 +27,7 @@
              (:conc-name %http2-connection-)
              (:constructor %make-http2-connection
                  (&key stream close-stream max-frame-size max-header-bytes max-fields
-                       max-body-bytes clock-function hpack-context
+                       max-concurrent-streams max-body-bytes clock-function hpack-context
                        next-stream-id peer-max-frame-size peer-max-table-size
                        peer-max-concurrent-streams peer-max-header-list-size
                        peer-initial-window-size peer-enable-connect-protocol-p
@@ -41,6 +41,7 @@
   max-frame-size
   max-header-bytes
   (max-fields 256)
+  (max-concurrent-streams 100)
   max-body-bytes
   clock-function
   (hpack-context nil)
@@ -72,7 +73,6 @@
   (scheduler-first-peer-frame-p t)
   (scheduler-last-opened-stream-id 0)
   (scheduler-ping-waiters nil)
-  (scheduler-pending-callback-payload-bytes 0)
   (scheduler-entries nil))
 
 (defun http2-connection-open-p (connection)
@@ -111,4 +111,3 @@
   (and (http2-connection-p connection)
        (%http2-connection-draining-p connection)))
 
-(defconstant +http2-pending-callback-payload-limit+ 65535)

@@ -435,6 +435,7 @@ character in that range is a decimal digit, apart from an optional sign when
   default-timeout
   max-header-bytes
   max-fields
+  (max-http2-concurrent-streams 100)
   max-body-bytes
   (automatic-decompression-p t)
   (content-decoders nil)

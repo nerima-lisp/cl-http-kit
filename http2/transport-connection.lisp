@@ -34,6 +34,7 @@
           (max-frame-size +http2-default-max-frame-size+)
           (max-header-bytes http-kit::*default-max-header-bytes*)
           (max-fields 256)
+          (max-concurrent-streams 100)
           (max-body-bytes http-kit::*default-max-body-bytes*)
           (max-control-frames 100)
           (max-control-window 1.0d0)
@@ -57,6 +58,7 @@ SETTINGS, stream identifiers, HPACK decoder state, and control frames."
   (%h2-validate-frame-size max-frame-size)
   (%h2-validate-limit :max-header-bytes max-header-bytes)
   (%h2-validate-limit :max-fields max-fields)
+  (%h2-validate-limit :max-concurrent-streams max-concurrent-streams)
   (%h2-validate-limit :max-body-bytes max-body-bytes :allow-zero t)
   (%h2-validate-limit :max-control-frames max-control-frames :allow-zero t)
   (%h2-validate-limit :max-pending-information-callbacks
@@ -78,6 +80,7 @@ SETTINGS, stream identifiers, HPACK decoder state, and control frames."
    :max-frame-size max-frame-size
    :max-header-bytes max-header-bytes
    :max-fields max-fields
+   :max-concurrent-streams max-concurrent-streams
    :max-body-bytes max-body-bytes
    :max-control-frames max-control-frames
    :max-control-window max-control-window
@@ -105,6 +108,13 @@ SETTINGS, stream identifiers, HPACK decoder state, and control frames."
 (defun http2-connection-peer-max-concurrent-streams (connection)
   (and (http2-connection-p connection)
        (%http2-connection-peer-max-concurrent-streams connection)))
+
+(defun %h2-connection-concurrent-stream-limit (connection)
+  (let ((local-limit (%http2-connection-max-concurrent-streams connection))
+        (peer-limit (%http2-connection-peer-max-concurrent-streams connection)))
+    (if peer-limit
+        (min local-limit peer-limit)
+        local-limit)))
 
 (defun http2-connection-peer-max-header-list-size (connection)
   (and (http2-connection-p connection)
@@ -861,7 +871,7 @@ are rejected after this function marks the connection draining."
 (defun %h2-connection-wait-for-stream-capacity
     (connection reader writer deadline clock-function)
   (loop while (eql 0
-                   (%http2-connection-peer-max-concurrent-streams connection))
+                   (%h2-connection-concurrent-stream-limit connection))
         do (let ((frame (%h2-read-frame
                          reader
                          (%http2-connection-max-frame-size connection)
@@ -882,7 +892,7 @@ are rejected after this function marks the connection draining."
               (%http2-connection-next-stream-id connection))
              (when (%http2-connection-goaway-last-stream-id connection)
                (%h2-connection-next-stream-id connection))))
-  (%http2-connection-peer-max-concurrent-streams connection))
+  (%h2-connection-concurrent-stream-limit connection))
 
 (defun %h2-connection-next-stream-id (connection)
   (when (%http2-connection-draining-p connection)
@@ -1089,7 +1099,7 @@ concurrent streams should use SEND-HTTP2-REQUESTS-OVER-CONNECTION."
                          :detail :protocol-error))
                 (when (and session-started-p
                            (eql 0
-                                (%http2-connection-peer-max-concurrent-streams
+                                (%h2-connection-concurrent-stream-limit
                                  connection)))
                   (%h2-connection-wait-for-stream-capacity
                    connection reader writer absolute-deadline clock))
@@ -1520,7 +1530,7 @@ CONTINUATION frames must still be consumed contiguously from that queue."
     t)
 
   (defun %h2-scheduler-enqueue-body-callback-locked
-      (connection entry callback payload flow-controlled-length end-stream-p
+      (entry callback payload flow-controlled-length end-stream-p
        collect-body-p)
     (let* ((tail (%h2-batch-entry-callback-events-tail entry))
            (event (and tail (car tail)))
@@ -1548,26 +1558,14 @@ CONTINUATION frames must still be consumed contiguously from that queue."
             (%h2-scheduler-enqueue-callback-locked
              entry (list :body callback queued-payload flow-controlled-length
                          end-stream-p collect-body-p))))
-      (unless collect-body-p
-        (incf (%http2-connection-scheduler-pending-callback-payload-bytes
-               connection)
-              (length payload)))
       t))
 
-  (defun %h2-scheduler-discard-callback-events-locked (connection entry)
+  (defun %h2-scheduler-discard-callback-events-locked (entry)
     (let* ((events (%h2-batch-entry-callback-events entry))
-           (queued-bytes
-             (loop for event in events
-                   when (and (eq (first event) :body)
-                             (not (sixth event)))
-                     sum (length (third event))))
            (queued-body-count
              (count :body events :key #'first :test #'eq))
            (queued-information-count
              (count :information events :key #'first :test #'eq)))
-      (decf (%http2-connection-scheduler-pending-callback-payload-bytes
-             connection)
-            queued-bytes)
       (decf (%h2-batch-entry-pending-information-callback-count entry)
             queued-information-count)
       (decf (%h2-batch-entry-pending-body-callback-count entry)
@@ -1613,16 +1611,11 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                              '(:information :response-headers) :test #'eq)))
         (let ((event (car events)))
           (setf (%h2-batch-entry-callback-events entry) (cdr events))
-          (when (eq (first event) :body)
-            (if (sixth event)
-                (let ((body-range (third event)))
-                  (setf (third event)
-                        (subseq (%h2-batch-entry-body-vector entry)
-                                (car body-range) (cdr body-range))))
-                (decf
-                 (%http2-connection-scheduler-pending-callback-payload-bytes
-                  connection)
-                 (length (third event)))))
+          (when (and (eq (first event) :body) (sixth event))
+            (let ((body-range (third event)))
+              (setf (third event)
+                    (subseq (%h2-batch-entry-body-vector entry)
+                            (car body-range) (cdr body-range)))))
           (unless (%h2-batch-entry-callback-events entry)
             (setf (%h2-batch-entry-callback-events-tail entry) nil))
           event)))))
@@ -1751,7 +1744,7 @@ CONTINUATION frames must still be consumed contiguously from that queue."
           (%http2-connection-scheduler-entries connection)))
 
   (defun %h2-scheduler-remove-entry (connection entry)
-    (%h2-scheduler-discard-callback-events-locked connection entry)
+    (%h2-scheduler-discard-callback-events-locked entry)
     (setf (%http2-connection-scheduler-entries connection)
           (delete entry (%http2-connection-scheduler-entries connection)
                   :test #'eq)))
@@ -1805,7 +1798,7 @@ CONTINUATION frames must still be consumed contiguously from that queue."
          (plusp (%h2-connection-stream-window connection stream-id))))
 
   (defun %h2-scheduler-capacity-available-p (connection)
-    (let ((limit (%http2-connection-peer-max-concurrent-streams connection)))
+    (let ((limit (%h2-connection-concurrent-stream-limit connection)))
       (and (not (eql limit 0))
            (or (null limit)
                (< (count-if-not #'%h2-batch-entry-error
@@ -1888,7 +1881,7 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                         :cause (list :goaway last-stream-id
                                      (%h2-u32 payload 4)))))
               (%h2-scheduler-discard-callback-events-locked
-               connection entry)
+               entry)
                (when (%h2-batch-entry-local-retired-p entry)
                  (%h2-scheduler-remove-entry connection entry))))))
         ((= type +http2-rst-stream-type+)
@@ -1920,7 +1913,7 @@ CONTINUATION frames must still be consumed contiguously from that queue."
              (when (%h2-peer-stream-reset-condition-p
                     (%h2-batch-entry-error entry))
                (%h2-scheduler-discard-callback-events-locked
-                connection entry))
+                entry))
              (when (%h2-batch-entry-local-retired-p entry)
                (%h2-scheduler-remove-entry connection entry)))))
         (t
@@ -2100,7 +2093,6 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                  (collect-body-p (%h2-batch-entry-collect-body-p entry))
                  (return-stream-credit-p nil)
                  (body-limit-condition nil)
-                 (callback-overflow-condition nil)
                  (response nil))
             (%h2-validate-response-stream-id stream-id type stream-id)
             (let ((retired-p nil))
@@ -2149,23 +2141,6 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                                                  (%h2-scheduler-enqueue-callback-locked
                                                   entry (list :body-limit-error
                                                               body-limit-condition))))
-                                             ((and callback
-                                                   (not collect-body-p)
-                                                   (plusp (length payload))
-                                                   (> (+ (%http2-connection-scheduler-pending-callback-payload-bytes
-                                                          connection)
-                                                         (length payload))
-                                                      +http2-pending-callback-payload-limit+))
-                                              (setf callback-overflow-condition
-                                                    (make-condition
-                                                     'http-kit:http-protocol-error
-                                                     :message "The pending HTTP/2 body callback payload limit was exceeded."
-                                                     :operation :http2-read
-                                                     :detail (list :pending-callback-payload stream-id
-                                                                   (%http2-connection-scheduler-pending-callback-payload-bytes
-                                                                    connection)
-                                                                   (length payload)
-                                                                   +http2-pending-callback-payload-limit+))))
                                              (t
                                                (progn
                                                  (incf (%h2-batch-entry-body-length entry)
@@ -2177,7 +2152,7 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                                                              (%h2-batch-entry-body-vector entry))))
                                                  (when (and callback (plusp (length payload)))
                                                    (%h2-scheduler-enqueue-body-callback-locked
-                                                    connection entry callback payload
+                                                    entry callback payload
                                                     flow-controlled-length end-stream-p
                                                     collect-body-p))
                                                  (setf return-stream-credit-p
@@ -2214,10 +2189,6 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                                          (%h2-scheduler-return-flow-credit
                                           connection 0 flow-controlled-length clock-function t))))
             (progn
-              (when callback-overflow-condition
-                (%h2-scheduler-retire-entry
-                 connection entry callback-overflow-condition clock-function)
-                (return-from %h2-scheduler-dispatch-frame nil))
               (when return-stream-credit-p
               (%h2-with-scheduler-lock (connection)
                                        (unless (or (%http2-connection-closed-p connection)
@@ -2424,7 +2395,7 @@ CONTINUATION frames must still be consumed contiguously from that queue."
         (dolist (entry (%http2-connection-scheduler-entries connection))
           (unless (%h2-batch-entry-error entry)
             (setf (%h2-batch-entry-error entry) condition))
-          (%h2-scheduler-discard-callback-events-locked connection entry))
+          (%h2-scheduler-discard-callback-events-locked entry))
         (dolist (waiter (%http2-connection-scheduler-ping-waiters connection))
           (unless (or (%h2-scheduler-ping-waiter-acknowledged-p waiter)
                       (%h2-scheduler-ping-waiter-failure waiter))
@@ -2801,7 +2772,7 @@ use each request's in-memory body.  Responses may arrive in any order and are
 returned in the same order as REQUESTS.  ON-BODY-CHUNK, when supplied,
 receives a payload and the corresponding request.  This API is cooperative
 rather than thread-safe: one caller owns a connection while this operation is
-active.  A batch larger than the peer's advertised concurrent-stream limit is
+active.  A batch larger than the effective local and peer concurrent-stream limit is
 sent in successive multiplexed waves under the same deadline."
   (unless (http2-connection-p connection)
     (error 'http-kit:http-protocol-error
@@ -2885,9 +2856,7 @@ sent in successive multiplexed waves under the same deadline."
                        :operation :http2-write
                        :detail :protocol-error))
               (let ((concurrent-limit
-                      (and session-started-p
-                           (%http2-connection-peer-max-concurrent-streams
-                            connection))))
+                      (%h2-connection-concurrent-stream-limit connection)))
                 (when (eql concurrent-limit 0)
                   (setf concurrent-limit
                         (%h2-connection-wait-for-stream-capacity

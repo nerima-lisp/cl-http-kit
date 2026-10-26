@@ -266,6 +266,7 @@
    #:http-client-default-timeout
    #:http-client-max-header-bytes
    #:http-client-max-fields
+   #:http-client-max-http2-concurrent-streams
    #:http-client-max-body-bytes
    #:http-client-on-request
    #:http-client-on-response

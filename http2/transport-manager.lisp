@@ -68,12 +68,12 @@ PROXY-PLAN and PROXY. By default, the cache key includes the request scheme,
 host, port, proxy plan, and proxy. MAX-CONNECTIONS bounds retained cache
 entries, not total open connections; request-scoped connections do not count
 toward it. Concurrent single-request calls for the same key share a retained
-connection. Its scheduler assigns streams and enforces peer concurrent-stream
-and flow-control limits. A batch call holds an exclusive lease because the
-batch operation is cooperative rather than thread-safe. If an incompatible
-operation is already using the same key, the manager uses a request-scoped
-connection. At capacity, requests for other keys use a request-scoped
-connection when every retained entry is active.
+connection. Its scheduler assigns streams and enforces the connection's local
+and peer concurrent-stream limits plus flow control. A batch call holds an
+exclusive lease because the batch operation is cooperative rather than
+thread-safe. If an incompatible operation is already using the same key, the
+manager uses a request-scoped connection. At capacity, requests for other keys
+use a request-scoped connection when every retained entry is active.
 
 IDLE-TIMEOUT retires entries after the configured time without a completed
 manager call. MAX-CONNECTION-AGE retires entries after the configured time from

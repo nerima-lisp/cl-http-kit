@@ -440,7 +440,7 @@
                   (and selected-alpn (funcall selected-alpn tls-stream))))))))
 
 (defun %client-transport-from-negotiated-connection-pool
-    (connection-pool)
+    (connection-pool &optional (max-http2-concurrent-streams 100))
   (let* ((open-stream (%http-connection-pool-open-stream connection-pool))
          (close-stream (%http-connection-pool-close-stream connection-pool))
          (http1-transport
@@ -503,7 +503,9 @@
                         (prog1
                             (http-kit/http2:make-http2-connection
                              :stream stream
-                             :close-stream close-stream)
+                             :close-stream close-stream
+                             :max-concurrent-streams
+                             max-http2-concurrent-streams)
                           (setf stream nil
                                 transferred-p t)))
                    (when (and stream (not transferred-p))
@@ -589,6 +591,7 @@
           (random-function #'random)
           (default-timeout *default-client-timeout*)
           max-header-bytes max-fields
+          (max-http2-concurrent-streams 100)
           (max-body-bytes http-kit::*default-max-body-bytes*)
           (automatic-decompression-p t)
           (content-decoders (make-http-content-decoders))
@@ -597,7 +600,8 @@
 
 TRANSPORT-FUNCTION is called with REQUEST and keyword arguments including
 :TIMEOUT, :DEADLINE, :MAX-HEADER-BYTES, :MAX-FIELDS, :MAX-BODY-BYTES, :PROXY, and
-:PROXY-PLAN.  Alternatively OPEN-STREAM and CLOSE-STREAM can be supplied to
+:PROXY-PLAN.  MAX-HTTP2-CONCURRENT-STREAMS limits streams on native HTTP/2
+connections.  Alternatively OPEN-STREAM and CLOSE-STREAM can be supplied to
 use the core HTTP/1.1 stream transport.  CONNECTION-POOL supplies a reusable
 stream boundary and owns opening and closing pooled streams.  TLS-UPGRADE and
 RESOLVE-HOST customize the injected stream boundary when OPEN-STREAM is used.
@@ -708,6 +712,11 @@ Pass NIL explicitly to disable either store."
     (%client-protocol-error
      "The maximum field count must be a positive integer or NIL."
      max-fields))
+  (unless (and (integerp max-http2-concurrent-streams)
+               (plusp max-http2-concurrent-streams))
+    (%client-protocol-error
+     "The maximum HTTP/2 concurrent stream count must be a positive integer."
+     max-http2-concurrent-streams))
   (%client-validate-limit
    max-body-bytes
    "The maximum body size must be a non-negative integer or NIL.")
@@ -763,7 +772,8 @@ Pass NIL explicitly to disable either store."
                         (and effective-connection-pool
                              (if native-default-p
                                  (%client-transport-from-negotiated-connection-pool
-                                  effective-connection-pool)
+                                  effective-connection-pool
+                                  max-http2-concurrent-streams)
                                  (%client-transport-from-connection-pool
                                   effective-connection-pool)))
                         (%client-transport-from-stream-boundary
@@ -800,6 +810,7 @@ Pass NIL explicitly to disable either store."
      :default-timeout default-timeout
      :max-header-bytes max-header-bytes
      :max-fields max-fields
+     :max-http2-concurrent-streams max-http2-concurrent-streams
      :max-body-bytes max-body-bytes
      :automatic-decompression-p automatic-decompression-p
      :content-decoders (copy-list content-decoders)
