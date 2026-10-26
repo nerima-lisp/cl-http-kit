@@ -17,8 +17,6 @@ The URI structure type.
 
 ### `http-uri-p`
 
-Return true when the object is an HTTP-URI.
-
 ### `make-http-uri`
 
 Construct a URI. The signature is
@@ -65,8 +63,6 @@ The header structure type. It contains a name and a trimmed string content.
 
 ### `http-header-p`
 
-Return true when the object is an HTTP-HEADER.
-
 ### `make-http-header`
 
 Construct a header with make-http-header (name content). Names must be
@@ -102,8 +98,6 @@ present. Inputs follow `http-header-values`.
 The request structure type.
 
 ### `http-request-p`
-
-Return true when the object is an HTTP-REQUEST.
 
 ### `make-http-request`
 
@@ -178,8 +172,6 @@ The response structure type.
 
 ### `http-response-p`
 
-Return true when the object is an HTTP-RESPONSE.
-
 ### `make-http-response`
 
 ```lisp
@@ -221,8 +213,6 @@ an empty octet vector.
 The streaming response type accepted by a `serve-http1-session` handler.
 
 ### `http-response-stream-p`
-
-Return true when the object is an HTTP-RESPONSE-STREAM.
 
 ### `make-http-response-stream`
 
@@ -374,8 +364,6 @@ It returns the number of final responses written and one of `:eof`, `:close`,
 The deterministic recording-session structure type.
 
 ### `recording-session-p`
-
-Return true when the object is a RECORDING-SESSION.
 
 ### `make-recording-session`
 
@@ -533,8 +521,6 @@ The HTTP/2 client structure type.
 
 ### `http2-client-p`
 
-Return true when the object is an HTTP2-CLIENT.
-
 ### `make-http2-client`
 
 Construct a client with make-http2-client (&key exchange open-stream
@@ -562,9 +548,9 @@ huffman-p)`.
 ### Reusable HTTP/2 connections
 
 `make-http2-connection (&key stream close-stream max-frame-size
-max-header-bytes max-fields max-body-bytes max-control-frames
-max-control-window max-pending-information-callbacks clock-function)` creates a
-connection over an already negotiated binary stream.
+max-header-bytes max-fields max-concurrent-streams max-body-bytes
+max-control-frames max-control-window max-pending-information-callbacks
+clock-function)` creates a connection over an already negotiated binary stream.
 `send-http2-request-over-connection (connection request &key timeout deadline
 max-header-bytes max-fields max-body-bytes clock-function
 request-body-function request-body-length on-body-chunk on-information
@@ -588,12 +574,23 @@ connection to the high-level client transport protocol.
 stream-backed client, when present. These functions accept `max-fields`; the
 default per decoded header or trailer section is 256.
 
-The connection-wide pending streaming body callback budget is 65,535 bytes.
-Only body bytes waiting for `on-body-chunk` delivery count toward it. Collected
-bodies are already bounded by `max-body-bytes`, so their pending callbacks refer
-to ranges in the body buffer and do not use this budget. If streaming callback
-bytes exceed the budget, the affected stream is cancelled with `RST_STREAM` and
-error code `CANCEL`.
+`max-concurrent-streams` must be a positive integer and defaults to 100. It
+caps active client request streams on this connection. The cap applies when the
+peer has not advertised
+`SETTINGS_MAX_CONCURRENT_STREAMS`; a lower peer limit also constrains stream
+admission. A batch larger than the effective limit runs in successive waves
+under the same deadline.
+
+On SBCL, when `collect-body-p` is NIL and `on-body-chunk` is supplied, the
+scheduler returns connection-level flow-control credit after it receives and
+queues each callback payload, without waiting for delivery. For nonterminal
+payloads, it holds that stream's credit until the callback completes, so a slow
+callback applies backpressure to its stream while other scheduled streams can
+continue. When body collection is enabled, callback events refer to ranges in
+the collected body vector; collected response storage remains bounded by
+`max-body-bytes`. On other implementations, the serial reader invokes the
+callback while processing DATA, then returns connection-level credit and, for
+nonterminal DATA, stream-level credit.
 
 `max-pending-information-callbacks` sets the per-stream limit for unfinished
 informational response callbacks, including queued and running callbacks. It
@@ -664,9 +661,13 @@ toward that limit, so the total number of open connections can exceed it. On
 SBCL, the manager synchronizes its entry state for concurrent callers. Ordinary
 single-request calls with the same key can share one retained connection; its
 scheduler assigns distinct stream IDs and observes the peer's concurrent-stream
-and flow-control limits. A batch call holds an exclusive lease on its selected
-connection. A concurrent call that cannot share an active entry uses a
-request-scoped connection.
+and flow-control limits together with that connection's local
+`max-concurrent-streams` cap. A batch call holds an exclusive lease on its
+selected connection and runs in waves if it exceeds the effective stream limit.
+A concurrent call that cannot share an active entry uses a request-scoped
+connection. The manager does not set a stream limit itself: `open-connection`
+must construct each returned connection with its desired
+`max-concurrent-streams` value.
 There is no separate cap on total open connections. Enforcing one would require
 the manager to define how concurrent calls wait or fail when all sockets are in
 use, so `max-connections` remains a retained-cache limit.
@@ -1167,8 +1168,6 @@ The metrics adapter structure type.
 
 ### `http-metrics-p`
 
-Return true when the object is an HTTP-METRICS value.
-
 ### `make-http-metrics`
 
 Construct metrics with make-http-metrics (&optional registry). When registry
@@ -1318,8 +1317,6 @@ decoded.
 The multipart-part structure type.
 
 ### `http-multipart-part-p`
-
-Return true when the object is an HTTP-MULTIPART-PART.
 
 ### `make-http-multipart-part`
 
@@ -1688,15 +1685,11 @@ protocol ID, host, port, expiry time, and persistence flag.
 
 ### `http-alternative-service-p`
 
-Return true when the object is an alternative-service record.
-
 ### `http-alternative-service-store`
 
 The in-memory RFC 7838 alternative-service store type.
 
 ### `http-alternative-service-store-p`
-
-Return true when the object is an alternative-service store.
 
 ### `make-http-alternative-service-store`
 
@@ -1762,8 +1755,6 @@ Return the cache entry snapshot.
 The cache-entry structure type.
 
 ### `http-cache-entry-p`
-
-Return true when the object is an HTTP-CACHE-ENTRY.
 
 ### `http-cache-entry-key`
 
@@ -1949,8 +1940,6 @@ The high-level client structure type.
 
 ### `http-client-p`
 
-Return true when the object is an HTTP-CLIENT.
-
 ### `make-http-client`
 
 Construct a client. The signature is
@@ -1961,7 +1950,8 @@ alternative-service-store redirect-policy
 retry-policy proxy tls-upgrade resolve-host resolve-host-style auth-provider
 challenge-auth-provider proxy-challenge-auth-provider
 stale-while-revalidate-scheduler clock-function
-wall-clock-function sleep-function random-function default-timeout max-header-bytes max-fields max-body-bytes
+wall-clock-function sleep-function random-function default-timeout
+max-header-bytes max-fields max-http2-concurrent-streams max-body-bytes
 automatic-decompression-p content-decoders on-request on-response). At most one
 of transport-function, open-stream, or connection-pool may be supplied;
 omitting all three and close-stream selects the native TCP/TLS connection pool.
@@ -1970,6 +1960,13 @@ optional for the direct stream transport boundary. Omitting
 strict-transport-store creates a new RFC 6797 store; explicitly passing nil
 disables HSTS. Omitting alternative-service-store creates a new RFC 7838 store;
 explicitly passing nil disables alternative-service discovery.
+
+`max-http2-concurrent-streams` must be a positive integer and defaults to 100.
+It sets the local stream cap for each HTTP/2 connection opened by the native
+negotiated client. The cap is per connection: requests sharing one
+manager-selected connection share this limit, while the manager's
+`max-connections` controls retained connections, not streams. Injected
+transports set their own HTTP/2 stream limits.
 
 ### `make-http-cancellation-token`
 
@@ -2172,6 +2169,11 @@ Return the client's maximum response header size.
 ### `http-client-max-fields`
 
 Return the client's maximum response field count per field section.
+
+### `http-client-max-http2-concurrent-streams`
+
+Return the client's maximum concurrent HTTP/2 request streams per native
+connection.
 
 ### `http-client-max-body-bytes`
 
