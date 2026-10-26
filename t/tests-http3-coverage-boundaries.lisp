@@ -4657,6 +4657,59 @@
       (setf (http-kit/http3::http3-client-scheduler-close-state client) nil)
       (when (http-kit/http3:http3-client-open-p client)
         (http-kit/http3:close-http3-client client)))))
+(deftest http3-native-scheduler-owner-loop-skips-poll-for-terminal-entry
+  (let* ((poll-count 0)
+         (client
+          (http3-test-make-native-client
+           :poll-function (lambda () (incf poll-count))
+           :try-read-stream
+           (lambda (stream &key timeout deadline)
+             (declare (ignore stream timeout deadline))
+             (values nil nil :would-block))))
+         (entry
+          (http-kit/http3::%make-http3-request-stream
+           :deadline -1
+           :done-p t)))
+    (unwind-protect
+         (progn
+           (http-kit/http3::%h3-scheduler-owner-loop client entry)
+           (ensure-equal 0 poll-count)
+           (ensure-true
+            (http-kit/http3::%http3-request-stream-done-p entry))
+           (ensure-equal nil
+                         (http-kit/http3::%http3-request-stream-failure entry)))
+      (when (http-kit/http3:http3-client-open-p client)
+        (http-kit/http3:close-http3-client client)))))
+(deftest http3-native-scheduler-owner-loop-fails-expired-owner-deadline
+  (let* ((poll-count 0)
+         (client
+          (http3-test-make-native-client
+           :poll-function (lambda () (incf poll-count))
+           :try-read-stream
+           (lambda (stream &key timeout deadline)
+             (declare (ignore stream timeout deadline))
+             (values nil nil :would-block))))
+         (entry
+          (http-kit/http3::%make-http3-request-stream
+           :deadline -1)))
+    (unwind-protect
+         (progn
+           (setf (gethash 0
+                          (http-kit/http3::http3-client-request-streams client))
+                 entry
+                 (http-kit/http3::http3-client-request-stream-count client)
+                 1)
+           (http-kit/http3::%h3-scheduler-owner-loop client entry)
+           (ensure-equal 0 poll-count)
+           (ensure-true
+            (http-kit/http3::%http3-request-stream-done-p entry))
+           (let ((failure
+                   (http-kit/http3::%http3-request-stream-failure entry)))
+             (ensure-true (typep failure (quote http-kit:http-timeout)))
+             (ensure-equal :read (http-kit:http-timeout-kind failure))
+             (ensure-equal :read (http-kit:http-error-operation failure))))
+      (when (http-kit/http3:http3-client-open-p client)
+        (http-kit/http3:close-http3-client client)))))
 (deftest http3-native-scheduler-close-waits-for-existing-close-owner
   (let* ((client
           (http3-test-make-native-client
