@@ -616,7 +616,12 @@
                         0 clock nil nil nil nil t nil
                         (lambda (wire)
                           (declare (ignore wire))
-                          (http-kit::%check-deadline 0 clock :write)))
+                          (http-kit::%check-deadline 0 clock :write))
+                        (lambda () nil)
+                        (lambda ()
+                          (error "Unexpected request cancellation."))
+                        (lambda (opened-entry)
+                          (declare (ignore opened-entry))))
                      (http-kit:http-timeout ()
                        (setf timeout-seen-p t)))
                    (ensure-true timeout-seen-p)
