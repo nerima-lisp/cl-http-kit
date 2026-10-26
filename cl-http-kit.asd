@@ -231,6 +231,7 @@
                (:file "tests-network-tls-server")
                (:file "tests-https-listener")
                (:file "tests-https-listener-coverage")
+               (:file "tests-https-listener-shutdown-coverage")
                (:file "tests-p9b-coverage-boundaries")
                (:file "runner"))
   :perform (asdf:test-op (op c)
