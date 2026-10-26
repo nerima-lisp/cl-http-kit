@@ -984,7 +984,7 @@ are rejected after this function marks the connection draining."
                           :message "The HTTP/2 stream was cancelled locally."
                           :operation :http2-write
                           :cause (list :local-cancel stream-id error-code))
-         clock 0 error-code only-if-active-p)))
+         clock error-code only-if-active-p)))
     (if (and only-if-active-p response-complete-p)
         :response-complete
         t)))
@@ -1557,10 +1557,9 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                                  event)))))
 
 (defun %h2-scheduler-retire-entry
-    (connection entry condition clock-function &optional (flow-credit 0)
+    (connection entry condition clock-function &optional
                 (reset-error-code 8) only-if-active-p)
-  (let ((reset-p nil)
-        (connection-credit flow-credit))
+  (let ((reset-p nil))
     (%h2-with-scheduler-lock (connection)
                              (unless (or (%h2-batch-entry-local-retired-p entry)
                                          (%h2-peer-stream-reset-condition-p
@@ -1586,14 +1585,10 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                                      (%h2-batch-entry-response entry) nil)
                                (%h2-scheduler-broadcast connection)))
     (handler-case
-        (progn
-          (when (plusp connection-credit)
-            (%h2-scheduler-return-flow-credit
-             connection 0 connection-credit clock-function t))
-          (when reset-p
-            (%h2-send-rst-stream
-             (%h2-scheduler-control-writer connection clock-function)
-             (%h2-batch-entry-stream-id entry) reset-error-code)))
+        (when reset-p
+          (%h2-send-rst-stream
+           (%h2-scheduler-control-writer connection clock-function)
+           (%h2-batch-entry-stream-id entry) reset-error-code))
       (error (reset-condition)
              (%h2-scheduler-fail-connection connection reset-condition)
              (error reset-condition)))))
@@ -1852,18 +1847,12 @@ CONTINUATION frames must still be consumed contiguously from that queue."
 )
 
   (defun %h2-scheduler-dispatch-retired-data
-      (connection entry frame clock-function)
+      (connection frame clock-function)
     (%h2-data-payload frame)
     (%h2-with-scheduler-lock (connection)
                              (unless (%http2-connection-closed-p connection)
                                (%h2-scheduler-return-flow-credit
-                                connection 0 (length (%h2-frame-payload frame)) clock-function t)))
-    (when (and entry
-               (/= 0 (logand (%h2-frame-flags frame)
-                             +http2-end-stream-flag+)))
-      (%h2-with-scheduler-lock (connection)
-        (%h2-scheduler-remove-entry connection entry)
-        (%h2-scheduler-broadcast connection))))
+                                connection 0 (length (%h2-frame-payload frame)) clock-function t))))
 
   (defun %h2-scheduler-previously-opened-client-stream-p
       (connection stream-id)
@@ -2005,7 +1994,7 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                          :operation :http2-client
                          :detail frame)
                 (%h2-scheduler-dispatch-retired-data
-                 connection nil frame clock-function))
+                 connection frame clock-function))
             (error 'http-kit:http-protocol-error
                    :message "The HTTP/2 scheduler received DATA for an unknown stream."
                    :operation :http2-read

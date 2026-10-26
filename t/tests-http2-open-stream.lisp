@@ -4358,7 +4358,8 @@
               (h2-frame 4 0 0 (octets))
               (h2-frame 1 4 1 (h2-header-block (cons ":status" "200")))
               (h2-frame 0 0 1 (octets 65))
-              (h2-frame 0 1 1 (octets 66))
+              (h2-frame 0 0 1 (octets 66))
+              (h2-frame 0 1 1 (octets 67))
               (h2-frame 1 5 3 (h2-header-block (cons ":status" "200")))))
            (stream (make-instance 'binary-session-stream :input input))
            (connection
@@ -4476,4 +4477,24 @@
               (http-kit/http2::%h2-batch-entry-request-body-abandoned-p entry))
              (ensure-equal 0 (length (binary-session-output stream))))
         (http-kit/http2:close-http2-connection connection)))))
-)
+
+  (deftest http2-cancel-does-not-preserve-entry-without-completed-response
+    (let* ((stream (make-instance 'binary-session-stream :input (octets)))
+           (connection (http-kit/http2:make-http2-connection :stream stream))
+           (entry (http-kit/http2::%make-h2-batch-entry :stream-id 1)))
+      (unwind-protect
+           (progn
+             (setf (http-kit/http2::%http2-connection-next-stream-id connection) 3
+                   (http-kit/http2::%http2-connection-scheduler-entries connection)
+                   (list entry))
+             (ensure-true
+              (http-kit/http2::%h2-cancel-http2-stream
+               connection 1 :only-if-active-p t))
+             (ensure-true (http-kit/http2::%h2-batch-entry-local-retired-p entry))
+             (ensure-true
+              (find-if (lambda (frame)
+                         (and (= 3 (http-kit/http2::%h2-frame-type frame))
+                              (= 1 (http-kit/http2::%h2-frame-stream-id frame))))
+                       (h2-output-frames stream)))
+        (http-kit/http2:close-http2-connection connection))))
+))
