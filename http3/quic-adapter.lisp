@@ -30,36 +30,30 @@
            :operation :http3-quic-adapter
            :kind :deadline))
 
-  (defun %http3-quic-adapter-owner-error ()
-    (error 'http-kit:http-connection-error
-           :message "The HTTP/3 QUIC client is owned by another thread."
-           :operation :http3-quic-client
-           :request-sent-p nil))
-
   (defun %http3-quic-adapter-call-with-owner (adapter thunk)
     #+sbcl
     (let ((thread sb-thread:*current-thread*)
-          (local-claimed-p nil)
+          (bootstrap-claimed-p nil)
           (client nil))
-      (sb-thread:with-mutex
-          ((http3-quic-adapter-owner-lock adapter))
+      (sb-thread:with-mutex ((http3-quic-adapter-owner-lock adapter))
         (let ((owner (http3-quic-adapter-owner-thread adapter)))
           (when (and owner (not (eq owner thread)))
-            (%http3-quic-adapter-owner-error))
+            (error 'http-kit:http-connection-error
+                   :message "The HTTP/3 QUIC client is owned by another thread."
+                   :operation :http3-quic-client
+                   :request-sent-p nil))
           (when (and (null owner)
                      (null (http3-quic-adapter-http3-client adapter)))
             (setf (http3-quic-adapter-owner-thread adapter) thread
-                  local-claimed-p t)))
+                  bootstrap-claimed-p t)))
         (setf client (http3-quic-adapter-http3-client adapter)))
       (unwind-protect
            (if client
                (%h3-call-with-scheduler-owner client thunk)
                (funcall thunk))
-        (when local-claimed-p
-          (sb-thread:with-mutex
-              ((http3-quic-adapter-owner-lock adapter))
-            (when (eq (http3-quic-adapter-owner-thread adapter) thread)
-              (setf (http3-quic-adapter-owner-thread adapter) nil))))))
+        (when bootstrap-claimed-p
+          (sb-thread:with-mutex ((http3-quic-adapter-owner-lock adapter))
+            (setf (http3-quic-adapter-owner-thread adapter) nil)))))
     #-sbcl
     (funcall thunk))
 

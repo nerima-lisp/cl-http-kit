@@ -260,14 +260,27 @@
         (ensure-equal :push kind)
         (ensure-equal '() events)
         (ensure-equal nil ended-p)))
-    (let ((client (make-client))
-          (stream
-            (make-http3-test-stream
-             :kind :truncated
-             :reads (list (list (octets #x40) t)))))
-      (signals http-protocol-error
-        (http-kit/http3:accept-http3-peer-unidirectional-stream
-         client stream)))))
+    (progn
+      (let ((client (make-client))
+            (stream
+              (make-http3-test-stream
+               :kind :truncated
+               :reads (list (list (octets #x40) t)))))
+        (signals http-protocol-error
+          (http-kit/http3:accept-http3-peer-unidirectional-stream
+           client stream)))
+      (let ((closed-client (make-client))
+            (stream (make-http3-test-stream :kind :peer)))
+        (unwind-protect
+             (progn
+               (signals http-protocol-error
+                 (http-kit/http3:process-http3-peer-unidirectional-stream
+                  :invalid stream))
+               (http-kit/http3:close-http3-client closed-client)
+               (signals http-protocol-error
+                 (http-kit/http3:process-http3-peer-unidirectional-stream
+                  closed-client stream)))
+          (http-kit/http3:close-http3-client closed-client))))))
 
 (deftest http3-control-frame-state-boundaries
   (labels ((frame (type &optional (payload (octets)))
@@ -15589,44 +15602,73 @@
                (symbol-function reader-name) original-reader
                (http-kit/http3::http3-client-poll-function client)
                original-poll-function))))))
-(deftest http3-quic-adapter-rejects-owner-bypassing-read-and-write-during-owner-poll
+(deftest http3-quic-adapter-serializes-public-poll-read-and-write-with-request-owner
   (call-with-http3-coverage-adapter-fixture
    (lambda (adapter)
      (let* ((client
               (http-kit/http3:http3-quic-adapter-http3-client adapter))
             (poll-started (sb-thread:make-semaphore :count 0))
             (release-poll (sb-thread:make-semaphore :count 0))
+            (public-poll-started (sb-thread:make-semaphore :count 0))
+            (public-poll-waiting (sb-thread:make-semaphore :count 0))
+            (poll-lock (sb-thread:make-mutex))
+            (poll-count 0)
+            (active-polls 0)
+            (max-active-polls 0)
             (write-lock (sb-thread:make-mutex))
             (write-count 0)
             (response-wire (http3-test-native-response-wire))
-            (first-poll-p nil)
             (original-poll-function
               (http-kit/http3::http3-client-poll-function client))
             (original-write-stream
               (http-kit/http3::http3-client-write-stream client))
+            (condition-wait-name
+              'http-kit/http3::%h3-scheduler-condition-wait)
+            (original-condition-wait
+              (symbol-function
+               'http-kit/http3::%h3-scheduler-condition-wait))
             (request-thread nil)
             (request-finished nil)
             (request-result nil)
-            (public-thread nil)
-            (public-finished nil)
-            (public-result nil)
+            (public-poll-thread nil)
+            (public-poll-finished nil)
+            (public-poll-result nil)
+            (write-thread nil)
+            (write-finished nil)
+            (write-result nil)
             (reader-thread nil)
             (reader-finished nil)
             (reader-result nil))
        (setf (http-kit/http3::http3-client-poll-function client)
              (lambda (&optional at)
-               (unless first-poll-p
-                 (setf first-poll-p t)
-                 (sb-thread:signal-semaphore poll-started)
-                 (sb-thread:wait-on-semaphore release-poll :timeout 5))
-               (if at
-                   (funcall original-poll-function at)
-                   (funcall original-poll-function)))
+               (let ((first-p nil))
+                 (sb-thread:with-mutex (poll-lock)
+                   (incf poll-count)
+                   (incf active-polls)
+                   (setf max-active-polls
+                         (max max-active-polls active-polls)
+                         first-p (= poll-count 1)))
+                 (unwind-protect
+                      (progn
+                        (when first-p
+                          (sb-thread:signal-semaphore poll-started)
+                          (sb-thread:wait-on-semaphore
+                           release-poll :timeout 5))
+                        (if at
+                            (funcall original-poll-function at)
+                            (funcall original-poll-function)))
+                   (sb-thread:with-mutex (poll-lock)
+                     (decf active-polls)))))
              (http-kit/http3::http3-client-write-stream client)
              (lambda (stream octets &rest arguments)
                (sb-thread:with-mutex (write-lock)
                  (incf write-count))
-               (apply original-write-stream stream octets arguments)))
+               (apply original-write-stream stream octets arguments))
+             (symbol-function condition-wait-name)
+             (lambda (wait-client deadline clock-function)
+               (sb-thread:signal-semaphore public-poll-waiting)
+               (funcall original-condition-wait
+                        wait-client deadline clock-function)))
        (unwind-protect
             (progn
               (multiple-value-setq
@@ -15650,19 +15692,35 @@
                        :level :1-rtt))))))
               (ensure-true
                (sb-thread:wait-on-semaphore poll-started :timeout 3))
+              (multiple-value-setq
+                  (public-poll-thread public-poll-finished public-poll-result)
+                (http3-test-start-native-call
+                 (lambda ()
+                   (sb-thread:signal-semaphore public-poll-started)
+                   (http-kit/http3:http3-quic-adapter-poll adapter))))
+              (ensure-true
+               (sb-thread:wait-on-semaphore public-poll-started :timeout 3))
+              (ensure-true
+               (sb-thread:wait-on-semaphore public-poll-waiting :timeout 3))
+              (ensure-false
+               (sb-thread:wait-on-semaphore public-poll-finished :timeout 0.05))
+              (sb-thread:with-mutex (poll-lock)
+                (ensure-equal 1 poll-count)
+                (ensure-equal 1 active-polls)
+                (ensure-equal 1 max-active-polls))
               (let ((writes-before-public-call
                       (sb-thread:with-mutex (write-lock) write-count)))
                 (multiple-value-setq
-                    (public-thread public-finished public-result)
+                    (write-thread write-finished write-result)
                   (http3-test-start-native-call
                    (lambda ()
                      (http-kit/http3:advertise-http3-max-push-id client 0))))
                 (ensure-true
-                 (sb-thread:wait-on-semaphore public-finished :timeout 3))
-                (ensure-equal :error (first public-result))
+                 (sb-thread:wait-on-semaphore write-finished :timeout 3))
+                (ensure-equal :error (first write-result))
                 (ensure-true
-                 (typep (second public-result)
-                        (quote http-kit:http-connection-error)))
+                 (typep (second write-result)
+                        'http-kit:http-connection-error))
                 (ensure-equal
                  writes-before-public-call
                  (sb-thread:with-mutex (write-lock) write-count)))
@@ -15676,19 +15734,31 @@
               (ensure-equal :error (first reader-result))
               (ensure-true
                (typep (second reader-result)
-                      (quote http-kit:http-connection-error)))
+                      'http-kit:http-connection-error))
               (ensure-true (sb-thread:thread-alive-p request-thread))
               (sb-thread:signal-semaphore release-poll)
               (ensure-true
                (sb-thread:wait-on-semaphore request-finished :timeout 3))
+              (ensure-true
+               (sb-thread:wait-on-semaphore public-poll-finished :timeout 3))
               (ensure-equal :response (first request-result))
               (ensure-equal 200
-                            (http-response-status (second request-result))))
+                            (http-response-status (second request-result)))
+              (ensure-equal :response (first public-poll-result))
+              (ensure-true (eq adapter (second public-poll-result)))
+              (sb-thread:with-mutex (poll-lock)
+                (ensure-equal 1 poll-count)
+                (ensure-equal 0 active-polls)
+                (ensure-equal 1 max-active-polls)))
          (sb-thread:signal-semaphore release-poll)
          (http3-test-join-native-thread request-thread request-finished)
-         (http3-test-join-native-thread public-thread public-finished)
+         (http3-test-join-native-thread
+          public-poll-thread public-poll-finished)
+         (http3-test-join-native-thread write-thread write-finished)
          (http3-test-join-native-thread reader-thread reader-finished)
-         (setf (http-kit/http3::http3-client-poll-function client)
+         (setf (symbol-function condition-wait-name)
+               original-condition-wait
+               (http-kit/http3::http3-client-poll-function client)
                original-poll-function
                (http-kit/http3::http3-client-write-stream client)
                original-write-stream))))))
@@ -15749,6 +15819,18 @@
                    (http-kit/http3:close-http3-client client))))
               (ensure-true
                (http3-test-await-native-close-state client :closing))
+              (let ((failure
+                      (handler-case
+                          (progn
+                            (http-kit/http3:attach-http3-peer-qpack-encoder-stream
+                             client (make-http3-test-stream :kind :peer))
+                            nil)
+                        (http-kit:http-connection-error (condition) condition))))
+                (ensure-true
+                 (typep failure 'http-kit:http-connection-error))
+                (ensure-equal
+                 nil
+                 (http-kit/http3:http3-client-peer-qpack-encoder-stream client)))
               (ensure-true
                (eq adapter
                    (http-kit/http3:http3-quic-adapter-poll adapter)))

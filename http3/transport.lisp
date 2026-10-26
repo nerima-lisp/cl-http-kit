@@ -707,8 +707,6 @@ The stream-type prefix may be fragmented across reads. Push streams are
 classified only after their complete push ID is available. Consumed prefix
 bytes are replayed to the corresponding reader. Returns :CONTROL,
 :QPACK-ENCODER, :QPACK-DECODER, :PUSH, or :UNKNOWN."
-  (unless (and (http3-client-p client) (http3-client-open-p client))
-    (%h3-transport-error "A live HTTP/3 client is required."))
   (unless stream
     (%h3-transport-error
      "ACCEPT-HTTP3-PEER-UNIDIRECTIONAL-STREAM requires a stream."))
@@ -1298,10 +1296,6 @@ Returns a list of effect keywords and a boolean indicating peer FIN.  The
 peer control stream must begin with its HTTP/3 stream-type prefix, then a
 SETTINGS frame; its state is available through
 HTTP3-CLIENT-PEER-CONTROL-STATE."
-  (unless (http3-client-p client)
-    (%h3-transport-error
-     "READ-HTTP3-CONTROL-STREAM requires an HTTP/3 client."
-     (type-of client)))
   (unless (http3-client-open-p client)
     (%h3-transport-error "Cannot read an HTTP/3 control stream after client close."))
   (let ((stream (http3-client-peer-control-stream client)))
@@ -1502,8 +1496,6 @@ HTTP3-CLIENT-PEER-CONTROL-STATE."
 
 (defun %read-http3-qpack-encoder-stream-serialized (client &key timeout deadline)
   "Read and apply one chunk from the peer's QPACK encoder stream."
-  (unless (and (http3-client-p client) (http3-client-open-p client))
-    (%h3-transport-error "A live HTTP/3 client is required."))
   (let ((stream (http3-client-peer-qpack-encoder-stream client)))
     (unless stream
       (%h3-transport-error "The peer QPACK encoder stream is not attached."))
@@ -1577,8 +1569,6 @@ HTTP3-CLIENT-PEER-CONTROL-STATE."
 
 (defun %read-http3-qpack-decoder-stream-serialized (client &key timeout deadline)
   "Read and apply one chunk from the peer's QPACK decoder stream."
-  (unless (and (http3-client-p client) (http3-client-open-p client))
-    (%h3-transport-error "A live HTTP/3 client is required."))
   (let ((stream (http3-client-peer-qpack-decoder-stream client)))
     (unless stream
       (%h3-transport-error "The peer QPACK decoder stream is not attached."))
@@ -2516,45 +2506,44 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
     #-sbcl nil)
 
   (defun %h3-call-with-scheduler-owner (client thunk)
-    #+sbcl
-    (let ((thread (%h3-scheduler-current-thread))
-          (claimed-p nil))
-      (%h3-with-scheduler-lock (client)
-        (cond
-          ((eq (http3-client-scheduler-owner-thread client) thread))
-          ((and (http3-client-scheduler-close-owner-active-p client)
-                (not (eq (http3-client-scheduler-close-owner-thread client)
-                         thread)))
-           (error 'http-kit:http-connection-error
-                  :message "The HTTP/3 QUIC client is owned by another thread."
-                  :operation :http3-quic-client
-                  :request-sent-p nil))
-          ((and (http3-client-scheduler-close-state client)
-                (not (and (http3-client-scheduler-close-owner-active-p client)
-                          (eq (http3-client-scheduler-close-owner-thread client)
-                              thread))))
-           (error 'http-kit:http-connection-error
-                  :message "The HTTP/3 QUIC connection is closing."
-                  :operation :http3-quic-client
-                  :request-sent-p nil))
-          ((null (http3-client-scheduler-owner-thread client))
-           (setf (http3-client-scheduler-owner-thread client) thread
-                 claimed-p t)
-           (%h3-scheduler-broadcast client))
-          (t
-           (error 'http-kit:http-connection-error
-                  :message "The HTTP/3 QUIC client is owned by another thread."
-                  :operation :http3-quic-client
-                  :request-sent-p nil))))
-      (unwind-protect
-           (funcall thunk)
-        (when claimed-p
-          (%h3-with-scheduler-lock (client)
-            (when (eq (http3-client-scheduler-owner-thread client) thread)
-              (setf (http3-client-scheduler-owner-thread client) nil))
-            (%h3-scheduler-broadcast client)))))
-    #-sbcl
-    (funcall thunk)))
+  #+sbcl
+  (let ((thread (%h3-scheduler-current-thread))
+        (claimed-p nil))
+    (%h3-with-scheduler-lock (client)
+      (cond
+        ((eq (http3-client-scheduler-owner-thread client) thread))
+        ((and (http3-client-scheduler-close-owner-active-p client)
+              (not (eq (http3-client-scheduler-close-owner-thread client)
+                       thread)))
+         (error 'http-kit:http-connection-error
+                :message "The HTTP/3 QUIC client is owned by another thread."
+                :operation :http3-quic-client
+                :request-sent-p nil))
+        ((and (http3-client-scheduler-close-state client)
+              (not (and (http3-client-scheduler-close-owner-active-p client)
+                        (eq (http3-client-scheduler-close-owner-thread client)
+                            thread))))
+         (error 'http-kit:http-connection-error
+                :message "The HTTP/3 QUIC connection is closing."
+                :operation :http3-quic-client
+                :request-sent-p nil))
+        ((null (http3-client-scheduler-owner-thread client))
+         (setf (http3-client-scheduler-owner-thread client) thread
+               claimed-p t)
+         (%h3-scheduler-broadcast client))
+        (t
+         (error 'http-kit:http-connection-error
+                :message "The HTTP/3 QUIC client is owned by another thread."
+                :operation :http3-quic-client
+                :request-sent-p nil))))
+    (unwind-protect
+         (funcall thunk)
+      (when claimed-p
+        (%h3-with-scheduler-lock (client)
+          (setf (http3-client-scheduler-owner-thread client) nil)
+          (%h3-scheduler-broadcast client)))))
+  #-sbcl
+  (funcall thunk)))
 
 
 (defun %h3-scheduler-entry-for-stream (client stream)
