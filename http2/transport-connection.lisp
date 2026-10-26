@@ -2374,6 +2374,7 @@ CONTINUATION frames must still be consumed contiguously from that queue."
     (let ((state nil))
       (%h2-with-scheduler-lock (connection)
         (loop
+          (http-kit::%check-deadline deadline clock-function :read)
           (setf state
                 (cond
                   ((funcall cancelled-p) :cancelled)
@@ -2383,7 +2384,8 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                   (t :wait)))
           (unless (eq state :wait)
             (return))
-          (%h2-scheduler-condition-wait connection deadline clock-function)))
+          (%h2-scheduler-condition-wait
+           connection deadline clock-function)))
       (case state
         (:cancelled
          (error (funcall local-cancel-condition)))
