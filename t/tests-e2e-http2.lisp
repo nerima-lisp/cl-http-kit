@@ -638,15 +638,26 @@
                     (http-kit/http2::%http2-connection-session-started-p
                      probe-connection))))
                (wait-for-callers (count)
-                 (let ((deadline (+ (http-kit::%monotonic-time) 5)))
-                   (sb-thread:with-mutex (lock)
-                     (loop while (< callback-count count)
-                           for remaining =
-                             (- deadline (http-kit::%monotonic-time))
-                           do (when (<= remaining 0)
-                                (return))
-                              (sb-thread:condition-wait
-                               waitqueue lock :timeout remaining)))
+                 (let ((deadline (+ (http-kit::%monotonic-time) 5))
+                       (timed-out-p nil))
+                   (sb-thread:grab-mutex lock)
+                   (unwind-protect
+                        (loop while (< callback-count count)
+                              for remaining =
+                                (- deadline (http-kit::%monotonic-time))
+                              do (when (<= remaining 0)
+                                   (setf timed-out-p t)
+                                   (return))
+                                 (unless
+                                     (sb-thread:condition-wait
+                                      waitqueue lock :timeout remaining)
+                                   (setf timed-out-p t)
+                                   (return)))
+                     (when (sb-thread:holding-mutex-p lock)
+                       (sb-thread:release-mutex lock)))
+                   (when timed-out-p
+                     (error "Timed out waiting for ~D HTTP/2 callbacks."
+                            count))
                    (sb-thread:with-mutex (lock)
                      (ensure-equal count callback-count))))
                (start-caller
