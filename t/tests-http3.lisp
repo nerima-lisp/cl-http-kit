@@ -15835,6 +15835,66 @@
                 client)))
          (setf (http-kit/http3::http3-client-close-stream client)
                original-close-stream))))))
+(deftest http3-quic-adapter-close-clears-prefixes-and-reports-quic-error-after-throw
+  (call-with-http3-coverage-adapter-fixture
+   (lambda (adapter)
+     (let* ((client
+              (http-kit/http3:http3-quic-adapter-http3-client adapter))
+            (original-close-stream
+              (http-kit/http3::http3-client-close-stream client))
+            (close-stream-calls 0)
+            (close-attempts 0)
+            (cleanup-warnings 0)
+            (outcome nil))
+       (ensure-true
+        (> (hash-table-count
+            (http-kit/http3::http3-quic-adapter-stream-prefixes adapter))
+           1))
+       (unwind-protect
+            (progn
+              (setf (http-kit/http3::http3-client-close-stream client)
+                    (lambda (stream &key condition)
+                      (incf close-stream-calls)
+                      (funcall original-close-stream stream :condition condition)
+                      (throw 'http3-adapter-close-error-nonlocal-exit :thrown)))
+              (handler-bind
+                  ((warning
+                    (lambda (condition)
+                      (when (search "nonlocal cleanup" (princ-to-string condition))
+                        (incf cleanup-warnings)
+                        (muffle-warning condition)))))
+                (call-with-http3-quic-lifecycle-spies
+                 (lambda (calls)
+                   (declare (ignore calls))
+                   (setf outcome
+                         (catch 'http3-adapter-close-error-nonlocal-exit
+                           (http-kit/http3:close-http3-quic-adapter adapter)
+                           :returned)))
+                 :client-close
+                 (lambda (&rest arguments)
+                   (declare (ignore arguments))
+                   (incf close-attempts)
+                   (error 'simple-error
+                          :format-control "Injected QUIC close failure."))))
+              (ensure-equal :thrown outcome)
+              (ensure-equal 1 close-stream-calls)
+              (ensure-equal 1 close-attempts)
+              (ensure-equal 1 cleanup-warnings)
+              (ensure-equal
+               0
+               (hash-table-count
+                (http-kit/http3::http3-quic-adapter-stream-prefixes adapter)))
+              (ensure-equal
+               0
+               (hash-table-count
+                (http-kit/http3::http3-quic-adapter-stream-prefix-sent adapter)))
+              (ensure-false
+               (http-kit/http3::http3-client-scheduler-close-owner-active-p client))
+              (ensure-true
+               (typep (http-kit/http3::http3-client-scheduler-close-state client)
+                      'simple-error)))
+         (setf (http-kit/http3::http3-client-close-stream client)
+               original-close-stream))))))
 (deftest http3-quic-adapter-start-rejects-foreign-bootstrap-owner
   (let* ((quic (make-http3-quic-adapter-test-client))
          (adapter
