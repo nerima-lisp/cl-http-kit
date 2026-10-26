@@ -4491,10 +4491,10 @@
               (http-kit/http2::%h2-cancel-http2-stream
                connection 1 :only-if-active-p t))
              (ensure-true (http-kit/http2::%h2-batch-entry-local-retired-p entry))
-             (ensure-true
-              (find-if (lambda (frame)
-                         (and (= 3 (http-kit/http2::%h2-frame-type frame))
-                              (= 1 (http-kit/http2::%h2-frame-stream-id frame))))
-                       (h2-output-frames stream)))
+             (let ((output (binary-session-output stream)))
+               (ensure-equal 13 (length output))
+               (ensure-equal 4 (http-kit/http2::%h2-u24 output 0))
+               (ensure-equal 3 (aref output 3))
+               (ensure-equal 1 (http-kit/http2::%h2-u32 output 5))))
         (http-kit/http2:close-http2-connection connection))))
 ))
