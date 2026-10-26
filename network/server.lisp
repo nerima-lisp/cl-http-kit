@@ -60,6 +60,7 @@
   started-event-emitted-p
   stopping-event-emitted-p
   stopped-event-emitted-p
+  shutdown-deferred-event-emitted-p
   #+sbcl (lock (sb-thread:make-mutex :name "http server") :read-only t)
   #+sbcl (waitqueue (sb-thread:make-waitqueue :name "http server") :read-only t))
 
@@ -278,18 +279,48 @@
 
   (defun %http-server-release-owned-ticket-key-store (server)
   (let ((stores nil)
-        (owned-p nil))
+        (stores-to-destroy nil)
+        (owned-p nil)
+        (release-succeeded-p nil)
+        (deferred-p nil))
     (%with-http-server-lock (server)
       (setf owned-p (http-server-ticket-key-store-owned-p server))
       (when owned-p
         (setf stores
-              (remove nil
-                      (cons (http-server-ticket-key-store server)
-                            (http-server-retired-ticket-key-stores server))))))
-    (if owned-p
-        (%http-server-destroy-ticket-key-stores
-         server stores :clear-error-p t)
-        t))))
+              (remove-duplicates
+               (remove nil
+                       (cons (http-server-ticket-key-store server)
+                             (http-server-retired-ticket-key-stores server)))
+               :test (function eq))
+              (http-server-ticket-key-store server) nil
+              (http-server-tls-wrapper server) nil
+              (http-server-ticket-key-rotation-deadline server) nil)
+        (dolist (store stores)
+          (pushnew store (http-server-retired-ticket-key-stores server)
+                   :test (function eq))
+          (let ((ready-store
+                  (%http-server-take-retired-ticket-key-store server store)))
+            (when ready-store
+              (push ready-store stores-to-destroy))))))
+    (setf release-succeeded-p
+          (if owned-p
+              (%http-server-destroy-ticket-key-stores
+               server stores-to-destroy :clear-error-p t)
+              t)
+          deferred-p
+          (and owned-p
+               (%with-http-server-lock (server)
+                 (loop for store in stores
+                       thereis
+                       (and (member store
+                                    (http-server-retired-ticket-key-stores server)
+                                    :test (function eq))
+                            (plusp
+                             (gethash
+                              store
+                              (http-server-ticket-key-store-users server)
+                              0)))))))
+    (values release-succeeded-p deferred-p))))
 
 (defun make-http-server
     (&key (transport :https)
@@ -547,6 +578,10 @@
         (:stopped
          (unless (http-server-stopped-event-emitted-p server)
            (setf (http-server-stopped-event-emitted-p server) t
+                 emit-p t)))
+        (:shutdown-deferred
+         (unless (http-server-shutdown-deferred-event-emitted-p server)
+           (setf (http-server-shutdown-deferred-event-emitted-p server) t
                  emit-p t)))))
     (when emit-p
       (%http-server-emit-event server event))))
@@ -1073,16 +1108,32 @@
                  (unless (sb-thread:thread-alive-p worker)
                    (%with-http-server-lock (server)
                      (remhash worker (http-server-workers server))))))
-             (let ((stores-released-p
-                     (%http-server-release-owned-ticket-key-store server))
-                   (workers-alive-p
+             (let ((store-release-succeeded-p nil)
+                   (ticket-key-store-destruction-deferred-p nil)
+                   (workers-alive-count 0)
+                   (workers-alive-p nil))
+               (multiple-value-setq
+                   (store-release-succeeded-p
+                    ticket-key-store-destruction-deferred-p)
+                 (%http-server-release-owned-ticket-key-store server))
+               (setf workers-alive-count
                      (%with-http-server-lock (server)
                        (loop for worker being the hash-keys of
                              (http-server-workers server)
-                             thereis (sb-thread:thread-alive-p worker)))))
+                             count (sb-thread:thread-alive-p worker)))
+                     workers-alive-p (plusp workers-alive-count))
+               (when (or workers-alive-p ticket-key-store-destruction-deferred-p)
+                 (%http-server-emit-event-once
+                  server :shutdown-deferred
+                  (list :type :listener-shutdown-deferred
+                        :phase :shutdown
+                        :worker-count workers-alive-count
+                        :ticket-key-store-destruction-deferred-p
+                        ticket-key-store-destruction-deferred-p)))
                (cond
-                 ((and stores-released-p
+                 ((and store-release-succeeded-p
                        (not workers-alive-p)
+                       (not ticket-key-store-destruction-deferred-p)
                        (not supervisor-alive-p))
                   (%http-server-emit-event-once
                    server :stopped
@@ -1097,7 +1148,7 @@
                               (http-server-shutdown-coordinator server))
                       (setf (http-server-shutdown-coordinator server) nil))
                     (%http-server-broadcast server)))
-                 (stores-released-p
+                 (store-release-succeeded-p
                   (%with-http-server-lock (server)
                     (unless supervisor-alive-p
                       (setf (http-server-supervisor server) nil))
@@ -1204,7 +1255,8 @@
                (http-server-listener-wake-in-progress-p server) nil
                (http-server-started-event-emitted-p server) nil
                (http-server-stopping-event-emitted-p server) nil
-               (http-server-stopped-event-emitted-p server) nil))))
+               (http-server-stopped-event-emitted-p server) nil
+               (http-server-shutdown-deferred-event-emitted-p server) nil))))
     (let ((listener
             (handler-case
                 (%http-server-start-listener server start-token)

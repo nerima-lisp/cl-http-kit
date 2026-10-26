@@ -2038,21 +2038,37 @@
              (ensure-equal 1 (%https-listener-connection-count server))
              (%https-listener-wait
               (lambda ()
-                (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p
-                 ticket-store))
-              3)
-             (ensure-equal :stopping (http-kit::http-server-state server))
+                (%https-listener-event-present-p
+                 context :listener-shutdown-deferred nil)))
+             (let ((deferred-event
+                     (find :listener-shutdown-deferred
+                           (%https-listener-events context)
+                           :key (lambda (event) (getf event :type))
+                           :test (function eq))))
+               (ensure-equal 1 (getf deferred-event :worker-count))
+               (ensure-true
+                (getf deferred-event
+                      :ticket-key-store-destruction-deferred-p)))
              (ensure-true
+              (loop for worker being the hash-keys of
+                    (http-kit::http-server-workers server)
+                    thereis (sb-thread:thread-alive-p worker)))
+             (ensure-false
               (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p
                ticket-store))
+             (ensure-equal :stopping (http-kit::http-server-state server))
              (ensure-false
               (%https-listener-event-present-p
                context :listener-stopped nil))
              (sb-thread:signal-semaphore release-handler)
              (%https-listener-wait
               (lambda ()
-                (%https-listener-event-present-p
-                 context :listener-stopped nil)))
+                (and
+                 (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p
+                  ticket-store)
+                 (%https-listener-event-present-p
+                  context :listener-stopped nil)
+                 (eq :stopped (http-kit::http-server-state server)))))
              (ensure-equal :stopped (http-kit::http-server-state server))
              (ensure-equal
               0
