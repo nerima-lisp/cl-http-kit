@@ -2454,6 +2454,7 @@
 (deftest https-listener-times-out-slow-real-tls-handshake
   (let* ((material (%tls-server-test-material))
          (context (%make-https-listener-test-context))
+         (client-upgrader (%https-listener-real-tls-upgrader material))
          (server nil)
          (transport nil)
          (client-thread nil)
@@ -2484,18 +2485,23 @@
                      context condition details))))
            (start-http-server server)
            (setf transport
-                 (nth-value
-                  0
-                  (%https-listener-open-real-tls-transport
-                   (http-server-port server)
-                   :mode :stall)))
+                 (let ((transport
+                         (nth-value
+                          0
+                          (%https-listener-open-real-tls-transport
+                           (http-server-port server)
+                           :mode :stall))))
+                   (%https-listener-wait
+                    (lambda ()
+                      (plusp (%https-listener-handshake-count server))))
+                   transport))
            (setf client-thread
                  (sb-thread:make-thread
                   (lambda ()
                     (handler-case
                         (setf client-tls-stream
                               (funcall
-                               (%https-listener-real-tls-upgrader material)
+                               client-upgrader
                                transport
                                (parse-http-uri
                                 (format nil "https://localhost:~D/"
