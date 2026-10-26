@@ -972,8 +972,15 @@ after its request deadline does not send a response. The graceful timeout bounds
 shutdown from its start until remaining connections are closed.
 
 `on-event` receives a sanitized plist with `:type` and `:phase`. Listener
-events use `:listener-started`, `:listener-stopping`, and `:listener-stopped`;
-the start event also includes `:host` and `:port`. Connection events use
+events use `:listener-started`, `:listener-stopping`, `:listener-stopped`, and
+`:listener-shutdown-deferred`; the start event also includes `:host` and
+`:port`. The shutdown-deferred event is emitted once when a tracked worker
+remains or owned ticket-key-store destruction is deferred. Its payload
+contains `:type :listener-shutdown-deferred`, `:phase :shutdown`,
+`:worker-count` (the number of live workers), and
+`:ticket-key-store-destruction-deferred-p` (whether owned store destruction
+is still deferred). This informational event does not set
+`http-server-failure`. Connection events use
 `:connection-accepted`, `:connection-rejected`, `:alpn-selected`, and
 `:connection-closed`; they include `:peer-address` and `:peer-port`, with
 `:reason-code` on rejection and `:protocol` on ALPN selection and close.
@@ -988,11 +995,16 @@ including when PORT was zero. `stop-http-server` stops accepting new
 connections and asks active HTTP/2 sessions to send GOAWAY at their next
 frame-processing point. Active responses can drain until the configured
 graceful timeout; sessions still waiting for a frame are closed when it
-expires. If a synchronous handler is still running, `stop-http-server` may
-return while shutdown remains in progress. The server does not cancel handler
-code and emits `:listener-stopped` only after every connection worker exits. It
-is safe to call more than once. `http-server-p` identifies a server handle;
-`http-server-port` returns its bound port and `http-server-failure`
+expires. Connections forced closed after the deadline may close the underlying
+TLS connection without sending `close_notify`. The peer may then be unable to
+determine whether all data arrived. If a synchronous handler is still running,
+`stop-http-server` may return while shutdown remains in progress. A tracked
+worker or deferred owned ticket-key-store destruction can keep shutdown
+pending after it returns; `:listener-shutdown-deferred` reports this state.
+The server does not cancel handler code and emits `:listener-stopped` only
+after every connection worker exits and owned store cleanup completes. It is
+safe to call more than once.
+`http-server-p` identifies a server handle, and `http-server-failure`
 returns a fatal server failure, if one occurred. `http-server-error-reason-code`
 and `http-server-error-phase` expose safe error metadata, while
 `http-server-callback-error-callback` identifies whether `:on-event` or
@@ -1012,8 +1024,9 @@ multiple server instances to share their TLS 1.3 session-ticket keys. Each
 instance still enforces its own connection and handshake limits. A server does
 not rotate or destroy a supplied store. The caller must rotate it with
 `cl-tls-kit:rotate-tls13-server-ticket-key-store`, coordinate that rotation
-across every server that shares the store, and stop those servers before
-destroying the store.
+across every server that shares the store. Call `stop-http-server` on each
+server and wait for `:listener-stopped` from every server before destroying the
+store.
 
 ## TLS package
 
@@ -1057,11 +1070,9 @@ closes the driver. A supplied store remains caller-owned when a connection
 closes. To resume sessions across connections handled by this wrapper, pass the
 same store with `:ticket-key-store` on each invocation and destroy it only after
 all connections using it have closed. The HTTPS listener instead owns one
-default store shared by its connections; its shutdown and rotation lifecycle is
-unchanged.
+default store shared by its connections.
 HTTP-TLS-SELECTED-ALPN-PROTOCOL returns the protocol negotiated on an upgraded
-client or server stream, or NIL when no protocol was negotiated. The HTTPS
-listener accepts only `h2` and `http/1.1`.
+client or server stream, or NIL when no protocol was negotiated.
 
 The TLS package is TLS 1.3 only through cl-tls-kit. TLS 1.2 and OCSP/CRL are
 outside the current boundary.
