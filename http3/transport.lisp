@@ -3672,8 +3672,7 @@ validated informational response in wire order."
                (%h3-scheduler-broadcast client))
              (error condition)))
       (%h3-with-scheduler-lock (client)
-        (when (eq thread (http3-client-scheduler-owner-thread client))
-          (setf (http3-client-scheduler-owner-thread client) nil))
+        (setf (http3-client-scheduler-owner-thread client) nil)
         (%h3-scheduler-broadcast client))))
   #-sbcl
   (progn
