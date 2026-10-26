@@ -2371,33 +2371,58 @@ CONTINUATION frames must still be consumed contiguously from that queue."
 
   (defun %h2-scheduler-wait-for-capacity
       (connection deadline clock-function cancelled-p local-cancel-condition)
-    (let ((state nil))
-      (%h2-with-scheduler-lock (connection)
-        (loop
-          (http-kit::%check-deadline deadline clock-function :read)
-          (setf state
-                (cond
-                  ((funcall cancelled-p) :cancelled)
-                  ((%http2-connection-goaway-last-stream-id connection) :goaway)
-                  ((not (http2-connection-open-p connection)) :closed)
-                  ((%h2-scheduler-capacity-available-p connection) :available)
-                  (t :wait)))
-          (unless (eq state :wait)
-            (return))
-          (%h2-scheduler-condition-wait
-           connection deadline clock-function)))
-      (case state
-        (:cancelled
-         (error (funcall local-cancel-condition)))
-        (:goaway
-         (%h2-connection-next-stream-id connection))
-        (:closed
-         (error 'http-kit:http-connection-error
-                :message "The HTTP/2 connection closed while streams were paused."
-                :operation :http2-write
-                :cause :closed))
-        (:available
-         nil))))
+    (let ((reader (%h2-reader-for (%http2-connection-stream connection)))
+          (writer (%h2-scheduler-writer connection deadline clock-function)))
+      (loop
+        (let ((state nil)
+              (read-for-peer-capacity-p nil))
+          (%h2-with-scheduler-lock (connection)
+            (http-kit::%check-deadline deadline clock-function :read)
+            (setf state
+                  (cond
+                    ((funcall cancelled-p) :cancelled)
+                    ((%http2-connection-goaway-last-stream-id connection) :goaway)
+                    ((not (http2-connection-open-p connection)) :closed)
+                    ((%h2-scheduler-capacity-available-p connection) :available)
+                    (t :wait)))
+            (when (eq state :wait)
+              (let* ((peer-limit
+                       (%http2-connection-peer-max-concurrent-streams connection))
+                     (local-limit
+                       (%http2-connection-max-concurrent-streams connection))
+                     (active-count
+                       (count-if-not
+                        (function %h2-batch-entry-error)
+                        (%http2-connection-scheduler-entries connection))))
+                (if (and peer-limit
+                         (or (null local-limit)
+                             (< active-count local-limit))
+                         (>= active-count peer-limit))
+                    (setf read-for-peer-capacity-p t)
+                    (%h2-scheduler-condition-wait
+                     connection deadline clock-function)))))
+          (case state
+            (:cancelled
+             (error (funcall local-cancel-condition)))
+            (:goaway
+             (%h2-connection-next-stream-id connection))
+            (:closed
+             (error (quote http-kit:http-connection-error)
+                    :message "The HTTP/2 connection closed while streams were paused."
+                    :operation :http2-write
+                    :cause :closed))
+            (:available
+             (return))
+            (:wait
+             (when read-for-peer-capacity-p
+               (%h2-scheduler-wait-until
+                connection
+                (lambda ()
+                  (or (funcall cancelled-p)
+                      (%http2-connection-goaway-last-stream-id connection)
+                      (not (http2-connection-open-p connection))
+                      (%h2-scheduler-capacity-available-p connection)))
+                reader writer deadline clock-function))))))))
 
   (defun %h2-scheduler-fail-connection (connection condition)
     (let ((close-p nil))
