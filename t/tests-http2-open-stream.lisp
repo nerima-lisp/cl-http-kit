@@ -4219,7 +4219,11 @@
         (http-kit/http2:close-http2-connection connection))))
 
   (defclass h2-window-update-peer-stream (binary-session-stream)
-    ((extra-data-sent-p
+    ((extra-data
+      :initarg :extra-data
+      :initform (h2-frame 0 1 1 (octets 66))
+      :reader h2-window-update-peer-extra-data)
+     (extra-data-sent-p
       :initform nil
       :accessor h2-window-update-peer-extra-data-sent-p)))
 
@@ -4235,7 +4239,7 @@
                 (slot-value stream 'input)
                 (concatenate-octets
                  (binary-session-input stream)
-                 (h2-frame 0 1 1 (octets 66)))))
+                 (h2-window-update-peer-extra-data stream))))
       result)))
 
   (deftest http2-public-connection-collects-body-over-initial-flow-window
@@ -4941,10 +4945,9 @@
                        (http-kit/http2::%h2-batch-entry-callback-events
                         entry))))
                (ensure-true entry)
-               (ensure-equal 1 (length body-events))
-               (ensure-equal (octets 65) (third (first body-events)))
+               (ensure-equal 0 (length body-events))
                (ensure-equal
-                1
+                0
                 (http-kit/http2::%http2-connection-scheduler-pending-callback-payload-bytes
                  connection))))
            (setf third-release-signaled-p t)
@@ -4971,3 +4974,574 @@
           (sb-thread:signal-semaphore release-third-open))
         (sb-thread:join-thread third-thread))
       (http-kit/http2:close-http2-connection connection))))
+
+#+sbcl
+(progn
+  (deftest http2-public-connection-coalesces-collected-body-callbacks-over-window
+    (let* ((full-frame-body
+             (make-array 16384 :element-type '(unsigned-byte 8)
+                         :initial-element 65))
+           (short-frame-body
+             (make-array 16383 :element-type '(unsigned-byte 8)
+                         :initial-element 65))
+           (extra-body
+             (make-array 465 :element-type '(unsigned-byte 8)
+                         :initial-element 65))
+           (ping-payload (octets 1 2 3 4 5 6 7 8))
+           (extra-data
+             (concatenate-octets
+              (h2-frame 0 1 1 extra-body)
+              (h2-frame 6 1 0 ping-payload)))
+           (input
+             (apply #'concatenate-octets
+                    (append
+                     (list
+                      (h2-frame 4 0 0 (octets))
+                      (h2-frame 1 4 1
+                                (h2-header-block (cons ":status" "200"))))
+                     (make-list 3
+                                :initial-element
+                                (h2-frame 0 0 1 full-frame-body))
+                     (list (h2-frame 0 0 1 short-frame-body)))))
+           (stream
+             (make-instance 'h2-window-update-peer-stream
+                            :input input
+                            :extra-data extra-data))
+           (connection
+             (http-kit/http2:make-http2-connection
+              :stream stream :max-body-bytes 70000))
+           (headers-entered (sb-thread:make-semaphore :count 0))
+           (release-headers (sb-thread:make-semaphore :count 0))
+           (release-signaled-p nil)
+           (header-wait-result nil)
+           (body-callback-count 0)
+           (body-callback-chunks nil)
+           (first-response nil)
+           (first-failure nil)
+           (first-thread nil))
+      (unwind-protect
+           (progn
+             (setf first-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (handler-case
+                          (setf first-response
+                                (http-kit/http2:send-http2-request-over-connection
+                                 connection
+                                 (make-http-request
+                                  :method "GET"
+                                  :uri "https://collect-queue.test/large")
+                                 :collect-body-p t
+                                 :max-body-bytes 70000
+                                 :on-response-headers
+                                 (lambda (status headers)
+                                   (declare (ignore headers))
+                                   (ensure-equal 200 status)
+                                   (sb-thread:signal-semaphore headers-entered)
+                                   (setf header-wait-result
+                                         (sb-thread:wait-on-semaphore
+                                          release-headers :timeout 10)))
+                                 :on-body-chunk
+                                 (lambda (chunk)
+                                   (incf body-callback-count)
+                                   (push (copy-seq chunk)
+                                         body-callback-chunks))))
+                        (error (condition)
+                          (setf first-failure condition))))))
+             (ensure-true
+              (sb-thread:wait-on-semaphore headers-entered :timeout 5))
+             (ensure-equal
+              ping-payload
+              (http-kit/http2:ping-http2-connection
+               connection :payload ping-payload))
+             (ensure-true
+              (h2-window-update-peer-extra-data-sent-p stream))
+             (ensure-true
+              (some (lambda (frame)
+                      (and (= 8 (http-kit/http2::%h2-frame-type frame))
+                           (zerop (http-kit/http2::%h2-frame-stream-id frame))))
+                    (h2-output-frames stream)))
+             (setf release-signaled-p t)
+             (sb-thread:signal-semaphore release-headers)
+             (sb-thread:join-thread first-thread)
+             (setf first-thread nil)
+             (ensure-true header-wait-result)
+             (ensure-false first-failure)
+             (ensure-equal 200 (http-response-status first-response))
+             (ensure-equal 66000 (length (http-response-body first-response)))
+             (ensure-true (equalp (http-response-body first-response) (first body-callback-chunks)))
+             (ensure-equal 1 body-callback-count)
+             (ensure-equal '(66000)
+                           (mapcar #'length
+                                   (nreverse body-callback-chunks)))
+             (ensure-true
+              (every (lambda (octet) (= octet 65))
+                     (first body-callback-chunks)))
+             (http-kit/http2:close-http2-connection connection))
+        (when first-thread
+          (unless release-signaled-p
+            (sb-thread:signal-semaphore release-headers))
+          (sb-thread:join-thread first-thread))
+        (http-kit/http2:close-http2-connection connection))))
+
+  (defclass h2-goaway-window-update-peer-stream (binary-session-stream)
+    ((injected-input
+      :initarg :injected-input
+      :reader h2-goaway-peer-injected-input)
+     (connection
+      :initform nil
+      :accessor h2-goaway-peer-connection)
+     (extra-data-sent-p
+      :initform nil
+      :accessor h2-goaway-peer-extra-data-sent-p)
+     (connection-window-updates-before-extra
+      :initform 0
+      :accessor h2-goaway-peer-connection-window-updates-before-extra)))
+
+  (defmethod sb-gray:stream-read-sequence
+      ((stream h2-goaway-window-update-peer-stream) sequence
+       &optional (start 0) end)
+    (when (and (not (h2-goaway-peer-extra-data-sent-p stream))
+               (>= (binary-session-input-position stream)
+                   (length (binary-session-input stream)))
+               (some (lambda (frame)
+                       (and (= 8 (http-kit/http2::%h2-frame-type frame))
+                            (zerop (http-kit/http2::%h2-frame-stream-id frame))))
+                     (h2-output-frames stream)))
+      (let* ((connection (h2-goaway-peer-connection stream))
+             (window-updates
+               (count-if
+                (lambda (frame)
+                  (and (= 8 (http-kit/http2::%h2-frame-type frame))
+                       (zerop (http-kit/http2::%h2-frame-stream-id frame))))
+                (h2-output-frames stream))))
+        (setf (h2-goaway-peer-extra-data-sent-p stream) t
+              (h2-goaway-peer-connection-window-updates-before-extra stream)
+              window-updates
+              (slot-value stream 'input)
+              (concatenate-octets
+               (binary-session-input stream)
+               (h2-goaway-peer-injected-input stream)))))
+    (call-next-method))
+
+  (deftest http2-public-goaway-releases-pending-budget-before-accepted-stream-data
+    (let* ((full-frame-body
+             (make-array 16384 :element-type '(unsigned-byte 8)
+                         :initial-element 65))
+           (short-frame-body
+             (make-array 16383 :element-type '(unsigned-byte 8)
+                         :initial-element 65))
+           (ping-payload (octets 8 7 6 5 4 3 2 1))
+           (injected-input
+             (concatenate-octets
+              (h2-frame 0 1 1 (octets 66))
+              (h2-frame 6 1 0 ping-payload)))
+           (input
+             (apply #'concatenate-octets
+                    (append
+                     (list
+                      (h2-frame 4 0 0 (octets))
+                      (h2-frame 1 4 1
+                                (h2-header-block (cons ":status" "200")))
+                      (h2-frame 1 4 3
+                                (h2-header-block (cons ":status" "200"))))
+                     (make-list 3
+                                :initial-element
+                                (h2-frame 0 0 3 full-frame-body))
+                     (list
+                      (h2-frame 0 0 3 short-frame-body)
+                      (h2-frame 7 0 0 (octets 0 0 0 1 0 0 0 0))))))
+           (stream
+             (make-instance 'h2-goaway-window-update-peer-stream
+                            :input input :injected-input injected-input))
+           (connection
+             (http-kit/http2:make-http2-connection :stream stream))
+           (first-headers-entered (sb-thread:make-semaphore :count 0))
+           (second-headers-entered (sb-thread:make-semaphore :count 0))
+           (release-first-headers (sb-thread:make-semaphore :count 0))
+           (release-second-headers (sb-thread:make-semaphore :count 0))
+           (first-release-signaled-p nil)
+           (second-release-signaled-p nil)
+           (first-header-wait-result nil)
+           (second-header-wait-result nil)
+           (first-body-callback-count 0)
+           (first-body-callback-chunks nil)
+           (second-body-callback-count 0)
+           (first-response nil)
+           (first-failure nil)
+           (second-failure nil)
+           (first-thread nil)
+           (second-thread nil))
+      (setf (h2-goaway-peer-connection stream) connection)
+      (unwind-protect
+           (progn
+             (setf first-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (handler-case
+                          (setf first-response
+                                (http-kit/http2:send-http2-request-over-connection
+                                 connection
+                                 (make-http-request :method "GET"
+                                                    :uri "https://goaway-queue.test/accepted")
+                                 :collect-body-p nil
+                                 :on-response-headers
+                                 (lambda (status headers)
+                                   (declare (ignore headers))
+                                   (ensure-equal 200 status)
+                                   (sb-thread:signal-semaphore
+                                    first-headers-entered)
+                                   (setf first-header-wait-result
+                                         (sb-thread:wait-on-semaphore
+                                          release-first-headers :timeout 10)))
+                                 :on-body-chunk
+                                 (lambda (chunk)
+                                   (incf first-body-callback-count)
+                                   (push (copy-seq chunk)
+                                         first-body-callback-chunks))))
+                        (error (condition)
+                          (setf first-failure condition))))))
+             (ensure-true
+              (sb-thread:wait-on-semaphore first-headers-entered :timeout 5))
+             (setf second-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (handler-case
+                          (http-kit/http2:send-http2-request-over-connection
+                           connection
+                           (make-http-request :method "GET"
+                                              :uri "https://goaway-queue.test/rejected")
+                           :collect-body-p nil
+                           :on-response-headers
+                           (lambda (status headers)
+                             (declare (ignore headers))
+                             (ensure-equal 200 status)
+                             (sb-thread:signal-semaphore
+                              second-headers-entered)
+                             (setf second-header-wait-result
+                                   (sb-thread:wait-on-semaphore
+                                    release-second-headers :timeout 10)))
+                           :on-body-chunk
+                           (lambda (chunk)
+                             (declare (ignore chunk))
+                             (incf second-body-callback-count)))
+                        (error (condition)
+                          (setf second-failure condition))))))
+             (ensure-true
+              (sb-thread:wait-on-semaphore second-headers-entered :timeout 5))
+             (ensure-equal
+              ping-payload
+              (http-kit/http2:ping-http2-connection
+               connection :payload ping-payload))
+             (ensure-true (h2-goaway-peer-extra-data-sent-p stream))
+             (ensure-true
+              (plusp
+               (h2-goaway-peer-connection-window-updates-before-extra stream)))
+             (ensure-true (http-kit/http2:http2-connection-open-p connection))
+             (setf first-release-signaled-p t)
+             (sb-thread:signal-semaphore release-first-headers)
+             (sb-thread:join-thread first-thread)
+             (setf first-thread nil)
+             (ensure-false first-failure)
+             (ensure-true first-header-wait-result)
+             (ensure-equal 200 (http-response-status first-response))
+             (ensure-equal (octets) (http-response-body first-response))
+             (ensure-equal 1 first-body-callback-count)
+             (ensure-equal (list (octets 66))
+                           (nreverse first-body-callback-chunks))
+             (setf second-release-signaled-p t)
+             (sb-thread:signal-semaphore release-second-headers)
+             (sb-thread:join-thread second-thread)
+             (setf second-thread nil)
+             (ensure-true second-header-wait-result)
+             (ensure-true second-failure)
+             (ensure-equal (list :goaway 1 0)
+                           (http-kit:http-connection-error-cause second-failure))
+             (ensure-equal 0 second-body-callback-count)
+             (ensure-false
+              (some (lambda (frame)
+                      (and (= 3 (http-kit/http2::%h2-frame-type frame))
+                           (= 1 (http-kit/http2::%h2-frame-stream-id frame))))
+                    (h2-output-frames stream)))
+             (http-kit/http2:close-http2-connection connection))
+        (when first-thread
+          (unless first-release-signaled-p
+            (sb-thread:signal-semaphore release-first-headers))
+          (sb-thread:join-thread first-thread))
+        (when second-thread
+          (unless second-release-signaled-p
+            (sb-thread:signal-semaphore release-second-headers))
+          (sb-thread:join-thread second-thread))
+        (http-kit/http2:close-http2-connection connection))))
+
+  (deftest http2-public-informational-callback-keeps-response-pending
+    (let* ((information-payload (h2-header-block (cons ":status" "103")))
+           (input
+             (concatenate-octets
+              (h2-frame 4 0 0 (octets))
+              (h2-frame 1 4 3 information-payload)
+              (h2-frame 1 5 3
+                        (h2-header-block (cons ":status" "200")))
+              (h2-frame 1 5 1
+                        (h2-header-block (cons ":status" "200")))))
+           (stream (make-instance 'binary-session-stream :input input))
+           (connection (http-kit/http2:make-http2-connection :stream stream))
+           (first-opened (sb-thread:make-semaphore :count 0))
+           (second-opened (sb-thread:make-semaphore :count 0))
+           (release-first-open (sb-thread:make-semaphore :count 0))
+           (release-second-open (sb-thread:make-semaphore :count 0))
+           (first-release-signaled-p nil)
+           (second-release-signaled-p nil)
+           (first-open-wait-result nil)
+           (second-open-wait-result nil)
+           (information-callback-count 0)
+           (first-response nil)
+           (first-failure nil)
+           (second-response nil)
+           (second-failure nil)
+           (first-thread nil)
+           (second-thread nil))
+      (unwind-protect
+           (progn
+             (setf first-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (handler-case
+                          (setf first-response
+                                (http-kit/http2:send-http2-request-over-connection
+                                 connection
+                                 (make-http-request :method "GET"
+                                                    :uri "https://information-race.test/first")
+                                 :on-stream-open
+                                 (lambda (stream-id cancel)
+                                   (declare (ignore cancel))
+                                   (ensure-equal 1 stream-id)
+                                   (sb-thread:signal-semaphore first-opened)
+                                   (setf first-open-wait-result
+                                         (sb-thread:wait-on-semaphore
+                                          release-first-open :timeout 10)))))
+                        (error (condition)
+                          (setf first-failure condition))))))
+             (ensure-true
+              (sb-thread:wait-on-semaphore first-opened :timeout 5))
+             (setf second-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (handler-case
+                          (progn
+                            (setf second-response
+                                  (http-kit/http2:send-http2-request-over-connection
+                                   connection
+                                   (make-http-request :method "GET"
+                                                      :uri "https://information-race.test/second")
+                                   :on-information
+                                   (lambda (response)
+                                     (ensure-equal 103
+                                                   (http-response-status response))
+                                     (incf information-callback-count))
+                                   :on-stream-open
+                                   (lambda (stream-id cancel)
+                                     (declare (ignore cancel))
+                                     (ensure-equal 3 stream-id)
+                                     (sb-thread:signal-semaphore second-opened)
+                                     (setf second-open-wait-result
+                                           (sb-thread:wait-on-semaphore
+                                            release-second-open :timeout 10)))))
+                            (ensure-equal 1 information-callback-count))
+                        (error (condition)
+                          (setf second-failure condition))))))
+             (ensure-true
+              (sb-thread:wait-on-semaphore second-opened :timeout 5))
+             (setf first-release-signaled-p t)
+             (sb-thread:signal-semaphore release-first-open)
+             (sb-thread:join-thread first-thread)
+             (setf first-thread nil)
+             (ensure-false first-failure)
+             (ensure-true first-open-wait-result)
+             (ensure-equal 200 (http-response-status first-response))
+             (ensure-equal 0 information-callback-count)
+             (ensure-false second-response)
+             (setf second-release-signaled-p t)
+             (sb-thread:signal-semaphore release-second-open)
+             (sb-thread:join-thread second-thread)
+             (setf second-thread nil)
+             (ensure-true second-open-wait-result)
+             (ensure-false second-failure)
+             (ensure-equal 200 (http-response-status second-response))
+             (ensure-equal 1 information-callback-count)
+             (http-kit/http2:close-http2-connection connection))
+        (when first-thread
+          (unless first-release-signaled-p
+            (sb-thread:signal-semaphore release-first-open))
+          (sb-thread:join-thread first-thread))
+        (when second-thread
+          (unless second-release-signaled-p
+            (sb-thread:signal-semaphore release-second-open))
+          (sb-thread:join-thread second-thread))
+        (http-kit/http2:close-http2-connection connection))))
+
+  (deftest http2-public-information-callback-limit-allows-two-pending-callbacks
+    (let* ((input
+             (concatenate-octets
+              (h2-frame 4 0 0 (octets))
+              (h2-frame 1 4 1
+                        (h2-header-block (cons ":status" "103")))
+              (h2-frame 1 4 1
+                        (h2-header-block (cons ":status" "102")))
+              (h2-frame 1 5 1
+                        (h2-header-block (cons ":status" "200")))
+              (h2-frame 1 5 3
+                        (h2-header-block (cons ":status" "200")))))
+           (stream (make-instance 'binary-session-stream :input input))
+           (connection
+             (http-kit/http2:make-http2-connection
+              :stream stream :max-pending-information-callbacks 2))
+           (first-opened (sb-thread:make-semaphore :count 0))
+           (release-first-open (sb-thread:make-semaphore :count 0))
+           (first-release-signaled-p nil)
+           (first-open-wait-result nil)
+           (information-statuses nil)
+           (first-response nil)
+           (first-failure nil)
+           (second-response nil)
+           (first-thread nil))
+      (unwind-protect
+           (progn
+             (setf first-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (handler-case
+                          (setf first-response
+                                (http-kit/http2:send-http2-request-over-connection
+                                 connection
+                                 (make-http-request
+                                  :method "GET"
+                                  :uri "https://information-limit.test/within")
+                                 :on-information
+                                 (lambda (response)
+                                   (push (http-response-status response)
+                                         information-statuses))
+                                 :on-stream-open
+                                 (lambda (stream-id cancel)
+                                   (declare (ignore cancel))
+                                   (ensure-equal 1 stream-id)
+                                   (sb-thread:signal-semaphore first-opened)
+                                   (setf first-open-wait-result
+                                         (sb-thread:wait-on-semaphore
+                                          release-first-open :timeout 10)))))
+                        (error (condition)
+                          (setf first-failure condition))))))
+             (ensure-true
+              (sb-thread:wait-on-semaphore first-opened :timeout 5))
+             (setf second-response
+                   (http-kit/http2:send-http2-request-over-connection
+                    connection
+                    (make-http-request
+                     :method "GET"
+                     :uri "https://information-limit.test/neighbor")))
+             (ensure-equal 200 (http-response-status second-response))
+             (ensure-equal nil information-statuses)
+             (setf first-release-signaled-p t)
+             (sb-thread:signal-semaphore release-first-open)
+             (sb-thread:join-thread first-thread)
+             (setf first-thread nil)
+             (ensure-true first-open-wait-result)
+             (ensure-false first-failure)
+             (ensure-equal 200 (http-response-status first-response))
+             (ensure-equal '(103 102) (nreverse information-statuses))
+             (ensure-true (http-kit/http2:http2-connection-open-p connection)))
+        (when first-thread
+          (unless first-release-signaled-p
+            (sb-thread:signal-semaphore release-first-open))
+          (sb-thread:join-thread first-thread))
+        (http-kit/http2:close-http2-connection connection))))
+
+  (deftest http2-public-information-callback-limit-retires-only-over-limit-stream
+    (let* ((input
+             (concatenate-octets
+              (h2-frame 4 0 0 (octets))
+              (h2-frame 1 4 1
+                        (h2-header-block (cons ":status" "103")))
+              (h2-frame 1 4 1
+                        (h2-header-block (cons ":status" "102")))
+              (h2-frame 1 5 3
+                        (h2-header-block (cons ":status" "200")))))
+           (stream (make-instance 'binary-session-stream :input input))
+           (connection
+             (http-kit/http2:make-http2-connection
+              :stream stream :max-pending-information-callbacks 1))
+           (first-opened (sb-thread:make-semaphore :count 0))
+           (release-first-open (sb-thread:make-semaphore :count 0))
+           (first-release-signaled-p nil)
+           (first-open-wait-result nil)
+           (information-callback-count 0)
+           (first-response nil)
+           (first-failure nil)
+           (second-response nil)
+           (first-thread nil))
+      (unwind-protect
+           (progn
+             (setf first-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (handler-case
+                          (setf first-response
+                                (http-kit/http2:send-http2-request-over-connection
+                                 connection
+                                 (make-http-request
+                                  :method "GET"
+                                  :uri "https://information-limit.test/over")
+                                 :on-information
+                                 (lambda (response)
+                                   (declare (ignore response))
+                                   (incf information-callback-count))
+                                 :on-stream-open
+                                 (lambda (stream-id cancel)
+                                   (declare (ignore cancel))
+                                   (ensure-equal 1 stream-id)
+                                   (sb-thread:signal-semaphore first-opened)
+                                   (setf first-open-wait-result
+                                         (sb-thread:wait-on-semaphore
+                                          release-first-open :timeout 10)))))
+                        (error (condition)
+                          (setf first-failure condition))))))
+             (ensure-true
+              (sb-thread:wait-on-semaphore first-opened :timeout 5))
+             (setf second-response
+                   (http-kit/http2:send-http2-request-over-connection
+                    connection
+                    (make-http-request
+                     :method "GET"
+                     :uri "https://information-limit.test/neighbor")))
+             (ensure-equal 200 (http-response-status second-response))
+             (ensure-equal 0 information-callback-count)
+             (ensure-true
+              (some (lambda (frame)
+                      (and (= 3 (http-kit/http2::%h2-frame-type frame))
+                           (= 1 (http-kit/http2::%h2-frame-stream-id frame))
+                           (= 8 (http-kit/http2::%h2-u32
+                                 (http-kit/http2::%h2-frame-payload frame) 0))))
+                    (h2-output-frames stream)))
+             (ensure-false
+              (some (lambda (frame)
+                      (and (= 3 (http-kit/http2::%h2-frame-type frame))
+                           (= 3 (http-kit/http2::%h2-frame-stream-id frame))))
+                    (h2-output-frames stream)))
+             (ensure-true (http-kit/http2:http2-connection-open-p connection))
+             (setf first-release-signaled-p t)
+             (sb-thread:signal-semaphore release-first-open)
+             (sb-thread:join-thread first-thread)
+             (setf first-thread nil)
+             (ensure-true first-open-wait-result)
+             (ensure-true
+              (typep first-failure 'http-kit:http-protocol-error))
+             (ensure-false first-response)
+             (ensure-equal 0 information-callback-count)
+             (ensure-true (http-kit/http2:http2-connection-open-p connection)))
+        (when first-thread
+          (unless first-release-signaled-p
+            (sb-thread:signal-semaphore release-first-open))
+          (sb-thread:join-thread first-thread))
+        (http-kit/http2:close-http2-connection connection))))
+
+)
