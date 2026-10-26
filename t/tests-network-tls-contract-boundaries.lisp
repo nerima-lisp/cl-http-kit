@@ -2068,8 +2068,22 @@
            (values driver nil)))
        (lambda ()
          (ensure-equal nil
-                       (http-kit/tls::%tls-server-process-record
-                        state legacy-handshake-record))))
+                       (let* ((reader-stream
+                                (make-instance 'network-tls-contract-stream
+                                               :input legacy-handshake-record))
+                              (reader-state
+                                (http-kit/tls::%make-http-tls-server-state
+                                 :driver nil :provider nil :transport-stream reader-stream)))
+                         (unwind-protect
+                              (let ((wire
+                                      (http-kit/tls::%tls-server-read-record
+                                       reader-state)))
+                                (ensure-octets-equal legacy-handshake-record wire)
+                                (ensure-equal
+                                 (length legacy-handshake-record)
+                                 (http-kit/test-core::binary-test-input-position reader-stream))
+                                (http-kit/tls::%tls-server-process-record state wire))
+                           (close reader-stream :abort t))))))
       (ensure-true
        (http-kit/tls::http-tls-server-state-client-hello-received-p state))
       (%network-tls-contract-protocol
