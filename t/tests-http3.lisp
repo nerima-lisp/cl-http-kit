@@ -14616,9 +14616,13 @@
                (http-error-message finished-condition))
               (ensure-false
                (http-kit/http3::http3-quic-adapter-closed-p adapter))
-              (ensure-true
-               (eq finished-condition
-                   (http-kit/http3::http3-client-scheduler-close-state client))))
+              (progn
+               (ensure-true
+                (eq finished-condition
+                    (http-kit/http3::http3-client-scheduler-close-state client)))
+               (ensure-true
+                (eq finished-condition
+                    (http-kit/http3::%h3-scheduler-write-close-condition client)))))
          (setf (symbol-function name) original))))))
 (deftest http3-quic-adapter-coverage-peer-control-duplicate-and-finished
   (let* ((quic (make-http3-quic-adapter-test-client))
@@ -15827,9 +15831,20 @@
               (ensure-true (cl-quic-kit:quic-client-closed-p quic))
               (ensure-true
                (http-kit/http3::http3-quic-adapter-closed-p adapter))
-              (ensure-equal
-               :closed
-               (http-kit/http3::http3-client-scheduler-close-state client))
+              (progn
+               (ensure-equal
+                :closed
+                (http-kit/http3::http3-client-scheduler-close-state client))
+               (let ((condition
+                       (http-kit/http3::%h3-scheduler-write-close-condition
+                        client)))
+                 (ensure-true
+                  (typep condition (find-symbol "HTTP-CONNECTION-ERROR" :http-kit)))
+                 (ensure-equal
+                  "The HTTP/3 QUIC connection was closed."
+                  (http-kit:http-error-message condition))
+                 (ensure-equal :http3-request
+                               (http-kit:http-error-operation condition))))
               (ensure-false
                (http-kit/http3::http3-client-scheduler-close-owner-active-p
                 client)))
