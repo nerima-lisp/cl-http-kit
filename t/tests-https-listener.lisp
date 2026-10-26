@@ -1179,8 +1179,7 @@
                      (when (<= remaining 0)
                        (setf timed-out-p t)
                        (return))
-                     ;; SBCL manual, "Waitqueue/condition variables": a timed
-                     ;; wait can return NIL without reacquiring the mutex.
+                     ;; SBCL manual 13.6: timed waits can return NIL without reacquiring the mutex.
                      (unless (sb-thread:condition-wait
                               waitqueue lock :timeout (min 0.1 remaining))
                        (let ((remaining
