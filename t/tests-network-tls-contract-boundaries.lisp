@@ -2053,7 +2053,7 @@
            (handshake-length (length handshake-wire))
            (legacy-handshake-record
              (concatenate '(vector (unsigned-byte 8))
-                          (vector 22 3 1
+                          (vector 22 #x00 #x00
                                   (ldb (byte 8 8) handshake-length)
                                   (ldb (byte 8 0) handshake-length))
                           handshake-wire)))
