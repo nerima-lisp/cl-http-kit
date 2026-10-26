@@ -1520,14 +1520,6 @@ CONTINUATION frames must still be consumed contiguously from that queue."
            (body-event (and event (eq (first event) :body) event)))
       (if body-event
           (let ((queued-payload (third body-event)))
-            (unless (and (array-has-fill-pointer-p queued-payload)
-                         (adjustable-array-p queued-payload))
-              (let ((copy (make-array 0 :element-type '(unsigned-byte 8)
-                                      :adjustable t :fill-pointer 0)))
-                (loop for octet across queued-payload
-                      do (vector-push-extend octet copy))
-                (setf queued-payload copy
-                      (third body-event) copy)))
             (loop for octet across payload
                   do (vector-push-extend octet queued-payload))
             (incf (fourth body-event) flow-controlled-length)
@@ -1884,9 +1876,8 @@ CONTINUATION frames must still be consumed contiguously from that queue."
                       :operation :http2-control
                       :cause (list :rst-stream stream-id
                                    (%h2-u32 payload 0))))))
-             (when (and (%h2-peer-stream-reset-condition-p
-                         (%h2-batch-entry-error entry))
-                        (not (%h2-batch-entry-local-retired-p entry)))
+             (when (%h2-peer-stream-reset-condition-p
+                    (%h2-batch-entry-error entry))
                (%h2-scheduler-discard-callback-events-locked
                 connection entry))
              (when (%h2-batch-entry-local-retired-p entry)
