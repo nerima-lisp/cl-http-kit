@@ -420,6 +420,53 @@
                          (close raw :abort t))))
                    (cl-tls-kit:destroy-tls13-server-ticket-key-store shared-store)
                    (%tls-server-test-remove-material material))))))
+(deftest tls-server-wrapper-closes-driver-after-close-notify-failure
+  (let* ((material (%tls-server-test-material))
+         (transport (make-instance '%tls-server-test-stream :input (octets)))
+         (wrapper
+           (make-http-tls-server-wrapper
+            :certificate-chain (getf material :certificate-chain)
+            :private-key (getf material :private-key)
+            :alpn-protocols '("h2")))
+         (secure nil)
+         (driver nil)
+         (driver-store nil)
+         (close-failed-p nil))
+    (unwind-protect
+         (%tls-server-test-with-spy
+          'http-kit/tls::%tls-server-handshake
+          (lambda (state)
+            (setf (http-kit/tls::http-tls-server-state-handshake-complete-p state) t)
+            state)
+          (lambda ()
+            (setf secure (funcall wrapper transport :timeout 2)
+                  driver
+                  (http-kit/tls::http-tls-server-state-driver
+                   (http-kit/tls::%tls-stream-driver secure))
+                  driver-store
+                  (cl-tls-kit::tls13-server-driver-ticket-key-store driver))
+            (ensure-true driver-store)
+            (ensure-true
+             (cl-tls-kit::tls13-server-driver-ticket-key-store-owned-p driver))
+            (%tls-server-test-with-spy
+             'http-kit/tls::%tls-server-send-close-notify
+             (lambda (state)
+               (declare (ignore state))
+               (error "Injected TLS close_notify failure."))
+             (lambda ()
+               (handler-case
+                   (close secure)
+                 (error ()
+                   (setf close-failed-p t)))))
+            (ensure-true close-failed-p)
+            (ensure-true
+             (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p driver-store))
+            (ensure-false (open-stream-p transport))))
+      (when secure
+        (http-kit::%with-http-cleanup (close secure :abort t)))
+      (when (open-stream-p transport)
+        (close transport :abort t))
+      (%tls-server-test-remove-material material))))
 
   (progn
 (deftest tls-server-wrapper-sanitizes-peer-and-setup-failures
