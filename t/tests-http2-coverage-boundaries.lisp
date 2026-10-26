@@ -976,6 +976,9 @@
            (callback-called-p nil)
            (before (copy-seq (binary-session-output stream))))
       (setf (http-kit/http2::%h2-batch-entry-error entry) existing-error
+            (http-kit/http2::%h2-batch-entry-body-vector entry)
+            (octets 100 101)
+            (http-kit/http2::%h2-batch-entry-body-length entry) 2
             (http-kit/http2::%h2-batch-entry-callback-events entry)
             (list (list :body (lambda (chunk)
                                 (declare (ignore chunk))
@@ -984,7 +987,7 @@
                   (list :body (lambda (chunk)
                                 (declare (ignore chunk))
                                 (setf callback-called-p t))
-                        (octets 100 101) 2 t t)))
+                        (cons 0 2) 2 t t)))
       (http-kit/http2::%h2-scheduler-run-entry-callbacks
        connection entry clock)
       (ensure-false callback-called-p)
