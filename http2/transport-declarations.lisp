@@ -70,6 +70,7 @@
   (scheduler-first-peer-frame-p t)
   (scheduler-last-opened-stream-id 0)
   (scheduler-ping-waiters nil)
+  (scheduler-pending-callback-payload-bytes 0)
   (scheduler-entries nil))
 
 (defun http2-connection-open-p (connection)
@@ -107,3 +108,5 @@
 (defun http2-connection-draining-p (connection)
   (and (http2-connection-p connection)
        (%http2-connection-draining-p connection)))
+
+(defconstant +http2-pending-callback-payload-limit+ 65535)
