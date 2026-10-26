@@ -2371,20 +2371,30 @@ CONTINUATION frames must still be consumed contiguously from that queue."
 
   (defun %h2-scheduler-wait-for-capacity
       (connection reader writer deadline clock-function)
-    (%h2-scheduler-wait-until
-     connection
-     (lambda ()
-       (or (%http2-connection-goaway-last-stream-id connection)
-           (%h2-scheduler-capacity-available-p connection)))
-     reader writer deadline clock-function)
-    (%h2-with-scheduler-lock (connection)
-      (when (%http2-connection-goaway-last-stream-id connection)
-        (%h2-connection-next-stream-id connection))
-      (unless (%h2-scheduler-capacity-available-p connection)
-        (error 'http-kit:http-connection-error
-               :message "The HTTP/2 connection closed while streams were paused."
-               :operation :http2-write
-               :cause :closed))))
+    (loop
+      (%h2-scheduler-wait-until
+       connection
+       (lambda ()
+         (or (%http2-connection-goaway-last-stream-id connection)
+             (%h2-scheduler-capacity-available-p connection)))
+       reader writer deadline clock-function)
+      (case
+          (%h2-with-scheduler-lock (connection)
+            (cond
+              ((%http2-connection-goaway-last-stream-id connection) :goaway)
+              ((not (http2-connection-open-p connection)) :closed)
+              ((%h2-scheduler-capacity-available-p connection) :available)
+              (t :retry)))
+        (:goaway
+         (%h2-connection-next-stream-id connection))
+        (:closed
+         (error 'http-kit:http-connection-error
+                :message "The HTTP/2 connection closed while streams were paused."
+                :operation :http2-write
+                :cause :closed))
+        (:available
+         (return))
+        (:retry nil))))
 
   (defun %h2-scheduler-fail-connection (connection condition)
     (let ((close-p nil))
