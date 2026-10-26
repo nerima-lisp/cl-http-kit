@@ -302,7 +302,9 @@
    (http-client-max-http2-concurrent-streams
     (make-http-client :max-http2-concurrent-streams 12)))
   (signals http-protocol-error
-    (make-http-client :max-http2-concurrent-streams 0)))
+    (make-http-client :max-http2-concurrent-streams 0))
+  (signals http-protocol-error
+    (make-http-client :max-http2-concurrent-streams "invalid")))
 
 (deftest client-challenge-authentication-requires-replayable-body
   (let ((calls 0)
