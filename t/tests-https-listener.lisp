@@ -2092,6 +2092,127 @@
                   context :listener-stopped nil)
                  (eq :failed (http-kit::http-server-state server))))))))))
 #+sbcl
+(deftest https-listener-deferred-event-callback-failure-cleans-up
+  (%with-https-listener-test-stubs (context)
+    (let* ((handler-entered (sb-thread:make-semaphore :count 0))
+           (release-handler (sb-thread:make-semaphore :count 0))
+           (ticket-store nil)
+           (callback-failure nil)
+           (stopped-after-store-destroyed-p nil)
+           (server nil))
+      (unwind-protect
+           (progn
+             (setf (%https-listener-test-context-session-action context)
+                   (lambda (protocol stream handler options)
+                     (declare (ignore protocol stream options))
+                     (funcall handler nil))
+                   server
+                   (%https-listener-make-server
+                    :graceful-timeout 0.1
+                    :handler
+                    (lambda (request)
+                      (declare (ignore request))
+                      (sb-thread:signal-semaphore handler-entered)
+                      (sb-thread:wait-on-semaphore release-handler)
+                      (make-http-response :status 204))
+                    :on-event
+                    (lambda (event)
+                      (%https-listener-record-event context event)
+                      (when (eq :listener-stopped (getf event :type))
+                        (setf stopped-after-store-destroyed-p
+                              (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p
+                               ticket-store)))
+                      (when (eq :listener-shutdown-deferred
+                                (getf event :type))
+                        (error "injected deferred event callback failure")))))
+             (start-http-server server)
+             (setf ticket-store
+                   (http-kit::http-server-ticket-key-store server))
+             (ensure-true ticket-store)
+             (let ((client (%https-listener-connect server)))
+               (close-http-tcp-stream client))
+             (ensure-true
+              (sb-thread:wait-on-semaphore handler-entered :timeout 5))
+             (stop-http-server server :graceful-timeout 0.1)
+             (ensure-true
+              (member (http-kit::http-server-state server)
+                      (quote (:stopping :failed))))
+             (ensure-equal
+              1
+              (hash-table-count (http-kit::http-server-workers server)))
+             (ensure-equal 1 (%https-listener-connection-count server))
+             (%https-listener-wait
+              (lambda ()
+                (and
+                 (%https-listener-event-present-p
+                  context :listener-shutdown-deferred nil)
+                 (http-server-failure server))))
+             (setf callback-failure (http-server-failure server))
+             (ensure-true
+              (typep callback-failure (quote http-server-callback-error)))
+             (ensure-equal
+              :on-event
+              (http-server-callback-error-callback callback-failure))
+             (ensure-equal
+              :event-callback-failed
+              (http-server-error-reason-code callback-failure))
+             (ensure-equal
+              :shutdown
+              (http-server-error-phase callback-failure))
+             (let ((deferred-event
+                     (find :listener-shutdown-deferred
+                           (%https-listener-events context)
+                           :key (lambda (event) (getf event :type))
+                           :test (function eq))))
+               (ensure-equal 1 (getf deferred-event :worker-count))
+               (ensure-true
+                (getf deferred-event
+                      :ticket-key-store-destruction-deferred-p))
+               (ensure-false
+                (http-kit::%http-server-emit-event-once
+                 server :shutdown-deferred deferred-event))
+               (ensure-equal
+                1
+                (count :listener-shutdown-deferred
+                       (%https-listener-events context)
+                       :key (lambda (event) (getf event :type))
+                       :test (function eq))))
+             (ensure-true
+              (loop for worker being the hash-keys of
+                    (http-kit::http-server-workers server)
+                    thereis (sb-thread:thread-alive-p worker)))
+             (ensure-false
+              (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p
+               ticket-store))
+             (ensure-equal :failed (http-kit::http-server-state server))
+             (ensure-false
+              (%https-listener-event-present-p
+               context :listener-stopped nil))
+             (sb-thread:signal-semaphore release-handler)
+             (%https-listener-wait
+              (lambda ()
+                (and
+                 (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p
+                  ticket-store)
+                 (%https-listener-event-present-p
+                  context :listener-stopped nil)
+                 stopped-after-store-destroyed-p)))
+             (ensure-true stopped-after-store-destroyed-p)
+             (ensure-true (eq callback-failure (http-server-failure server)))
+             (ensure-equal :failed (http-kit::http-server-state server))
+             (ensure-equal
+              0
+              (hash-table-count (http-kit::http-server-workers server)))
+             (ensure-equal 0 (%https-listener-connection-count server)))
+        (when server
+          (sb-thread:signal-semaphore release-handler)
+          (stop-http-server server :graceful-timeout 1)
+          (%https-listener-wait
+           (lambda ()
+             (or (%https-listener-event-present-p
+                  context :listener-stopped nil)
+                 (eq :failed (http-kit::http-server-state server))))))))))
+#+sbcl
 (deftest https-listener-preserves-external-ticket-store-through-public-stop
   (%with-https-listener-test-stubs (context)
     (ensure-true context)

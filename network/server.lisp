@@ -875,7 +875,7 @@
                          (%http-server-broadcast server))
                        (when (%with-http-server-lock (server)
                                (and (http-server-shutdown-p server)
-                                    (eq (http-server-state server) :stopping)
+                                    (member (http-server-state server) (quote (:stopping :failed)))
                                     (let ((supervisor
                                             (http-server-supervisor server)))
                                       (or (null supervisor)
@@ -1010,7 +1010,7 @@
                    (http-server-graceful-timeout server)))))
       (setf shutdown-p
             (and (http-server-shutdown-p server)
-                 (eq (http-server-state server) :stopping)))
+                 (member (http-server-state server) (quote (:stopping :failed)))))
       (%http-server-broadcast server))
     (when (or unexpected-p shutdown-p)
       (%http-server-ensure-shutdown-coordinator server))
@@ -1122,13 +1122,16 @@
                              count (sb-thread:thread-alive-p worker)))
                      workers-alive-p (plusp workers-alive-count))
                (when (or workers-alive-p ticket-key-store-destruction-deferred-p)
-                 (%http-server-emit-event-once
-                  server :shutdown-deferred
-                  (list :type :listener-shutdown-deferred
-                        :phase :shutdown
-                        :worker-count workers-alive-count
-                        :ticket-key-store-destruction-deferred-p
-                        ticket-key-store-destruction-deferred-p)))
+                 (handler-case
+                     (%http-server-emit-event-once
+                      server :shutdown-deferred
+                      (list :type :listener-shutdown-deferred
+                            :phase :shutdown
+                            :worker-count workers-alive-count
+                            :ticket-key-store-destruction-deferred-p
+                            ticket-key-store-destruction-deferred-p))
+                   (http-server-callback-error ()
+                     nil)))
                (cond
                  ((and store-release-succeeded-p
                        (not workers-alive-p)
@@ -1173,7 +1176,10 @@
           (%http-server-broadcast server))
         (when (%with-http-server-lock (server)
                 (and (http-server-shutdown-p server)
-                     (eq (http-server-state server) :stopping)
+                     (or (eq (http-server-state server) :stopping)
+                         (and (eq (http-server-state server) :failed)
+                              (http-server-shutdown-deferred-event-emitted-p server)
+                              (not (http-server-stopped-event-emitted-p server))))
                      (null (http-server-ticket-key-store-cleanup-error server))
                      (zerop (http-server-connection-count server))
                      (let ((supervisor
