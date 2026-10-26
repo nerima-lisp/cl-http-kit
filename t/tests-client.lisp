@@ -292,6 +292,18 @@
                       (lambda (&rest arguments)
                         (declare (ignore arguments))))))
 
+
+(deftest client-configures-max-http2-concurrent-streams
+  (ensure-equal
+   100
+   (http-client-max-http2-concurrent-streams (make-http-client)))
+  (ensure-equal
+   12
+   (http-client-max-http2-concurrent-streams
+    (make-http-client :max-http2-concurrent-streams 12)))
+  (signals http-protocol-error
+    (make-http-client :max-http2-concurrent-streams 0)))
+
 (deftest client-challenge-authentication-requires-replayable-body
   (let ((calls 0)
         (provider-calls 0))

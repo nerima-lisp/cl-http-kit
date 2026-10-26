@@ -970,7 +970,7 @@
                    entry))
     (http-kit/http2::%h2-with-scheduler-lock (connection)
       (http-kit/http2::%h2-scheduler-enqueue-body-callback-locked
-       connection entry
+       entry
        (lambda (chunk) (push (copy-seq chunk) body-chunks))
        (octets 97) 1 t t)
       (setf (http-kit/http2::%h2-batch-entry-pending-body-callback-count entry) 0))
