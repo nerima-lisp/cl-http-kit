@@ -1115,12 +1115,17 @@
         (http-kit/http3:read-http3-qpack-encoder-stream client)
       (ensure-equal '(:set-capacity :insert) (mapcar #'first application-events))
       (ensure-equal nil ended-p))
-    (ensure-equal '((:enter 0)
-                    (:leave 0)
-                    (:read nil)
-                    (:enter 0)
-                    (:leave 1))
-                  (nreverse events))
+    (ensure-equal
+     (quote ((:enter 0)
+             (:leave 0)
+             (:enter 0)
+             (:enter 0)
+             (:leave 0)
+             (:read t)
+             (:enter 0)
+             (:leave 1)
+             (:leave 1)))
+     (nreverse events))
     (ensure-equal 1 (http-message-kit:qpack-context-insert-count decoder-context))))
 
 (deftest http3-qpack-local-write-failure-preserves-state
@@ -15584,6 +15589,109 @@
                (symbol-function reader-name) original-reader
                (http-kit/http3::http3-client-poll-function client)
                original-poll-function))))))
+(deftest http3-quic-adapter-rejects-owner-bypassing-read-and-write-during-owner-poll
+  (call-with-http3-coverage-adapter-fixture
+   (lambda (adapter)
+     (let* ((client
+              (http-kit/http3:http3-quic-adapter-http3-client adapter))
+            (poll-started (sb-thread:make-semaphore :count 0))
+            (release-poll (sb-thread:make-semaphore :count 0))
+            (write-lock (sb-thread:make-mutex))
+            (write-count 0)
+            (response-wire (http3-test-native-response-wire))
+            (first-poll-p nil)
+            (original-poll-function
+              (http-kit/http3::http3-client-poll-function client))
+            (original-write-stream
+              (http-kit/http3::http3-client-write-stream client))
+            (request-thread nil)
+            (request-finished nil)
+            (request-result nil)
+            (public-thread nil)
+            (public-finished nil)
+            (public-result nil)
+            (reader-thread nil)
+            (reader-finished nil)
+            (reader-result nil))
+       (setf (http-kit/http3::http3-client-poll-function client)
+             (lambda (&optional at)
+               (unless first-poll-p
+                 (setf first-poll-p t)
+                 (sb-thread:signal-semaphore poll-started)
+                 (sb-thread:wait-on-semaphore release-poll :timeout 5))
+               (if at
+                   (funcall original-poll-function at)
+                   (funcall original-poll-function)))
+             (http-kit/http3::http3-client-write-stream client)
+             (lambda (stream octets &rest arguments)
+               (sb-thread:with-mutex (write-lock)
+                 (incf write-count))
+               (apply original-write-stream stream octets arguments)))
+       (unwind-protect
+            (progn
+              (multiple-value-setq
+                  (request-thread request-finished request-result)
+                (http3-test-start-native-call
+                 (lambda ()
+                   (http-kit/http3:send-http3-request
+                    client
+                    (make-http-request
+                     :method "GET"
+                     :uri "https://example.test/control-write-owner")
+                    :timeout 2
+                    :on-stream-open
+                    (lambda (stream stream-id cancel)
+                      (declare (ignore stream cancel))
+                      (cl-quic-kit:client-receive-frame
+                       (http-kit/http3::http3-quic-adapter-quic-client adapter)
+                       (cl-quic-kit:make-frame
+                        :stream :stream-id stream-id :offset 0
+                        :data response-wire :fin t :len-present t)
+                       :level :1-rtt))))))
+              (ensure-true
+               (sb-thread:wait-on-semaphore poll-started :timeout 3))
+              (let ((writes-before-public-call
+                      (sb-thread:with-mutex (write-lock) write-count)))
+                (multiple-value-setq
+                    (public-thread public-finished public-result)
+                  (http3-test-start-native-call
+                   (lambda ()
+                     (http-kit/http3:advertise-http3-max-push-id client 0))))
+                (ensure-true
+                 (sb-thread:wait-on-semaphore public-finished :timeout 3))
+                (ensure-equal :error (first public-result))
+                (ensure-true
+                 (typep (second public-result)
+                        (quote http-kit:http-connection-error)))
+                (ensure-equal
+                 writes-before-public-call
+                 (sb-thread:with-mutex (write-lock) write-count)))
+              (multiple-value-setq
+                  (reader-thread reader-finished reader-result)
+                (http3-test-start-native-call
+                 (lambda ()
+                   (http-kit/http3:read-http3-control-stream client))))
+              (ensure-true
+               (sb-thread:wait-on-semaphore reader-finished :timeout 3))
+              (ensure-equal :error (first reader-result))
+              (ensure-true
+               (typep (second reader-result)
+                      (quote http-kit:http-connection-error)))
+              (ensure-true (sb-thread:thread-alive-p request-thread))
+              (sb-thread:signal-semaphore release-poll)
+              (ensure-true
+               (sb-thread:wait-on-semaphore request-finished :timeout 3))
+              (ensure-equal :response (first request-result))
+              (ensure-equal 200
+                            (http-response-status (second request-result))))
+         (sb-thread:signal-semaphore release-poll)
+         (http3-test-join-native-thread request-thread request-finished)
+         (http3-test-join-native-thread public-thread public-finished)
+         (http3-test-join-native-thread reader-thread reader-finished)
+         (setf (http-kit/http3::http3-client-poll-function client)
+               original-poll-function
+               (http-kit/http3::http3-client-write-stream client)
+               original-write-stream))))))
 (deftest http3-quic-adapter-poll-waits-for-close-owner
   (call-with-http3-coverage-adapter-fixture
    (lambda (adapter)

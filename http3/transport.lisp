@@ -699,7 +699,7 @@ RECEIVE-HTTP3-PUSH."
           (t
            (error cancel-condition)))))
     stream))
-(defun accept-http3-peer-unidirectional-stream
+(defun %accept-http3-peer-unidirectional-stream-serialized
     (client stream &key timeout deadline)
   "Classify and attach one peer-created HTTP/3 unidirectional STREAM.
 
@@ -791,8 +791,18 @@ bytes are replayed to the corresponding reader. Returns :CONTROL,
                (%h3-transport-error
                 "A peer HTTP/3 unidirectional stream ended before its type prefix."
                 :h3-stream-creation-error)))))))))
+(defun accept-http3-peer-unidirectional-stream
+    (client stream &key timeout deadline)
+  "Classify and attach one peer-created HTTP/3 unidirectional STREAM."
+  (unless (and (http3-client-p client) (http3-client-open-p client))
+    (%h3-transport-error "A live HTTP/3 client is required."))
+  (%call-http3-serialized
+   client
+   (lambda ()
+     (%accept-http3-peer-unidirectional-stream-serialized
+      client stream :timeout timeout :deadline deadline))))
 
-(defun process-http3-peer-unidirectional-stream
+(defun %process-http3-peer-unidirectional-stream-serialized
     (client stream &key timeout deadline)
   "Classify STREAM and apply its first control or QPACK input to CLIENT.
 
@@ -823,6 +833,16 @@ becomes readable again."
          (values kind events ended-p)))
       (otherwise
        (values kind '() nil)))))
+(defun process-http3-peer-unidirectional-stream
+    (client stream &key timeout deadline)
+  "Classify and apply input from one peer-created unidirectional stream."
+  (unless (and (http3-client-p client) (http3-client-open-p client))
+    (%h3-transport-error "A live HTTP/3 client is required."))
+  (%call-http3-serialized
+   client
+   (lambda ()
+     (%process-http3-peer-unidirectional-stream-serialized
+      client stream :timeout timeout :deadline deadline))))
 
 (progn
 (defun %h3-scheduler-cancel-qpack (client entry timeout deadline)
@@ -1249,10 +1269,7 @@ becomes readable again."
     (error condition))))
 
 (defun attach-http3-peer-control-stream (client stream)
-  "Attach the peer's incoming HTTP/3 control stream to CLIENT.
-
-The stream is read with READ-HTTP3-CONTROL-STREAM.  Only an open client may
-attach a stream; its single attachment is retained after closing."
+  "Attach the incoming HTTP/3 control stream to CLIENT."
   (unless (http3-client-p client)
     (%h3-transport-error
      "ATTACH-HTTP3-PEER-CONTROL-STREAM requires an HTTP/3 client."
@@ -1260,18 +1277,21 @@ attach a stream; its single attachment is retained after closing."
   (unless stream
     (%h3-transport-error
      "ATTACH-HTTP3-PEER-CONTROL-STREAM requires a stream."))
-  (when (http3-client-peer-control-stream client)
-    (%h3-connection-transport-error
-     "An HTTP/3 client can have only one peer control stream."
-     :h3-stream-creation-error #x103))
-  (unless (http3-client-open-p client)
-    (%h3-transport-error
-     "Cannot attach an HTTP/3 control stream after client close."))
-  ;; Reading requires this attachment, and closing retains it.
-  (setf (http3-client-peer-control-stream client) stream)
-  client)
+  (%call-http3-serialized
+   client
+   (lambda ()
+     (when (http3-client-peer-control-stream client)
+       (%h3-connection-transport-error
+        "An HTTP/3 client can have only one peer control stream."
+        :h3-stream-creation-error #x103))
+     (unless (http3-client-open-p client)
+       (%h3-transport-error
+        "Cannot attach an HTTP/3 control stream after client close."))
+     ;; Reading requires this attachment, and closing retains it.
+     (setf (http3-client-peer-control-stream client) stream)
+     client)))
 
-(defun read-http3-control-stream (client &key timeout deadline)
+(defun %read-http3-control-stream-serialized (client &key timeout deadline)
   "Read one chunk from CLIENT's peer control stream and apply its frames.
 
 Returns a list of effect keywords and a boolean indicating peer FIN.  The
@@ -1289,7 +1309,7 @@ HTTP3-CLIENT-PEER-CONTROL-STATE."
       (%h3-transport-error
        "READ-HTTP3-CONTROL-STREAM requires an attached peer control stream."))
     (when (http3-client-peer-control-fin-p client)
-      (return-from read-http3-control-stream (values '() t)))
+      (return-from %read-http3-control-stream-serialized (values '() t)))
     (multiple-value-bind (chunk fin-p)
         (%h3-read-client-stream client stream timeout deadline)
       (let ((buffer (http3-client-peer-control-buffer client))
@@ -1365,6 +1385,17 @@ HTTP3-CLIENT-PEER-CONTROL-STATE."
            :h3-closed-critical-stream #x104))
         (setf (http3-client-peer-control-buffer client) buffer)
         (values events ended-p)))))
+(defun read-http3-control-stream (client &key timeout deadline)
+  "Read and apply one chunk from CLIENT’s peer control stream."
+  (unless (http3-client-p client)
+    (%h3-transport-error
+     "READ-HTTP3-CONTROL-STREAM requires an HTTP/3 client."
+     (type-of client)))
+  (%call-http3-serialized
+   client
+   (lambda ()
+     (%read-http3-control-stream-serialized
+      client :timeout timeout :deadline deadline))))
 
 (defun %h3-write-client-qpack-transaction
     (client prepare write result-function)
@@ -1438,32 +1469,38 @@ HTTP3-CLIENT-PEER-CONTROL-STATE."
       (http3-client-qpack-encoder-context client)))))
 
 (defun attach-http3-peer-qpack-encoder-stream (client stream)
-  "Attach the peer's single QPACK encoder stream to CLIENT."
+  "Attach one peer QPACK encoder stream to CLIENT."
   (unless (and (http3-client-p client) stream)
     (%h3-transport-error
      "ATTACH-HTTP3-PEER-QPACK-ENCODER-STREAM requires a client and stream."))
-  (when (or (http3-client-peer-qpack-encoder-stream client)
-            (http3-client-peer-qpack-encoder-prefix-seen-p client))
-    (%h3-connection-transport-error
-     "An HTTP/3 connection can have only one peer QPACK encoder stream."
-     :h3-stream-creation-error #x103))
-  (setf (http3-client-peer-qpack-encoder-stream client) stream)
-  client)
+  (%call-http3-serialized
+   client
+   (lambda ()
+     (when (or (http3-client-peer-qpack-encoder-stream client)
+               (http3-client-peer-qpack-encoder-prefix-seen-p client))
+       (%h3-connection-transport-error
+        "An HTTP/3 connection can have only one peer QPACK encoder stream."
+        :h3-stream-creation-error #x103))
+     (setf (http3-client-peer-qpack-encoder-stream client) stream)
+     client)))
 
 (defun attach-http3-peer-qpack-decoder-stream (client stream)
-  "Attach the peer's single QPACK decoder stream to CLIENT."
+  "Attach one peer QPACK decoder stream to CLIENT."
   (unless (and (http3-client-p client) stream)
     (%h3-transport-error
      "ATTACH-HTTP3-PEER-QPACK-DECODER-STREAM requires a client and stream."))
-  (when (or (http3-client-peer-qpack-decoder-stream client)
-            (http3-client-peer-qpack-decoder-prefix-seen-p client))
-    (%h3-connection-transport-error
-     "An HTTP/3 connection can have only one peer QPACK decoder stream."
-     :h3-stream-creation-error #x103))
-  (setf (http3-client-peer-qpack-decoder-stream client) stream)
-  client)
+  (%call-http3-serialized
+   client
+   (lambda ()
+     (when (or (http3-client-peer-qpack-decoder-stream client)
+               (http3-client-peer-qpack-decoder-prefix-seen-p client))
+       (%h3-connection-transport-error
+        "An HTTP/3 connection can have only one peer QPACK decoder stream."
+        :h3-stream-creation-error #x103))
+     (setf (http3-client-peer-qpack-decoder-stream client) stream)
+     client)))
 
-(defun read-http3-qpack-encoder-stream (client &key timeout deadline)
+(defun %read-http3-qpack-encoder-stream-serialized (client &key timeout deadline)
   "Read and apply one chunk from the peer's QPACK encoder stream."
   (unless (and (http3-client-p client) (http3-client-open-p client))
     (%h3-transport-error "A live HTTP/3 client is required."))
@@ -1528,8 +1565,17 @@ HTTP3-CLIENT-PEER-CONTROL-STATE."
                                  (list :qpack-stream-unblocked blocked))
                                ready))
                 ended-p)))))
+(defun read-http3-qpack-encoder-stream (client &key timeout deadline)
+  "Read and apply one chunk from the peer QPACK encoder stream."
+  (unless (and (http3-client-p client) (http3-client-open-p client))
+    (%h3-transport-error "A live HTTP/3 client is required."))
+  (%call-http3-serialized
+   client
+   (lambda ()
+     (%read-http3-qpack-encoder-stream-serialized
+      client :timeout timeout :deadline deadline))))
 
-(defun read-http3-qpack-decoder-stream (client &key timeout deadline)
+(defun %read-http3-qpack-decoder-stream-serialized (client &key timeout deadline)
   "Read and apply one chunk from the peer's QPACK decoder stream."
   (unless (and (http3-client-p client) (http3-client-open-p client))
     (%h3-transport-error "A live HTTP/3 client is required."))
@@ -1584,6 +1630,15 @@ HTTP3-CLIENT-PEER-CONTROL-STATE."
            (setf (http3-client-peer-qpack-decoder-buffer client) buffer)
            (%h3-check-state-bytes client)
            (values events ended-p)))))))
+(defun read-http3-qpack-decoder-stream (client &key timeout deadline)
+  "Read and apply one chunk from the peer QPACK decoder stream."
+  (unless (and (http3-client-p client) (http3-client-open-p client))
+    (%h3-transport-error "A live HTTP/3 client is required."))
+  (%call-http3-serialized
+   client
+   (lambda ()
+     (%read-http3-qpack-decoder-stream-serialized
+      client :timeout timeout :deadline deadline))))
 
 (defun serve-http3-control-stream
     (stream &key read-stream close-stream
@@ -2453,11 +2508,54 @@ is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
   #+sbcl sb-thread:*current-thread*
   #-sbcl nil)
 
-(defun %h3-scheduler-owner-p (client)
-  #+sbcl (eq (http3-client-scheduler-owner-thread client)
-             (%h3-scheduler-current-thread))
-  #-sbcl (declare (ignore client))
-  #-sbcl nil)
+(progn
+  (defun %h3-scheduler-owner-p (client)
+    #+sbcl (eq (http3-client-scheduler-owner-thread client)
+               (%h3-scheduler-current-thread))
+    #-sbcl (declare (ignore client))
+    #-sbcl nil)
+
+  (defun %h3-call-with-scheduler-owner (client thunk)
+    #+sbcl
+    (let ((thread (%h3-scheduler-current-thread))
+          (claimed-p nil))
+      (%h3-with-scheduler-lock (client)
+        (cond
+          ((eq (http3-client-scheduler-owner-thread client) thread))
+          ((and (http3-client-scheduler-close-owner-active-p client)
+                (not (eq (http3-client-scheduler-close-owner-thread client)
+                         thread)))
+           (error 'http-kit:http-connection-error
+                  :message "The HTTP/3 QUIC client is owned by another thread."
+                  :operation :http3-quic-client
+                  :request-sent-p nil))
+          ((and (http3-client-scheduler-close-state client)
+                (not (and (http3-client-scheduler-close-owner-active-p client)
+                          (eq (http3-client-scheduler-close-owner-thread client)
+                              thread))))
+           (error 'http-kit:http-connection-error
+                  :message "The HTTP/3 QUIC connection is closing."
+                  :operation :http3-quic-client
+                  :request-sent-p nil))
+          ((null (http3-client-scheduler-owner-thread client))
+           (setf (http3-client-scheduler-owner-thread client) thread
+                 claimed-p t)
+           (%h3-scheduler-broadcast client))
+          (t
+           (error 'http-kit:http-connection-error
+                  :message "The HTTP/3 QUIC client is owned by another thread."
+                  :operation :http3-quic-client
+                  :request-sent-p nil))))
+      (unwind-protect
+           (funcall thunk)
+        (when claimed-p
+          (%h3-with-scheduler-lock (client)
+            (when (eq (http3-client-scheduler-owner-thread client) thread)
+              (setf (http3-client-scheduler-owner-thread client) nil))
+            (%h3-scheduler-broadcast client)))))
+    #-sbcl
+    (funcall thunk)))
+
 
 (defun %h3-scheduler-entry-for-stream (client stream)
   (%h3-with-scheduler-lock (client)
