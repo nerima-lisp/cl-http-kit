@@ -188,7 +188,9 @@ same framing checks while the response reader tracks flow-control bytes."
             frame status body
             (first arguments) (second arguments) (third arguments)
             (fourth arguments) (fifth arguments) (list (sixth arguments))))
-    ((= (length arguments) 7)
+    ((and (= (length arguments) 7)
+          (or (null (seventh arguments))
+              (functionp (seventh arguments))))
      (apply #'%h2-append-data-frame*
             frame status body
             (first arguments) (second arguments) (third arguments)
