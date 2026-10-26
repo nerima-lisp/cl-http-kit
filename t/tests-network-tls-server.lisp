@@ -1399,7 +1399,10 @@
                         (handler-bind
                             ((http-kit/tls::tls-server-cleanup-warning
                               (lambda (warning)
-                                (setf cleanup-warning warning)
+                                (progn
+                                  (setf cleanup-warning warning)
+                                  (ensure-equal "TLS server driver cleanup failed."
+                                                (format nil "~A" warning)))
                                 (muffle-warning warning))))
                           (%tls-server-test-with-spy
                            'cl-tls-kit:make-tls13-server-driver
@@ -1419,7 +1422,20 @@
                      (ensure-true (typep primary-condition 'http-protocol-error))
                      (ensure-equal :handshake-failed
                                    (http-protocol-error-detail primary-condition))
-                     (ensure-true cleanup-warning)
+                     (progn
+                       (ensure-true cleanup-warning)
+                       (let ((warning-output (make-string-output-stream)))
+                         (close warning-output)
+                         (%tls-server-test-with-spy
+                          'cl-tls-kit:destroy-tls13-server-ticket-key-store
+                          (lambda (store)
+                            (if (eq store driver-store)
+                                (error destroy-condition)
+                              (funcall original-destroy store)))
+                          (lambda ()
+                            (let ((*error-output* warning-output))
+                              (ensure-false
+                               (http-kit/tls::%tls-server-cleanup-driver-close driver)))))))
                      (ensure-true
                       (eq destroy-condition
                           (http-kit/tls::tls-server-cleanup-warning-cause cleanup-warning)))
