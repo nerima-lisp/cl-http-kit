@@ -851,9 +851,9 @@
             until (eq frame :eof)
             do (push frame frames))
       (setf frames (nreverse frames))
-      (ensure-equal '(1 0 1 0)
+      (ensure-equal '(1 1)
                     (mapcar #'http-kit/http2::%h2-frame-stream-id frames))
-      (ensure-equal '(2 2 3 3)
+      (ensure-equal '(2 3)
                     (mapcar (lambda (frame)
                               (http-kit/http2::%h2-u32
                                (http-kit/http2::%h2-frame-payload frame) 0))
@@ -899,13 +899,8 @@
               until (eq frame :eof)
               do (push frame frames))
         (setf frames (nreverse frames))
-        (ensure-equal 6 (length frames))
-        (let ((window-update (fifth frames))
-              (reset (sixth frames)))
-          (ensure-equal 8 (http-kit/http2::%h2-frame-type window-update))
-          (ensure-equal 0 (http-kit/http2::%h2-frame-stream-id window-update))
-          (ensure-equal (octets 0 0 0 1)
-                        (http-kit/http2::%h2-frame-payload window-update))
+        (ensure-equal 3 (length frames))
+        (let ((reset (third frames)))
           (ensure-equal 3 (http-kit/http2::%h2-frame-type reset))
           (ensure-equal 1 (http-kit/http2::%h2-frame-stream-id reset))
           (ensure-equal (octets 0 0 0 8)
@@ -970,9 +965,7 @@
     (ensure-true (http-kit/http2::%h2-batch-entry-local-retired-p entry))
     (ensure-false (http-kit/http2::%http2-connection-scheduler-entries connection))
     (let ((expected
-            (concatenate-octets
-             (http-kit/http2::%h2-frame-wire 8 0 0 (octets 0 0 0 2))
-             (http-kit/http2::%h2-frame-wire 3 0 1 (octets 0 0 0 8)))))
+            (http-kit/http2::%h2-frame-wire 3 0 1 (octets 0 0 0 8))))
       (ensure-equal expected (binary-session-output stream)))
     (let* ((entry (http-kit/http2::%make-h2-batch-entry
                    :request request :stream-id 3))
@@ -992,9 +985,7 @@
        connection entry clock)
       (ensure-false callback-called-p)
       (ensure-false (http-kit/http2::%h2-batch-entry-callback-events entry))
-      (ensure-equal
-       (http-kit/http2::%h2-frame-wire 8 0 0 (octets 0 0 0 1))
-       (subseq (binary-session-output stream) (length before))))
+      (ensure-equal before (binary-session-output stream)))
     (let* ((entry (http-kit/http2::%make-h2-batch-entry
                    :request request :stream-id 5))
            (callback-error nil))
@@ -1034,10 +1025,14 @@
       (http-kit/http2:close-http2-connection failing-connection))
     (let* ((entry (http-kit/http2::%make-h2-batch-entry
                    :request request :stream-id 1))
-           (response (make-http-response :status 200)))
+           (response (make-http-response :status 200))
+           (retirement-error
+             (make-condition 'simple-error
+                             :format-control "Retired entry response.")))
       (setf (http-kit/http2::%http2-connection-scheduler-entries connection)
-            (list entry)
-            (http-kit/http2::%h2-batch-entry-local-retired-p entry) t)
+            (list entry))
+      (http-kit/http2::%h2-scheduler-retire-entry
+       connection entry retirement-error clock)
       (http-kit/http2::%h2-scheduler-mark-response connection entry response)
       (ensure-false (http-kit/http2::%h2-batch-entry-response entry))
       (ensure-false
@@ -2293,12 +2288,12 @@
                    until (eq frame :eof)
                    do (push frame frames))
              (setf frames (nreverse frames))
-             (ensure-equal '(8 3)
+             (ensure-equal '(3)
                            (mapcar #'http-kit/http2::%h2-frame-type frames))
-             (ensure-equal (octets 0 0 0 2)
-                           (http-kit/http2::%h2-frame-payload (first frames)))
+             (ensure-equal 1
+                           (http-kit/http2::%h2-frame-stream-id (first frames)))
              (ensure-equal (octets 0 0 0 8)
-                           (http-kit/http2::%h2-frame-payload (second frames)))))
+                           (http-kit/http2::%h2-frame-payload (first frames)))))
       (http-kit/http2:close-http2-connection connection)))
   (let* ((stream (make-instance 'binary-session-stream :input (octets)))
          (connection (http-kit/http2:make-http2-connection :stream stream))

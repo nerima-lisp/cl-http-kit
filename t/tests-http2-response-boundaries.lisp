@@ -1191,9 +1191,9 @@
                       (http-size-limit-exceeded-kind result))
         (ensure-equal (if (eq kind :headers) header-limit body-limit)
                       (http-size-limit-exceeded-limit result))
-        (ensure-equal 1 closed)
-        (ensure-false
-         (http-kit/http2:http2-connection-open-p connection))
+        (ensure-equal (if (or (eq kind :headers) batch-p) 1 0) closed)
+        (ensure-equal (and (eq kind :body) (not batch-p))
+                      (http-kit/http2:http2-connection-open-p connection))
         (http-kit/http2:close-http2-connection connection)
         (ensure-equal 1 closed)))))
 #+sbcl
@@ -1203,13 +1203,12 @@
             (h2-frame 4 0 0 (octets))
             (h2-frame 1 4 1 (h2-header-block (cons ":status" "200")))
             (h2-frame 1 4 3 (h2-header-block (cons ":status" "200")))
-            (h2-frame 0 1 1 (octets 1 2))))
+            (h2-frame 0 1 5 (octets 1 2))))
          (stream (make-instance 'binary-session-stream :input input))
          (closed 0)
          (connection
            (http-kit/http2:make-http2-connection
             :stream stream
-            :max-body-bytes 1
             :close-stream (lambda (actual)
                             (ensure-true (eq stream actual))
                             (incf closed)
@@ -1259,8 +1258,8 @@
              (setf first-thread nil)
              (sb-thread:join-thread second-thread)
              (setf second-thread nil)
-             (ensure-true (typep first-error 'http-size-limit-exceeded))
-             (ensure-true (typep second-error 'http-size-limit-exceeded))
+             (ensure-true (typep first-error 'http-protocol-error))
+             (ensure-true (typep second-error 'http-protocol-error))
              (ensure-false
               (http-kit/http2:http2-connection-open-p connection))
              (ensure-equal 1 closed))
@@ -1321,7 +1320,7 @@
       (let ((frames (h2-output-frames stream)))
         (ensure-equal '(4 1 4 8 8) (mapcar #'http-kit/http2::%h2-frame-type frames))
         (ensure-equal '(0 5 1 0 0) (mapcar #'http-kit/http2::%h2-frame-flags frames))
-        (ensure-equal '(0 1 0 1 0) (mapcar #'http-kit/http2::%h2-frame-stream-id frames))
+        (ensure-equal '(0 1 0 0 1) (mapcar #'http-kit/http2::%h2-frame-stream-id frames))
         (ensure-equal (octets) (http-kit/http2::%h2-frame-payload (third frames)))
         (dolist (frame (last frames 2))
           (ensure-equal (octets 0 0 0 5) (http-kit/http2::%h2-frame-payload frame)))))))

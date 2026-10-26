@@ -387,6 +387,7 @@
                          http-kit/http2::+http2-data-type+
                          http-kit/http2::+http2-settings-type+
                          http-kit/http2::+http2-window-update-type+
+                         http-kit/http2::+http2-window-update-type+
                          http-kit/http2::+http2-rst-stream-type+))
                   ((nil)
                    (list http-kit/http2::+http2-settings-type+
@@ -399,13 +400,30 @@
                 (mapcar #'http-kit/http2::%h2-frame-type frames))
                (ensure-equal '(0 4) (mapcar #'http-kit/http2::%h2-frame-flags (subseq frames 0 2)))
                (when (null phase)
-                 (ensure-equal '(1 0 0)
+                 (ensure-equal '(0 1 0)
                                (mapcar #'http-kit/http2::%h2-frame-stream-id
                                        (nthcdr 4 frames))))
                (when (eq phase :body)
                  (ensure-equal '(0 1)
                                (mapcar #'http-kit/http2::%h2-frame-stream-id
-                                       (nthcdr 4 frames))))
+                                       (remove-if-not
+                                        (lambda (frame)
+                                          (= http-kit/http2::+http2-window-update-type+
+                                             (http-kit/http2::%h2-frame-type frame)))
+                                        frames))))
+               (when (member phase '(nil :body))
+                 (let ((window-updates
+                         (remove-if-not
+                          (lambda (frame)
+                            (= http-kit/http2::+http2-window-update-type+
+                               (http-kit/http2::%h2-frame-type frame)))
+                          frames)))
+                   (ensure-equal (if (eq phase :body) '(1 1) '(1 1 1))
+                                 (mapcar
+                                  (lambda (frame)
+                                    (http-kit/http2::%h2-u32
+                                     (http-kit/http2::%h2-frame-payload frame) 0))
+                                  window-updates))))
                (multiple-value-bind (sent count ack) (h2-output-data-summary stream)
                  (ensure-equal (if (member phase '(:open :producer)) (octets) (octets 7)) sent)
                  (ensure-equal (if (member phase '(:open :producer)) 0 1) count)
