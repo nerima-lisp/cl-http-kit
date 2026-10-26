@@ -75,6 +75,29 @@
               (gethash worker (http-kit::http-server-workers server))))))
         (ensure-equal 1 coordinator-requests))
       (let* ((server (%https-listener-make-server))
+             (connection (http-kit::%make-http-server-connection))
+             (supervisor (sb-thread:make-thread (lambda () nil)))
+             (coordinator-requests 0))
+        (sb-thread:join-thread supervisor)
+        (setf (http-kit::http-server-state server) :stopping
+              (http-kit::http-server-shutdown-p server) t
+              (http-kit::http-server-supervisor server) supervisor)
+        (%https-listener-test-call-with-function-stubs
+         (list
+          (cons 'http-kit::%http-server-run-connection
+                (lambda (&rest arguments)
+                  (declare (ignore arguments))
+                  nil))
+          (cons 'http-kit::%http-server-ensure-shutdown-coordinator
+                (lambda (target)
+                  (declare (ignore target))
+                  (incf coordinator-requests))))
+         (lambda ()
+           (sb-thread:join-thread
+            (http-kit::%http-server-start-connection-worker
+             server connection))))
+        (ensure-equal 1 coordinator-requests))
+      (let* ((server (%https-listener-make-server))
              (supervisor-gate (sb-thread:make-semaphore :count 0))
              (supervisor
                (sb-thread:make-thread
@@ -114,12 +137,18 @@
         (%https-listener-test-call-with-function-stubs
          (list
           (cons 'http-kit::%http-server-release-owned-ticket-key-store
-                (lambda (&rest arguments)
-                  (declare (ignore arguments))
+                (lambda (server)
                   (case release-mode
                     (:released t)
                     (:not-released nil)
                     (:stop-supervisor
+                     (let ((late-worker
+                             (sb-thread:make-thread (lambda () nil))))
+                       (sb-thread:join-thread late-worker)
+                       (setf (gethash
+                              late-worker
+                              (http-kit::http-server-workers server))
+                             t))
                      (sb-thread:signal-semaphore supervisor-gate)
                      (sb-thread:join-thread supervisor-to-stop)
                      t))))
@@ -196,6 +225,17 @@
              (ensure-false (http-kit::http-server-supervisor server))
              (ensure-true
               (gethash worker (http-kit::http-server-workers server))))
+           (let* ((server (%https-listener-make-server))
+                  (worker sb-thread:*current-thread*))
+             (setf release-mode :released
+                   (http-kit::http-server-state server) :failed
+                   (http-kit::http-server-shutdown-p server) t
+                   (http-kit::http-server-stop-deadline server) 9.0d0
+                   (http-kit::http-server-supervisor server) worker
+                   (http-kit::http-server-shutdown-coordinator server) worker
+                   (gethash worker (http-kit::http-server-workers server)) t)
+             (http-kit::%http-server-shutdown-coordinator server)
+             (ensure-equal :failed (http-kit::http-server-state server)))
            (let* ((server (%https-listener-make-server))
                   (supervisor sb-thread:*current-thread*)
                   (cleanup-error
