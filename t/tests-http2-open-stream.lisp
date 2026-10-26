@@ -5621,4 +5621,150 @@
       (ensure-equal 1 opened)
       (ensure-equal 1 closed)))
 )
+
+  (deftest http2-public-connection-manager-cancels-waiting-request-before-stream-open
+    (let* ((stream
+             (make-instance 'h2-manager-capacity-peer-stream
+                            :input (h2-frame 4 0 0 (octets))))
+           (connection nil)
+           (manager
+             (http-kit/http2:make-http2-connection-manager
+              :open-connection
+              (lambda (request &key timeout deadline proxy-plan proxy)
+                (declare (ignore request timeout deadline proxy-plan proxy))
+                (setf connection
+                      (http-kit/http2:make-http2-connection
+                       :stream stream
+                       :max-concurrent-streams 1
+                       :close-stream
+                       (lambda (closed-stream)
+                         (ensure-true (eq stream closed-stream))
+                         (h2-manager-capacity-peer-close stream)))))))
+           (manager-transport
+             (http-kit/http2:make-http2-connection-manager-transport manager))
+           (second-transport-entered (sb-thread:make-semaphore :count 0))
+           (second-cancel-registered (sb-thread:make-semaphore :count 0))
+           (client
+             (http-kit/client:make-http-client
+              :transport-function
+              (lambda (request &rest arguments)
+                (when (search "/second"
+                              (http-uri-string (http-request-uri request)))
+                  (let ((register-cancel (getf arguments :on-cancel)))
+                    (ensure-true (functionp register-cancel))
+                    (setf (getf arguments :on-cancel)
+                          (lambda (cancel-function)
+                            (let ((cleanup (funcall register-cancel cancel-function)))
+                              (sb-thread:signal-semaphore
+                               second-cancel-registered)
+                              cleanup)))
+                    (sb-thread:signal-semaphore second-transport-entered)))
+                (apply manager-transport request
+                       :connection-key "capacity-cancel.test" arguments))
+              :cache nil
+              :default-timeout 15))
+           (cancel-token (http-kit/client:make-http-cancellation-token))
+           (first-headers-entered (sb-thread:make-semaphore :count 0))
+           (release-first-headers (sb-thread:make-semaphore :count 0))
+           (first-release-signaled-p nil)
+           (first-response nil)
+           (first-error nil)
+           (first-done (sb-thread:make-semaphore :count 0))
+           (second-response nil)
+           (second-error nil)
+           (second-done (sb-thread:make-semaphore :count 0))
+           (first-thread nil)
+           (second-thread nil))
+      (unwind-protect
+           (progn
+             (setf first-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (unwind-protect
+                           (handler-case
+                               (setf first-response
+                                     (sb-ext:with-timeout 15
+                                       (http-kit/client:http-client-send
+                                        client "GET"
+                                        "http://capacity-cancel.test/first"
+                                        :collect-body-p t
+                                        :on-response-headers
+                                        (lambda (status headers)
+                                          (declare (ignore headers))
+                                          (ensure-equal 200 status)
+                                          (sb-thread:signal-semaphore
+                                           first-headers-entered)
+                                          (ensure-true
+                                           (sb-thread:wait-on-semaphore
+                                            release-first-headers
+                                            :timeout 10))))))
+                             (error (condition)
+                               (setf first-error condition)))
+                        (sb-thread:signal-semaphore first-done)))))
+             (ensure-true
+              (sb-thread:wait-on-semaphore first-headers-entered :timeout 5))
+             (ensure-true
+              (sb-thread:wait-on-semaphore
+               (h2-manager-capacity-peer-header-available stream) :timeout 5))
+             (ensure-equal '(1)
+                           (h2-manager-capacity-peer-output-header-ids stream))
+             (setf second-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (unwind-protect
+                           (handler-case
+                               (setf second-response
+                                     (sb-ext:with-timeout 15
+                                       (http-kit/client:http-client-send
+                                        client "GET"
+                                        "http://capacity-cancel.test/second"
+                                        :collect-body-p t
+                                        :cancel-token cancel-token)))
+                             (error (condition)
+                               (setf second-error condition)))
+                        (sb-thread:signal-semaphore second-done)))))
+             (ensure-true
+              (sb-thread:wait-on-semaphore second-transport-entered :timeout 5))
+             (ensure-true
+              (sb-thread:wait-on-semaphore second-cancel-registered :timeout 5))
+             (ensure-equal '(1)
+                           (h2-manager-capacity-peer-output-header-ids stream))
+             (ensure-true
+              (http-kit/client:http-client-cancel-request cancel-token))
+             (ensure-true
+              (sb-thread:wait-on-semaphore second-done :timeout 1))
+             (ensure-false second-response)
+             (ensure-true
+              (typep second-error 'http-kit/client:http-client-request-cancelled))
+             (let* ((detail
+                      (http-kit/client:http-client-error-detail second-error))
+                    (cause
+                      (and (typep detail 'http-kit:http-connection-error)
+                           (http-kit:http-connection-error-cause detail))))
+               (ensure-true (typep detail 'http-kit:http-connection-error))
+               (ensure-true (consp cause))
+               (ensure-equal :local-cancel (first cause)))
+             (ensure-equal '(1)
+                           (h2-manager-capacity-peer-output-header-ids stream))
+             (ensure-true (http-kit/http2:http2-connection-open-p connection))
+             (setf first-release-signaled-p t)
+             (sb-thread:signal-semaphore release-first-headers)
+             (h2-manager-capacity-peer-feed
+              stream (h2-frame 0 1 1 (octets 65)))
+             (ensure-true (sb-thread:wait-on-semaphore first-done :timeout 5))
+             (sb-thread:join-thread first-thread)
+             (setf first-thread nil)
+             (ensure-false first-error)
+             (ensure-equal 200 (http-response-status first-response))
+             (ensure-equal (octets 65) (http-response-body first-response))
+             (ensure-true (http-kit/http2:http2-connection-open-p connection)))
+        (unless first-release-signaled-p
+          (setf first-release-signaled-p t)
+          (sb-thread:signal-semaphore release-first-headers))
+        (h2-manager-capacity-peer-close stream)
+        (http-kit/http2:close-http2-connection-manager manager)
+        (when first-thread
+          (sb-thread:join-thread first-thread))
+        (when second-thread
+          (sb-thread:join-thread second-thread)))))
 )
