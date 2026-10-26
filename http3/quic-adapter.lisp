@@ -267,8 +267,6 @@
             (%http3-quic-adapter-error
              "The QUIC TLS handshake did not complete."
              state))
-           ((eq state :established)
-            (values nil quic-client))
            ((cl-quic-kit:quic-client-closed-p quic-client)
             (let ((detail (%http3-quic-adapter-close-detail quic-client)))
               (%http3-quic-adapter-error
@@ -451,14 +449,6 @@
                  (cl-quic-kit:connection-state
                   (cl-quic-kit:quic-client-connection quic-client)))
            (cond
-             ((>= iteration-count 3000)
-              (%http3-quic-adapter-error
-               "The peer HTTP/3 SETTINGS did not arrive."
-               state))
-             ((http3-control-state-settings-received-p
-               (http3-client-peer-control-state http3-client))
-              (preserve-pending-prefixes)
-              (values nil http3-client))
              ((cl-quic-kit:quic-client-closed-p quic-client)
               (%http3-quic-adapter-error
                "The QUIC client closed before peer HTTP/3 SETTINGS arrived."
