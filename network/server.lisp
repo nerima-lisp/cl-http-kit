@@ -1214,7 +1214,11 @@
                   (declare (ignore result))
                   (case status
                     (:abort (sb-thread:join-thread coordinator))
-                    (:timeout (%http-server-force-close-connections server))))
+                    (:timeout
+                     (loop for remaining = (- deadline (%http-server-now))
+                           while (plusp remaining)
+                           do (sleep remaining))
+                     (%http-server-force-close-connections server))))
                 (%http-server-force-close-connections server))))))
     (when event-error
       (error event-error))
