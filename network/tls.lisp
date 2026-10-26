@@ -869,6 +869,22 @@ driver's transport callbacks."
                driver (subseq sequence start end))))
         sequence))
 
+    (define-condition tls-server-cleanup-warning (warning)
+      ((cause :initarg :cause :reader tls-server-cleanup-warning-cause))
+      (:report (lambda (condition stream)
+                 (declare (ignore condition))
+                 (write-string "TLS server driver cleanup failed." stream))))
+
+    (defun %tls-server-cleanup-driver-close (driver)
+      (when driver
+        (handler-case
+            (cl-tls-kit:tls13-server-driver-close driver)
+          (error (condition)
+            (handler-case
+                (warn 'tls-server-cleanup-warning :cause condition)
+              (error () nil)))))
+      nil)
+
     (defmethod close ((stream http-tls-stream) &key abort)
       (unless (%tls-stream-closed-p stream)
         (let* ((completed-p nil)
@@ -898,8 +914,7 @@ driver's transport callbacks."
                            (http-kit::%with-http-cleanup
                              (close transport :abort t))))
                    (when (and server-driver (not driver-closed-p))
-                     (http-kit::%with-http-cleanup
-                       (cl-tls-kit:tls13-server-driver-close server-driver))))
+                     (%tls-server-cleanup-driver-close server-driver)))
               (setf (%tls-stream-closed-p stream) t)))))
       t))
 
@@ -972,9 +987,7 @@ driver's transport callbacks."
                         clock-function)
                        (setf completed-p t))
                   (unless completed-p
-                    (http-kit::%with-http-cleanup
-                      (when driver
-                        (cl-tls-kit:tls13-server-driver-close driver)))
+                    (%tls-server-cleanup-driver-close driver)
                     (http-kit::%with-http-cleanup
                       (when (open-stream-p stream)
                         (close stream :abort t))))))
