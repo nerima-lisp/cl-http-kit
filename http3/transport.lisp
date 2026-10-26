@@ -3752,10 +3752,7 @@ validated informational response in wire order."
                       nil)))
              (error (condition)
                (unless (%h3-scheduler-close-started-p client)
-                 (if (typep condition
-                            (quote http3-connection-protocol-error))
-                     (%h3-scheduler-fail-connection client condition)
-                     (%h3-scheduler-fail-active client condition)))))
+                 (%h3-scheduler-fail-active client condition))))
            (setf normal-exit-p t))
       (unwind-protect
            (unwind-protect
