@@ -942,6 +942,46 @@
          (binary-session-output stream))))
     (http-kit/http2:close-http2-connection connection)))
 #+sbcl
+(deftest http2-coverage-scheduler-zero-pending-callback-counts
+  (let* ((stream (make-instance 'binary-session-stream :input (octets)))
+         (connection (http-kit/http2:make-http2-connection :stream stream))
+         (entry (http-kit/http2::%make-h2-batch-entry :stream-id 1))
+         (clock (lambda () 0))
+         (information-statuses nil)
+         (body-chunks nil))
+    (setf (http-kit/http2::%h2-batch-entry-response-headers-callback-complete-p
+           entry) t
+          (http-kit/http2::%h2-batch-entry-body-vector entry) (octets 120)
+          (http-kit/http2::%h2-batch-entry-body-length entry) 1)
+    (ensure-true
+     (http-kit/http2::%h2-scheduler-queue-callback
+      connection entry
+      (list :information
+            (lambda (response)
+              (push (http-response-status response) information-statuses))
+            (make-http-response :status 103))))
+    (setf (http-kit/http2::%h2-batch-entry-pending-information-callback-count
+           entry) 0)
+    (http-kit/http2::%h2-scheduler-run-entry-callbacks
+     connection entry clock)
+    (ensure-equal '(103) (nreverse information-statuses))
+    (ensure-equal 0
+                  (http-kit/http2::%h2-batch-entry-pending-information-callback-count
+                   entry))
+    (http-kit/http2::%h2-with-scheduler-lock (connection)
+      (http-kit/http2::%h2-scheduler-enqueue-body-callback-locked
+       connection entry
+       (lambda (chunk) (push (copy-seq chunk) body-chunks))
+       (octets 97) 1 t t)
+      (setf (http-kit/http2::%h2-batch-entry-pending-body-callback-count entry) 0))
+    (http-kit/http2::%h2-scheduler-run-entry-callbacks
+     connection entry clock)
+    (ensure-equal (list (octets 120)) (nreverse body-chunks))
+    (ensure-equal 0
+                  (http-kit/http2::%h2-batch-entry-pending-body-callback-count
+                   entry))
+    (http-kit/http2:close-http2-connection connection)))
+#+sbcl
 (deftest http2-coverage-scheduler-retirement-and-control-state
   (let* ((stream (make-instance 'binary-session-stream :input (octets)))
          (connection (http-kit/http2:make-http2-connection :stream stream))
