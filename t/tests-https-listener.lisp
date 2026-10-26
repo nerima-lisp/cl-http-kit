@@ -735,8 +735,7 @@
                                context)
                         do (sb-thread:condition-wait
                             (%https-listener-test-context-waitqueue context)
-                            (%https-listener-test-context-lock context)
-                            :timeout 0.1)))
+                            (%https-listener-test-context-lock context))))
                 stream))
         (unwind-protect
              (progn
@@ -1160,20 +1159,41 @@
       (write-sequence bytes transport :end record-end)
       (incf (%https-listener-client-stream-record-count stream))
       (finish-output transport)
-      (sb-thread:with-mutex
-          ((%https-listener-client-stream-lock stream))
-        (setf (%https-listener-client-stream-client-hello-sent-p stream) t)
-        (sb-thread:condition-broadcast
-         (%https-listener-client-stream-waitqueue stream))
-        (let ((deadline (+ (get-internal-real-time)
-                           (* 10 internal-time-units-per-second))))
-          (loop until (%https-listener-client-stream-release-p stream)
-                do (when (>= (get-internal-real-time) deadline)
-                     (error "Timed out waiting to release the TLS client stream."))
-                   (sb-thread:condition-wait
-                    (%https-listener-client-stream-waitqueue stream)
-                    (%https-listener-client-stream-lock stream)
-                    :timeout 0.1))))
+      (let ((lock (%https-listener-client-stream-lock stream))
+            (waitqueue (%https-listener-client-stream-waitqueue stream))
+            (timed-out-p nil))
+        (sb-thread:grab-mutex lock)
+        (unwind-protect
+             (progn
+               (setf (%https-listener-client-stream-client-hello-sent-p stream)
+                     t)
+               (sb-thread:condition-broadcast waitqueue)
+               (let ((deadline (+ (get-internal-real-time)
+                                  (* 10 internal-time-units-per-second))))
+                 (loop
+                   (when (%https-listener-client-stream-release-p stream)
+                     (return))
+                   (let ((remaining
+                           (/ (- deadline (get-internal-real-time))
+                              internal-time-units-per-second)))
+                     (when (<= remaining 0)
+                       (setf timed-out-p t)
+                       (return))
+                     ;; SBCL manual 13.6: timed waits can return NIL without reacquiring the mutex.
+                     (unless (sb-thread:condition-wait
+                              waitqueue lock :timeout (min 0.1 remaining))
+                       (let ((remaining
+                               (/ (- deadline (get-internal-real-time))
+                                  internal-time-units-per-second)))
+                         (unless (and (> remaining 0)
+                                      (sb-thread:grab-mutex
+                                       lock :timeout remaining))
+                           (setf timed-out-p t)
+                           (return))))))))
+          (when (sb-thread:holding-mutex-p lock)
+            (sb-thread:release-mutex lock)))
+        (when timed-out-p
+          (error "Timed out waiting to release the TLS client stream.")))
       (when (< record-end (length bytes))
         (write-sequence bytes transport :start record-end))))
 
