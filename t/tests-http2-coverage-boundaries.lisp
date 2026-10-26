@@ -824,6 +824,8 @@
          (clock (lambda () 0))
          (chunks nil)
          (information-statuses nil))
+    (setf (http-kit/http2::%h2-batch-entry-body-vector entry) (octets 120)
+          (http-kit/http2::%h2-batch-entry-body-length entry) 1)
     (setf (http-kit/http2::%http2-connection-scheduler-entries connection)
           (list entry))
     (ensure-true
@@ -866,7 +868,7 @@
         (list :body (lambda (chunk)
                       (declare (ignore chunk))
                       (setf callback-called-p t))
-              (octets 120) 1 t t)))
+              (cons 0 1) 1 t t)))
       (http-kit/http2::%h2-scheduler-run-entry-callbacks
        connection entry clock)
       (ensure-true callback-called-p)
@@ -909,6 +911,8 @@
                    :request request :stream-id 3))
            (callback-error nil)
            (before (copy-seq (binary-session-output stream))))
+      (setf (http-kit/http2::%h2-batch-entry-body-vector entry) (octets 120)
+            (http-kit/http2::%h2-batch-entry-body-length entry) 1)
       (setf (http-kit/http2::%http2-connection-scheduler-entries connection)
             (list entry))
       (ensure-true
@@ -917,7 +921,7 @@
         (list :body (lambda (chunk)
                       (declare (ignore chunk))
                       (error "Replayed consumer rejected the chunk."))
-              (octets 120) 1 t t)))
+              (cons 0 1) 1 t t)))
       (handler-case
           (http-kit/http2::%h2-scheduler-run-entry-callbacks
            connection entry clock)
