@@ -794,7 +794,7 @@ MAKE-HTTP3-CLIENT opens the local control stream and writes SETTINGS using
 caller-supplied OPEN-STREAM, WRITE-STREAM, and READ-STREAM callbacks. The
 callbacks receive stream type, timeout, deadline, and FIN options as
 appropriate. MAX-HEADER-BYTES and MAX-FIELDS bound decoded response field
-sections. CLOSE-HTTP3-CLIENT closes the control stream.
+sections. CLOSE-HTTP3-CLIENT closes the client's open HTTP/3 streams.
 
 With the QUIC adapter, a WRITE-STREAM callback that omits both TIMEOUT and
 DEADLINE may wait for peer flow-control credit. READ-HTTP3-CONTROL-STREAM may
