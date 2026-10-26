@@ -3677,7 +3677,11 @@
                         nil #'http-kit::%monotonic-time nil nil nil nil t nil
                         (lambda (wire)
                           (ensure-true (plusp (length wire)))
-                          (error failure)))
+                          (error failure))
+                        (lambda () nil)
+                        (lambda () (error "Unexpected request cancellation."))
+                        (lambda (opened-entry)
+                          (declare (ignore opened-entry))))
                      (http-kit:http-error (condition) condition))))
             (ensure-true (eq failure observed))
             (ensure-false
@@ -3704,7 +3708,11 @@
                      (http-kit/http2::%http2-connection-max-header-bytes connection)
                      (http-kit/http2::%http2-connection-max-fields connection)
                      (http-kit/http2::%http2-connection-max-body-bytes connection)
-                     nil #'http-kit::%monotonic-time nil nil nil nil t nil nil)
+                     nil #'http-kit::%monotonic-time nil nil nil nil t nil nil
+                     (lambda () nil)
+                     (lambda () (error "Unexpected request cancellation."))
+                     (lambda (opened-entry)
+                       (declare (ignore opened-entry))))
                   (http-kit:http-connection-error (condition) condition))))
           (ensure-true (typep observed 'http-kit:http-connection-error))
           (ensure-equal :http2-client (http-kit:http-error-operation observed))
@@ -3758,7 +3766,9 @@
         (let ((observed
                 (handler-case
                     (http-kit/http2::%h2-scheduler-wait-for-capacity
-                     connection nil nil nil #'http-kit::%monotonic-time)
+                     connection nil #'http-kit::%monotonic-time
+                     (lambda () nil)
+                     (lambda () (error "Unexpected request cancellation.")))
                   (http-kit:http-connection-error (condition) condition))))
           (ensure-true (typep observed 'http-kit:http-connection-error))
           (ensure-equal :http2-write (http-kit:http-error-operation observed))
@@ -5440,6 +5450,7 @@
            (first-headers-entered (sb-thread:make-semaphore :count 0))
            (second-headers-entered (sb-thread:make-semaphore :count 0))
            (third-headers-entered (sb-thread:make-semaphore :count 0))
+           (later-headers-entered (sb-thread:make-semaphore :count 0))
            (release-first-headers (sb-thread:make-semaphore :count 0))
            (release-second-headers (sb-thread:make-semaphore :count 0))
            (release-third-headers (sb-thread:make-semaphore :count 0))
@@ -5477,8 +5488,13 @@
                              :on-response-headers
                              (lambda (status headers)
                                (declare (ignore headers))
-                               (ensure-equal expected-status status)
+                               (if (listp expected-status)
+                                   (ensure-true (member status expected-status))
+                                   (ensure-equal expected-status status))
                                (sb-thread:signal-semaphore headers-entered)
+                               (unless (string= path "/first")
+                                 (sb-thread:signal-semaphore
+                                  later-headers-entered))
                                (ensure-true
                                 (sb-thread:wait-on-semaphore
                                  release-headers :timeout 10))))))
@@ -5503,7 +5519,7 @@
                              (h2-manager-capacity-peer-output-header-ids stream))
                (setf second-thread
                      (start-request
-                      "/second" 201 second-headers-entered
+                      "/second" '(201 202) second-headers-entered
                       release-second-headers
                       (lambda (response) (setf second-response response))
                       (lambda (condition) (setf second-error condition))
@@ -5512,7 +5528,8 @@
                 (sb-thread:wait-on-semaphore second-transport-entered :timeout 5))
                (setf third-thread
                      (start-request
-                      "/third" 202 third-headers-entered release-third-headers
+                      "/third" '(201 202) third-headers-entered
+                      release-third-headers
                       (lambda (response) (setf third-response response))
                       (lambda (condition) (setf third-error condition))
                       third-done))
@@ -5537,48 +5554,90 @@
                (sb-thread:signal-semaphore release-first-headers)
                (h2-manager-capacity-peer-feed
                 stream (h2-frame 0 1 1 (octets 65)))
-               (ensure-true
-                (sb-thread:wait-on-semaphore second-headers-entered :timeout 5))
-               (ensure-true
-                (sb-thread:wait-on-semaphore
-                 (h2-manager-capacity-peer-header-available stream)
-                 :timeout 5))
-               (ensure-equal '(1 3)
-                             (h2-manager-capacity-peer-output-header-ids stream))
-               (ensure-false
-                (sb-thread:wait-on-semaphore
-                 (h2-manager-capacity-peer-header-available stream)
-                 :timeout 0.05))
-               (ensure-false
-                (sb-thread:wait-on-semaphore third-done :timeout 0.001))
-               (ensure-true (http-kit/http2:http2-connection-open-p connection))
-               (setf second-release-signaled-p t)
-               (sb-thread:signal-semaphore release-second-headers)
-               (h2-manager-capacity-peer-feed
-                stream (h2-frame 0 1 3 (octets 66)))
-               (ensure-true
-                (sb-thread:wait-on-semaphore third-headers-entered :timeout 5))
-               (ensure-true
-                (sb-thread:wait-on-semaphore
-                 (h2-manager-capacity-peer-header-available stream)
-                 :timeout 5))
-               (ensure-equal '(1 3 5)
-                             (h2-manager-capacity-peer-output-header-ids stream))
-               (ensure-false
-                (sb-thread:wait-on-semaphore
-                 (h2-manager-capacity-peer-header-available stream)
-                 :timeout 0.05))
-               (ensure-true (http-kit/http2:http2-connection-open-p connection))
-               (setf third-release-signaled-p t)
-               (sb-thread:signal-semaphore release-third-headers)
-               (h2-manager-capacity-peer-feed
-                stream (h2-frame 0 1 5 (octets 67)))
+               (let* ((first-slot-request
+                        (progn
+                          (ensure-true
+                           (sb-thread:wait-on-semaphore
+                            later-headers-entered :timeout 5))
+                          (cond
+                            ((sb-thread:wait-on-semaphore
+                              second-headers-entered :timeout 0.000001)
+                             :second)
+                            ((sb-thread:wait-on-semaphore
+                              third-headers-entered :timeout 0.000001)
+                             :third)
+                            (t (error "A capacity waiter opened an unknown request.")))))
+                      (second-slot-request
+                        (if (eq first-slot-request :second) :third :second))
+                      (first-slot-done
+                        (if (eq first-slot-request :second)
+                            second-done
+                            third-done))
+                      (second-slot-done
+                        (if (eq second-slot-request :second)
+                            second-done
+                            third-done)))
+                 (ensure-true
+                  (sb-thread:wait-on-semaphore
+                   (h2-manager-capacity-peer-header-available stream)
+                   :timeout 5))
+                 (ensure-equal '(1 3)
+                               (h2-manager-capacity-peer-output-header-ids stream))
+                 (ensure-false
+                  (sb-thread:wait-on-semaphore
+                   (h2-manager-capacity-peer-header-available stream)
+                   :timeout 0.05))
+                 (ensure-false
+                  (sb-thread:wait-on-semaphore second-done :timeout 0.001))
+                 (ensure-false
+                  (sb-thread:wait-on-semaphore third-done :timeout 0.001))
+                 (ensure-true (http-kit/http2:http2-connection-open-p connection))
+                 (if (eq first-slot-request :second)
+                     (progn
+                       (setf second-release-signaled-p t)
+                       (sb-thread:signal-semaphore release-second-headers))
+                     (progn
+                       (setf third-release-signaled-p t)
+                       (sb-thread:signal-semaphore release-third-headers)))
+                 (h2-manager-capacity-peer-feed
+                  stream (h2-frame 0 1 3 (octets 66)))
+                 (ensure-true
+                  (sb-thread:wait-on-semaphore first-slot-done :timeout 5))
+                 (ensure-true
+                  (sb-thread:wait-on-semaphore
+                   later-headers-entered :timeout 5))
+                 (ensure-true
+                  (if (eq second-slot-request :second)
+                      (sb-thread:wait-on-semaphore
+                       second-headers-entered :timeout 0.000001)
+                      (sb-thread:wait-on-semaphore
+                       third-headers-entered :timeout 0.000001)))
+                 (ensure-true
+                  (sb-thread:wait-on-semaphore
+                   (h2-manager-capacity-peer-header-available stream)
+                   :timeout 5))
+                 (ensure-equal '(1 3 5)
+                               (h2-manager-capacity-peer-output-header-ids stream))
+                 (ensure-false
+                  (sb-thread:wait-on-semaphore
+                   (h2-manager-capacity-peer-header-available stream)
+                   :timeout 0.05))
+                 (ensure-false
+                  (sb-thread:wait-on-semaphore second-slot-done :timeout 0.001))
+                 (ensure-true (http-kit/http2:http2-connection-open-p connection))
+                 (if (eq second-slot-request :second)
+                     (progn
+                       (setf second-release-signaled-p t)
+                       (sb-thread:signal-semaphore release-second-headers))
+                     (progn
+                       (setf third-release-signaled-p t)
+                       (sb-thread:signal-semaphore release-third-headers)))
+                 (h2-manager-capacity-peer-feed
+                  stream (h2-frame 0 1 5 (octets 67)))
+                 (ensure-true
+                  (sb-thread:wait-on-semaphore second-slot-done :timeout 5)))
                (ensure-true
                 (sb-thread:wait-on-semaphore first-done :timeout 5))
-               (ensure-true
-                (sb-thread:wait-on-semaphore second-done :timeout 5))
-               (ensure-true
-                (sb-thread:wait-on-semaphore third-done :timeout 5))
                (sb-thread:join-thread first-thread)
                (setf first-thread nil)
                (sb-thread:join-thread second-thread)
@@ -5589,11 +5648,23 @@
                (ensure-false second-error)
                (ensure-false third-error)
                (ensure-equal 200 (http-response-status first-response))
-               (ensure-equal 201 (http-response-status second-response))
-               (ensure-equal 202 (http-response-status third-response))
+               (ensure-true
+                (member (http-response-status second-response) '(201 202)))
+               (ensure-true
+                (member (http-response-status third-response) '(201 202)))
+               (ensure-false
+                (= (http-response-status second-response)
+                   (http-response-status third-response)))
                (ensure-equal (octets 65) (http-response-body first-response))
-               (ensure-equal (octets 66) (http-response-body second-response))
-               (ensure-equal (octets 67) (http-response-body third-response))
+               (ensure-true
+                (member (http-response-body second-response)
+                        (list (octets 66) (octets 67)) :test #'equalp))
+               (ensure-true
+                (member (http-response-body third-response)
+                        (list (octets 66) (octets 67)) :test #'equalp))
+               (ensure-false
+                (equalp (http-response-body second-response)
+                        (http-response-body third-response)))
                (ensure-equal '(1 3 5)
                              (h2-manager-capacity-peer-output-header-ids stream))
                (ensure-true (http-kit/http2:http2-connection-open-p connection))
