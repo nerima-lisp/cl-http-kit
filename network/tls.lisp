@@ -496,8 +496,8 @@ driver's transport callbacks."
 #+sbcl
 (defmethod http-kit/http2::%h2-reader-stateful-input-p
     ((stream http-tls-stream))
-  (declare (ignore stream))
-  t)
+  (not (eq (type-of (%tls-stream-driver stream))
+           (quote http-tls-server-state))))
 
 (progn
   (defstruct (http-tls-server-state
