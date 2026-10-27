@@ -226,24 +226,21 @@
     (check (plusp files) :nonempty-index-comparison)
     (check (null (http-coverage-child-merge::code-records "unknown native file" index))
            :missing-index-file-has-no-records))
-  (let* ((suite (cl-weave:root-suite))
-         (old-hooks (cl-weave::suite-after-each suite))
-         (selected 0) (assertions 0))
-    (unwind-protect
-         (progn
-           (setf (cl-weave::suite-after-each suite)
-                 (append old-hooks
-                         (list (lambda ()
-                                 (incf selected)
-                                 (incf assertions cl-weave::*assertion-count*)))))
-           (check (cl-weave:run-all :name-filter "client-contract-partial-missing-"
-                                   :timeout-ms 30000 :max-workers 1 :retry 0 :bail t
-                                   :pass-with-no-tests nil :coverage-reset nil)
-                  :existing-public-contracts))
-      (setf (cl-weave::suite-after-each suite) old-hooks))
+  (let* ((selected 0)
+         (assertions 0))
+    (check
+     (cl-weave:run-all
+      :name-filter "client-contract-partial-missing-"
+      :timeout-ms 30000 :max-workers 1 :retry 0 :bail t
+      :pass-with-no-tests nil :coverage-reset nil
+      :on-test-attempt-complete
+      (lambda (path assertion-count)
+        (declare (ignore path))
+        (incf selected)
+        (incf assertions assertion-count)))
+     :existing-public-contracts)
     (check (= 3 selected) :exact-existing-selection)
     (check (= 9 assertions) :unchanged-existing-assertions)
-    (check (eq old-hooks (cl-weave::suite-after-each suite)) :hook-restored-eq)
     (format t "PUBLIC selected=~D assertions=~D timeout-ms=30000 worker=1 retry=0~%"
             selected assertions))
   (let* ((collector http-coverage-child-merge:*collector*)
