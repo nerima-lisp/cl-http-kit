@@ -3447,28 +3447,34 @@ the HTTP/3 API reference."
 
 (progn
   (defun %h3-scheduler-drain-discard-streams (client)
-    (let ((progress-p nil)
-          (remaining-read-budget
-            +http3-unknown-peer-stream-drain-read-budget+)
-          (remaining-entries
-            (http3-client-discard-peer-unidirectional-streams client))
-          (visited-entries nil))
-      (loop while (and remaining-entries (plusp remaining-read-budget))
-            do (let ((entry (pop remaining-entries)))
-                 (push entry visited-entries)
-                 (when (eq (cdr entry) :drain)
+  (let ((progress-p nil)
+        (remaining-read-budget
+          +http3-unknown-peer-stream-drain-read-budget+)
+        (remaining-entries
+          (http3-client-discard-peer-unidirectional-streams client))
+        (deferred-entries nil))
+    (loop while (and remaining-entries (plusp remaining-read-budget))
+          do (let ((entry (pop remaining-entries)))
+               (if (eq (cdr entry) :drain)
                    (multiple-value-bind (chunk fin-p status)
                        (%h3-try-read-client-stream client (car entry) nil nil)
                      (declare (ignore chunk))
                      (decf remaining-read-budget)
-                     (unless (eq status :would-block)
-                       (setf progress-p t)
-                       (when (or fin-p (eq status :fin))
-                         (setf (cdr entry) :finished)))))))
-      (when remaining-entries
-        (setf (http3-client-discard-peer-unidirectional-streams client)
-              (append remaining-entries (nreverse visited-entries))))
-      progress-p))
+                     (cond
+                       ((eq status :would-block)
+                        (push entry deferred-entries))
+                       ((or fin-p (eq status :fin))
+                        (setf progress-p t
+                              (cdr entry) :finished)
+                        (push entry deferred-entries))
+                       (t
+                        (setf progress-p t
+                              remaining-entries
+                              (append remaining-entries (list entry))))))
+                   (push entry deferred-entries))))
+    (setf (http3-client-discard-peer-unidirectional-streams client)
+          (append remaining-entries (nreverse deferred-entries)))
+    progress-p))
   (defun %h3-scheduler-discover-peer-unidirectional-streams (client)
     (let ((accept (http3-client-accept-peer-unidirectional-stream client))
           (pending (http3-client-pending-peer-unidirectional-streams client))
