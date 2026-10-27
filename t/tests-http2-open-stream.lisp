@@ -7363,3 +7363,65 @@
         (when request-thread
           (sb-thread:join-thread request-thread)))))
 )
+
+#+sbcl
+(progn
+  (defclass h2-generic-listen-stream-wrapper
+      (h2-generic-stream-wrapper)
+    ())
+  (defmethod sb-gray:stream-listen
+      ((stream h2-generic-listen-stream-wrapper))
+    (sb-gray:stream-listen
+     (h2-generic-stream-wrapper-delegate stream)))
+  (deftest http2-reader-generic-listen-preserves-partial-frame
+    (let* ((wire (h2-frame 4 0 0 (octets 0 4 0 0 0 2)))
+           (peer
+             (make-instance (quote h2-manager-capacity-peer-stream)
+                            :input (subseq wire 0 10)))
+           (stream
+             (make-instance (quote h2-generic-listen-stream-wrapper)
+                            :delegate peer))
+           (reader (http-kit/http2::%h2-reader-for stream)))
+      (ensure-true
+       (not
+        (null
+         (sb-mop:compute-applicable-methods
+          (function sb-gray:stream-listen)
+          (list stream)))))
+      (ensure-equal
+       :would-block
+       (http-kit/http2::%h2-read-frame
+        reader 16384 nil (function http-kit::%monotonic-time) :slice-p t))
+      (h2-manager-capacity-peer-feed peer (subseq wire 10))
+      (h2-manager-capacity-peer-close peer)
+      (let ((frame
+              (http-kit/http2::%h2-read-frame
+               reader 16384 nil (function http-kit::%monotonic-time) :slice-p t)))
+        (ensure-equal 4 (http-kit/http2::%h2-frame-type frame))
+        (ensure-equal 0 (http-kit/http2::%h2-frame-stream-id frame))
+        (ensure-equal
+         (octets 0 4 0 0 0 2)
+         (http-kit/http2::%h2-frame-payload frame)))
+      (ensure-equal
+       :eof
+       (http-kit/http2::%h2-read-frame
+        reader 16384 nil (function http-kit::%monotonic-time) :slice-p t))))
+  (deftest http2-reader-generic-listen-eof-rejects-partial-frame
+    (let ((wire (h2-frame 4 0 0 (octets 0 4 0 0 0 2))))
+      (dolist (partial-length (list 5 12))
+        (let* ((peer
+                 (make-instance (quote h2-manager-capacity-peer-stream)
+                                :input (subseq wire 0 partial-length)))
+               (stream
+                 (make-instance (quote h2-generic-listen-stream-wrapper)
+                                :delegate peer))
+               (reader (http-kit/http2::%h2-reader-for stream))
+               (failure nil))
+          (h2-manager-capacity-peer-close peer)
+          (handler-case
+              (http-kit/http2::%h2-read-frame
+               reader 16384 nil (function http-kit::%monotonic-time) :slice-p t)
+            (http-kit:http-protocol-error (condition)
+              (setf failure condition)))
+          (ensure-true
+           (typep failure (quote http-kit:http-protocol-error))))))))
