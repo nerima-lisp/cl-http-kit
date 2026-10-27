@@ -16835,3 +16835,12 @@
         (sb-thread:wait-on-semaphore close-finished :timeout 3))
       (http3-test-join-native-thread owner-thread owner-finished)
       (http3-test-join-native-thread close-thread close-finished)))
+
+(deftest http3-quic-adapter-rejects-blocking-udp-socket
+  (let ((socket (cl-quic-kit:make-udp-socket :non-blocking-p nil)))
+    (unwind-protect
+         (signals http-protocol-error
+           (http-kit/http3:make-http3-quic-adapter
+            :hostname "example.test"
+            :udp-socket socket))
+      (cl-quic-kit:udp-close socket))))

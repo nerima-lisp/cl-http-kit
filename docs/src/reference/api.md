@@ -919,7 +919,8 @@ caller-supplied connection, socket, TLS, and QUIC options. Its HTTP3-OPTIONS
 argument is a flat property list of MAKE-HTTP3-CLIENT keyword arguments;
 malformed or non-keyword lists are rejected before the QUIC client is created.
 QUIC, TLS, certificate, socket configuration, and shutdown policy remain
-caller-controlled. Callbacks supplied through this
+caller-controlled. A supplied UDP-SOCKET must be a nonblocking cl-quic-kit UDP
+socket; blocking sockets are rejected. Callbacks supplied through this
 constructor and HTTP3-OPTIONS follow the callback completion contract above.
 POLL-INTERVAL defaults to 0 and must be a real value from 0 through 1/10
 seconds, inclusive; values outside that range are rejected. The 100 ms cap

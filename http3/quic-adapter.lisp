@@ -595,7 +595,14 @@ supplied through this constructor and HTTP3-OPTIONS."
     (%http3-quic-adapter-error
      "HTTP/3 QUIC adapter http3-options must be a property list."
      http3-options))
-  (%http3-quic-adapter-configure-protection)
+  (progn
+    (when (and udp-socket
+               (not (and (typep udp-socket 'cl-quic-kit:udp-socket)
+                         (cl-quic-kit::udp-socket-non-blocking-p udp-socket))))
+      (%http3-quic-adapter-error
+       "HTTP/3 QUIC adapter UDP-SOCKET must be a nonblocking CL-QUIC-KIT UDP socket."
+       udp-socket))
+    (%http3-quic-adapter-configure-protection))
   (let* ((stream-prefixes (make-hash-table :test #'eq))
          (stream-prefix-sent (make-hash-table :test #'eq))
          (adapter
