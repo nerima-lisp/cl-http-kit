@@ -766,32 +766,25 @@
              (http-message-kit:qpack-encode-header-block
               (list (http-message-kit:make-http-header "x" "y"))
               :context context :use-dynamic-p t :stream-id 4 :huffman nil))
-           (table-before
-             (http-message-kit::qpack-context-dynamic-table context))
-           (entry-before
-             (first
-              (http-message-kit::qpack-dynamic-table-entries table-before)))
+           (same-first-entry-p
+             (http-message-kit/test-support:make-qpack-first-dynamic-entry-identity-probe
+              context))
            (failure
              (handler-case
                  (progn
                    (http-message-kit:qpack-context-set-capacity context 0)
                    nil)
-               (http-protocol-error (condition) condition)))
-           (table-after
-             (http-message-kit::qpack-context-dynamic-table context))
-           (entry-after
-             (first
-              (http-message-kit::qpack-dynamic-table-entries table-after))))
-      (ensure-true (typep failure (quote http-protocol-error)))
+               (http-protocol-error (condition) condition))))
+      (ensure-true (typep failure 'http-protocol-error))
       (ensure-equal
        "QPACK cannot evict an entry referenced by a field section."
        (http-error-message failure))
       (ensure-equal 34 (http-message-kit:qpack-context-table-capacity context))
       (ensure-equal 34 (http-message-kit:qpack-context-table-size context))
       (ensure-equal 1 (http-message-kit:qpack-context-dynamic-entry-count context))
-      (ensure-true (eq entry-before entry-after))
+      (ensure-true (funcall same-first-entry-p))
       (ensure-equal
-       (quote (("x" . "y")))
+       '(("x" . "y"))
        (mapcar
         (lambda (header)
           (cons (http-message-kit:http-header-name header)

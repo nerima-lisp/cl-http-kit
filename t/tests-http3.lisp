@@ -5377,11 +5377,18 @@
     (when established-p
       (cl-quic-kit:connection-set-state connection :established))
     client))
-(defun register-http3-quic-test-stream (client stream)
-  (setf (gethash (cl-quic-kit:stream-id stream)
-                 (cl-quic-kit::quic-client-streams client))
-        stream)
-  stream)
+(defun make-http3-quic-test-peer-stream (client stream-id)
+  (cl-quic-kit:client-receive-frame
+   client
+   (cl-quic-kit:make-frame :stream :stream-id stream-id :offset 0
+                           :data (octets) :len-present t)
+   :level :1-rtt)
+  (let ((stream
+          (cl-quic-kit:client-accept-peer-stream
+           client :type :unidirectional)))
+    (unless (and stream (= stream-id (cl-quic-kit:stream-id stream)))
+      (error "HTTP/3 QUIC test did not create peer stream ~D." stream-id))
+    stream))
 
 (defun call-with-http3-quic-lifecycle-spies
     (operation &key client-poll client-close client-accept client-accept-streams)
@@ -5407,15 +5414,12 @@
                                  (apply client-close arguments))
                                 ((and (eq name 'cl-quic-kit:client-accept-peer-stream)
                                       client-accept-streams)
-                                 (let* ((accepted
-                                          (multiple-value-list
-                                           (apply client-accept-streams arguments)))
-                                        (client (first arguments))
-                                        (stream (first accepted)))
-                                   (when stream
-                                     (register-http3-quic-test-stream client stream))
+                                 (let ((accepted
+                                         (multiple-value-list
+                                          (apply client-accept-streams arguments))))
                                    (when client-accept
-                                     (funcall client-accept client stream))
+                                     (funcall client-accept
+                                              (first arguments) (first accepted)))
                                    (values-list accepted)))
                                 ((and (eq name 'cl-quic-kit:client-accept-peer-stream)
                                       client-accept)
@@ -5805,13 +5809,13 @@
            (ensure-equal "example.test" (getf arguments :hostname))
            (ensure-equal 17 (getf arguments :idle-timeout))
            (ensure-true driver)
-           (ensure-true (eq provider (cl-tls-kit::tls13-client-driver-provider driver)))
-           (ensure-equal "example.test" (cl-tls-kit::tls13-client-driver-hostname driver))
+           (ensure-true (eq provider (cl-tls-kit:tls13-client-driver-provider driver)))
+           (ensure-equal "example.test" (cl-tls-kit:tls13-client-driver-hostname driver))
            (ensure-true
             (functionp
-             (cl-tls-kit::tls13-client-driver-verify-signature driver)))
+             (cl-tls-kit:tls13-client-driver-verify-signature driver)))
            (ensure-true (eq algorithms
-                            (cl-tls-kit::tls13-client-driver-signature-algorithms driver)))
+                            (cl-tls-kit:tls13-client-driver-signature-algorithms driver)))
            (ensure-true (cl-quic-kit:quic-client-closed-p quic))
            (ensure-true (some (lambda (bytes) (plusp (length bytes))) writes))
            ;; The close callback runs after draining, not when cleanup initiates close.
@@ -6151,8 +6155,8 @@
 
 (deftest http3-quic-adapter-qpack-before-control
   (let* ((quic (make-http3-quic-adapter-test-client))
-         (encoder (cl-quic-kit:make-stream 3))
-         (control (cl-quic-kit:make-stream 7))
+         (encoder (make-http3-quic-test-peer-stream quic 3))
+         (control (make-http3-quic-test-peer-stream quic 7))
          (pending-streams (list encoder control))
          (accepted-streams nil)
          (polls 0)
@@ -6218,8 +6222,8 @@
 
 (deftest http3-quic-adapter-queues-push-before-peer-settings
   (let* ((quic (make-http3-quic-adapter-test-client))
-         (push-stream (cl-quic-kit:make-stream 3))
-         (control (cl-quic-kit:make-stream 7))
+         (push-stream (make-http3-quic-test-peer-stream quic 3))
+         (control (make-http3-quic-test-peer-stream quic 7))
          (pending-streams nil)
          (polls 0)
          (push-accepted-poll nil)
@@ -6343,8 +6347,8 @@
 
 (deftest http3-quic-adapter-fragmented-prefix-does-not-block-control
   (let* ((quic (make-http3-quic-adapter-test-client))
-         (incomplete (cl-quic-kit:make-stream 3))
-         (control (cl-quic-kit:make-stream 7))
+         (incomplete (make-http3-quic-test-peer-stream quic 3))
+         (control (make-http3-quic-test-peer-stream quic 7))
          (pending-streams (list incomplete control))
          (incomplete-observed nil)
          (control-observed nil)
@@ -6406,7 +6410,7 @@
 
 (deftest http3-quic-adapter-fragmented-settings
   (let* ((quic (make-http3-quic-adapter-test-client))
-         (control (cl-quic-kit:make-stream 3))
+         (control (make-http3-quic-test-peer-stream quic 3))
          (pending-streams (list control))
          (polls 0)
          (reads 0)
@@ -14588,17 +14592,13 @@
    (lambda (adapter)
      (let* ((client (http-kit/http3:http3-quic-adapter-http3-client adapter))
             (callback (http-kit/http3::http3-client-try-read-stream client))
-            (incoming (cl-quic-kit:make-stream 15))
-            (finished-stream (cl-quic-kit:make-stream 19))
-            (would-block-stream (cl-quic-kit:make-stream 23))
+            (incoming (make-http3-quic-test-peer-stream (http-kit/http3:http3-quic-adapter-quic-client adapter) 15))
+            (finished-stream (make-http3-quic-test-peer-stream (http-kit/http3:http3-quic-adapter-quic-client adapter) 19))
+            (would-block-stream (make-http3-quic-test-peer-stream (http-kit/http3:http3-quic-adapter-quic-client adapter) 23))
             (name 'cl-quic-kit:stream-read)
             (original (symbol-function name))
             (read-chunk nil)
             (read-fin nil))
-       (dolist (stream (list incoming finished-stream would-block-stream))
-         (register-http3-quic-test-stream
-          (http-kit/http3::http3-quic-adapter-quic-client adapter)
-          stream))
        (cl-quic-kit:stream-receive-data incoming 0 (octets 9))
        (cl-quic-kit:stream-receive-data finished-stream 0 (octets) :fin t)
        (unwind-protect
@@ -14689,7 +14689,7 @@
          (setf (symbol-function name) original))))))
 (deftest http3-quic-adapter-coverage-peer-control-duplicate-and-finished
   (let* ((quic (make-http3-quic-adapter-test-client))
-         (stream (cl-quic-kit:make-stream 3))
+         (stream (make-http3-quic-test-peer-stream quic 3))
          (symbols '(cl-quic-kit:stream-readable-bytes
                     cl-quic-kit:stream-finished-p))
          (originals (mapcar #'symbol-function symbols)))
@@ -14731,7 +14731,7 @@
       (cl-quic-kit:client-close quic))))
 (deftest http3-quic-adapter-coverage-settings-duplicate-pending-stream
   (let* ((quic (make-http3-quic-adapter-test-client))
-         (stream (cl-quic-kit:make-stream 3))
+         (stream (make-http3-quic-test-peer-stream quic 3))
          (queue (list stream))
          (client
            (make-http3-coverage-client
@@ -14771,8 +14771,8 @@
       (http-kit/http3:close-http3-quic-adapter adapter))))
 (deftest http3-quic-adapter-coverage-preserves-repeated-prefix
   (let* ((quic (make-http3-quic-adapter-test-client))
-         (incomplete (cl-quic-kit:make-stream 3))
-         (control (cl-quic-kit:make-stream 7))
+         (incomplete (make-http3-quic-test-peer-stream quic 3))
+         (control (make-http3-quic-test-peer-stream quic 7))
          (polls 0)
          (client
            (make-http3-coverage-client
@@ -14789,8 +14789,6 @@
             (list incomplete control))))
     (unwind-protect
          (progn
-           (register-http3-quic-test-stream quic incomplete)
-           (register-http3-quic-test-stream quic control)
            (ensure-true
             (eq client
                 (http-kit/http3::%http3-quic-adapter-await-peer-settings
@@ -14822,8 +14820,8 @@
       (http-kit/http3:close-http3-quic-adapter adapter))))
 (deftest http3-quic-adapter-coverage-push-replay-and-existing-queue
   (let* ((quic (make-http3-quic-adapter-test-client))
-         (push-stream (cl-quic-kit:make-stream 3))
-         (control (cl-quic-kit:make-stream 7))
+         (push-stream (make-http3-quic-test-peer-stream quic 3))
+         (control (make-http3-quic-test-peer-stream quic 7))
          (accepted (list push-stream control))
          (polls 0)
          (synthetic-control-read-p nil)
@@ -14881,7 +14879,7 @@
       (cl-quic-kit:client-close quic))))
 (deftest http3-quic-adapter-coverage-unregistered-push
   (let* ((quic (make-http3-quic-adapter-test-client))
-         (push-stream (cl-quic-kit:make-stream 3))
+         (push-stream (make-http3-quic-test-peer-stream quic 3))
          (accepted (list push-stream))
          (client
            (http-kit/http3::%make-http3-client
@@ -14921,7 +14919,7 @@
      (let* ((client
               (http-kit/http3:http3-quic-adapter-http3-client adapter))
             (pending (cl-quic-kit:make-stream 31))
-            (fallback (cl-quic-kit:make-stream 35))
+            (fallback (make-http3-quic-test-peer-stream (http-kit/http3:http3-quic-adapter-quic-client adapter) 35))
             (callback
               (http-kit/http3::http3-client-accept-peer-unidirectional-stream
                client)))
