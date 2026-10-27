@@ -147,17 +147,29 @@ SETTINGS, stream identifiers, HPACK decoder state, and control frames."
            :message "CLOSE-HTTP2-CONNECTION requires an HTTP2-CONNECTION."
            :operation :http2-client
            :detail (type-of connection)))
+  #+sbcl
+  (http-kit::%with-http-cleanup
+    (close (%http2-connection-stream connection) :abort t))
   (let ((close-p nil))
     #+sbcl
-    (%h2-with-scheduler-lock (connection)
-      (unless (%http2-connection-closed-p connection)
-        (setf (%http2-connection-closed-p connection) t
-              close-p t))
-      (%h2-scheduler-broadcast connection))
+    (sb-thread:with-mutex ((%http2-connection-close-lock connection))
+      (%h2-with-scheduler-lock (connection)
+        (unless (%http2-connection-closed-p connection)
+          (setf (%http2-connection-closed-p connection) t
+                close-p t))
+        (setf (%http2-connection-scheduler-write-queue connection) nil
+              (%http2-connection-scheduler-write-queue-tail connection) nil
+              (%http2-connection-scheduler-header-block-state connection) nil)
+        (%h2-scheduler-broadcast connection))
+      (when close-p
+        (http-kit::%with-http-cleanup
+          (funcall (%http2-connection-close-stream connection)
+                   (%http2-connection-stream connection)))))
     #-sbcl
     (unless (%http2-connection-closed-p connection)
       (setf (%http2-connection-closed-p connection) t
             close-p t))
+    #-sbcl
     (when close-p
       (http-kit::%with-http-cleanup
         (funcall (%http2-connection-close-stream connection)
