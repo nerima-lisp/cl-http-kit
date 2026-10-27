@@ -38,10 +38,12 @@ certificate when exercising HTTPS clients.
 | `http-client-cancel-request` | Cancel the token once and invoke its active transport handlers. |
 
 Cancellation behavior depends on the transport. The direct HTTP/1.1 stream
-transport closes the stream. HTTP/2 sends `RST_STREAM`, but a caller that owns a
-blocked synchronous frame read may not return until that read completes or its
-deadline expires. An HTTP/3 transport must provide `cancel-stream`; the built-in
-cl-quic-kit adapter does not currently provide that callback. On that adapter,
+transport closes the stream. For HTTP/2, cancellation sends `RST_STREAM` after a
+stream has been allocated; cancellation while waiting for a stream slot sends no
+`RST_STREAM`. A caller that owns a blocked synchronous frame read may not return
+until that read completes or its deadline expires. An HTTP/3 transport must
+provide `cancel-stream`; the built-in cl-quic-kit adapter does not currently
+provide that callback. On that adapter,
 `http-client-cancel-request` marks the token cancelled and then signals
 `http-protocol-error` with operation `:http3-transport` and detail `:unsupported`.
 It sends no stream reset or stop-sending signal, so active I/O can continue until

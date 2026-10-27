@@ -568,7 +568,7 @@ clock-function)` creates a connection over an already negotiated binary stream.
 `send-http2-request-over-connection (connection request &key timeout deadline
 max-header-bytes max-fields max-body-bytes clock-function
 request-body-function request-body-length on-body-chunk on-information
-on-stream-open collect-body-p huffman-p)` sends one request.
+on-response-headers on-stream-open collect-body-p huffman-p)` sends one request.
 `send-http2-requests-over-connection (connection requests &key timeout deadline
 max-header-bytes max-fields max-body-bytes clock-function
 request-body-functions request-body-lengths on-body-chunk collect-body-p
@@ -576,7 +576,7 @@ huffman-p)` multiplexes a non-empty batch. The CPS signatures are
 `send-http2-request-over-connection/cps (connection request on-success &key
 on-error timeout deadline max-header-bytes max-fields max-body-bytes
 clock-function request-body-function request-body-length on-body-chunk
-on-stream-open collect-body-p huffman-p)` and
+on-response-headers on-stream-open collect-body-p huffman-p)` and
 `send-http2-requests-over-connection/cps (connection requests on-success &key
 on-error timeout deadline max-header-bytes max-fields max-body-bytes
 clock-function request-body-functions request-body-lengths on-body-chunk
@@ -2006,11 +2006,13 @@ requests. Return true only when this call changes the token to cancelled. A
 token can be shared between concurrent requests; cancellation functions are
 removed when their transport operations complete. Each transport owns how it
 interrupts I/O. The direct HTTP/1.1 stream transport closes its stream. HTTP/2
-sends `RST_STREAM`; if the request caller currently owns a blocked synchronous
-frame read, it observes cancellation after that read completes or its deadline
-expires. An HTTP/3 transport must supply a `cancel-stream` callback to
-`make-http3-client`; the built-in cl-quic-kit adapter does not currently supply
-one. With that adapter, `http-client-cancel-request` marks the token cancelled
+sends `RST_STREAM` when a stream has been allocated. Cancellation while waiting
+for a stream slot sends no `RST_STREAM`. If the request caller currently owns a
+blocked synchronous frame read, it observes cancellation after that read
+completes or its deadline expires. An HTTP/3 transport must supply a
+`cancel-stream` callback to `make-http3-client`; the built-in cl-quic-kit adapter
+does not currently supply one. With that adapter,
+`http-client-cancel-request` marks the token cancelled
 and signals `http-protocol-error` with operation `:http3-transport` and detail
 `:unsupported`. It sends no stream reset or stop-sending signal, so active I/O
 can continue until it completes or its deadline expires.
