@@ -2993,7 +2993,22 @@
      :connect-p t)
     (check-public-batch-boundary
      (h2-frame 4 0 0 (octets)) :connect-p t :request-streams nil
-     :operation :http2-write :detail :protocol-error))
+     :operation :http2-write :detail :protocol-error)
+    (check-public-batch-boundary
+     (octets) :connect-p t :request-streams nil
+     :operation :http2-read :detail :eof)
+    (check-public-batch-boundary
+     (h2-frame 6 0 0 (octets 0 1 2 3 4 5 6 7))
+     :connect-p t :request-streams nil
+     :operation :http2-read :detail '(6 0 0))
+    (check-public-batch-boundary
+     (h2-frame 4 1 0 (octets))
+     :connect-p t :request-streams nil
+     :operation :http2-read :detail '(4 0 1))
+    (check-public-batch-boundary
+     (h2-frame 4 0 1 (octets))
+     :connect-p t :request-streams nil
+     :operation :http2-read :detail '(4 1 0)))
 
   (deftest http2-public-batch-disabled-push-boundary
     (check-public-batch-boundary
@@ -6697,7 +6712,8 @@
         (when second-thread
           (sb-thread:join-thread second-thread)))))
 )
-#+sbcl (progn
+#+sbcl
+(progn
   (defmethod sb-gray:stream-read-byte
       ((stream binary-session-stream))
     (let ((input (binary-session-input stream))
@@ -6709,8 +6725,8 @@
 
   (defmethod sb-gray:stream-listen
       ((stream binary-session-stream))
-    (< (binary-session-input-position stream)
-       (length (binary-session-input stream))))
+    (declare (ignore stream))
+    t)
 
   (defmethod sb-gray:stream-read-byte
       ((stream h2-manager-capacity-peer-stream))
@@ -6735,5 +6751,149 @@
       ((stream h2-manager-capacity-peer-stream))
     (let ((lock (h2-manager-capacity-peer-input-lock stream)))
       (sb-thread:with-mutex (lock)
-        (< (binary-session-input-position stream)
-           (length (binary-session-input stream)))))))
+        (let ((ready-p
+                (or (h2-manager-capacity-peer-closed-p stream)
+                    (< (binary-session-input-position stream)
+                       (length (binary-session-input stream))))))
+          (unless ready-p
+            (sb-thread:signal-semaphore
+             (h2-manager-capacity-peer-input-read-waiting stream)))
+          ready-p))))
+
+  (defclass h2-manager-partial-read-timeout-stream
+      (h2-manager-capacity-peer-stream)
+    ((stall-after-position
+       :initarg :stall-after-position
+       :reader h2-manager-partial-read-stall-after-position)
+     (read-consumed
+       :initarg :read-consumed
+       :reader h2-manager-partial-read-consumed)))
+
+  (defmethod sb-gray:stream-read-sequence
+      ((stream h2-manager-partial-read-timeout-stream) sequence
+       &optional (start 0) end)
+    (let ((end (or end (length sequence)))
+          (lock (h2-manager-capacity-peer-input-lock stream)))
+      (sb-thread:with-mutex (lock)
+        (loop while (and (>= (binary-session-input-position stream)
+                             (length (binary-session-input stream)))
+                         (not (h2-manager-capacity-peer-closed-p stream)))
+              do (progn
+                   (sb-thread:signal-semaphore
+                    (h2-manager-capacity-peer-input-read-waiting stream))
+                   (sb-thread:condition-wait
+                    (h2-manager-capacity-peer-input-ready stream) lock)))
+        (let* ((input (binary-session-input stream))
+               (position (binary-session-input-position stream))
+               (count (min (- end start) (- (length input) position))))
+          (when (plusp count)
+            (replace sequence input
+                     :start1 start
+                     :end1 (+ start count)
+                     :start2 position
+                     :end2 (+ position count))
+            (incf (binary-session-input-position stream) count))
+          (when (= (binary-session-input-position stream)
+                   (h2-manager-partial-read-stall-after-position stream))
+            (sb-thread:signal-semaphore
+             (h2-manager-partial-read-consumed stream))
+            (loop while (not (h2-manager-capacity-peer-closed-p stream))
+                  do (sb-thread:condition-wait
+                      (h2-manager-capacity-peer-input-ready stream) lock)))
+          (+ start count)))))
+
+  (defmethod sb-gray:stream-listen
+      ((stream scheduled-ping-eof-stream))
+    (let ((input (binary-session-input stream))
+          (position (binary-session-input-position stream)))
+      (if (< position (length input))
+          t
+          (progn
+            (sb-thread:signal-semaphore (scheduled-ping-eof-started stream))
+            (plusp
+             (sb-thread:semaphore-count
+              (scheduled-ping-eof-release stream)))))))
+
+  (defclass h2-generic-stream-wrapper
+      (sb-gray:fundamental-binary-input-stream
+       sb-gray:fundamental-binary-output-stream)
+    ((delegate
+       :initarg :delegate
+       :reader h2-generic-stream-wrapper-delegate)))
+
+  (defmethod sb-gray:stream-read-sequence
+      ((stream h2-generic-stream-wrapper) sequence &optional (start 0) end)
+    (sb-gray:stream-read-sequence
+     (h2-generic-stream-wrapper-delegate stream) sequence start end))
+
+  (defmethod sb-gray:stream-write-sequence
+      ((stream h2-generic-stream-wrapper) sequence &optional (start 0) end)
+    (sb-gray:stream-write-sequence
+     (h2-generic-stream-wrapper-delegate stream) sequence start end))
+
+  (defmethod sb-gray:stream-finish-output ((stream h2-generic-stream-wrapper))
+    (sb-gray:stream-finish-output
+     (h2-generic-stream-wrapper-delegate stream)))
+
+  (deftest http2-public-partial-frame-generic-read-timeout-closes-connection
+    (let* ((initial-settings
+             (h2-frame 4 0 0 (octets 0 3 0 0 0 1)))
+           (read-consumed (sb-thread:make-semaphore :count 0))
+           (delegate
+             (make-instance (quote h2-manager-partial-read-timeout-stream)
+                            :input initial-settings
+                            :stall-after-position (1+ (length initial-settings))
+                            :read-consumed read-consumed))
+           (stream
+             (make-instance 'h2-generic-stream-wrapper :delegate delegate))
+           (connection
+             (http-kit/http2:make-http2-connection
+              :stream stream
+              :close-stream
+              (lambda (closed-stream)
+                (ensure-true (eq stream closed-stream))
+                (h2-manager-capacity-peer-close delegate))))
+           (request-done (sb-thread:make-semaphore :count 0))
+           (response nil)
+           (failure nil)
+           (request-thread nil))
+      (unwind-protect
+           (progn
+             (ensure-false
+              (sb-mop:compute-applicable-methods
+               #'sb-gray:stream-listen (list stream)))
+             (setf request-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (unwind-protect
+                           (handler-case
+                               (setf response
+                                     (http-kit/http2:send-http2-request-over-connection
+                                      connection
+                                      (make-http-request
+                                       :method "GET"
+                                       :uri "https://partial-timeout.test/")
+                                      :timeout 2))
+                             (error (condition)
+                               (setf failure condition)))
+                        (sb-thread:signal-semaphore request-done)))))
+             (ensure-true
+              (sb-thread:wait-on-semaphore read-consumed :timeout 5))
+             (ensure-true (sb-thread:wait-on-semaphore request-done :timeout 2))
+             (sb-thread:join-thread request-thread)
+             (setf request-thread nil)
+             (ensure-false response)
+             (ensure-true
+              (typep failure (quote http-kit:http-connection-error)))
+             (ensure-equal
+              :ambiguous-read-timeout
+              (http-kit:http-connection-error-cause failure))
+             (ensure-false (http-kit/http2:http2-connection-open-p connection))
+             (ensure-equal
+              (1+ (length initial-settings))
+              (binary-session-input-position delegate)))
+        (h2-manager-capacity-peer-close delegate)
+        (http-kit/http2:close-http2-connection connection)
+        (when request-thread
+          (sb-thread:join-thread request-thread)))))
+)

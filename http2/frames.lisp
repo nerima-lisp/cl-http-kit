@@ -31,44 +31,62 @@
       t))
 
   (defmethod %h2-reader-read-available ((stream stream) count timeout)
-    (let ((buffer (make-array count :element-type (quote (unsigned-byte 8))))
-          (one-byte (make-array 1 :element-type (quote (unsigned-byte 8))))
-          (position 0)
-          (eof-p nil)
-          (timeout (if timeout (min timeout 0.1d0) 0.1d0)))
-      (flet ((read-one ()
-               (if (= (read-sequence one-byte stream) 1)
-                   (aref one-byte 0)
-                   :eof)))
-        #+sbcl
-        (handler-case
-            (sb-ext:with-timeout timeout
-              (loop while (< position count)
-                    do (let ((octet (read-one)))
-                         (if (eq octet :eof)
-                             (progn
-                               (setf eof-p t)
-                               (return))
-                             (progn
-                               (setf (aref buffer position) octet)
-                               (incf position))))))
-          (sb-ext:timeout () nil))
-        #-sbcl
-        (loop while (< position count)
-              do (let ((octet (read-one)))
-                   (if (eq octet :eof)
-                       (progn
-                         (setf eof-p t)
-                         (return))
-                       (progn
-                         (setf (aref buffer position) octet)
-                         (incf position)))))
-        (values (subseq buffer 0 position)
-                (cond
-                  ((plusp position) :data)
-                  (eof-p :eof)
-                  (t :would-block))
-                eof-p))))
+    (check-type count (integer 0 *))
+    (check-type timeout (or null (real 0 *)))
+    (let* ((buffer (make-array count
+                               :element-type (quote (unsigned-byte 8))))
+           (one-byte (make-array 1
+                                 :element-type (quote (unsigned-byte 8))))
+           (position 0)
+           (eof-p nil)
+           (timeout (if timeout (min timeout 0.1d0) 0.1d0))
+           (deadline (+ (http-kit::%monotonic-time) timeout))
+           (listen-supported-p
+             #+sbcl
+             (not (null (sb-mop:compute-applicable-methods
+                         #'sb-gray:stream-listen
+                         (list stream))))
+             #-sbcl
+             t))
+      (loop while (< position count)
+            do (let* ((remaining (- deadline
+                                    (http-kit::%monotonic-time)))
+                      (end
+                        (progn
+                          (when (<= remaining 0)
+                            (return))
+                          (if listen-supported-p
+                              (if (listen stream)
+                                  (read-sequence one-byte stream)
+                                  (progn
+                                    (when (zerop position)
+                                      (sleep remaining))
+                                    (return)))
+                              #+sbcl
+                              (handler-case
+                                  (sb-ext:with-timeout (min timeout remaining)
+                                    (read-sequence one-byte stream))
+                                (sb-ext:timeout ()
+                                  (error 'http-kit:http-connection-error
+                                         :message "The HTTP/2 stream read timed out with an uncertain input position."
+                                         :operation :http2-read
+                                         :cause :ambiguous-read-timeout)))
+                              #-sbcl
+                              (read-sequence one-byte stream)))))
+                 (if (= end 1)
+                     (progn
+                       (setf (aref buffer position) (aref one-byte 0))
+                       (incf position))
+                     (progn
+                       (setf eof-p t)
+                       (return)))))
+      (values (subseq buffer 0 position)
+              (cond
+                ((zerop count) :data)
+                ((plusp position) :data)
+                (eof-p :eof)
+                (t :would-block))
+              eof-p)))
   #+sbcl
   (defmethod %h2-reader-read-available
       ((stream sb-sys:fd-stream) count timeout)
