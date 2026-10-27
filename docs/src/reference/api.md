@@ -1063,8 +1063,11 @@ determine whether all data arrived. If a synchronous handler is still running,
 worker or deferred owned ticket-key-store destruction can keep shutdown
 pending after it returns; `:listener-shutdown-deferred` reports this state.
 The server does not cancel handler code and emits `:listener-stopped` only
-after every connection worker exits and owned store cleanup completes. It is
-safe to call more than once.
+after every connection worker exits and owned store cleanup completes.
+Connection errors may reach `on-error` before the connection closes, and
+shutdown cleanup or error notification may continue after `stop-http-server`
+returns; wait for `:listener-stopped` to observe completion.
+`stop-http-server` is safe to call more than once.
 `http-server-p` identifies a server handle, and `http-server-failure`
 returns a fatal server failure, if one occurred. `http-server-error-reason-code`
 and `http-server-error-phase` expose safe error metadata, while

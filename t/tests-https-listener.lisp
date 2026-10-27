@@ -1794,6 +1794,10 @@
              (ensure-true
               (cl-tls-kit:tls13-server-ticket-key-store-p external-store))
              (stop-http-server owned-server :graceful-timeout 1)
+             (%https-listener-wait
+              (lambda ()
+                (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p
+                 current-owned-store)))
              (signals error
                (cl-tls-kit:rotate-tls13-server-ticket-key-store
                 current-owned-store))
@@ -1993,6 +1997,10 @@
              (sb-thread:signal-semaphore release-session)
              (%https-listener-wait
               (lambda () (zerop (%https-listener-connection-count server))))
+             (%https-listener-wait
+              (lambda ()
+                (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p
+                 old-store)))
              (signals error
                (cl-tls-kit:rotate-tls13-server-ticket-key-store old-store))
              (stop-http-server server :graceful-timeout 1)
@@ -2295,6 +2303,7 @@
            (server nil)
            (destroy-attempts 0)
            (cleanup-error-reported-p nil)
+           (cleanup-error-reported (sb-thread:make-semaphore :count 0))
            (fail-stop-callback-p t)
            (first-cleanup-error nil)
            (first-stop-error nil)
@@ -2327,7 +2336,8 @@
                       (declare (ignore details))
                       (when (eq :ticket-key-store-destroy-failed
                                 (http-server-error-reason-code condition))
-                        (setf cleanup-error-reported-p t)))))
+                        (setf cleanup-error-reported-p t)
+                        (sb-thread:signal-semaphore cleanup-error-reported)))))
              (start-http-server server)
              (setf first-stop-error
                    (handler-case
@@ -2339,6 +2349,8 @@
               (typep first-stop-error 'http-server-callback-error))
              (ensure-equal :event-callback-failed
                            (http-server-error-reason-code first-stop-error))
+             (ensure-true
+              (sb-thread:wait-on-semaphore cleanup-error-reported :timeout 5))
              (ensure-true cleanup-error-reported-p)
              (ensure-true (plusp destroy-attempts))
              (ensure-equal store
@@ -2527,6 +2539,10 @@
                  (cl-tls-kit:rotate-tls13-server-ticket-key-store
                   replacement-store))
                (stop-http-server server :graceful-timeout 1)
+               (%https-listener-wait
+                (lambda ()
+                  (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p
+                   initial-store)))
                (signals error
                  (cl-tls-kit:rotate-tls13-server-ticket-key-store
                   initial-store))))
@@ -2690,6 +2706,10 @@
            (ensure-equal 0 (%https-listener-session-count context))
            (ensure-false
             (%https-listener-event-present-p context :alpn-selected nil))
+           (%https-listener-wait
+            (lambda ()
+              (and (zerop (%https-listener-connection-count server))
+                   (zerop (%https-listener-handshake-count server)))))
            (%https-listener-release-client-hello transport)
            (sb-thread:join-thread client-thread :default nil :timeout 5)
            (ensure-false (sb-thread:thread-alive-p client-thread))
