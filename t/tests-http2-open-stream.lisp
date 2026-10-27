@@ -1459,6 +1459,41 @@
       (ensure-equal 1 (http-kit/http2::%h2-frame-type headers))
       (http-kit/http2:close-http2-connection connection)))
 
+  (deftest http2-scheduler-extended-connect-cancel-after-start-selection-skips-preface-write
+    (let* ((stream
+             (make-instance (quote binary-session-stream) :input (octets)))
+           (connection
+             (http-kit/http2:make-http2-connection :stream stream))
+           (cancel-checks 0)
+           (failure nil))
+      (unwind-protect
+           (progn
+             (handler-case
+                 (http-kit/http2::%h2-scheduler-ensure-extended-connect-session
+                  connection nil nil nil nil
+                  (lambda ()
+                    (incf cancel-checks)
+                    (= cancel-checks 2))
+                  (lambda ()
+                    (make-condition
+                     (quote http-kit:http-connection-error)
+                     :message "The HTTP/2 stream was cancelled locally."
+                     :operation :http2-write
+                     :cause (list :local-cancel nil 8))))
+               (http-kit:http-connection-error (condition)
+                 (setf failure condition)))
+             (ensure-equal 2 cancel-checks)
+             (ensure-true
+              (typep failure (quote http-kit:http-connection-error)))
+             (ensure-equal
+              (list :local-cancel nil 8)
+              (http-kit:http-connection-error-cause failure))
+             (ensure-equal
+              :starting
+              (http-kit/http2::%http2-connection-session-start-state connection))
+             (ensure-equal 0 (length (binary-session-output stream))))
+        (http-kit/http2:close-http2-connection connection))))
+
   (deftest http2-public-connection-graceful-shutdown
     (let* ((stream
              (make-instance
