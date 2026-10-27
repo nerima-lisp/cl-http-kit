@@ -120,7 +120,7 @@
   :license "MIT"
   :version "0.4.1"
   :depends-on ("cl-http-kit/network" "cl-http-kit/http2"
-               (:version "cl-tls-kit" "0.5.1")
+               (:version "cl-tls-kit" "0.5.2")
                "cl-crypto-kit")
   :pathname "network"
   :serial t
@@ -132,7 +132,7 @@
   :author "nerima-lisp"
   :license "MIT"
   :version "0.4.1"
-  :depends-on ("cl-http-kit" "cl-quic-kit")
+  :depends-on ("cl-http-kit" (:version "cl-quic-kit" "0.2.6"))
   :pathname "http3"
   :serial t
   :components ((:file "package")
