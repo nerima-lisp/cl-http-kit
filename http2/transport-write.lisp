@@ -1,10 +1,13 @@
 (in-package #:http-kit/http2)
 
-(defun %h2-write-wire (stream wire deadline clock-function)
+(defun %h2-write-wire (stream wire deadline clock-function
+                       &optional before-write-function)
   (http-kit::%check-deadline deadline clock-function :write)
-  (write-sequence wire stream)
-  (finish-output stream)
-  wire)
+  (when (or (null before-write-function)
+            (funcall before-write-function))
+    (write-sequence wire stream)
+    (finish-output stream)
+    wire))
 
 (defun %h2-writer (stream deadline clock-function &optional lock)
   (and stream
