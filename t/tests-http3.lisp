@@ -16786,7 +16786,7 @@
                                 (sb-thread:thread-yield))
                               (values (octets 1) nil :data))
                             (values nil nil :would-block))))
-                  (values nil nil :would-block))))))
+                  (values nil nil :would-block)))))
          (owner-thread nil)
          (owner-finished nil)
          (owner-result nil)
@@ -16834,7 +16834,7 @@
       (when close-thread
         (sb-thread:wait-on-semaphore close-finished :timeout 3))
       (http3-test-join-native-thread owner-thread owner-finished)
-      (http3-test-join-native-thread close-thread close-finished)))
+      (http3-test-join-native-thread close-thread close-finished))))
 
 (deftest http3-quic-adapter-rejects-blocking-udp-socket
   (let ((socket (cl-quic-kit:make-udp-socket :non-blocking-p nil)))
