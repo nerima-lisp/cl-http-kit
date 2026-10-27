@@ -1796,8 +1796,7 @@
                    (http-kit/http3::%http3-quic-adapter-read
                     quic nil stream :deadline 0 :poll-interval 0))
                   (:write
-                   (setf (cl-quic-kit::flow-control-state-connection-max-data
-                          (cl-quic-kit::quic-client-flow-control quic)) 0)
+                   (cl-quic-kit:client-receive-frame quic (cl-quic-kit:make-frame :max-data :maximum 0) :level :1-rtt)
                    (cl-quic-kit:client-write-stream quic stream (octets 1))
                    (ensure-true (cl-quic-kit:client-stream-write-pending-p quic stream))
                    (http-kit/http3::%http3-quic-adapter-await-stream-write

@@ -351,7 +351,7 @@ are ignored and return :EXTENSION, as required by HTTP/3 extensibility rules."
                (/= type +http3-settings-type+))
       (%http3-control-error
        "The first HTTP/3 control-stream frame must be SETTINGS."
-       type))
+       :h3-missing-settings))
     (when (and (null (http3-control-state-peer-role state))
                (member type (list +http3-goaway-type+
                                   +http3-max-push-id-type+
@@ -365,9 +365,16 @@ are ignored and return :EXTENSION, as required by HTTP/3 extensibility rules."
       ((= type +http3-settings-type+)
        (when (http3-control-state-settings-received-p state)
          (%http3-control-error
-          "An HTTP/3 control stream cannot contain more than one SETTINGS frame."))
+          "An HTTP/3 control stream cannot contain more than one SETTINGS frame."
+          :h3-frame-unexpected))
        (setf (http3-control-state-settings state)
-             (decode-http3-settings frame)
+             (handler-case
+                 (decode-http3-settings frame)
+               (http-protocol-error (condition)
+                 (error 'http-protocol-error
+                        :message (http-kit:http-error-message condition)
+                        :operation :http3-control-stream
+                        :detail :h3-settings-error)))
              (http3-control-state-settings-received-p state) t)
        :settings)
       ((= type +http3-goaway-type+)

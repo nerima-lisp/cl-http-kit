@@ -782,7 +782,7 @@
            (entry-after
              (first
               (http-message-kit::qpack-dynamic-table-entries table-after))))
-      (ensure-true (typep failure 'http-protocol-error))
+      (ensure-true (typep failure (quote http-protocol-error)))
       (ensure-equal
        "QPACK cannot evict an entry referenced by a field section."
        (http-error-message failure))
@@ -790,10 +790,8 @@
       (ensure-equal 34 (http-message-kit:qpack-context-table-size context))
       (ensure-equal 1 (http-message-kit:qpack-context-dynamic-entry-count context))
       (ensure-true (eq entry-before entry-after))
-      (ensure-equal "x" (http-message-kit::qpack-dynamic-entry-name entry-after))
-      (ensure-equal "y" (http-message-kit::qpack-dynamic-entry-value entry-after))
       (ensure-equal
-       '(("x" . "y"))
+       (quote (("x" . "y")))
        (mapcar
         (lambda (header)
           (cons (http-message-kit:http-header-name header)

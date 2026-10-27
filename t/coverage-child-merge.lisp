@@ -226,7 +226,7 @@
     (check (plusp files) :nonempty-index-comparison)
     (check (null (http-coverage-child-merge::code-records "unknown native file" index))
            :missing-index-file-has-no-records))
-  (let* ((suite (cl-weave::root-suite))
+  (let* ((suite (cl-weave:root-suite))
          (old-hooks (cl-weave::suite-after-each suite))
          (selected 0) (assertions 0))
     (unwind-protect

@@ -11,7 +11,7 @@
   (let ((paths (make-hash-table :test (function equal))))
     (dolist (system (cl-weave/cli::cli-options-coverage-systems options))
       (cl-weave/cli::ensure-requested-system-visible system options)
-      (dolist (pathname (cl-weave::asdf-system-files system))
+      (dolist (pathname (cl-weave:asdf-system-files system))
         (setf (gethash (namestring (truename pathname)) paths) t)))
     paths))
 
@@ -90,8 +90,8 @@
                (lambda (install)
                  (let ((consumers
                          (loop for symbol in '(cl-weave::save-coverage-report
-                                               cl-weave::coverage-statistics
-                                               cl-weave::save-coverage)
+                                               cl-weave:coverage-statistics
+                                               cl-weave:save-coverage)
                                collect (cons symbol (fdefinition symbol)))))
                    (unwind-protect
                         (progn

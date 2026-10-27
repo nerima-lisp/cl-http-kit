@@ -107,16 +107,29 @@ to the core 16 MiB body limit at the client, server-stream, push, and
 connection-manager entry points. Passing `NIL` explicitly disables that body
 limit for that call.
 
+The native HTTP/3 scheduler can poll one QUIC client for concurrent request
+operations when `POLL-FUNCTION`, `TRY-READ-STREAM`, and
+`STREAM-WRITE-PENDING-P` are supplied together. Add the nonblocking
+`ACCEPT-PEER-UNIDIRECTIONAL-STREAM` callback to have it discover peer streams.
+It classifies fragmented prefixes, reads control and QPACK streams, and queues
+push streams after their type and push-ID prefixes are complete for
+`dequeue-http3-pending-push`. Unknown extension
+streams are cancelled when a cancellation callback is available, or drained
+through FIN. The scheduler's concurrent-call behavior is implemented and
+tested on SBCL only. Its non-SBCL synchronization and owner-identity fallbacks
+are no-ops and do not support concurrent use of one client.
+
 The boundary does not provide QUIC packets, loss recovery, congestion control,
 TLS 1.3, ALPN, native sockets, a connection-level accept loop, or a native
-HTTP/3 server. The injected
-transport can pass accepted peer unidirectional streams to
+HTTP/3 server. With the native scheduler, the injected transport supplies a
+nonblocking peer-stream accept callback. An application using the direct
+event-loop APIs can pass accepted peer unidirectional streams to
 `accept-http3-peer-unidirectional-stream` for fragmented-prefix classification
 and control/QPACK attachment, or to
 `process-http3-peer-unidirectional-stream` to classify and apply the first
-control or QPACK input. It remains responsible for accepting streams, invoking
-the matching reader on later readiness notifications, and discarding unknown
-extension streams.
+control or QPACK input. That event loop remains responsible for accepting
+streams, invoking the matching reader on later readiness notifications, and
+discarding unknown extension streams.
 The client can advertise `MAX_PUSH_ID`, receive promised responses on injected
 push streams, and cancel pushes. The server boundary can emit a push promise
 and its matching push stream when the surrounding QUIC transport supplies the
@@ -233,11 +246,6 @@ listener is provided by `cl-http-kit/tls`.
 
 serve-http1-listener combines accept and serve-http1-session dispatch for a
 caller-owned listener, with connection limits and accept/error callbacks.
-
-The native client path uses cl-tls-kit. Client-side HTTP/3 connection setup is
-available through the cl-quic-kit adapter, while the HTTP/3 framing system
-remains an injected QUIC stream boundary and applications retain socket and
-certificate policy.
 
 ## Application-owned behavior
 
