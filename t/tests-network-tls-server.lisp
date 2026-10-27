@@ -2212,7 +2212,115 @@
         (when client-socket
           (sb-bsd-sockets:socket-close client-socket))
         (when listener
-          (sb-bsd-sockets:socket-close listener))))))
+          (sb-bsd-sockets:socket-close listener)))))
+  (deftest tls-server-check-handshake-deadline-skips-completed-handshake
+    (let ((state
+            (http-kit/tls::%make-http-tls-server-state
+             :driver nil
+             :provider nil
+             :deadline 10
+             :clock-function (lambda () 10))))
+      (let ((condition
+              (handler-case
+                  (progn
+                    (http-kit/tls::%tls-server-check-handshake-deadline state)
+                    nil)
+                (http-timeout (condition) condition))))
+        (ensure-true (typep condition 'http-timeout)))
+      (setf (http-kit/tls::http-tls-server-state-handshake-complete-p state) t)
+      (ensure-false
+       (http-kit/tls::%tls-server-check-handshake-deadline state))))
+  (deftest tls-server-write-record-without-deadline
+    (let* ((wire (octets 22 3 3 0 1 1))
+           (raw (make-instance '%tls-server-test-stream :input (octets)))
+           (state
+             (http-kit/tls::%make-http-tls-server-state
+              :driver nil :provider nil :transport-stream raw)))
+      (unwind-protect
+           (progn
+             (http-kit/tls::%tls-server-write-record state wire)
+             (ensure-octets-equal wire (binary-test-output raw)))
+        (when (open-stream-p raw)
+          (close raw :abort t)))))
+  (deftest tls-server-write-record-aborts-after-write-crosses-deadline
+    (let* ((clock-calls 0)
+           (wire (octets 22 3 3 0 1 1))
+           (raw (make-instance '%tls-server-test-stream :input (octets)))
+           (transport
+             (make-instance '%tls-server-backpressure-stream :stream raw))
+           (state
+             (http-kit/tls::%make-http-tls-server-state
+              :driver nil
+              :provider nil
+              :transport-stream transport
+              :deadline 10
+              :clock-function
+              (lambda ()
+                (prog1 (if (zerop clock-calls) 9 10)
+                  (incf clock-calls))))))
+      (unwind-protect
+           (let ((condition
+                   (handler-case
+                       (progn
+                         (http-kit/tls::%tls-server-write-record state wire)
+                         nil)
+                     (http-timeout (condition) condition))))
+             (ensure-true (typep condition 'http-timeout))
+             (ensure-equal 2 clock-calls)
+             (ensure-octets-equal
+              wire (%tls-server-backpressure-stream-buffer transport))
+             (ensure-equal 0 (length (binary-test-output raw)))
+             (ensure-true (%tls-server-backpressure-stream-aborted-p transport))
+             (ensure-false (open-stream-p transport)))
+        (when (open-stream-p transport)
+          (close transport :abort t)))))
+  (deftest tls-server-write-record-handles-socket-timeouts-by-handshake-phase
+    (dolist (case '((nil :handshake-timeout)
+                    (t :transport-error)))
+      (let* ((raw
+               (make-instance '%tls-server-failure-test-stream
+                              :input (octets)
+                              :fail-on
+                              (make-condition
+                               'sb-bsd-sockets:operation-timeout-error)))
+             (state
+               (http-kit/tls::%make-http-tls-server-state
+                :driver nil :provider nil :transport-stream raw)))
+        (when (first case)
+          (setf (http-kit/tls::http-tls-server-state-handshake-complete-p state) t))
+        (unwind-protect
+             (let ((condition
+                     (handler-case
+                         (progn
+                           (http-kit/tls::%tls-server-write-record state (octets 1))
+                           nil)
+                       (http-timeout (condition) condition)
+                       (http-protocol-error (condition) condition))))
+               (if (eq (second case) :handshake-timeout)
+                   (ensure-true (typep condition 'http-timeout))
+                 (ensure-equal :transport-error
+                               (http-protocol-error-detail condition)))
+               (ensure-false (open-stream-p raw)))
+          (when (open-stream-p raw)
+            (close raw :abort t))))))
+  (deftest tls-server-write-record-skips-abort-for-closed-transport
+    (let* ((raw (make-instance '%tls-server-test-stream :input (octets)))
+           (state
+             (http-kit/tls::%make-http-tls-server-state
+              :driver nil
+              :provider nil
+              :transport-stream raw
+              :deadline 10
+              :clock-function (lambda () 10))))
+      (close raw :abort t)
+      (let ((condition
+              (handler-case
+                  (progn
+                    (http-kit/tls::%tls-server-write-record state (octets 1))
+                    nil)
+                (http-timeout (condition) condition))))
+        (ensure-true (typep condition 'http-timeout))
+        (ensure-false (open-stream-p raw))))))
 )
 
 #+sbcl
