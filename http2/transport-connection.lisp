@@ -2146,8 +2146,7 @@ CONTINUATION frames must still be consumed contiguously from that queue."
               (when (and headers-p entry write-started-p)
                 (sb-thread:with-mutex
                     ((%http2-connection-scheduler-lock connection))
-                  (when (eq (%h2-batch-entry-request-state entry) :writing)
-                    (setf (%h2-batch-entry-request-state entry) :written))
+                  (setf (%h2-batch-entry-request-state entry) :written)
                   (setf (%http2-connection-scheduler-last-opened-stream-id
                          connection)
                         (max (%http2-connection-scheduler-last-opened-stream-id
@@ -2373,7 +2372,6 @@ CONTINUATION frames must still be consumed contiguously from that queue."
           connection
           (lambda ()
             (or (funcall cancelled-p)
-                (not (http2-connection-open-p connection))
                 (not (eq (%http2-connection-session-start-state connection)
                          :starting))))
           reader writer deadline clock-function))
@@ -2383,7 +2381,6 @@ CONTINUATION frames must still be consumed contiguously from that queue."
               connection
               (lambda ()
                 (or (funcall cancelled-p)
-                    (not (http2-connection-open-p connection))
                     (eq (%http2-connection-session-start-state connection)
                         :ready)))
               reader writer deadline clock-function)
@@ -2999,7 +2996,6 @@ CONTINUATION frames must still be consumed contiguously from that queue."
           (lambda ()
             (or (funcall cancelled-p)
                 (%http2-connection-goaway-last-stream-id connection)
-                (not (http2-connection-open-p connection))
                 (%h2-scheduler-capacity-available-p connection)))
           reader writer deadline clock-function))
         (:session-starting
@@ -3007,7 +3003,6 @@ CONTINUATION frames must still be consumed contiguously from that queue."
           connection
           (lambda ()
             (or (funcall cancelled-p)
-                (not (http2-connection-open-p connection))
                 (not (eq (%http2-connection-session-start-state connection)
                          :starting))))
           reader writer deadline clock-function))
