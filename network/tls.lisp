@@ -1140,7 +1140,10 @@ driver's transport callbacks."
                                      :transport-stream stream
                                      :deadline effective-deadline
                                      :clock-function clock-function)))
-                              (%tls-server-handshake state)
+                              (http-kit/network::%network-call-with-accepted-stream-socket-non-blocking-mode
+                               stream
+                               (lambda ()
+                                 (%tls-server-handshake state)))
                               (make-instance 'http-tls-stream
                                              :driver state
                                              :transport-stream stream))))

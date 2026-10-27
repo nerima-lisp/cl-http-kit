@@ -712,21 +712,6 @@
 (defun %http-server-open-tls-stream (server connection raw-stream)
   (let ((wrapper
           (%http-server-rotate-ticket-key-store-if-due server connection)))
-    #+sbcl
-    (let ((tls-stream
-            (http-kit/network::%network-call-with-accepted-stream-socket-non-blocking-mode
-             raw-stream
-             (lambda ()
-               (funcall wrapper
-                        raw-stream
-                        :timeout (http-server-handshake-timeout server)
-                        :deadline
-                        (%http-server-connection-handshake-deadline
-                         connection))))))
-      (http-kit/network::%network-set-accepted-stream-socket-non-blocking-mode
-       raw-stream nil)
-      tls-stream)
-    #-sbcl
     (funcall wrapper
              raw-stream
              :timeout (http-server-handshake-timeout server)

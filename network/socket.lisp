@@ -306,7 +306,6 @@ stream's read timeout after a connection is accepted."
                                          clock-function)
                (declare (ignore ignored-address))
                (setf accepted-socket socket)
-               (setf (sb-bsd-sockets:non-blocking-mode socket) t)
                (let ((remaining (%network-remaining effective-deadline
                                                       clock-function
                                                       :accept)))
@@ -639,13 +638,10 @@ Returns the number of accepted connections and either :MAX-CONNECTIONS or
                             (unwind-protect
                                  (let ((session-stream
                                          (if stream-wrapper
-                                             (%network-call-with-accepted-stream-socket-non-blocking-mode
-                                              stream
-                                              (lambda ()
-                                                (funcall stream-wrapper
-                                                         stream
-                                                         :timeout accept-timeout
-                                                         :deadline accept-deadline)))
+                                             (funcall stream-wrapper
+                                                      stream
+                                                      :timeout accept-timeout
+                                                      :deadline accept-deadline)
                                              stream)))
                                    (unless (streamp session-stream)
                                      (%network-listener-error :serve
