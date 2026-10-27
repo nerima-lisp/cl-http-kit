@@ -3374,6 +3374,21 @@
                  (h2-output-frames stream))))
           (http-kit/http2:close-http2-connection connection)))))
 
+  (defclass scheduler-close-on-eof-stream (scheduled-ping-eof-stream)
+    ((close-on-eof
+      :initarg :close-on-eof
+      :reader scheduler-close-on-eof-function)))
+
+  (defmethod sb-gray:stream-read-sequence :around
+      ((stream scheduler-close-on-eof-stream) sequence &optional (start 0) end)
+    (declare (ignore start))
+    (let ((result (call-next-method)))
+      (when (and (< result (or end (length sequence)))
+                 (>= (binary-session-input-position stream)
+                     (length (binary-session-input stream))))
+        (funcall (scheduler-close-on-eof-function stream)))
+      result))
+
   (deftest http2-coverage-scheduler-eof-after-close
     (let* ((eof-started (sb-thread:make-semaphore :count 0))
            (eof-release (sb-thread:make-semaphore :count 0))
@@ -3420,7 +3435,86 @@
         (sb-thread:signal-semaphore eof-release)
         (when pump-thread
           (ignore-errors (sb-thread:join-thread pump-thread)))
-        (http-kit/http2:close-http2-connection connection)))))
+        (http-kit/http2:close-http2-connection connection))))
+
+  (deftest http2-coverage-scheduler-eof-after-close-before-pump-check
+    (let ((connection nil)
+          (pump-error nil))
+      (let* ((eof-started (sb-thread:make-semaphore :count 0))
+             (stream
+               (make-instance
+                'scheduler-close-on-eof-stream
+                :input (octets)
+                :eof-started eof-started
+                :eof-release (sb-thread:make-semaphore :count 1)
+                :ping-write-started (sb-thread:make-semaphore :count 0)
+                :ping-write-release (sb-thread:make-semaphore :count 0)
+                :ping-write-failed (sb-thread:make-semaphore :count 0)
+                :ping-written (sb-thread:make-semaphore :count 0)
+                :defer-ping-write-p nil
+                :fail-ping-write-p nil
+                :close-on-eof
+                (lambda ()
+                  (http-kit/http2:close-http2-connection connection))))
+             (opened-connection
+               (http-kit/http2:make-http2-connection :stream stream)))
+        (setf connection opened-connection)
+        (unwind-protect
+             (progn
+               (ensure-true
+                (http-kit/http2:http2-connection-open-p connection))
+               (handler-case
+                   (http-kit/http2::%h2-scheduler-pump-until
+                    connection (lambda () nil)
+                    (http-kit/http2::%http2-connection-scheduler-reader
+                     connection)
+                    nil nil (lambda () 0))
+                 (error (condition)
+                   (setf pump-error condition)))
+               (ensure-true
+                (sb-thread:wait-on-semaphore eof-started :timeout 0.001d0))
+               (ensure-false pump-error)
+               (ensure-false
+                (http-kit/http2:http2-connection-open-p connection)))
+          (http-kit/http2:close-http2-connection connection)))))
+  (deftest http2-coverage-scheduler-eof-while-open-reports-error
+    (let* ((eof-started (sb-thread:make-semaphore :count 0))
+           (stream
+             (make-instance
+              'scheduled-ping-eof-stream
+              :input (octets)
+              :eof-started eof-started
+              :eof-release (sb-thread:make-semaphore :count 1)
+              :ping-write-started (sb-thread:make-semaphore :count 0)
+              :ping-write-release (sb-thread:make-semaphore :count 0)
+              :ping-write-failed (sb-thread:make-semaphore :count 0)
+              :ping-written (sb-thread:make-semaphore :count 0)
+              :defer-ping-write-p nil
+              :fail-ping-write-p nil))
+           (connection (http-kit/http2:make-http2-connection :stream stream))
+           (failure nil))
+      (unwind-protect
+           (progn
+             (ensure-true (http-kit/http2:http2-connection-open-p connection))
+             (handler-case
+                 (http-kit/http2::%h2-scheduler-pump-until
+                  connection (lambda () nil)
+                  (http-kit/http2::%http2-connection-scheduler-reader
+                   connection)
+                  nil nil (lambda () 0))
+               (http-kit:http-connection-error (condition)
+                 (setf failure condition)))
+             (ensure-true
+              (sb-thread:wait-on-semaphore eof-started :timeout 0.001d0))
+             (ensure-true (typep failure 'http-kit:http-connection-error))
+             (ensure-equal :eof
+                           (http-kit:http-connection-error-cause failure))
+             (ensure-equal
+              "The HTTP/2 peer closed during a scheduled request."
+              (http-kit:http-error-message failure)))
+        (http-kit/http2:close-http2-connection connection))))
+
+)
 #+sbcl
 (deftest http2-coverage-request-body-unscheduled-trailer-headers
   (let* ((stream
