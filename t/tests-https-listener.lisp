@@ -1778,7 +1778,8 @@
              (signals error
                (cl-tls-kit:rotate-tls13-server-ticket-key-store
                 initial-owned-store))
-             (ensure-true current-owned-store)
+             (ensure-true
+              (cl-tls-kit:tls13-server-ticket-key-store-p current-owned-store))
              (setf clock-offset (* 26 60 60))
              (start-http-server external-server)
              (setf external-client (%https-listener-connect external-server))
@@ -1796,12 +1797,15 @@
              (stop-http-server owned-server :graceful-timeout 1)
              (%https-listener-wait
               (lambda ()
-                (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p
+                (cl-tls-kit:tls13-server-ticket-key-store-destroyed-p
                  current-owned-store)))
              (signals error
                (cl-tls-kit:rotate-tls13-server-ticket-key-store
                 current-owned-store))
              (stop-http-server external-server :graceful-timeout 1)
+             (ensure-false
+              (cl-tls-kit:tls13-server-ticket-key-store-destroyed-p
+               external-store))
              (ensure-true
               (cl-tls-kit:tls13-server-ticket-key-store-p external-store))
              (ensure-equal
@@ -1999,7 +2003,7 @@
               (lambda () (zerop (%https-listener-connection-count server))))
              (%https-listener-wait
               (lambda ()
-                (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p
+                (cl-tls-kit:tls13-server-ticket-key-store-destroyed-p
                  old-store)))
              (signals error
                (cl-tls-kit:rotate-tls13-server-ticket-key-store old-store))
@@ -2053,7 +2057,8 @@
              (start-http-server server)
              (setf ticket-store
                    (http-kit::http-server-ticket-key-store server))
-             (ensure-true ticket-store)
+             (ensure-true
+              (cl-tls-kit:tls13-server-ticket-key-store-p ticket-store))
              (let ((client (%https-listener-connect server)))
                (close-http-tcp-stream client))
              (ensure-true
@@ -2091,7 +2096,7 @@
                     (http-kit::http-server-workers server)
                     thereis (sb-thread:thread-alive-p worker)))
              (ensure-false
-              (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p
+              (cl-tls-kit:tls13-server-ticket-key-store-destroyed-p
                ticket-store))
              (ensure-equal :stopping (http-kit::http-server-state server))
              (ensure-false
@@ -2101,7 +2106,7 @@
              (%https-listener-wait
               (lambda ()
                 (and
-                 (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p
+                 (cl-tls-kit:tls13-server-ticket-key-store-destroyed-p
                   ticket-store)
                  (%https-listener-event-present-p
                   context :listener-stopped nil)
@@ -2148,7 +2153,7 @@
                       (%https-listener-record-event context event)
                       (when (eq :listener-stopped (getf event :type))
                         (setf stopped-after-store-destroyed-p
-                              (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p
+                              (cl-tls-kit:tls13-server-ticket-key-store-destroyed-p
                                ticket-store)))
                       (when (eq :listener-shutdown-deferred
                                 (getf event :type))
@@ -2156,7 +2161,8 @@
              (start-http-server server)
              (setf ticket-store
                    (http-kit::http-server-ticket-key-store server))
-             (ensure-true ticket-store)
+             (ensure-true
+              (cl-tls-kit:tls13-server-ticket-key-store-p ticket-store))
              (let ((client (%https-listener-connect server)))
                (close-http-tcp-stream client))
              (ensure-true
@@ -2210,7 +2216,7 @@
                     (http-kit::http-server-workers server)
                     thereis (sb-thread:thread-alive-p worker)))
              (ensure-false
-              (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p
+              (cl-tls-kit:tls13-server-ticket-key-store-destroyed-p
                ticket-store))
              (ensure-equal :failed (http-kit::http-server-state server))
              (ensure-false
@@ -2220,7 +2226,7 @@
              (%https-listener-wait
               (lambda ()
                 (and
-                 (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p
+                 (cl-tls-kit:tls13-server-ticket-key-store-destroyed-p
                   ticket-store)
                  (%https-listener-event-present-p
                   context :listener-stopped nil)
@@ -2274,7 +2280,7 @@
                    (lambda (&rest arguments)
                      (setf store (apply original-store-maker arguments))))
              (setf server (%https-listener-make-server))
-             (ensure-true store)
+             (ensure-true (cl-tls-kit:tls13-server-ticket-key-store-p store))
              (start-http-server server)
              (ensure-equal
               server
@@ -2419,7 +2425,7 @@
                      (error "injected TLS wrapper construction failure")))
              (signals http-server-error
                (%https-listener-make-server))
-             (ensure-true store)
+             (ensure-true (cl-tls-kit:tls13-server-ticket-key-store-p store))
              (signals error
                (cl-tls-kit:rotate-tls13-server-ticket-key-store store)))
         (setf (fdefinition 'cl-tls-kit:make-tls13-server-ticket-key-store)
@@ -2541,7 +2547,7 @@
                (stop-http-server server :graceful-timeout 1)
                (%https-listener-wait
                 (lambda ()
-                  (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p
+                  (cl-tls-kit:tls13-server-ticket-key-store-destroyed-p
                    initial-store)))
                (signals error
                  (cl-tls-kit:rotate-tls13-server-ticket-key-store
@@ -3004,7 +3010,8 @@
                    (format nil "https://localhost:~D/"
                            (http-server-port server)))
                   :timeout 5))
-           (ensure-true ticket-store)
+           (ensure-true
+            (cl-tls-kit:tls13-server-ticket-key-store-p ticket-store))
            (write-sequence
             (ascii "GET / HTTP/1.1|CRLF|Host: localhost|CRLF|Connection: close|CRLF||CRLF|")
             tls-stream)
@@ -3073,7 +3080,7 @@
             (sb-thread:wait-on-semaphore close-notify-returned :timeout 2))
            (%https-listener-wait
             (lambda ()
-              (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p
+              (cl-tls-kit:tls13-server-ticket-key-store-destroyed-p
                ticket-store))
             5)
            (%https-listener-wait
@@ -3081,7 +3088,7 @@
               (eq :stopped (http-kit::http-server-state server)))
             5)
            (ensure-true
-            (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p ticket-store)))
+            (cl-tls-kit:tls13-server-ticket-key-store-destroyed-p ticket-store)))
       (sb-thread:signal-semaphore release-close-notify)
       (sb-ext:without-package-locks
         (setf (fdefinition 'http-kit/tls::%tls-server-send-close-notify)
@@ -3127,11 +3134,12 @@
            (setf supervisor (http-kit::http-server-supervisor server)
                  ticket-store (http-kit::http-server-ticket-key-store server))
            (ensure-true supervisor)
-           (ensure-true ticket-store)
+           (ensure-true
+            (cl-tls-kit:tls13-server-ticket-key-store-p ticket-store))
            (stop-http-server server :graceful-timeout 0.1)
            (%https-listener-wait
             (lambda ()
-              (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p
+              (cl-tls-kit:tls13-server-ticket-key-store-destroyed-p
                ticket-store))
             5)
            (ensure-equal :stopping (http-kit::http-server-state server))
