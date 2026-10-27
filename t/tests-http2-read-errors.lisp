@@ -177,6 +177,66 @@
           (http-kit/http2:close-http2-connection connection))
         (ensure-equal 1 closes)
         (ensure-false (open-stream-p stream))))))
+#+sbcl
+(progn
+  (defclass http2-connect-initial-settings-read-error-stream
+      (binary-session-stream)
+    ((read-error
+      :initarg :read-error
+      :reader http2-connect-initial-settings-read-error-stream-error)))
+
+  (defmethod sb-gray:stream-read-sequence
+      ((stream http2-connect-initial-settings-read-error-stream) sequence
+       &optional (start 0) end)
+    (declare (ignore sequence start end))
+    (error (http2-connect-initial-settings-read-error-stream-error stream)))
+
+  (deftest http2-public-connect-initial-settings-propagates-read-error
+    (let* ((read-error
+             (make-condition 'http-connection-error
+                             :message "synthetic initial SETTINGS timeout"
+                             :operation :http2-read
+                             :cause :timeout))
+           (stream
+             (make-instance 'http2-connect-initial-settings-read-error-stream
+                            :input (octets)
+                            :read-error read-error))
+           (closes 0)
+           (seen nil)
+           (connection
+             (http-kit/http2:make-http2-connection
+              :stream stream
+              :close-stream (lambda (actual)
+                              (ensure-true (eq actual stream))
+                              (incf closes)
+                              (close actual)))))
+      (unwind-protect
+           (let ((result
+                   (handler-case
+                       (handler-bind ((http-error (lambda (condition)
+                                                    (setf seen condition))))
+                         (http-kit/http2:send-http2-request-over-connection
+                          connection
+                          (make-http-request :method "CONNECT" :protocol "websocket"
+                                             :uri "https://example.test/chat")))
+                     (http-error (condition) condition))))
+             (ensure-true (eq read-error result))
+             (ensure-true (typep result 'http-connection-error))
+             (ensure-equal :timeout (http-connection-error-cause result))
+             (ensure-equal :http2-read (http-error-operation result))
+             (ensure-true (eq seen result))
+             (ensure-equal 1 closes)
+             (ensure-false (http-kit/http2:http2-connection-open-p connection))
+             (let ((frames (h2-output-frames stream)))
+               (ensure-equal '(4)
+                             (mapcar #'http-kit/http2::%h2-frame-type frames))
+               (ensure-equal '(0)
+                             (mapcar #'http-kit/http2::%h2-frame-flags frames))
+               (ensure-equal '(0)
+                             (mapcar #'http-kit/http2::%h2-frame-stream-id frames))))
+        (http-kit/http2:close-http2-connection connection))
+      (ensure-equal 1 closes)
+      (ensure-false (open-stream-p stream)))))
 
 #+sbcl
 (deftest http2-public-single-goaway-boundaries

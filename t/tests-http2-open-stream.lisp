@@ -2113,6 +2113,333 @@
         (http-kit/http2:close-http2-connection connection)
         (sb-thread:join-thread request-thread))
       (http-kit/http2:close-http2-connection connection))))
+#+sbcl
+(deftest http2-public-single-request-reassembles-multiple-continuations
+  (let* ((header-block
+           (h2-header-block (cons ":status" "200")
+                            (cons "content-length" "3")
+                            (cons "x-continuation" "reassembled")))
+         (first-end (floor (length header-block) 3))
+         (second-end (floor (* 2 (length header-block)) 3))
+         (first-fragment (subseq header-block 0 first-end))
+         (intermediate-fragment (subseq header-block first-end second-end))
+         (final-fragment (subseq header-block second-end))
+         (body (octets 1 2 3))
+         (stream
+           (make-instance
+            'binary-session-stream
+            :input
+            (concatenate-octets
+             (h2-frame 4 0 0 (octets))
+             (h2-frame 1 0 1 first-fragment)
+             ;; The scheduler must retain the block until the final continuation.
+             (h2-frame 9 0 1 intermediate-fragment)
+             (h2-frame 9 4 1 final-fragment)
+             (h2-frame 0 1 1 body)
+             (h2-frame 1 4 3
+                       (h2-header-block (cons ":status" "201")
+                                        (cons "content-length" "1")))
+             (h2-frame 0 1 3 (octets 9)))))
+         (connection (http-kit/http2:make-http2-connection :stream stream))
+         (first-response
+           (http-kit/http2:send-http2-request-over-connection
+            connection
+            (make-http-request :method "GET" :uri "https://127.0.0.1/first")))
+         (second-response
+           (http-kit/http2:send-http2-request-over-connection
+            connection
+            (make-http-request :method "GET" :uri "https://127.0.0.1/second"))))
+    (ensure-true (plusp (length first-fragment)))
+    (ensure-true (plusp (length intermediate-fragment)))
+    (ensure-true (plusp (length final-fragment)))
+    (ensure-equal 200 (http-response-status first-response))
+    (ensure-equal "reassembled"
+                  (http-header-value (http-response-headers first-response)
+                                     "x-continuation"))
+    (ensure-equal body (http-response-body first-response))
+    (ensure-true (http-kit/http2:http2-connection-open-p connection))
+    (ensure-equal 201 (http-response-status second-response))
+    (ensure-equal (octets 9) (http-response-body second-response))
+    (ensure-true (http-kit/http2:http2-connection-open-p connection))
+    (ensure-true (http-kit/http2:http2-connection-session-started-p connection))
+    (ensure-equal '(1 3)
+                  (mapcar #'http-kit/http2::%h2-frame-stream-id
+                          (remove-if-not
+                           (lambda (frame)
+                             (= 1 (http-kit/http2::%h2-frame-type frame)))
+                           (h2-output-frames stream))))
+    (ensure-equal (length (binary-session-input stream))
+                  (binary-session-input-position stream))
+    (http-kit/http2:close-http2-connection connection)))
+#+sbcl
+(deftest http2-public-single-request-rejects-malformed-continuation-frame
+  (let* ((header-block (h2-header-block (cons ":status" "200")))
+         (split (max 1 (floor (length header-block) 2)))
+         (first-fragment (subseq header-block 0 split))
+         (last-fragment (subseq header-block split)))
+    (ensure-true (plusp (length first-fragment)))
+    (ensure-true (plusp (length last-fragment)))
+    (dolist (scenario '(:wrong-stream :wrong-type :invalid-flags))
+      (let* ((bad-frame
+               (case scenario
+                 (:wrong-stream (h2-frame 9 4 3 last-fragment))
+                 (:wrong-type (h2-frame 0 0 1 last-fragment))
+                 (:invalid-flags (h2-frame 9 1 1 last-fragment))))
+             (expected-detail
+               (case scenario
+                 (:wrong-stream '(9 3 1))
+                 (:wrong-type '(0 1 1))
+                 (:invalid-flags 1)))
+             (stream
+               (make-instance
+                'binary-session-stream
+                :input
+                (concatenate-octets
+                 (h2-frame 4 0 0 (octets))
+                 (h2-frame 1 0 1 first-fragment)
+                 bad-frame)))
+             (closed 0)
+             (connection
+               (http-kit/http2:make-http2-connection
+                :stream stream
+                :close-stream (lambda (closed-stream)
+                                (ensure-true (eq stream closed-stream))
+                                (incf closed))))
+             (result
+               (handler-case
+                   (http-kit/http2:send-http2-request-over-connection
+                    connection
+                    (make-http-request :method "GET"
+                                       :uri "https://127.0.0.1/malformed"))
+                 (http-protocol-error (condition) condition))))
+        (unwind-protect
+             (progn
+               (ensure-true (typep result 'http-protocol-error))
+               (ensure-equal :http2-headers (http-error-operation result))
+               (ensure-equal expected-detail
+                             (http-protocol-error-detail result))
+               (ensure-true (not (http-kit/http2:http2-connection-open-p
+                                  connection)))
+               (ensure-equal 1 closed)
+               (ensure-equal (length (binary-session-input stream))
+                             (binary-session-input-position stream))
+               (ensure-equal '(1)
+                             (mapcar #'http-kit/http2::%h2-frame-stream-id
+                                     (remove-if-not
+                                      (lambda (frame)
+                                        (= 1 (http-kit/http2::%h2-frame-type frame)))
+                                      (h2-output-frames stream)))))
+          (http-kit/http2:close-http2-connection connection))))))
+#+sbcl
+(progn
+  (defclass h2-concurrent-start-stream-wrapper
+      (sb-gray:fundamental-binary-input-stream
+       sb-gray:fundamental-binary-output-stream)
+    ((delegate :initarg :delegate :reader h2-concurrent-start-stream-delegate)
+     (gate-lock
+       :initform (sb-thread:make-mutex :name "HTTP/2 concurrent start gate")
+       :reader h2-concurrent-start-stream-gate-lock)
+     (first-write-seen-p
+       :initform nil :accessor h2-concurrent-start-stream-first-write-seen-p)
+     (first-write-entered
+       :initform (sb-thread:make-semaphore :count 0)
+       :reader h2-concurrent-start-stream-first-write-entered)
+     (release-first-write
+       :initform (sb-thread:make-semaphore :count 0)
+       :reader h2-concurrent-start-stream-release-first-write)
+     (startup-write-completed
+       :initform (sb-thread:make-semaphore :count 0)
+       :reader h2-concurrent-start-stream-startup-write-completed)))
+
+  (defmethod sb-gray:stream-read-sequence
+      ((stream h2-concurrent-start-stream-wrapper) sequence
+       &optional (start 0) end)
+    (sb-gray:stream-read-sequence
+     (h2-concurrent-start-stream-delegate stream) sequence start end))
+
+  (defmethod sb-gray:stream-write-sequence
+      ((stream h2-concurrent-start-stream-wrapper) sequence
+       &optional (start 0) end)
+    (let ((first-write-p nil)
+          (gate-lock (h2-concurrent-start-stream-gate-lock stream)))
+      (sb-thread:with-mutex (gate-lock)
+        (unless (h2-concurrent-start-stream-first-write-seen-p stream)
+          (setf (h2-concurrent-start-stream-first-write-seen-p stream) t
+                first-write-p t)))
+      (when first-write-p
+        (sb-thread:signal-semaphore
+         (h2-concurrent-start-stream-first-write-entered stream))
+        (sb-thread:wait-on-semaphore
+         (h2-concurrent-start-stream-release-first-write stream)))
+      (let ((result
+              (sb-gray:stream-write-sequence
+               (h2-concurrent-start-stream-delegate stream)
+               sequence start end)))
+        (when first-write-p
+          (sb-thread:signal-semaphore
+           (h2-concurrent-start-stream-startup-write-completed stream)))
+        result)))
+
+  (defmethod sb-gray:stream-finish-output
+      ((stream h2-concurrent-start-stream-wrapper))
+    (sb-gray:stream-finish-output
+     (h2-concurrent-start-stream-delegate stream)))
+
+  (deftest http2-public-concurrent-extended-connect-start-is-shared
+    (let* ((peer (make-instance 'h2-manager-capacity-peer-stream
+                                :input (octets)
+                                :response-end-stream-p t))
+           (stream
+             (make-instance 'h2-concurrent-start-stream-wrapper
+                            :delegate peer))
+           (connection
+             (http-kit/http2:make-http2-connection
+              :stream stream
+              :close-stream
+              (lambda (closed-stream)
+                (ensure-true (eq stream closed-stream))
+                (h2-manager-capacity-peer-close peer))))
+           (first-entered (sb-thread:make-semaphore :count 0))
+           (second-entered (sb-thread:make-semaphore :count 0))
+           (first-done (sb-thread:make-semaphore :count 0))
+           (second-done (sb-thread:make-semaphore :count 0))
+           (first-response nil)
+           (second-response nil)
+           (first-failure nil)
+           (second-failure nil)
+           (first-thread nil)
+           (second-thread nil)
+           (release-signaled-p nil))
+      (unwind-protect
+           (progn
+             (setf first-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (sb-thread:signal-semaphore first-entered)
+                      (unwind-protect
+                           (handler-case
+                               (setf first-response
+                                     (sb-ext:with-timeout 10
+                                       (http-kit/http2:send-http2-request-over-connection
+                                        connection
+                                        (make-http-request
+                                         :method "CONNECT" :protocol "websocket"
+                                         :uri "https://concurrent-start.test/first")
+                                        :timeout 5)))
+                             (error (condition)
+                               (setf first-failure condition)))
+                        (sb-thread:signal-semaphore first-done)))))
+             (ensure-true (sb-thread:wait-on-semaphore first-entered :timeout 5))
+             (ensure-true
+              (sb-thread:wait-on-semaphore
+               (h2-concurrent-start-stream-first-write-entered stream)
+               :timeout 5))
+             (ensure-equal
+              :starting
+              (http-kit/http2::%http2-connection-session-start-state connection))
+             (setf second-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (sb-thread:signal-semaphore second-entered)
+                      (unwind-protect
+                           (handler-case
+                               (setf second-response
+                                     (sb-ext:with-timeout 10
+                                       (http-kit/http2:send-http2-request-over-connection
+                                        connection
+                                        (make-http-request
+                                         :method "CONNECT" :protocol "websocket"
+                                         :uri "https://concurrent-start.test/second")
+                                        :timeout 5)))
+                             (error (condition)
+                               (setf second-failure condition)))
+                        (sb-thread:signal-semaphore second-done)))))
+             (ensure-true (sb-thread:wait-on-semaphore second-entered :timeout 5))
+             (ensure-true
+              (sb-thread:wait-on-semaphore
+               (h2-manager-capacity-peer-input-read-waiting peer) :timeout 5))
+             (ensure-equal
+              :starting
+              (http-kit/http2::%http2-connection-session-start-state connection))
+             (let ((output-lock
+                     (h2-manager-capacity-peer-output-lock peer)))
+               (ensure-equal
+                0
+                (sb-thread:with-mutex (output-lock)
+                  (length (binary-session-output peer)))))
+             (ensure-equal 0 (sb-thread:semaphore-count first-done))
+             (ensure-equal 0 (sb-thread:semaphore-count second-done))
+             (ensure-false first-response)
+             (ensure-false second-response)
+             (setf release-signaled-p t)
+             (sb-thread:signal-semaphore
+              (h2-concurrent-start-stream-release-first-write stream))
+             (ensure-true
+              (sb-thread:wait-on-semaphore
+               (h2-concurrent-start-stream-startup-write-completed stream)
+               :timeout 5))
+             (h2-manager-capacity-peer-feed
+              peer (h2-frame 4 0 0 (octets 0 8 0 0 0 1)))
+             (ensure-true
+              (sb-thread:wait-on-semaphore
+               (h2-manager-capacity-peer-header-available peer) :timeout 5))
+             (ensure-true
+              (sb-thread:wait-on-semaphore
+               (h2-manager-capacity-peer-header-available peer) :timeout 5))
+             (ensure-true (sb-thread:wait-on-semaphore first-done :timeout 5))
+             (ensure-true (sb-thread:wait-on-semaphore second-done :timeout 5))
+             (sb-thread:join-thread first-thread)
+             (setf first-thread nil)
+             (sb-thread:join-thread second-thread)
+             (setf second-thread nil)
+             (ensure-false first-failure)
+             (ensure-false second-failure)
+             (ensure-equal '(200 201)
+                           (sort (list (http-response-status first-response)
+                                       (http-response-status second-response))
+                                 #'<))
+             (ensure-equal (octets) (http-response-body first-response))
+             (ensure-equal (octets) (http-response-body second-response))
+             (let ((output-lock (h2-manager-capacity-peer-output-lock peer)))
+               (sb-thread:with-mutex (output-lock)
+                 (let* ((preface (h2-preface))
+                        (output (binary-session-output peer))
+                        (frames (h2-output-frames peer))
+                        (headers
+                          (remove-if-not
+                           (lambda (frame)
+                             (= 1 (http-kit/http2::%h2-frame-type frame)))
+                           frames))
+                        (settings
+                          (remove-if-not
+                           (lambda (frame)
+                             (and (= 4 (http-kit/http2::%h2-frame-type frame))
+                                  (zerop (http-kit/http2::%h2-frame-flags frame))
+                                  (zerop (http-kit/http2::%h2-frame-stream-id frame))))
+                           frames)))
+                   (ensure-equal preface (subseq output 0 (length preface)))
+                   (ensure-false (search preface output :start2 (length preface)))
+                   (ensure-equal 1 (length settings))
+                   (ensure-equal 2 (length headers))))
+               (ensure-equal '(1 3)
+                             (sort
+                              (h2-manager-capacity-peer-output-header-ids peer)
+                              #'<)))
+             (ensure-true (http-kit/http2:http2-connection-open-p connection))
+             (ensure-true
+              (http-kit/http2:http2-connection-session-started-p connection))
+             (ensure-equal
+              :ready
+              (http-kit/http2::%http2-connection-session-start-state connection)))
+        (unless release-signaled-p
+          (setf release-signaled-p t)
+          (sb-thread:signal-semaphore
+           (h2-concurrent-start-stream-release-first-write stream)))
+        (h2-manager-capacity-peer-close peer)
+        (http-kit/http2:close-http2-connection connection)
+        (dolist (thread (list first-thread second-thread))
+          (when thread
+            (sb-thread:join-thread thread)))))))
 
 #+sbcl
 (deftest http2-public-control-priority-wire-boundaries
