@@ -2739,6 +2739,92 @@
         (stop-http-server server :graceful-timeout 2))
       (%tls-server-test-remove-material material))))
 #+sbcl
+(deftest https-listener-handshake-deadline-includes-accept-reservation-delay
+  (%with-https-listener-test-stubs (context)
+    (ensure-true context)
+    (let* ((clock-value 100)
+           (original-clock http-kit::*http-server-clock-function*)
+           (original-accept
+             (fdefinition 'http-kit/network:accept-http-tcp-stream))
+           (original-reserve
+             (fdefinition 'http-kit::%http-server-reserve-connection))
+           (original-start-worker
+             (fdefinition 'http-kit::%http-server-start-connection-worker))
+           (reservation-entered (sb-thread:make-semaphore :count 0))
+           (release-reservation (sb-thread:make-semaphore :count 0))
+           (raw-stream (make-string-input-stream "raw"))
+           (listener (gensym "LISTENER-"))
+           (server nil)
+           (connection nil)
+           (reservation-rejection :not-called)
+           (accepted-at nil)
+           (thread nil))
+      (unwind-protect
+           (progn
+             (setf http-kit::*http-server-clock-function*
+                   (lambda () clock-value)
+                   server (%https-listener-make-server :handshake-timeout 10)
+                   (http-kit::http-server-state server) :running
+                   (http-kit::http-server-listener server) listener)
+             (sb-ext:without-package-locks
+               (setf (fdefinition 'http-kit/network:accept-http-tcp-stream)
+                     (lambda (candidate &rest options)
+                       (declare (ignore candidate options))
+                       (values raw-stream "127.0.0.1" 4321))
+                     (fdefinition 'http-kit::%http-server-reserve-connection)
+                     (lambda (&rest arguments)
+                       (setf accepted-at (nth 5 arguments))
+                       (sb-thread:signal-semaphore reservation-entered)
+                       (sb-thread:wait-on-semaphore release-reservation)
+                       (multiple-value-bind (reserved rejection)
+                           (apply original-reserve arguments)
+                         (setf connection reserved
+                               reservation-rejection rejection)
+                         (values reserved rejection)))
+                     (fdefinition 'http-kit::%http-server-start-connection-worker)
+                     (lambda (candidate-server candidate-connection)
+                       (declare (ignore candidate-server candidate-connection))
+                       nil)))
+             (setf thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (http-kit::%http-server-accept-one server listener))))
+             (ensure-true
+              (sb-thread:wait-on-semaphore reservation-entered :timeout 5))
+             (setf clock-value 104)
+             (sb-thread:signal-semaphore release-reservation)
+             (sb-thread:join-thread thread :default nil :timeout 5)
+             (ensure-false (sb-thread:thread-alive-p thread))
+             (ensure-false reservation-rejection)
+             (ensure-equal
+              110
+              (http-kit::%http-server-connection-handshake-deadline connection))
+             (ensure-equal 100 accepted-at))
+        (unwind-protect
+             (sb-ext:without-package-locks
+               (setf (fdefinition 'http-kit/network:accept-http-tcp-stream)
+                     original-accept
+                     (fdefinition 'http-kit::%http-server-reserve-connection)
+                     original-reserve
+                     (fdefinition 'http-kit::%http-server-start-connection-worker)
+                     original-start-worker))
+          (unwind-protect
+               (setf http-kit::*http-server-clock-function* original-clock)
+            (unwind-protect
+                 (sb-thread:signal-semaphore release-reservation)
+              (unwind-protect
+                   (when (and thread (sb-thread:thread-alive-p thread))
+                     (sb-thread:join-thread thread :default nil :timeout 5))
+                (unwind-protect
+                     (when connection
+                       (http-kit::%http-server-release-connection server connection))
+                  (unwind-protect
+                       (when (open-stream-p raw-stream)
+                         (close raw-stream))
+                    (when server
+                      (setf (http-kit::http-server-state server) :stopped
+                            (http-kit::http-server-listener server) nil))))))))))))
+#+sbcl
 (deftest https-listener-rejects-unoffered-alpn-over-real-tls
   (let* ((material (%tls-server-test-material))
          (context (%make-https-listener-test-context))
