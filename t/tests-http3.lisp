@@ -16743,6 +16743,95 @@
                 adapter)
                nil))))))
 
-
-
-
+#+sbcl
+(deftest http3-client-close-interrupts-unknown-peer-stream-drain
+  (let* ((unknown-stream
+           (make-http3-test-stream :kind :peer-extension))
+         (pending-peer-streams nil)
+         (first-poll-p nil)
+         (poll-count 0)
+         (unknown-read-count 0)
+         (data-read-count 0)
+         (data-read-limit
+           (* 4
+              http-kit/http3::+http3-unknown-peer-stream-drain-read-budget+))
+         (drain-started (sb-thread:make-semaphore :count 0))
+         (close-thread-ready (sb-thread:make-semaphore :count 0))
+         (client
+           (http3-test-make-native-client
+            :poll-function
+            (lambda ()
+              (incf poll-count)
+              (unless first-poll-p
+                (setf first-poll-p t
+                      pending-peer-streams (list unknown-stream))))
+            :accept-peer-unidirectional-stream
+            (lambda ()
+              (pop pending-peer-streams))
+            :try-read-stream
+            (lambda (stream &key timeout deadline)
+              (declare (ignore timeout deadline))
+              (if (eq stream unknown-stream)
+                  (progn
+                    (incf unknown-read-count)
+                    (if (= unknown-read-count 1)
+                        (values
+                         (http-kit/http3:http3-varint-encode 64)
+                         nil :data)
+                        (if (< data-read-count data-read-limit)
+                            (progn
+                              (incf data-read-count)
+                              (when (= data-read-count 1)
+                                (sb-thread:signal-semaphore drain-started)
+                                (sb-thread:thread-yield))
+                              (values (octets 1) nil :data))
+                            (values nil nil :would-block))))
+                  (values nil nil :would-block))))))
+         (owner-thread nil)
+         (owner-finished nil)
+         (owner-result nil)
+         (close-thread nil)
+         (close-finished nil)
+         (close-result nil))
+    (unwind-protect
+         (progn
+           (multiple-value-setq (close-thread close-finished close-result)
+             (http3-test-start-native-call
+              (lambda ()
+                (sb-thread:signal-semaphore close-thread-ready)
+                (sb-thread:wait-on-semaphore drain-started :timeout 3)
+                (http-kit/http3:close-http3-client client))))
+           (ensure-true
+            (sb-thread:wait-on-semaphore close-thread-ready :timeout 3))
+           (multiple-value-setq (owner-thread owner-finished owner-result)
+             (http3-test-start-native-call
+              (lambda ()
+                (http-kit/http3:send-http3-request
+                 client
+                 (make-http-request
+                  :method "GET"
+                  :uri "https://example.test/unknown-stream-drain")))))
+           (ensure-true
+            (http3-test-await-native-close-state client :closing))
+           (ensure-true
+            (sb-thread:wait-on-semaphore close-finished :timeout 3))
+           (ensure-true
+            (sb-thread:wait-on-semaphore owner-finished :timeout 3))
+           (ensure-equal :error (first owner-result))
+           (ensure-true
+            (typep (second owner-result) 'http-kit:http-connection-error))
+           (ensure-equal "The HTTP/3 client was closed."
+                         (http-kit:http-error-message (second owner-result)))
+           (ensure-equal :http3-request
+                         (http-kit:http-error-operation (second owner-result)))
+           (ensure-equal :response (first close-result))
+           (ensure-true (plusp poll-count))
+           (ensure-true (>= data-read-count 1))
+           (ensure-true (< data-read-count data-read-limit))
+           (ensure-true (>= unknown-read-count 2)))
+      (when owner-thread
+        (sb-thread:wait-on-semaphore owner-finished :timeout 3))
+      (when close-thread
+        (sb-thread:wait-on-semaphore close-finished :timeout 3))
+      (http3-test-join-native-thread owner-thread owner-finished)
+      (http3-test-join-native-thread close-thread close-finished)))

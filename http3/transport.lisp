@@ -6,6 +6,9 @@
 (defparameter +http3-default-max-peer-unidirectional-streams+ 16)
 (defparameter +http3-default-max-state-bytes+ (* 4 1024 1024))
 
+(defparameter +http3-unknown-peer-stream-drain-read-budget+ 64
+  "Bound unknown peer stream reads in each scheduler poll step.")
+
 (progn
   (define-condition http3-connection-protocol-error (http-protocol-error)
     ((quic-error-code :initarg :quic-error-code
@@ -3444,19 +3447,27 @@ the HTTP/3 API reference."
 
 (progn
   (defun %h3-scheduler-drain-discard-streams (client)
-    (let ((progress-p nil))
-      (dolist (entry (http3-client-discard-peer-unidirectional-streams client))
-        (when (eq (cdr entry) :drain)
-          (loop
-           (multiple-value-bind (chunk fin-p status)
-               (%h3-try-read-client-stream client (car entry) nil nil)
-             (declare (ignore chunk))
-             (when (eq status :would-block)
-               (return))
-             (setf progress-p t)
-             (when (or fin-p (eq status :fin))
-               (setf (cdr entry) :finished)
-               (return))))))
+    (let ((progress-p nil)
+          (remaining-read-budget
+            +http3-unknown-peer-stream-drain-read-budget+)
+          (remaining-entries
+            (http3-client-discard-peer-unidirectional-streams client))
+          (visited-entries nil))
+      (loop while (and remaining-entries (plusp remaining-read-budget))
+            do (let ((entry (pop remaining-entries)))
+                 (push entry visited-entries)
+                 (when (eq (cdr entry) :drain)
+                   (multiple-value-bind (chunk fin-p status)
+                       (%h3-try-read-client-stream client (car entry) nil nil)
+                     (declare (ignore chunk))
+                     (decf remaining-read-budget)
+                     (unless (eq status :would-block)
+                       (setf progress-p t)
+                       (when (or fin-p (eq status :fin))
+                         (setf (cdr entry) :finished)))))))
+      (when remaining-entries
+        (setf (http3-client-discard-peer-unidirectional-streams client)
+              (append remaining-entries (nreverse visited-entries))))
       progress-p))
   (defun %h3-scheduler-discover-peer-unidirectional-streams (client)
     (let ((accept (http3-client-accept-peer-unidirectional-stream client))
