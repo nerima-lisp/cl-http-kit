@@ -239,6 +239,97 @@
             #+sbcl
             (sb-thread:join-thread server-thread)))
         (close-http-tcp-listener listener))))
+  #+sbcl
+(deftest native-network-accepted-stream-mode-and-abort-close-share-lock
+  (let* ((listener (open-http-tcp-listener
+                   :host "127.0.0.1"
+                   :port 0))
+         (client-socket
+           (make-instance 'sb-bsd-sockets:inet-socket
+                          :type :stream
+                          :protocol :tcp))
+         (stream nil)
+         (mode-started (sb-thread:make-semaphore :count 0))
+         (mode-entered (sb-thread:make-semaphore :count 0))
+         (mode-done (sb-thread:make-semaphore :count 0))
+         (close-started (sb-thread:make-semaphore :count 0))
+         (close-done (sb-thread:make-semaphore :count 0))
+         (mode-thread nil)
+         (close-thread nil)
+         (mode-result nil)
+         (mode-error nil)
+         (close-error nil))
+    (unwind-protect
+         (progn
+           (sb-bsd-sockets:socket-connect
+            client-socket #(127 0 0 1) (http-network-listener-port listener))
+           (setf stream (accept-http-tcp-stream listener))
+           (ensure-true
+            (sb-bsd-sockets:non-blocking-mode
+             (http-kit/network::%network-stream-socket stream)))
+           (sb-thread:with-mutex (http-kit/network::*network-stream-sockets-lock*)
+             (setf mode-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (sb-thread:signal-semaphore mode-started)
+                      (setf mode-result
+                            (handler-case
+                                (http-kit/network::%network-call-with-accepted-stream-socket-non-blocking-mode
+                                 stream
+                                 (lambda ()
+                                   (sb-thread:signal-semaphore mode-entered)
+                                   :mode-ran))
+                              (error (condition)
+                                (setf mode-error condition))))
+                      (sb-thread:signal-semaphore mode-done))))
+             (ensure-true
+              (sb-thread:wait-on-semaphore mode-started :timeout 3))
+             (ensure-true
+              (not (sb-thread:wait-on-semaphore mode-entered :timeout 0.05)))
+             (ensure-true (open-stream-p stream)))
+           (ensure-true
+            (sb-thread:wait-on-semaphore mode-done :timeout 3))
+           (sb-thread:join-thread mode-thread)
+           (ensure-true (null mode-error))
+           (ensure-equal :mode-ran mode-result)
+           (sb-thread:with-mutex (http-kit/network::*network-stream-sockets-lock*)
+             (setf close-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (sb-thread:signal-semaphore close-started)
+                      (handler-case
+                          (http-kit/network::%network-close-accepted-stream
+                           stream :abort t)
+                        (error (condition)
+                          (setf close-error condition)))
+                      (sb-thread:signal-semaphore close-done))))
+             (ensure-true
+              (sb-thread:wait-on-semaphore close-started :timeout 3))
+             (ensure-true
+              (not (sb-thread:wait-on-semaphore close-done :timeout 0.05)))
+             (ensure-true (open-stream-p stream)))
+           (ensure-true
+            (sb-thread:wait-on-semaphore close-done :timeout 3))
+           (sb-thread:join-thread close-thread)
+           (ensure-true (null close-error))
+           (ensure-true (not (open-stream-p stream)))
+           (ensure-equal
+            :closed-stream-thunk-ran
+            (http-kit/network::%network-call-with-accepted-stream-socket-non-blocking-mode
+             stream
+             (lambda () :closed-stream-thunk-ran)))
+           (ensure-true (not (open-stream-p stream))))
+      (when (and stream (open-stream-p stream))
+        (http-kit::%with-http-cleanup
+          (http-kit/network::%network-close-accepted-stream stream :abort t)))
+      (when mode-thread
+        (http-kit::%with-http-cleanup
+          (sb-thread:join-thread mode-thread)))
+      (when close-thread
+        (http-kit::%with-http-cleanup
+          (sb-thread:join-thread close-thread)))
+      (%network-test-close-socket client-socket)
+      (close-http-tcp-listener listener))))
 
 #+sbcl
 (deftest native-network-http1-listener-service

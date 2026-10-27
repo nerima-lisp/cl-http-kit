@@ -682,6 +682,10 @@
     (when stream
       (unless (and abort (not (open-stream-p stream)))
         (handler-case
+            #+sbcl
+            (http-kit/network::%network-close-accepted-stream
+             stream :abort abort)
+            #-sbcl
             (close stream :abort abort)
           (error ()
             (unless (or (and abort (not (open-stream-p stream)))
@@ -709,14 +713,19 @@
   (let ((wrapper
           (%http-server-rotate-ticket-key-store-if-due server connection)))
     #+sbcl
-    (http-kit/network::%network-call-with-accepted-stream-socket-non-blocking-mode
-     raw-stream
-     (lambda ()
-       (funcall wrapper
-                raw-stream
-                :timeout (http-server-handshake-timeout server)
-                :deadline
-                (%http-server-connection-handshake-deadline connection))))
+    (let ((tls-stream
+            (http-kit/network::%network-call-with-accepted-stream-socket-non-blocking-mode
+             raw-stream
+             (lambda ()
+               (funcall wrapper
+                        raw-stream
+                        :timeout (http-server-handshake-timeout server)
+                        :deadline
+                        (%http-server-connection-handshake-deadline
+                         connection))))))
+      (http-kit/network::%network-set-accepted-stream-socket-non-blocking-mode
+       raw-stream nil)
+      tls-stream)
     #-sbcl
     (funcall wrapper
              raw-stream
