@@ -2295,6 +2295,7 @@
            (server nil)
            (destroy-attempts 0)
            (cleanup-error-reported-p nil)
+           (cleanup-error-reported (sb-thread:make-semaphore :count 0))
            (fail-stop-callback-p t)
            (first-cleanup-error nil)
            (first-stop-error nil)
@@ -2327,7 +2328,8 @@
                       (declare (ignore details))
                       (when (eq :ticket-key-store-destroy-failed
                                 (http-server-error-reason-code condition))
-                        (setf cleanup-error-reported-p t)))))
+                        (setf cleanup-error-reported-p t)
+                        (sb-thread:signal-semaphore cleanup-error-reported)))))
              (start-http-server server)
              (setf first-stop-error
                    (handler-case
@@ -2339,6 +2341,8 @@
               (typep first-stop-error 'http-server-callback-error))
              (ensure-equal :event-callback-failed
                            (http-server-error-reason-code first-stop-error))
+             (ensure-true
+              (sb-thread:wait-on-semaphore cleanup-error-reported :timeout 5))
              (ensure-true cleanup-error-reported-p)
              (ensure-true (plusp destroy-attempts))
              (ensure-equal store
