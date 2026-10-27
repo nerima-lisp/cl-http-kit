@@ -612,12 +612,17 @@
       (let* ((raw (make-instance '%tls-server-test-stream :input (octets)))
              (stream (http-kit/tls::%make-http-tls-stream :client raw))
              (reader
-               (lambda (driver)
-                 (declare (ignore driver))
-                 (case status
-                   (:data (values :data (octets 42)))
-                   (:eof (values :eof nil))
-                   (:would-block (values :would-block nil))))))
+               (let ((read-count 0))
+                 (lambda (driver)
+                   (declare (ignore driver))
+                   (case status
+                     (:data (values :data (octets 42)))
+                     (:eof (values :eof nil))
+                     (:would-block
+                      (if (= (incf read-count) 1)
+                          (values :would-block nil)
+                          (values :data (octets 42)))))))
+             ))
         (unwind-protect
              (%tls-server-test-with-spy
               'cl-tls-kit:tls13-client-driver-read-application-data
@@ -636,9 +641,113 @@
                      (ensure-equal nil condition)
                      (ensure-equal :eof value))
                     (:would-block
-                     (ensure-equal :would-block
-                                   (http-protocol-error-detail condition)))))))
+                     (ensure-equal nil condition)
+                     (ensure-equal 42 value))))))
           (close stream :abort t)))))
+  (deftest tls-fd-transport-preserves-partial-record-across-read-slices
+    (let* ((listener
+             (make-instance (quote sb-bsd-sockets:inet-socket)
+                            :type :stream
+                            :protocol :tcp))
+           (port nil)
+           (client-socket nil)
+           (client-stream nil)
+           (accepted-socket nil)
+           (server-stream nil)
+           (server-thread nil)
+           (server-error nil)
+           (transport nil)
+           (read-function nil)
+           (enable-application-read nil)
+           (record-wire (octets 22 3 3 0 4 1 2 3 4))
+           (first-write-ready (sb-thread:make-semaphore :count 0))
+           (send-rest (sb-thread:make-semaphore :count 0))
+           (rest-write-ready (sb-thread:make-semaphore :count 0))
+           (server-done (sb-thread:make-semaphore :count 0)))
+      (unwind-protect
+           (progn
+             (sb-bsd-sockets:socket-bind listener #(127 0 0 1) 0)
+             (sb-bsd-sockets:socket-listen listener 1)
+             (setf port
+                   (nth-value 1 (sb-bsd-sockets:socket-name listener))
+                   client-socket
+                   (make-instance (quote sb-bsd-sockets:inet-socket)
+                                  :type :stream
+                                  :protocol :tcp))
+             (sb-bsd-sockets:socket-connect
+              client-socket #(127 0 0 1) port)
+             (setf client-stream
+                   (sb-bsd-sockets:socket-make-stream
+                    client-socket
+                    :input t
+                    :output t
+                    :element-type (quote (unsigned-byte 8))
+                    :buffering :none)
+                   server-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (unwind-protect
+                           (handler-case
+                               (progn
+                                 (setf accepted-socket
+                                       (sb-bsd-sockets:socket-accept listener)
+                                       server-stream
+                                       (sb-bsd-sockets:socket-make-stream
+                                        accepted-socket
+                                        :input t
+                                        :output t
+                                        :element-type
+                                        (quote (unsigned-byte 8))
+                                        :buffering :none))
+                                 (write-sequence
+                                  (subseq record-wire 0 4) server-stream)
+                                 (finish-output server-stream)
+                                 (sb-thread:signal-semaphore first-write-ready)
+                                 (unless
+                                     (sb-thread:wait-on-semaphore
+                                      send-rest :timeout 5)
+                                   (error
+                                    "The TLS test timed out before sending the remainder."))
+                                 (write-sequence
+                                  (subseq record-wire 4) server-stream)
+                                 (finish-output server-stream)
+                                 (sb-thread:signal-semaphore rest-write-ready))
+                             (error (condition)
+                               (setf server-error condition)))
+                        (sb-thread:signal-semaphore server-done)))))
+             (setf transport (http-kit/tls::%tls-transport client-stream)
+                   read-function (getf transport :read)
+                   enable-application-read
+                   (getf transport :enable-application-read))
+             (funcall enable-application-read)
+             (ensure-true
+              (sb-thread:wait-on-semaphore first-write-ready :timeout 5))
+             (ensure-equal :would-block (funcall read-function nil))
+             (sb-thread:signal-semaphore send-rest)
+             (ensure-true
+              (sb-thread:wait-on-semaphore rest-write-ready :timeout 5))
+             (ensure-equal record-wire (funcall read-function nil))
+             (ensure-true
+              (sb-thread:wait-on-semaphore server-done :timeout 5))
+             (sb-thread:join-thread server-thread)
+             (setf server-thread nil)
+             (ensure-false server-error))
+        (when server-thread
+          (sb-thread:signal-semaphore send-rest)
+          (when client-stream
+            (ignore-errors (close client-stream :abort t)))
+          (when server-stream
+            (ignore-errors (close server-stream :abort t)))
+          (sb-thread:join-thread server-thread))
+        (when client-stream
+          (ignore-errors (close client-stream :abort t)))
+        (when server-stream
+          (ignore-errors (close server-stream :abort t)))
+        (when client-socket
+          (ignore-errors (sb-bsd-sockets:socket-close client-socket)))
+        (when accepted-socket
+          (ignore-errors (sb-bsd-sockets:socket-close accepted-socket)))
+        (ignore-errors (sb-bsd-sockets:socket-close listener)))))
   (deftest tls-client-driver-error-boundaries
   (let* ((raw (make-instance '%tls-server-test-stream :input (octets)))
          (stream (http-kit/tls::%make-http-tls-stream :client raw)))
