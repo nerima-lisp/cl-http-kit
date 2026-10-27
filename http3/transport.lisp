@@ -235,15 +235,19 @@ its blocking behavior.
 
 ACCEPT-PEER-UNIDIRECTIONAL-STREAM, when supplied, takes no arguments and
 returns one newly accepted peer-created unidirectional stream, or NIL when
-none is available. It must return without blocking. The native scheduler drains
-this callback after each poll and buffers an incomplete stream-type prefix
-until it can classify the stream. When omitted, the native scheduler does not
-discover peer-created unidirectional streams.
+none is available. It must satisfy the callback completion contract in the
+HTTP/3 API reference. The native scheduler drains this callback after each poll
+and buffers an incomplete stream-type prefix until it can classify the stream.
+When omitted, the native scheduler does not discover peer-created
+unidirectional streams.
 
 TRY-WRITE-STREAM, when supplied, is called like WRITE-STREAM and returns after
 submitting its octets. The native scheduler uses it for request frames and
 falls back to WRITE-STREAM when it is absent. WRITE-STREAM remains the callback
 for synchronous operations.
+
+All callbacks supplied here and all callbacks invoked during request processing
+follow the callback completion contract in the HTTP/3 API reference.
 
 These callbacks own QUIC, TLS, ALPN, socket, and event-loop behavior; this
 system supplies the HTTP/3 stream and codec layer."
@@ -1199,6 +1203,9 @@ becomes readable again."
             (error first-failure))
           t))))
   (defun close-http3-client (client &key condition)
+    "Close CLIENT and its open HTTP/3 streams. Cleanup waits for any active owner
+operation to return; callbacks are not interrupted. Its callbacks follow the
+callback completion contract in the HTTP/3 API reference."
     (unless (http3-client-p client)
       (%h3-transport-error "CLOSE-HTTP3-CLIENT requires an HTTP/3 client."
                            (type-of client)))
@@ -1411,11 +1418,14 @@ HTTP3-CLIENT-PEER-CONTROL-STATE."
         (setf (http3-client-peer-control-buffer client) buffer)
         (values events ended-p)))))
 (defun read-http3-control-stream (client &key timeout deadline)
-  "Read and apply one chunk from CLIENT’s peer control stream.
+  "Read and apply one chunk from CLIENT peer control stream.
 
 With the QUIC adapter, omitting TIMEOUT and DEADLINE may wait for peer data
-while the client remains open. CLOSE-HTTP3-CLIENT interrupts that wait with
-HTTP-KIT:HTTP-CONNECTION-ERROR."
+while the client remains open. Its owner loop checks for close only after
+the current wait step returns, including all callbacks it invokes, and exits
+with HTTP-KIT:HTTP-CONNECTION-ERROR. A callback that does not return
+prevents that check and can keep close waiting; see the callback completion
+contract in the HTTP/3 API reference."
   (unless (http3-client-p client)
     (%h3-transport-error
      "READ-HTTP3-CONTROL-STREAM requires an HTTP/3 client."
@@ -1673,12 +1683,14 @@ HTTP-KIT:HTTP-CONNECTION-ERROR."
   "Serve one incoming HTTP/3 control stream over QUIC callbacks.
 
 READ-STREAM is called as (STREAM &KEY TIMEOUT DEADLINE) and returns an octet
-vector and a FIN boolean.  CLOSE-STREAM, when supplied, is called as
-(STREAM &KEY CONDITION) exactly once.  The stream must begin with the
-HTTP/3 control-stream type prefix and a SETTINGS frame.  ON-SETTINGS receives
+vector and a FIN boolean. CLOSE-STREAM, when supplied, is called as
+(STREAM &KEY CONDITION) exactly once. The stream must begin with the
+HTTP/3 control-stream type prefix and a SETTINGS frame. ON-SETTINGS receives
 (SETTINGS STATE), while ON-GOAWAY, ON-MAX-PUSH-ID, and ON-CANCEL-PUSH receive
-(IDENTIFIER STATE).  ON-ERROR receives (CONDITION STATE) before the condition
-is re-signaled.  PROMISED-PUSH-IDS identifies pushes already sent to a client."
+(IDENTIFIER STATE). ON-ERROR receives (CONDITION STATE) before the condition
+is re-signaled. PROMISED-PUSH-IDS identifies pushes already sent to a client.
+All callbacks supplied here follow the callback completion contract in the
+HTTP/3 API reference."
   (unless (functionp read-stream)
     (%h3-transport-error
      "HTTP/3 control read-stream callback is required."
@@ -3148,7 +3160,9 @@ emitted field values and names.
 
 ON-PUSH-PROMISE receives the push ID and decoded request fields after the
 promise passes HTTP/3 request-field validation. ON-INFORMATION receives each
-validated informational response in wire order."
+validated informational response in wire order. ON-STREAM-OPEN and the request
+body, response, and QPACK callbacks follow the callback completion contract in
+the HTTP/3 API reference."
   (unless (http3-client-p client)
     (%h3-transport-error "SEND-HTTP3-REQUEST requires an HTTP/3 client."
                          (type-of client)))
@@ -3918,7 +3932,9 @@ validated informational response in wire order."
        request-body-length qpack-encoder-context qpack-decoder-context
        qpack-http3-decoder-context await-qpack (huffman-p nil) on-stream-open
        on-push-promise timeout deadline)
-  "Send REQUEST and deliver its response to ON-SUCCESS."
+  "Send REQUEST and deliver its response to ON-SUCCESS. ON-SUCCESS, ON-ERROR, and
+all callbacks forwarded to SEND-HTTP3-REQUEST follow the callback completion
+contract in the HTTP/3 API reference."
   (http-kit::%call-http-operation/cps
    (lambda ()
      (send-http3-request
@@ -4377,16 +4393,17 @@ can be consumed only once."
        (max-header-bytes 65536) (huffman-p nil) timeout deadline)
   "Promise and send one HTTP/3 server push over caller-supplied QUIC callbacks.
 
-REQUEST-STREAM is the client-initiated stream that caused the push.  The
+REQUEST-STREAM is the client-initiated stream that caused the push. The
 PUSH_PROMISE is written there before OPEN-STREAM is called for a new
-unidirectional push stream.  CONTROL-STATE must be the state populated by
-SERVE-HTTP3-CONTROL-STREAM for a client peer.  PUSH-ID defaults to the lowest
-unused ID.  PROMISED-REQUEST must be GET or HEAD without content or trailers.
+unidirectional push stream. CONTROL-STATE must be the state populated by
+SERVE-HTTP3-CONTROL-STREAM for a client peer. PUSH-ID defaults to the lowest
+unused ID. PROMISED-REQUEST must be GET or HEAD without content or trailers.
 
 SERIALIZE protects push-ID allocation, the PUSH_PROMISE write, and its state
-commit.  On failure after opening the push stream, CANCEL-STREAM is called with
-H3_REQUEST_CANCELLED when supplied.  CLOSE-STREAM is called exactly once for
-an opened push stream.  Returns the push ID and RESPONSE."
+commit. On failure after opening the push stream, CANCEL-STREAM is called with
+H3_REQUEST_CANCELLED when supplied. CLOSE-STREAM is called exactly once for
+an opened push stream. Returns the push ID and RESPONSE. All callbacks supplied
+here follow the callback completion contract in the HTTP/3 API reference."
   (unless (http-kit:http-request-p promised-request)
     (%h3-transport-error "SEND-HTTP3-PUSH requires an HTTP request."
                          (type-of promised-request)))
@@ -4778,7 +4795,9 @@ HTTP responses sent before the final response. ON-BODY-CHUNK, when supplied,
 receives each request DATA payload. If COLLECT-BODY-P is false, handlers receive
 an empty request body while the body-length and Content-Length checks still
 use all received bytes. ON-ERROR receives (CONDITION REQUEST), where REQUEST
-is NIL if parsing failed before the request model was constructed."
+is NIL if parsing failed before the request model was constructed. All callbacks
+and the handler follow the callback completion contract in the HTTP/3 API
+reference."
   (dolist (callback (list handler read-stream write-stream))
     (unless (functionp callback)
       (%h3-transport-error
@@ -5011,7 +5030,8 @@ is NIL if parsing failed before the request model was constructed."
 OPEN-CLIENT receives the request and TIMEOUT and DEADLINE keyword arguments,
 and must return an open HTTP3-CLIENT. Connections are keyed by request scheme,
 host, and port unless CONNECTION-KEY is supplied when sending. The manager is
-owner-thread and non-reentrant."
+owner-thread and non-reentrant. OPEN-CLIENT and CLOCK-FUNCTION follow the
+callback completion contract in the HTTP/3 API reference."
   (unless (functionp open-client)
     (%h3-transport-error
      "MAKE-HTTP3-CONNECTION-MANAGER requires an open-client callback."
@@ -5174,7 +5194,9 @@ owner-thread and non-reentrant."
        qpack-encoder-context qpack-decoder-context qpack-http3-decoder-context
        await-qpack (huffman-p nil) on-stream-open on-push-promise
        timeout deadline)
-  "Send REQUEST through a reusable HTTP/3 connection manager."
+  "Send REQUEST through a reusable HTTP/3 connection manager. User callbacks
+forwarded to SEND-HTTP3-REQUEST and the manager OPEN-CLIENT callback follow the
+callback completion contract in the HTTP/3 API reference."
   (when (or proxy
             (and proxy-plan
                  (not
@@ -5227,7 +5249,9 @@ owner-thread and non-reentrant."
         (error condition)))))
 
 (defun make-http3-connection-manager-transport (manager)
-  "Return a high-level client transport backed by MANAGER."
+  "Return a high-level client transport backed by MANAGER. Request callbacks
+accepted by the returned transport follow the callback completion contract in
+the HTTP/3 API reference."
   (unless (http3-connection-manager-p manager)
     (%h3-transport-error
      "MAKE-HTTP3-CONNECTION-MANAGER-TRANSPORT requires a manager."

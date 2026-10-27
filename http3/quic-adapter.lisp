@@ -574,10 +574,18 @@
 TLS trust anchors and all other QUIC/TLS options remain caller-owned and are
 passed to CL-QUIC-KIT:MAKE-QUIC-CLIENT. HTTP3-OPTIONS is a property list of
 keyword arguments appended to MAKE-HTTP3-CLIENT, allowing HTTP/3 limits and
-settings to be selected without exposing QUIC implementation details."
-  (unless (and (realp poll-interval) (not (minusp poll-interval)))
+settings to be selected without exposing QUIC implementation details.
+
+POLL-INTERVAL defaults to zero and must be a real value from zero through
+1/10 seconds, inclusive. Values outside that range are rejected. The 100 ms
+cap limits the no-data sleep before the next close check. See the HTTP/3
+callback completion contract in the API reference; it applies to callbacks
+supplied through this constructor and HTTP3-OPTIONS."
+  (unless (and (realp poll-interval)
+               (not (minusp poll-interval))
+               (<= poll-interval 1/10))
     (%http3-quic-adapter-error
-     "HTTP/3 QUIC adapter poll-interval must be a non-negative real."
+     "HTTP/3 QUIC adapter poll-interval must be a real from 0 through 1/10 seconds."
      poll-interval))
   (unless (and (stringp hostname) (plusp (length hostname)))
     (%http3-quic-adapter-error
@@ -591,40 +599,40 @@ settings to be selected without exposing QUIC implementation details."
   (let* ((stream-prefixes (make-hash-table :test #'eq))
          (stream-prefix-sent (make-hash-table :test #'eq))
          (adapter
-           (%make-http3-quic-adapter
-            :stream-prefixes stream-prefixes
-            :stream-prefix-sent stream-prefix-sent
-            :max-peer-unidirectional-streams
-            (getf http3-options :max-peer-unidirectional-streams
-                  +http3-default-max-peer-unidirectional-streams+)
-            :poll-interval poll-interval))
+          (%make-http3-quic-adapter
+           :stream-prefixes stream-prefixes
+           :stream-prefix-sent stream-prefix-sent
+           :max-peer-unidirectional-streams
+           (getf http3-options :max-peer-unidirectional-streams
+                 +http3-default-max-peer-unidirectional-streams+)
+           :poll-interval poll-interval))
          (quic-client
-           (%http3-quic-adapter-call-with-owner
-            adapter
-            (lambda ()
-              (%http3-quic-adapter-connect
-               (lambda ()
-                 (cl-quic-kit:make-quic-client
-                  :connection connection
-                  :udp-socket udp-socket
-                  :tls-boundary tls-boundary
-                  :tls-driver tls-driver
-                  :local-connection-id local-connection-id
-                  :destination-connection-id destination-connection-id
-                  :server-host server-host
-                  :server-port server-port
-                  :hostname hostname
-                  :alpn alpn
-                  :transport-parameters transport-parameters
-                  :tls-key-exchange tls-key-exchange
-                  :tls-provider tls-provider
-                  :tls-trust-anchors tls-trust-anchors
-                  :tls-verify-signature tls-verify-signature
-                  :now-fn (or now-fn #'%http3-quic-adapter-now)
-                  :tls-signature-algorithms tls-signature-algorithms
-                  :idle-timeout idle-timeout
-                  :io-write io-write
-                  :on-close on-close)))))))
+          (%http3-quic-adapter-call-with-owner
+           adapter
+           (lambda ()
+             (%http3-quic-adapter-connect
+              (lambda ()
+                (cl-quic-kit:make-quic-client
+                 :connection connection
+                 :udp-socket udp-socket
+                 :tls-boundary tls-boundary
+                 :tls-driver tls-driver
+                 :local-connection-id local-connection-id
+                 :destination-connection-id destination-connection-id
+                 :server-host server-host
+                 :server-port server-port
+                 :hostname hostname
+                 :alpn alpn
+                 :transport-parameters transport-parameters
+                 :tls-key-exchange tls-key-exchange
+                 :tls-provider tls-provider
+                 :tls-trust-anchors tls-trust-anchors
+                 :tls-verify-signature tls-verify-signature
+                 :now-fn (or now-fn #'%http3-quic-adapter-now)
+                 :tls-signature-algorithms tls-signature-algorithms
+                 :idle-timeout idle-timeout
+                 :io-write io-write
+                 :on-close on-close)))))))
     (setf (http3-quic-adapter-quic-client adapter) quic-client)
     (%http3-quic-adapter-initialize
      adapter
@@ -641,11 +649,11 @@ settings to be selected without exposing QUIC implementation details."
               :open-stream
               (lambda (request &key stream-type timeout deadline)
                 (let ((stream
-                        (cl-quic-kit:client-open-stream
-                         quic-client request
-                         :stream-type stream-type
-                         :timeout timeout
-                         :deadline deadline)))
+                       (cl-quic-kit:client-open-stream
+                        quic-client request
+                        :stream-type stream-type
+                        :timeout timeout
+                        :deadline deadline)))
                   (setf (gethash stream stream-prefixes)
                         (case stream-type
                           (:control (http3-control-stream-prefix))
@@ -658,15 +666,15 @@ settings to be selected without exposing QUIC implementation details."
               (lambda (stream octets &key fin-p timeout deadline)
                 (let* ((prefix (gethash stream stream-prefixes))
                        (payload
-                         (if (and prefix
-                                  (not (gethash stream stream-prefix-sent))
-                                  (>= (length octets) (length prefix))
-                                  (equalp prefix
-                                          (subseq octets 0 (length prefix))))
-                             (progn
-                               (setf (gethash stream stream-prefix-sent) t)
-                               (subseq octets (length prefix)))
-                             octets)))
+                        (if (and prefix
+                                 (not (gethash stream stream-prefix-sent))
+                                 (>= (length octets) (length prefix))
+                                 (equalp prefix
+                                         (subseq octets 0 (length prefix))))
+                            (progn
+                              (setf (gethash stream stream-prefix-sent) t)
+                              (subseq octets (length prefix)))
+                          octets)))
                   (prog1
                       (cl-quic-kit:client-write-stream
                        quic-client stream payload
@@ -685,8 +693,8 @@ settings to be selected without exposing QUIC implementation details."
               :close-stream
               (lambda (stream &key condition)
                 (unwind-protect
-                     (cl-quic-kit:client-close-stream
-                      quic-client stream :condition condition)
+                    (cl-quic-kit:client-close-stream
+                     quic-client stream :condition condition)
                   (remhash stream stream-prefixes)
                   (remhash stream stream-prefix-sent)))
               :on-control-stream-ready
@@ -701,20 +709,20 @@ settings to be selected without exposing QUIC implementation details."
               (lambda (stream &key timeout deadline)
                 (declare (ignore timeout deadline))
                 (cond
-                  ((plusp (cl-quic-kit:stream-readable-bytes stream))
-                   (multiple-value-bind (chunk fin-p)
-                       (cl-quic-kit:client-read-stream quic-client stream)
-                     (cond
-                       ((and chunk (plusp (length chunk)))
-                        (values chunk fin-p :data))
-                       (fin-p
-                        (values nil t :fin))
-                       (t
-                        (values nil nil :would-block)))))
-                  ((cl-quic-kit:stream-finished-p stream)
-                   (values nil t :fin))
-                  (t
-                   (values nil nil :would-block))))
+                 ((plusp (cl-quic-kit:stream-readable-bytes stream))
+                  (multiple-value-bind (chunk fin-p)
+                      (cl-quic-kit:client-read-stream quic-client stream)
+                    (cond
+                     ((and chunk (plusp (length chunk)))
+                      (values chunk fin-p :data))
+                     (fin-p
+                      (values nil t :fin))
+                     (t
+                      (values nil nil :would-block)))))
+                 ((cl-quic-kit:stream-finished-p stream)
+                  (values nil t :fin))
+                 (t
+                  (values nil nil :would-block))))
               :timeout timeout
               :deadline deadline
               (append
@@ -732,16 +740,16 @@ settings to be selected without exposing QUIC implementation details."
                 :accept-peer-unidirectional-stream
                 (lambda ()
                   (let ((pending
-                          (http3-quic-adapter-pending-peer-unidirectional-streams
-                           adapter)))
+                         (http3-quic-adapter-pending-peer-unidirectional-streams
+                          adapter)))
                     (if pending
                         (prog1 (car pending)
                           (setf
                            (http3-quic-adapter-pending-peer-unidirectional-streams
                             adapter)
                            (cdr pending)))
-                        (cl-quic-kit:client-accept-peer-stream
-                         quic-client :type :unidirectional)))))
+                      (cl-quic-kit:client-accept-peer-stream
+                       quic-client :type :unidirectional)))))
                http3-options
                (list
                 :close-connection
@@ -762,7 +770,9 @@ settings to be selected without exposing QUIC implementation details."
        adapter))))
 
 (defun http3-quic-adapter-start (adapter)
-  "Start ADAPTER if it has not already been started."
+  "Start ADAPTER if it has not already been started. Any callback reached through
+the QUIC client follows the callback completion contract in the HTTP/3 API
+reference."
   (unless (http3-quic-adapter-p adapter)
     (%http3-quic-adapter-error "START requires an HTTP/3 QUIC adapter."
                                (type-of adapter)))
@@ -780,7 +790,9 @@ settings to be selected without exposing QUIC implementation details."
   adapter)
 
 (defun http3-quic-adapter-poll (adapter &optional at)
-  "Drive ADAPTER's QUIC client once and return the adapter."
+  "Drive the QUIC client used by ADAPTER once and return the adapter. Any
+callback reached while polling follows the callback completion contract in the
+HTTP/3 API reference."
   (unless (http3-quic-adapter-p adapter)
     (%http3-quic-adapter-error "POLL requires an HTTP/3 QUIC adapter."
                                (type-of adapter)))
@@ -811,7 +823,8 @@ settings to be selected without exposing QUIC implementation details."
   adapter)
 
 (defun close-http3-quic-adapter (adapter &key (error-code :no-error) reason)
-  "Close ADAPTER's HTTP/3 streams and its underlying QUIC client."
+  "Close ADAPTER HTTP/3 streams and its underlying QUIC client. Its cleanup
+callbacks follow the callback completion contract in the HTTP/3 API reference."
   (unless (http3-quic-adapter-p adapter)
     (%http3-quic-adapter-error "CLOSE requires an HTTP/3 QUIC adapter."
                                (type-of adapter)))

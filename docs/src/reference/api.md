@@ -790,17 +790,43 @@ count.
 
 ### HTTP/3 client
 
+#### Callback completion contract
+
+Every user-supplied callback passed through MAKE-HTTP3-CLIENT,
+MAKE-HTTP3-QUIC-ADAPTER, HTTP/3 request and connection-manager APIs, or
+caller-supplied HTTP/3 stream boundaries must not block indefinitely: it must
+return without blocking or return within a finite time. This includes clock
+functions, polling, stream open/read/write and write-pending callbacks,
+serializers, accept/cancel/close callbacks, TLS provider, key-exchange and
+signature-verification callbacks, socket I/O callbacks, request-body producers,
+response callbacks, and user handlers invoked during HTTP/3 processing. The
+QUIC adapter's timeoutless read and flow-control waits are operation-level
+waits: they may remain pending while the client is open, but their owner loops
+check for close only after the current wait step returns, including every
+callback it invokes. The client does not interrupt callback code. If any
+callback invocation does not return, a close operation waiting on it does not
+complete. Close liveness is guaranteed only while every callback it depends on
+satisfies this contract.
+
 MAKE-HTTP3-CLIENT opens the local control stream and writes SETTINGS using
 caller-supplied OPEN-STREAM, WRITE-STREAM, and READ-STREAM callbacks. The
-callbacks receive stream type, timeout, deadline, and FIN options as
-appropriate. MAX-HEADER-BYTES and MAX-FIELDS bound decoded response field
-sections. CLOSE-HTTP3-CLIENT closes the client's open HTTP/3 streams.
+OPEN-STREAM callback returns a stream and may return its numeric stream ID as a
+second value. READ-STREAM returns an octet vector, optionally with a FIN boolean
+as a second value, or NIL when the stream has ended. The callbacks receive
+stream type, timeout, deadline, and FIN options as appropriate. SERIALIZE
+defaults to calling its thunk directly; supply it when backend operations need
+serialization. MAX-HEADER-BYTES and MAX-FIELDS bound decoded response field
+sections. CLOSE-HTTP3-CLIENT closes all open streams owned by the client.
+Callbacks used by construction and later request processing follow the
+callback completion contract above.
 
-With the QUIC adapter, a WRITE-STREAM callback that omits both TIMEOUT and
-DEADLINE may wait for peer flow-control credit. READ-HTTP3-CONTROL-STREAM may
-likewise wait for peer control-stream data when both are omitted. Both waits can
-remain pending while the client is open. CLOSE-HTTP3-CLIENT interrupts either
-wait with `http-kit:http-connection-error`, allowing close to finish.
+With the QUIC adapter, an HTTP/3 write that omits both TIMEOUT and DEADLINE may
+wait for peer flow-control credit. READ-HTTP3-CONTROL-STREAM may likewise wait
+for peer control-stream data when both are omitted. These operation-level waits
+can remain pending while the client is open. Their owner loops check for close
+after the current wait step returns, including every callback it invokes, then
+exit with `http-kit:http-connection-error`. If a callback itself does not
+return, it prevents that close check and close does not complete.
 
 ATTACH-HTTP3-PEER-CONTROL-STREAM accepts one incoming control stream while the
 client is open. Closing retains the attachment identity; a closed client
@@ -814,17 +840,19 @@ RECEIVE-HTTP3-PUSH and :UNKNOWN for an extension stream whose remaining bytes
 the surrounding QUIC transport must discard. Prefix bytes consumed during
 classification are replayed to the corresponding HTTP/3 reader.
 PROCESS-HTTP3-PEER-UNIDIRECTIONAL-STREAM additionally applies the first
-available control or QPACK input and returns its stream kind, effects, and end
-status. A connection event loop can call the matching READ-HTTP3-CONTROL-STREAM
-or QPACK reader on later readiness notifications. Push and unknown extension
-streams remain caller-owned.
+available control or QPACK input and returns three values: the stream kind, a
+list of control or QPACK effects, and whether the processed input ended. Push
+and unknown extension streams return an empty effect list; pass push streams to
+RECEIVE-HTTP3-PUSH. A connection event loop can call the matching
+READ-HTTP3-CONTROL-STREAM or QPACK reader on later readiness notifications.
+Push and unknown extension streams remain caller-owned.
 
 For native scheduler operation, supply POLL-FUNCTION, TRY-READ-STREAM, and
 STREAM-WRITE-PENDING-P together. POLL-FUNCTION takes no arguments;
 TRY-READ-STREAM returns data, FIN, or would-block without waiting, and
 STREAM-WRITE-PENDING-P reports whether submitted bytes remain queued. The
-optional ACCEPT-PEER-UNIDIRECTIONAL-STREAM callback must also return without
-blocking. The scheduler calls it after each poll, buffers incomplete stream
+optional ACCEPT-PEER-UNIDIRECTIONAL-STREAM callback follows the callback
+completion contract above. The scheduler calls it after each poll, buffers incomplete stream
 type and push-ID prefixes, and reads peer control and QPACK streams as they
 become readable. Push streams with complete stream-type and push-ID prefixes
 are queued for DEQUEUE-HTTP3-PENDING-PUSH, which returns the stream and push ID without
@@ -834,13 +862,15 @@ CANCEL-STREAM is available, or drained through FIN.
 
 SEND-HTTP3-REQUEST takes an HTTP request and optional ON-BODY-CHUNK,
 ON-INFORMATION, COLLECT-BODY-P, MAX-HEADER-BYTES, MAX-FIELDS, MAX-BODY-BYTES,
-REQUEST-BODY-FUNCTION, REQUEST-BODY-LENGTH, QPACK-ENCODER-TABLE,
-QPACK-DECODER-TABLE, HUFFMAN-P, TIMEOUT, and DEADLINE arguments. A request-body
+REQUEST-BODY-FUNCTION, REQUEST-BODY-LENGTH, QPACK-ENCODER-CONTEXT,
+QPACK-DECODER-CONTEXT, QPACK-HTTP3-DECODER-CONTEXT, AWAIT-QPACK, HUFFMAN-P,
+ON-STREAM-OPEN, ON-PUSH-PROMISE, TIMEOUT, and DEADLINE arguments. A request-body
 producer receives the client's maximum DATA payload
 size and returns non-empty octet arrays until NIL; a declared length is
 enforced and emitted as Content-Length. It opens a request stream, writes
 request headers, DATA, and trailers, then parses the response. The QPACK tables
-are caller-owned and are not synchronized automatically. Public accessors
+are caller-owned when supplied; otherwise the client uses its connection-owned
+contexts. Public accessors
 include `http3-client-open-p`; callback slots `http3-client-open-stream`,
 `http3-client-write-stream`, `http3-client-read-stream`,
 `http3-client-close-stream`, and `http3-client-cancel-stream`; limits
@@ -856,7 +886,8 @@ include `http3-client-open-p`; callback slots `http3-client-open-stream`,
 MAKE-HTTP3-CLIENT also accepts MAX-REQUEST-STREAMS,
 MAX-PEER-UNIDIRECTIONAL-STREAMS, MAX-STATE-BYTES,
 QPACK-MAX-INSTRUCTION-BYTES, and QPACK-MAX-BUFFER-BYTES. Their finite defaults
-are 100, 16, 4 MiB, 65,536 bytes, and 262,144 bytes respectively. The
+are 100 active request streams, 16 accepted peer unidirectional streams, 4 MiB
+of buffered HTTP/3 state, 65,536 bytes, and 262,144 bytes respectively. The
 client, server-stream, push, and connection-manager body-limit entry points
 default MAX-BODY-BYTES to the core 16 MiB default; an explicitly supplied NIL
 disables that limit for the call.
@@ -865,7 +896,9 @@ disables that limit for the call.
 max-connection-age clock-function)` pools clients by request origin. Its
 MAX-CONNECTIONS policy evicts the least recently used origin, while
 IDLE-TIMEOUT and MAX-CONNECTION-AGE expire retained clients using a monotonic
-CLOCK-FUNCTION. `send-http3-request-over-connection-manager (manager request
+CLOCK-FUNCTION. The manager is owner-thread and non-reentrant; manager calls
+must stay on that owner thread and callbacks must not re-enter it.
+`send-http3-request-over-connection-manager (manager request
 &key connection-key on-body-chunk on-information collect-body-p
 max-header-bytes max-fields max-body-bytes request-body-function
 request-body-length proxy proxy-plan qpack-encoder-context
@@ -878,13 +911,19 @@ validated 1xx response in wire order; proxy routing is rejected rather than sile
 ignored. Per-request MAX-HEADER-BYTES and MAX-FIELDS values can tighten but
 never weaken the retained client's configured limits.
 CLOSE-HTTP3-CONNECTION-MANAGER closes all retained clients and rejects
-subsequent sends.
+subsequent sends. Callbacks supplied to the manager, request operations, and
+returned transport callback follow the callback completion contract above.
 
-MAKE-HTTP3-QUIC-ADAPTER connects the HTTP/3 client boundary to a caller-owned
-cl-quic-kit client. Its HTTP3-OPTIONS argument is a flat property list of
-MAKE-HTTP3-CLIENT keyword arguments; malformed or non-keyword lists are
-rejected before the QUIC client is created. QUIC, TLS, certificate, socket,
-and shutdown policy remain caller-owned.
+MAKE-HTTP3-QUIC-ADAPTER creates an HTTP/3 client and a cl-quic-kit client from
+caller-supplied connection, socket, TLS, and QUIC options. Its HTTP3-OPTIONS
+argument is a flat property list of MAKE-HTTP3-CLIENT keyword arguments;
+malformed or non-keyword lists are rejected before the QUIC client is created.
+QUIC, TLS, certificate, socket configuration, and shutdown policy remain
+caller-controlled. Callbacks supplied through this
+constructor and HTTP3-OPTIONS follow the callback completion contract above.
+POLL-INTERVAL defaults to 0 and must be a real value from 0 through 1/10
+seconds, inclusive; values outside that range are rejected. The 100 ms cap
+limits the no-data sleep before the next close check.
 HOSTNAME must be a non-empty string identifying the origin for TLS SNI and
 certificate verification. SERVER-HOST and SERVER-PORT select the UDP peer,
 which can differ from that origin. Native sockets require a numeric IPv4
@@ -926,7 +965,8 @@ qpack-decoder-context stream-id await-qpack qpack-serialize qpack-encoder-table
 huffman-p enable-connect-p timeout deadline on-error). The session owns
 HTTP/3 framing, QPACK field sections, request-body limits, and response
 framing; the caller owns QPACK instruction-stream synchronization, QUIC, TLS,
-ALPN, and connection-level stream dispatch.
+ALPN, and connection-level stream dispatch. Its callbacks and handler follow
+the callback completion contract above.
 
 ## Native network package
 
