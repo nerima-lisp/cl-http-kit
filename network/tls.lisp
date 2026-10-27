@@ -557,16 +557,60 @@ driver's transport callbacks."
                        deadline))
           (%tls-timeout))))
     nil)
+  (progn
+    #+sbcl
+    (defun %tls-call-with-io-deadline (thunk remaining)
+      (if remaining
+          (handler-case
+              (sb-sys:with-deadline (:seconds remaining)
+                (funcall thunk))
+            (sb-sys:deadline-timeout ()
+              (%tls-timeout)))
+          (funcall thunk)))
+    #-sbcl
+    (defun %tls-call-with-io-deadline (thunk remaining)
+      (declare (ignore remaining))
+      (funcall thunk))
+    (defun %call-with-tls-io-deadline (thunk deadline clock-function)
+      (let ((remaining (and deadline (- deadline (funcall clock-function)))))
+        (when (and remaining (<= remaining 0))
+          (%tls-timeout))
+        (let ((result (%tls-call-with-io-deadline thunk remaining)))
+          (when (and deadline
+                     (>= (funcall clock-function) deadline))
+            (%tls-timeout))
+          result))))
   (defun %tls-server-write-record (state bytes)
-    (handler-case
-        (let ((stream (http-tls-server-state-transport-stream state)))
-          (%tls-server-check-handshake-deadline state)
-          (write-sequence bytes stream)
-          (%tls-server-check-handshake-deadline state)
-          (finish-output stream))
-      (http-timeout (condition) (error condition))
-      (error ()
-        (%tls-server-fail "TLS transport write failed." :transport-error))))
+    (let ((stream (http-tls-server-state-transport-stream state)))
+      (flet ((write-with-deadline (thunk)
+               (if (http-tls-server-state-handshake-complete-p state)
+                   (funcall thunk)
+                   (%call-with-tls-io-deadline
+                    thunk
+                    (http-tls-server-state-deadline state)
+                    (http-tls-server-state-clock-function state))))
+             (abort-transport ()
+               (http-kit::%with-http-cleanup
+                 (when (open-stream-p stream)
+                   (close stream :abort t)))))
+        (handler-case
+            (progn
+              (write-with-deadline
+               (lambda () (write-sequence bytes stream)))
+              (write-with-deadline
+               (lambda () (finish-output stream))))
+          (http-timeout (condition)
+            (abort-transport)
+            (error condition))
+          #+sbcl (sb-bsd-sockets:operation-timeout-error ()
+            (abort-transport)
+            (if (http-tls-server-state-handshake-complete-p state)
+                (%tls-server-fail "TLS transport write failed."
+                                  :transport-error)
+                (%tls-timeout)))
+          (error ()
+            (%tls-server-fail "TLS transport write failed." :transport-error))))))
+
 
   (defun %tls-server-content-type (name)
     (cond ((eq name :handshake) cl-tls-kit:+tls-content-type-handshake+)

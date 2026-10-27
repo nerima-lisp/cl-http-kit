@@ -196,6 +196,9 @@
                        (handler-case
                            (multiple-value-bind (stream address port)
                                (accept-http-tcp-stream listener :timeout 5)
+                             (ensure-true
+                              (sb-bsd-sockets:non-blocking-mode
+                               (http-kit/network::%network-stream-socket stream)))
                              (setf peer-address address
                                    peer-port port)
                              (let ((request-wire

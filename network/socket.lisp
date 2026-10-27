@@ -268,6 +268,8 @@ stream's read timeout after a connection is accepted."
                                          clock-function)
                (declare (ignore ignored-address))
                (setf accepted-socket socket)
+               ;; FD stream writes need a nonblocking descriptor to honor deadlines.
+               (setf (sb-bsd-sockets:non-blocking-mode socket) t)
                (let ((remaining (%network-remaining effective-deadline
                                                       clock-function
                                                       :accept)))
