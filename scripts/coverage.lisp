@@ -144,8 +144,8 @@
        (*coverage-pending-proofs* (make-hash-table :test 'equal))
        (*coverage-source-paths* nil)
        (http-coverage-child-merge:*collector*
-         (when (http-coverage-child-merge:supported-runtime-p)
-           (http-coverage-child-merge:make-collector)))
+        (when (http-coverage-child-merge:supported-runtime-p)
+          (http-coverage-child-merge:make-collector)))
        (http-coverage-normalization:*proofs* (make-hash-table :test 'equal)))
   (unless (coverage-run-command-p arguments)
     (error "Coverage requires a non-watch test run with --coverage."))
@@ -154,93 +154,94 @@
     (format *error-output*
             "Child coverage merge: unsupported runtime; native raw coverage retained.~%"))
   (let ((status
-          (http-coverage-normalization:call-with-deferred-projection
-           http-coverage-normalization:*proofs*
-           (lambda (install)
-             (cl-weave/cli:run-coverage
-              arguments
-              :run-options
-              (list :coverage-reset nil
-                    :location-filter (coverage-test-location-paths))
-              :around-input-loading
-              (lambda (load-inputs)
-                (setf *coverage-source-paths*
-                      (coverage-source-paths arguments))
-                ;; Reset before loading: load-time forms must remain part of the measurement.
-                (sb-cover:reset-coverage)
-                (dolist (operation '(asdf:compile-op asdf:load-op))
-                  (when (find-method #'asdf:perform '(:around)
-                                     (list (find-class operation)
-                                           (find-class 'asdf:cl-source-file))
-                                     nil)
-                    (error "Coverage loading would replace an existing ASDF method.")))
-                (let ((methods nil))
-                  (unwind-protect
-                       (progn
-                         (push
-                          (eval
-                           '(defmethod asdf:perform :around
-                                ((operation asdf:compile-op)
-                                 (component asdf:cl-source-file))
-                              (let* ((pathname (asdf:component-pathname component))
-                                     (proof
-                                       (when (coverage-source-p pathname)
-                                         (http-coverage-normalization:capture-source
-                                          pathname))))
-                                (multiple-value-prog1 (call-next-method)
-                                  (when proof
-                                    (setf
-                                     (gethash (namestring (truename pathname))
-                                              *coverage-pending-proofs*)
-                                     proof)))))
-                          methods)
-                         ;; SBCL stores coverage code weakly; retain records through reporting.
-                         (push
-                          (eval
-                           '(defmethod asdf:perform :around
-                                ((operation asdf:load-op)
-                                 (component asdf:cl-source-file))
-                              (let* ((previous (cdr sb-c::*code-coverage-info*))
-                                     (pathname (asdf:component-pathname component))
-                                     (load-record
-                                       (http-coverage-child-merge:capture-load
-                                        component)))
-                                (sb-sys:without-gcing
-                                  (multiple-value-prog1 (call-next-method)
-                                    (loop for tail on (cdr sb-c::*code-coverage-info*)
-                                          until (eq tail previous)
-                                          do (let ((vector (car tail)))
-                                               (dotimes
-                                                   (index
-                                                    (sb-int:weak-vector-len vector))
-                                                 (let ((code
-                                                         (sb-int:weak-vector-ref
-                                                          vector index)))
-                                                   (when code
-                                                     (push code
-                                                           *coverage-code-roots*))))))
-                                    (http-coverage-child-merge:record-load
-                                     load-record *coverage-code-roots*)
-                                    (let ((proof
-                                            (gethash
-                                             (namestring (truename pathname))
-                                             *coverage-pending-proofs*)))
-                                      (when (and proof
-                                                 (coverage-source-p pathname))
-                                        (http-coverage-normalization:seal-source
-                                         pathname proof))))))))
-                          methods)
-                         (funcall load-inputs))
-                    (dolist (method methods)
-                      (remove-method #'asdf:perform method))))
-              :around-coverage-consumer
-              (lambda (kind consume)
-                (declare (ignore kind))
-                (http-coverage-child-merge:merge-pending)
-                (format *error-output*
-                        "Coverage declaration projection: ~D expressions.~%"
-                        (funcall install))
-                (funcall consume)))))))
-    ;; A failed coverage consumer must not be hidden by reporter cleanup.
+         (http-coverage-normalization:call-with-deferred-projection
+          http-coverage-normalization:*proofs*
+          (lambda (install)
+            (cl-weave/cli:run-coverage
+             arguments
+             :run-options
+             (list :coverage-reset nil
+                   :location-filter (coverage-test-location-paths))
+             :around-input-loading
+             (lambda (load-inputs)
+               (setf *coverage-source-paths*
+                     (coverage-source-paths arguments))
+               ;; Reset before loading: load-time forms must remain part of the measurement.
+               (sb-cover:reset-coverage)
+               (dolist (operation '(asdf:compile-op asdf:load-op))
+                 (when (find-method #'asdf:perform '(:around)
+                                    (list (find-class operation)
+                                          (find-class 'asdf:cl-source-file))
+                                    nil)
+                   (error "Coverage loading would replace an existing ASDF method.")))
+               (let ((methods nil))
+                 (unwind-protect
+                     (progn
+                       (push
+                        (eval
+                         '(defmethod asdf:perform :around
+                            ((operation asdf:compile-op)
+                             (component asdf:cl-source-file))
+                            (let* ((pathname (asdf:component-pathname component))
+                                   (proof
+                                    (when (coverage-source-p pathname)
+                                      (http-coverage-normalization:capture-source
+                                       pathname))))
+                              (multiple-value-prog1 (call-next-method)
+                                (when proof
+                                  (setf
+                                   (gethash (namestring (truename pathname))
+                                            *coverage-pending-proofs*)
+                                   proof))))))
+                        methods
+                        )
+                       ;; SBCL stores coverage code weakly; retain records through reporting.
+                       (push
+                        (eval
+                         '(defmethod asdf:perform :around
+                            ((operation asdf:load-op)
+                             (component asdf:cl-source-file))
+                            (let* ((previous (cdr sb-c::*code-coverage-info*))
+                                   (pathname (asdf:component-pathname component))
+                                   (load-record
+                                    (http-coverage-child-merge:capture-load
+                                     component)))
+                              (sb-sys:without-gcing
+                               (multiple-value-prog1 (call-next-method)
+                                 (loop for tail on (cdr sb-c::*code-coverage-info*)
+                                       until (eq tail previous)
+                                       do (let ((vector (car tail)))
+                                            (dotimes
+                                                (index
+                                                 (sb-int:weak-vector-len vector))
+                                              (let ((code
+                                                     (sb-int:weak-vector-ref
+                                                      vector index)))
+                                                (when code
+                                                  (push code
+                                                        *coverage-code-roots*))))))
+                                 (http-coverage-child-merge:record-load
+                                  load-record *coverage-code-roots*)
+                                 (let ((proof
+                                        (gethash
+                                         (namestring (truename pathname))
+                                         *coverage-pending-proofs*)))
+                                   (when (and proof
+                                              (coverage-source-p pathname))
+                                     (http-coverage-normalization:seal-source
+                                      pathname proof))))))))
+                        methods)
+                       (funcall load-inputs))
+                   (dolist (method methods)
+                     (remove-method #'asdf:perform method)))))
+             :around-coverage-consumer (lambda (kind consume)
+                                         (declare (ignore kind))
+                                         (http-coverage-child-merge:merge-pending)
+                                         (format *error-output*
+                                                 "Coverage declaration projection: ~D expressions.~%"
+                                                 (funcall install))
+                                         (funcall consume)))))
+         ;; A failed coverage consumer must not be hidden by reporter cleanup.
+         ))
     (http-coverage-child-merge:merge-pending)
-    (uiop:quit status)))))
+    (uiop:quit status)))
