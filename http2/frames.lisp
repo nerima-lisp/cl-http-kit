@@ -19,7 +19,16 @@
     (frame-payload-position 0)
     stream-eof-p)
 
-  (defgeneric %h2-reader-read-available (stream count timeout))
+  (progn
+    (defgeneric %h2-reader-read-available (stream count timeout))
+    (defgeneric %h2-reader-stateful-input-p (stream))
+    (defmethod %h2-reader-stateful-input-p ((stream stream))
+      (declare (ignore stream))
+      nil)
+    #+sbcl
+    (defmethod %h2-reader-stateful-input-p ((stream sb-sys:fd-stream))
+      (declare (ignore stream))
+      t))
 
   (defmethod %h2-reader-read-available ((stream stream) count timeout)
     (let ((buffer (make-array count :element-type (quote (unsigned-byte 8))))
@@ -59,7 +68,49 @@
                   ((plusp position) :data)
                   (eof-p :eof)
                   (t :would-block))
-                eof-p)))))
+                eof-p))))
+  #+sbcl
+  (defmethod %h2-reader-read-available
+      ((stream sb-sys:fd-stream) count timeout)
+    ;; A timed read can consume an octet before SBCL delivers the timeout.
+    ;; Wait for readiness first, then save each octet without async interruption.
+    (check-type count (integer 0 *))
+    (check-type timeout (or null (real 0 *)))
+    (let ((buffer (make-array (min count 16384)
+                              :element-type (quote (unsigned-byte 8))))
+          (read-limit (min count 16384))
+          (position 0)
+          (eof-p nil)
+          (waited-p nil)
+          (timeout (if timeout (min timeout 0.1d0) 0.1d0)))
+      (loop while (< position read-limit)
+            do (let ((octet
+                       (if (listen stream)
+                           (read-byte stream nil :eof)
+                           (if (or waited-p (zerop timeout))
+                               :would-block
+                               (progn
+                                 (setf waited-p t)
+                                 (if (sb-sys:wait-until-fd-usable
+                                      (sb-sys:fd-stream-fd stream)
+                                      :input timeout nil)
+                                     (read-byte stream nil :eof)
+                                     :would-block))))))
+                 (cond
+                   ((eq octet :would-block) (return))
+                   ((eq octet :eof)
+                    (setf eof-p t)
+                    (return))
+                   (t
+                    (setf (aref buffer position) octet)
+                    (incf position)))))
+      (values (subseq buffer 0 position)
+              (cond
+                ((plusp position) :data)
+                (eof-p :eof)
+                ((zerop count) :data)
+                (t :would-block))
+              eof-p))))
 
 (defun %h2-reader-for (input)
   (cond
@@ -320,32 +371,54 @@
               (%h2-reader-frame-payload reader) nil
               (%h2-reader-frame-payload-position reader) 0
               (%h2-reader-stream-eof-p reader) nil)))))))
-  (let ((header (%h2-reader-read reader 9 deadline clock-function
-                                 :allow-eof t
-                                 :deadline-function deadline-function
-                                 :on-first-byte on-first-byte)))
-    (when (eq header :eof)
-      (return-from %h2-read-frame :eof))
-    (let ((length (%h2-u24 header 0))
-          (type (aref header 3))
-          (flags (aref header 4))
-          (stream-word (%h2-u32 header 5)))
-      (when (> length max-frame-size)
-        (error 'http-protocol-error
-               :message "The HTTP/2 frame exceeds this transport's configured receive maximum."
-               :operation :http2-read
-               :detail (list length max-frame-size)))
-      (when (/= 0 (logand stream-word #x80000000))
-        (error 'http-protocol-error
-               :message "The reserved HTTP/2 stream identifier bit is set."
-               :operation :http2-read
-               :detail stream-word))
-      (when on-header
-        (funcall on-header length type flags stream-word))
-      (%make-h2-frame :length length
-                      :type type
-                      :flags flags
-                      :stream-id stream-word
-                      :payload (%h2-reader-read
-                                reader length deadline clock-function
-                                :deadline-function deadline-function)))))
+  (unless slice-p
+    (return-from %h2-read-frame
+      (if (and (%h2-reader-stream reader)
+               (%h2-reader-stateful-input-p (%h2-reader-stream reader)))
+          (loop for frame = (%h2-read-frame
+                             reader max-frame-size deadline
+                             (or clock-function
+                                 (function http-kit::%monotonic-time))
+                             :deadline-function deadline-function
+                             :on-first-byte on-first-byte
+                             :on-header on-header
+                             :slice-p t)
+                unless (eq frame :would-block)
+                  return frame)
+        (let* ((clock-function
+                 (or clock-function
+                     (function http-kit::%monotonic-time)))
+               (header
+                 (%h2-reader-read
+                  reader 9 deadline clock-function
+                  :allow-eof t
+                  :deadline-function deadline-function
+                  :on-first-byte on-first-byte)))
+          (when (eq header :eof)
+            (return-from %h2-read-frame :eof))
+          (let* ((length (%h2-u24 header 0))
+                 (type (aref header 3))
+                 (flags (aref header 4))
+                 (stream-word (%h2-u32 header 5))
+                 (metadata (list length type flags stream-word)))
+            (when (> length max-frame-size)
+              (error 'http-protocol-error
+                     :message "The HTTP/2 frame exceeds this transport's configured receive maximum."
+                     :operation :http2-read
+                     :detail (list length max-frame-size)))
+            (when (/= 0 (logand stream-word #x80000000))
+              (error 'http-protocol-error
+                     :message "The reserved HTTP/2 stream identifier bit is set."
+                     :operation :http2-read
+                     :detail stream-word))
+            (when on-header
+              (apply on-header metadata))
+            (%make-h2-frame
+             :length length
+             :type type
+             :flags flags
+             :stream-id stream-word
+             :payload
+             (%h2-reader-read
+              reader length deadline clock-function
+              :deadline-function deadline-function))))))))

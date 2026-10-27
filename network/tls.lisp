@@ -147,10 +147,21 @@
 (defun %tls-transport (stream)
   (let ((ciphertext-p nil)
         (application-read-p nil)
-        (handshake-buffer (make-array 0 :element-type '(unsigned-byte 8)))
-        (record-buffer (make-array 0 :element-type '(unsigned-byte 8)
+        (handshake-buffer (make-array 0 :element-type (quote (unsigned-byte 8))))
+        (record-buffer (make-array 0 :element-type (quote (unsigned-byte 8))
                                    :adjustable t :fill-pointer 0)))
-    (labels ((read-available-record ()
+    (labels ((read-transport-byte ()
+               ;; Do not interrupt a consuming read after the descriptor has yielded a byte.
+               (cond
+                 ((listen stream) (read-byte stream nil :eof))
+                 #+sbcl
+                 ((typep stream (quote sb-sys:fd-stream))
+                  (if (sb-sys:wait-until-fd-usable
+                       (sb-sys:fd-stream-fd stream) :input 0.001d0 nil)
+                      (read-byte stream nil :eof)
+                      :would-block))
+                 (t :would-block)))
+             (read-available-record ()
                (loop
                  (let ((filled (fill-pointer record-buffer)))
                    (when (>= filled 5)
@@ -171,16 +182,7 @@
                          (let ((wire (subseq record-buffer 0 record-length)))
                            (setf (fill-pointer record-buffer) 0)
                            (return (values wire :data)))))))
-                 (let ((byte
-                         #+sbcl
-                         (handler-case
-                             (sb-ext:with-timeout 0.001d0
-                               (read-byte stream nil :eof))
-                           (sb-ext:timeout () :would-block))
-                         #-sbcl
-                         (if (listen stream)
-                             (read-byte stream nil :eof)
-                             :would-block)))
+                 (let ((byte (read-transport-byte)))
                    (cond
                      ((eq byte :would-block)
                       (return (values nil :would-block)))
@@ -491,6 +493,11 @@ driver's transport callbacks."
         (close stream :abort t)))))
     #-sbcl
     (%tls-unsupported :tls-native-client)))
+#+sbcl
+(defmethod http-kit/http2::%h2-reader-stateful-input-p
+    ((stream http-tls-stream))
+  (declare (ignore stream))
+  t)
 
 (progn
   (defstruct (http-tls-server-state
