@@ -1974,6 +1974,145 @@
       (when request-thread
         (sb-thread:join-thread request-thread))
       (http-kit/http2:close-http2-connection connection))))
+#+sbcl
+(deftest http2-public-single-request-waits-for-peer-stream-capacity-settings-update
+  (let* ((initial-input
+           (concatenate-octets
+            (h2-frame 4 0 0 (octets 0 3 0 0 0 1))
+            (h2-frame 1 4 1
+                      (h2-header-block (cons ":status" "200")
+                                       (cons "content-length" "1")))
+            (h2-frame 0 1 1 (octets 9))))
+         (input
+           (make-array (length initial-input)
+                       :element-type '(unsigned-byte 8)
+                       :adjustable t
+                       :fill-pointer t
+                       :initial-contents initial-input))
+         (stream (make-instance 'binary-session-stream :input input))
+         (connection (http-kit/http2:make-http2-connection :stream stream))
+         (wait-symbol 'http-kit/http2::%h2-scheduler-condition-wait)
+         (original-wait (symbol-function wait-symbol))
+         (capacity-wait-entered (sb-thread:make-semaphore :count 0))
+         (request-opened (sb-thread:make-semaphore :count 0))
+         (request-finished (sb-thread:make-semaphore :count 0))
+         (request-thread nil)
+         (request-stream-id nil)
+         (request-response nil)
+         (request-error nil)
+         (capacity-wait-entered-p nil)
+         (request-opened-p nil)
+         (request-finished-p nil))
+    (unwind-protect
+         (progn
+           (ensure-equal
+            (octets 9)
+            (http-response-body
+             (http-kit/http2:send-http2-request-over-connection
+              connection
+              (make-http-request :method "GET"
+                                 :uri "https://127.0.0.1/capacity-warmup"))))
+           (http-kit/http2::%h2-with-scheduler-lock (connection)
+             (setf (http-kit/http2::%http2-connection-peer-max-concurrent-streams
+                    connection)
+                   0))
+           (setf (symbol-function wait-symbol)
+                 (lambda (wait-connection deadline clock-function)
+                   (sb-thread:signal-semaphore capacity-wait-entered)
+                   (funcall original-wait wait-connection deadline clock-function)))
+           (http-kit/http2::%h2-with-scheduler-lock (connection)
+             (setf (http-kit/http2::%http2-connection-scheduler-reader-active-p
+                    connection)
+                   t))
+           (setf request-thread
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (unwind-protect
+                         (handler-case
+                             (setf request-response
+                                   (http-kit/http2:send-http2-request-over-connection
+                                    connection
+                                    (make-http-request
+                                     :method "GET"
+                                     :uri "https://127.0.0.1/settings-update")
+                                    :timeout 5
+                                    :on-stream-open
+                                    (lambda (stream-id cancel-function)
+                                      (declare (ignore cancel-function))
+                                      (setf request-stream-id stream-id)
+                                      (http-kit/http2::%h2-with-scheduler-lock
+                                          (connection)
+                                        (setf
+                                         (http-kit/http2::%http2-connection-scheduler-reader-active-p
+                                          connection)
+                                         t))
+                                      (sb-thread:signal-semaphore request-opened))))
+                           (error (condition)
+                             (setf request-error condition)))
+                      (sb-thread:signal-semaphore request-finished)))))
+           (setf capacity-wait-entered-p
+                 (sb-thread:wait-on-semaphore capacity-wait-entered :timeout 5))
+           (ensure-true capacity-wait-entered-p)
+           (ensure-equal
+            0
+            (count-if
+             (lambda (frame)
+               (and (= 1 (http-kit/http2::%h2-frame-type frame))
+                    (= 3 (http-kit/http2::%h2-frame-stream-id frame))))
+             (h2-output-frames stream)))
+           (loop for octet across (h2-frame 4 0 0 (octets 0 3 0 0 0 1))
+                 do (vector-push-extend octet input))
+           (http-kit/http2::%h2-with-scheduler-lock (connection)
+             (setf (http-kit/http2::%http2-connection-scheduler-reader-active-p
+                    connection)
+                   nil)
+             (http-kit/http2::%h2-scheduler-broadcast connection))
+           (setf request-opened-p
+                 (sb-thread:wait-on-semaphore request-opened :timeout 5))
+           (ensure-true request-opened-p)
+           (ensure-equal 3 request-stream-id)
+           (http-kit/http2::%h2-with-scheduler-lock (connection)
+             (ensure-equal
+              1
+              (http-kit/http2::%http2-connection-peer-max-concurrent-streams
+               connection)))
+           (ensure-equal
+            1
+            (count-if
+             (lambda (frame)
+               (and (= 1 (http-kit/http2::%h2-frame-type frame))
+                    (= 3 (http-kit/http2::%h2-frame-stream-id frame))))
+             (h2-output-frames stream)))
+           (loop for octet across
+                 (concatenate-octets
+                  (h2-frame 1 4 3
+                            (h2-header-block (cons ":status" "200")
+                                             (cons "content-length" "1")))
+                  (h2-frame 0 1 3 (octets 7)))
+                 do (vector-push-extend octet input))
+           (http-kit/http2::%h2-with-scheduler-lock (connection)
+             (setf (http-kit/http2::%http2-connection-scheduler-reader-active-p
+                    connection)
+                   nil)
+             (http-kit/http2::%h2-scheduler-broadcast connection))
+           (setf request-finished-p
+                 (sb-thread:wait-on-semaphore request-finished :timeout 5))
+           (ensure-true request-finished-p)
+           (sb-thread:join-thread request-thread)
+           (setf request-thread nil)
+           (ensure-true (null request-error))
+           (ensure-equal (octets 7) (http-response-body request-response))
+           (ensure-true (http-kit/http2:http2-connection-open-p connection)))
+      (setf (symbol-function wait-symbol) original-wait)
+      (when request-thread
+        (http-kit/http2::%h2-with-scheduler-lock (connection)
+          (setf (http-kit/http2::%http2-connection-scheduler-reader-active-p
+                 connection)
+                nil)
+          (http-kit/http2::%h2-scheduler-broadcast connection))
+        (http-kit/http2:close-http2-connection connection)
+        (sb-thread:join-thread request-thread))
+      (http-kit/http2:close-http2-connection connection))))
 
 #+sbcl
 (deftest http2-public-control-priority-wire-boundaries
