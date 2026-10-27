@@ -2283,7 +2283,7 @@
             :try-read-stream
             (lambda (stream &key timeout deadline)
               (declare (ignore stream timeout deadline))
-              (values nil nil :would-block))))
+              (values nil nil :would-block)))))
     (unwind-protect
          (let ((failure
                  (http3-boundary-error
@@ -2305,7 +2305,7 @@
            (ensure-equal 1 cancel-count)
            (ensure-true (http-kit/http3:http3-client-open-p client)))
       (when (http-kit/http3:http3-client-open-p client)
-        (http-kit/http3:close-http3-client client))))))
+        (http-kit/http3:close-http3-client client)))))
 (deftest http3-client-native-scheduler-preserves-response-after-peer-stops-request
   (let* ((quic (make-http3-quic-adapter-test-client))
          (response-wire (http3-test-native-response-wire (octets 7 8)))
