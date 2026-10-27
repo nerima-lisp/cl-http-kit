@@ -322,7 +322,7 @@
                port client-store trust-anchor nil)
               (sb-thread:join-thread thread)
               (ensure-false server-failed-p)
-              (ensure-equal 0 (cl-tls-kit::%tls13-ticket-store-count client-store)))
+              (ensure-equal 0 (cl-tls-kit:tls13-ticket-store-count client-store)))
          (when thread
            (close-http-tcp-listener listener)
            (sb-thread:join-thread thread))
@@ -364,18 +364,13 @@
                                                    (http-kit/tls::http-tls-server-state-driver
                                                     (http-kit/tls::%tls-stream-driver secure))
                                                    driver-store
-                                                   (cl-tls-kit::tls13-server-driver-ticket-key-store
-                                                    driver))
-                                             (ensure-true driver-store)
-                                             (ensure-equal (not supplied-store-p)
-                                                           (cl-tls-kit::tls13-server-driver-ticket-key-store-owned-p
-                                                            driver))
+                                                   (cl-tls-kit:tls13-server-driver-ticket-key-store driver))
+                                             (ensure-true (cl-tls-kit:tls13-server-ticket-key-store-p driver-store))
                                              (ensure-equal (if supplied-store-p shared-store driver-store)
                                                            driver-store)
                                              (close secure :abort abort-p)
                                              (ensure-equal (not supplied-store-p)
-                                                           (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p
-                                                            driver-store))))
+                                                           (cl-tls-kit:tls13-server-ticket-key-store-destroyed-p driver-store))))
                                         (when secure
                                           (http-kit::%with-http-cleanup
                                            (close secure :abort t)))
@@ -402,8 +397,7 @@
                           (lambda (&rest arguments)
                             (setf driver (apply original-maker arguments)
                                   driver-store
-                                  (cl-tls-kit::tls13-server-driver-ticket-key-store
-                                   driver))
+                                  (cl-tls-kit:tls13-server-driver-ticket-key-store driver))
                             driver)
                           (lambda ()
                             (setf condition
@@ -411,10 +405,9 @@
                                    (lambda () (funcall wrapper raw :timeout 2))))
                             (ensure-equal :handshake-failed
                                           (http-protocol-error-detail condition))
-                            (ensure-true driver-store)
+                            (ensure-true (cl-tls-kit:tls13-server-ticket-key-store-p driver-store))
                             (ensure-true
-                             (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p
-                              driver-store))
+                             (cl-tls-kit:tls13-server-ticket-key-store-destroyed-p driver-store))
                             (ensure-false (open-stream-p raw))))
                        (when (open-stream-p raw)
                          (close raw :abort t))))
@@ -444,10 +437,8 @@
                   (http-kit/tls::http-tls-server-state-driver
                    (http-kit/tls::%tls-stream-driver secure))
                   driver-store
-                  (cl-tls-kit::tls13-server-driver-ticket-key-store driver))
-            (ensure-true driver-store)
-            (ensure-true
-             (cl-tls-kit::tls13-server-driver-ticket-key-store-owned-p driver))
+                  (cl-tls-kit:tls13-server-driver-ticket-key-store driver))
+            (ensure-true (cl-tls-kit:tls13-server-ticket-key-store-p driver-store))
             (%tls-server-test-with-spy
              'http-kit/tls::%tls-server-send-close-notify
              (lambda (state)
@@ -460,7 +451,7 @@
                    (setf close-failed-p t)))))
             (ensure-true close-failed-p)
             (ensure-true
-             (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p driver-store))
+             (cl-tls-kit:tls13-server-ticket-key-store-destroyed-p driver-store))
             (ensure-false (open-stream-p transport))))
       (when secure
         (http-kit::%with-http-cleanup (close secure :abort t)))
@@ -1409,16 +1400,14 @@
                            (lambda (&rest arguments)
                              (setf driver (apply original-driver-maker arguments)
                                    driver-store
-                                   (cl-tls-kit::tls13-server-driver-ticket-key-store driver))
+                                   (cl-tls-kit:tls13-server-driver-ticket-key-store driver))
                              driver)
                            (lambda ()
                              (handler-case
                                  (funcall wrapper raw :timeout 2)
                                (error (condition)
                                       (setf primary-condition condition))))))))
-                     (ensure-true driver-store)
-                     (ensure-true
-                      (cl-tls-kit::tls13-server-driver-ticket-key-store-owned-p driver))
+                     (ensure-true (cl-tls-kit:tls13-server-ticket-key-store-p driver-store))
                      (ensure-true (typep primary-condition 'http-protocol-error))
                      (ensure-equal :handshake-failed
                                    (http-protocol-error-detail primary-condition))
@@ -1483,10 +1472,8 @@
                             (http-kit/tls::http-tls-server-state-driver
                              (http-kit/tls::%tls-stream-driver secure))
                             driver-store
-                            (cl-tls-kit::tls13-server-driver-ticket-key-store driver))))
-                   (ensure-true driver-store)
-                   (ensure-true
-                    (cl-tls-kit::tls13-server-driver-ticket-key-store-owned-p driver))
+                            (cl-tls-kit:tls13-server-driver-ticket-key-store driver))))
+                   (ensure-true (cl-tls-kit:tls13-server-ticket-key-store-p driver-store))
                    (progn
                      (%tls-server-test-with-spy
                       'cl-tls-kit:destroy-tls13-server-ticket-key-store
@@ -1516,14 +1503,13 @@
                       (eq destroy-condition
                           (http-kit/tls::tls-server-cleanup-warning-cause cleanup-warning)))
                      (ensure-false
-                      (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p driver-store))
+                      (cl-tls-kit:tls13-server-ticket-key-store-destroyed-p driver-store))
                      (ensure-false (open-stream-p transport)))
                    (when secure
                      (http-kit::%with-http-cleanup
                       (close secure :abort t)))
                    (when (and driver-store
-                              (not (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p
-                                    driver-store)))
+                              (not (cl-tls-kit:tls13-server-ticket-key-store-destroyed-p driver-store)))
                      (funcall original-destroy driver-store))
                    (when (open-stream-p transport)
                      (close transport :abort t))

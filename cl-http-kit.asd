@@ -5,7 +5,7 @@
   :author "nerima-lisp"
   :license "MIT"
   :version "0.4.1"
-  :depends-on ("cl-http-message-kit")
+  :depends-on ((:version "cl-http-message-kit" "2.0.1"))
   :pathname "src"
   :serial t
   :components ((:file "package")
@@ -120,7 +120,7 @@
   :license "MIT"
   :version "0.4.1"
   :depends-on ("cl-http-kit/network" "cl-http-kit/http2"
-               (:version "cl-tls-kit" "0.5.0")
+               (:version "cl-tls-kit" "0.5.1")
                "cl-crypto-kit")
   :pathname "network"
   :serial t
@@ -145,7 +145,7 @@
   :description "Core tests for cl-http-kit without optional transport or client subsystems."
   :version "0.4.1"
   :depends-on ("cl-http-kit"
-               "cl-weave")
+               (:version "cl-weave" "1.5.0"))
   :pathname "t"
   :serial t
   :components ((:file "package-core")
@@ -181,7 +181,9 @@
                "cl-http-kit/network"
                "cl-http-kit/tls"
                "cl-http-kit/observability"
-               "cl-weave")
+               (:version "cl-weave" "1.5.0")
+               "cl-tls-kit/test-support"
+               "cl-http-message-kit/test-support")
   :pathname "t"
   :serial t
   :components ((:file "package")

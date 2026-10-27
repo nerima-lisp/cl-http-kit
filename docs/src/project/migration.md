@@ -1,31 +1,36 @@
 # Migration guide
 
-This guide describes the 0.4.0 integration and the planned 0.5.0 QPACK API
-break from the current 0.4.1 API. It does not announce a 0.5.0 release. See the
-[changelog](changelog.md) for the 0.4.x security and protocol fixes.
+This guide describes the 0.4.0 integration and the planned migration from the
+0.4.1 API to 0.5.0. See the [changelog](changelog.md) for pending changes and
+historical release behavior.
 
-For the planned WebSocket and SSE API removal, see the
+The 0.4.0 sections describe upgrades from 0.3.x. If you are already on 0.4.1,
+start with [0.5.0 changes](#0-5-0-changes); use the WebSocket/SSE section when
+you use those APIs.
+
+For the WebSocket and SSE API removal, see the
 [WebSocket and SSE API migration](#websocket-and-sse-api-migration).
 
-## 0.3.x client boundary carried into 0.4.0
+## Client boundary carried from 0.3.x into 0.4.0
 
-The current high-level client permits `make-http-client` without a supplied
-transport boundary and lazily creates a native TCP/TLS connection pool. Build a
+In 0.4.0, the high-level client permitted `make-http-client` without a supplied
+transport boundary and lazily created a native TCP/TLS connection pool. Build a
 request with `http-client-request` and execute it with `http-client-send`.
-These compatibility entry points remain supported by 0.4.0, and
+These compatibility entry points are planned to remain supported in 0.5.0, and
 `http-client-send` also accepts a method and URL convenience form.
 
-The current client already provides explicit policy helpers for proxy routing,
+The 0.4.0 client provided explicit policy helpers for proxy routing,
 origin and proxy challenge authentication, gzip/deflate response decoding,
 redirects, cookies, proxy environment lookup, and an HTTP/1.1 connection pool.
-Pool and cookie state now has lock-backed access in the current integration.
+Pool and cookie state had lock-backed access in that integration.
 
-Native TCP and DNS are available through `cl-http-kit/network`. The separate
-`cl-http-kit/tls` source now adapts cl-tls-kit and cl-crypto-kit for the TLS 1.3
-client driver. The client system uses cl-deflate-kit for gzip and deflate.
-Server-side TLS remains an explicit unsupported boundary because the kit does
-not expose a server driver. For HTTPS servers, terminate TLS in a reverse
-proxy or load balancer and forward plain HTTP to `cl-http-kit/network`.
+The 0.4.0 integration provided native TCP and DNS through
+`cl-http-kit/network`, and its separate `cl-http-kit/tls` source adapted
+cl-tls-kit and cl-crypto-kit for the TLS 1.3 client driver. The client system
+used cl-deflate-kit for gzip and deflate. Server-side TLS was unsupported in
+0.4.0. The planned 0.5.0 release will add the optional `cl-http-kit/tls`
+HTTPS listener; see the
+[HTTPS server API](../reference/api.md#https-server).
 HTTP/2 and the base HTTP/3 APIs use injected stream or exchange boundaries.
 The optional cl-quic-kit client adapter can open and drive a QUIC connection
 when explicitly supplied; QUIC setup and server-side accept remain outside the
@@ -54,15 +59,19 @@ The dependency and policy changes are:
 
 ## 0.5.0 changes
 
-The planned 0.5.0 migration removes the local QPACK implementation from
+The planned 0.5.0 release will remove the local QPACK implementation from
 `http-kit/http3`. The mapping below covers all 57 QPACK migration-table entries:
-it names their replacement APIs, identifies the exports that will be removed,
-and marks the HTTP/3 transport operations that will remain. The target
-`cl-http-message-kit` revision is `874662c25187403604497c26723c309a9005d6d6`.
+it names their replacement APIs and exports slated for removal in 0.5.0, and
+marks the HTTP/3 transport operations that remain. The separate HTTP/3 client
+QPACK table below lists six additional entries, outside those 57. The
+target is `cl-http-message-kit` v2.0.1 at revision
+`1bc39c8659ec282496366d24fab6e5c21096caa2`.
 It includes the Section Ack callback, transactional encoder API, and the
 `qpack-context-set-max-table-capacity` operation described below. It also
-rejects a Section Ack when no field section is outstanding. This planned change
+rejects a Section Ack when no field section is outstanding. This change
 breaks the 0.4.1 API. cl-http-kit will not provide compatibility adapters.
+The replacement QPACK functions are exported by the `http-message-kit`
+package; qualify them as `http-message-kit:` in Lisp.
 
 Paths in this section are repository-relative. Unqualified `http3/`, `t/`, and
 `docs/` paths refer to cl-http-kit; paths under `src/` in the external-consumer
@@ -104,9 +113,9 @@ delegates to the same operation. The setter accepts values from zero through
 before mutation. A changed maximum preserves current capacity and advances the
 context revision, so a prepared encoding transaction based on the old revision
 cannot commit. Use this operation when peer SETTINGS change the outbound
-encoder's maximum table capacity. The old transport initializes that maximum
-to zero and updates it after peer SETTINGS arrive; ordinary requests can
-encode HEADERS before SETTINGS arrive (`http3/transport.lisp` lines 262–266,
+encoder's maximum table capacity. The cl-http-kit HTTP/3 client initializes
+that maximum to zero and updates it after peer SETTINGS arrive; ordinary
+requests can encode HEADERS before SETTINGS arrive (`http3/transport.lisp` lines 262–266,
 685–701, 1623–1699).
 
 ### Dynamic table and entries
@@ -272,10 +281,13 @@ callback as `http3-client-serialize` and invokes it through
 `serve-http3-request-stream`. These callbacks define the transport's lock
 boundary; the QPACK code does not create a lock. Use the same lock while
 decoding the peer's encoder stream and taking ready tokens.
-`qpack-resume-blocked-stream` uses the callback saved in its token. Cancellation returns `released-p` as true when it
-removed local blocked or latest-token state for that stream, and false when no
-such state existed. It returns cancellation instruction octets either way; send
-those octets on the decoder stream even when `released-p` is false.
+`qpack-resume-blocked-stream` uses the callback saved in its token.
+`qpack-take-ready-streams` removes ready tokens from the blocked set but the
+adapter retains each token for its stream until it is resumed or cancelled.
+Cancellation returns `released-p` as true when it removes a blocked or retained
+token for that stream, and false when neither exists. It returns cancellation
+instruction octets either way; send those octets on the decoder stream even
+when `released-p` is false.
 
 Tokens do not expose stream IDs, so retain each original stream ID alongside
 its token if the caller needs to associate it with a transport stream. Pass
@@ -285,7 +297,10 @@ that retained ID to cancellation.
 
 For `qpack-decode-http3-field-section`, omitted `:max-header-bytes` and
 `:max-fields` default to 65536 and 256; passing `nil` explicitly for either
-keyword is rejected. Keep passing both limits to the HTTP/3 decoder.
+keyword is rejected. Pass existing custom header-byte and field-count limits as
+`:max-header-bytes` and `:max-fields`; omit them to use the defaults. Set
+`:max-blocked-streams` when creating the adapter to preserve an existing blocked
+stream limit.
 The raw `qpack-decode-header-block` accepts the same keywords but uses its
 context/default limits when either keyword is omitted or explicitly `nil`.
 `:max-header-bytes` limits the decoded
@@ -330,7 +345,7 @@ the decoded headers.
 
 For server Section Ack handling, `serve-http3-request-stream` accepts
 `:on-qpack-section-acknowledgment`, which has the same stream-ID callback and
-write behavior described above under `:on-section-acknowledgment`. Build the
+callback contract as `:on-section-acknowledgment` described above. Build the
 adapter with `qpack-make-http3-decoder-context` from the same context passed as
 `:qpack-decoder-context`, then pass the context as `:qpack-decoder-context`
 and the returned adapter as `:qpack-http3-decoder-context`, with `:stream-id`;
@@ -382,8 +397,8 @@ no references to any of the 57 exports.
 
 ### Downstream cl-websocket-kit migration
 
-The downstream cl-websocket-kit migration follows its update to cl-http-kit
-0.5.0. It is separate from this cl-http-kit migration:
+The downstream cl-websocket-kit migration is separate from this cl-http-kit
+migration. Prepare it against the cl-http-kit 0.5.0 pin:
 
 1. Replace the 10 old QPACK exports at the call sites in the table above.
    Use `make-qpack-context` and context operations for encoder state, and the
@@ -392,12 +407,13 @@ The downstream cl-websocket-kit migration follows its update to cl-http-kit
    decode values, and opaque blocked-stream tokens described above. Do not
    inspect or construct the removed table and state objects.
 3. Run the cl-websocket-kit test suite and require its GitHub PR checks to pass
-   against the 0.5.0 pin before landing the dependency update.
+   against the 0.5.0 pin before landing its dependency update.
 
 ### WebSocket and SSE API migration
 
 The 0.4.1 release includes the `http-kit/websocket` package and SSE exports
-from `http-kit/client`. The planned 0.5.0 release removes them. When upgrading,
+from `http-kit/client`. The planned 0.5.0 release will remove them. When
+upgrading,
 add the relevant kit to your application's dependencies: use `cl-websocket-kit`
 for `websocket-kit` and `cl-sse-kit` for `sse-kit`. Neither kit is a dependency
 of `cl-http-kit`. The replacement names below were verified against the
@@ -464,7 +480,9 @@ which is specific to permessage-deflate.
 
 ## Migration checklist
 
-This checklist covers the 0.4.0 integration described above.
+### Checklist for the 0.4.0 integration
+
+Use this checklist only when upgrading from 0.3.x to 0.4.0.
 
 1. Keep a custom `transport-function` compatible with
    `(request &key timeout deadline max-header-bytes max-fields max-body-bytes
@@ -485,7 +503,7 @@ This checklist covers the 0.4.0 integration described above.
 4. Treat 0.4.0 as a compatibility review point for redirects, authentication
    replay, proxy environment precedence, and HTTP/2 selection.
 
-### For the planned 0.5.0 QPACK API change
+### Checklist for the 0.5.0 QPACK API change
 
 When upgrading to 0.5.0, replace each old QPACK export using the mapping above.
 Configure the outbound encoder context from the peer's
@@ -494,7 +512,7 @@ values limit the dynamic table and blocked streams used in field sections sent
 to that peer. Configure the inbound decoder context and its HTTP/3 adapter from
 the locally advertised settings; those values limit dynamic references and
 blocked sections accepted from the peer. Start table capacity at zero and pass
-`:huffman nil` where needed to preserve the current defaults.
+`:huffman nil` where needed to preserve cl-http-kit 0.4.x's Huffman-off default.
 
 For every state-changing encoder write, prepare the instruction or field section,
 write its octets while holding the connection QPACK lock. On success, commit.

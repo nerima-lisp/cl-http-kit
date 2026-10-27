@@ -1453,9 +1453,11 @@
                   :transport-close (lambda (driver)
                                      (declare (ignore driver))
                                      (vector-push-extend :driver-close events)))))
-          (setf (cl-tls-kit::tls13-client-driver-state driver) :connected
-                (cl-tls-kit::tls13-client-driver-application-read-state driver) (state)
-                (cl-tls-kit::tls13-client-driver-application-write-state driver) (state))
+          (cl-tls-kit/test-support:set-tls13-client-driver-state driver :connected)
+          (cl-tls-kit/test-support:set-tls13-client-driver-application-read-state
+           driver (state))
+          (cl-tls-kit/test-support:set-tls13-client-driver-application-write-state
+           driver (state))
           (values (http-kit/tls::%make-http-tls-stream driver raw)
                   driver raw events written peer-read)))))
 

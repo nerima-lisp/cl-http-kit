@@ -456,9 +456,9 @@
                 (incf reads)
                 (if (= reads 1) wire (error "Read after close_notify.")))))
            (stream (http-kit/tls::%make-http-tls-stream driver raw)))
-      (setf (cl-tls-kit::tls13-client-driver-state driver) :connected
-            (cl-tls-kit::tls13-client-driver-application-read-state driver)
-            read-state)
+      (cl-tls-kit/test-support:set-tls13-client-driver-state driver :connected)
+      (cl-tls-kit/test-support:set-tls13-client-driver-application-read-state
+       driver read-state)
       (unwind-protect
            (progn
              (ensure-equal :eof (read-byte stream nil :eof))
@@ -472,7 +472,7 @@
                     :provider (cl-tls-kit:make-cl-crypto-kit-provider)
                     :transport (http-kit/tls::%tls-transport raw)))
            (stream (http-kit/tls::%make-http-tls-stream driver raw)))
-      (setf (cl-tls-kit::tls13-client-driver-state driver) :connected)
+      (cl-tls-kit/test-support:set-tls13-client-driver-state driver :connected)
       (unwind-protect
            (signals http-protocol-error
              (read-byte stream nil :eof))
@@ -484,8 +484,9 @@
                     :provider (cl-tls-kit:make-cl-crypto-kit-provider)
                     :transport (http-kit/tls::%tls-transport raw)))
            (stream (http-kit/tls::%make-http-tls-stream driver raw)))
-      (setf (cl-tls-kit::tls13-client-driver-state driver) :closed
-            (cl-tls-kit::tls13-client-driver-close-notify-received driver) t)
+      (cl-tls-kit/test-support:set-tls13-client-driver-state driver :closed)
+      (cl-tls-kit/test-support:set-tls13-client-driver-close-notify-received
+       driver t)
       (close stream)
       (ensure-false (open-stream-p raw))
       (ensure-false (open-stream-p stream))))
@@ -510,7 +511,7 @@
                                        (declare (ignore driver wire))
                                        (error failure))))
            (stream (http-kit/tls::%make-http-tls-stream driver raw)))
-      (setf (cl-tls-kit::tls13-client-driver-state driver) :connected)
+      (cl-tls-kit/test-support:set-tls13-client-driver-state driver :connected)
       (ensure-true
        (eq failure (handler-case (close stream)
                      (error (condition) condition))))
