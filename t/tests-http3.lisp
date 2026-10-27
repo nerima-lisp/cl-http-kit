@@ -16844,3 +16844,8 @@
             :hostname "example.test"
             :udp-socket socket))
       (cl-quic-kit:udp-close socket))))
+(deftest http3-quic-adapter-rejects-non-udp-socket
+  (signals http-protocol-error
+    (http-kit/http3:make-http3-quic-adapter
+     :hostname "example.test"
+     :udp-socket :not-a-udp-socket)))
