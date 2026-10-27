@@ -1,10 +1,9 @@
 # Migration guide
 
-This guide describes the 0.4.0 integration and the planned 0.5.0 QPACK API
-break from the current 0.4.1 API. It does not announce a 0.5.0 release. See the
-[changelog](changelog.md) for the 0.4.x security and protocol fixes.
+This guide describes the 0.4.0 integration and the 0.5.0 migration from the
+0.4.1 API. See the [changelog](changelog.md) for release behavior.
 
-For the planned WebSocket and SSE API removal, see the
+For the WebSocket and SSE API removal, see the
 [WebSocket and SSE API migration](#websocket-and-sse-api-migration).
 
 ## 0.3.x client boundary carried into 0.4.0
@@ -54,14 +53,14 @@ The dependency and policy changes are:
 
 ## 0.5.0 changes
 
-The planned 0.5.0 migration removes the local QPACK implementation from
+The 0.5.0 release removes the local QPACK implementation from
 `http-kit/http3`. The mapping below covers all 57 QPACK migration-table entries:
-it names their replacement APIs, identifies the exports that will be removed,
-and marks the HTTP/3 transport operations that will remain. The target
-`cl-http-message-kit` revision is `874662c25187403604497c26723c309a9005d6d6`.
+it names their replacement APIs, identifies the exports removed from 0.5.0,
+and marks the HTTP/3 transport operations that remain. The target
+`cl-http-message-kit` v2.0.1 at revision `1bc39c8659ec282496366d24fab6e5c21096caa2`.
 It includes the Section Ack callback, transactional encoder API, and the
 `qpack-context-set-max-table-capacity` operation described below. It also
-rejects a Section Ack when no field section is outstanding. This planned change
+rejects a Section Ack when no field section is outstanding. This change
 breaks the 0.4.1 API. cl-http-kit will not provide compatibility adapters.
 
 Paths in this section are repository-relative. Unqualified `http3/`, `t/`, and
@@ -397,7 +396,7 @@ The downstream cl-websocket-kit migration follows its update to cl-http-kit
 ### WebSocket and SSE API migration
 
 The 0.4.1 release includes the `http-kit/websocket` package and SSE exports
-from `http-kit/client`. The planned 0.5.0 release removes them. When upgrading,
+from `http-kit/client`. The 0.5.0 release removes them. When upgrading,
 add the relevant kit to your application's dependencies: use `cl-websocket-kit`
 for `websocket-kit` and `cl-sse-kit` for `sse-kit`. Neither kit is a dependency
 of `cl-http-kit`. The replacement names below were verified against the
@@ -485,7 +484,7 @@ This checklist covers the 0.4.0 integration described above.
 4. Treat 0.4.0 as a compatibility review point for redirects, authentication
    replay, proxy environment precedence, and HTTP/2 selection.
 
-### For the planned 0.5.0 QPACK API change
+### For the 0.5.0 QPACK API change
 
 When upgrading to 0.5.0, replace each old QPACK export using the mapping above.
 Configure the outbound encoder context from the peer's

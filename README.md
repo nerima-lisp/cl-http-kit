@@ -12,15 +12,16 @@ integrations.
 
 ## Release status
 
-The checked-in ASDF systems are version 0.4.1. `make-http-client` creates a
-native TCP/TLS connection pool when no transport boundary is supplied, while
-`http-client-request` and `http-client-send` remain supported request paths.
-`http-client-send` also accepts a method and URL convenience form. See the
+The checked-in ASDF systems remain at version 0.4.1 while the 0.5.0 changes
+are pending. `make-http-client` creates a native TCP/TLS connection pool when
+no transport boundary is supplied, while `http-client-request` and
+`http-client-send` remain supported request paths. `http-client-send` also
+accepts a method and URL convenience form. See the
 [changelog](docs/src/project/changelog.md) and [migration guide](docs/src/project/migration.md)
-for the 0.4.0 compatibility boundary.
+for the 0.4.0 and 0.5.0 compatibility boundaries.
 
 The client uses cl-deflate-kit for compression, and the client and HTTPS
-listener use cl-tls-kit 0.1.0 or later for TLS 1.3.
+listener use cl-tls-kit 0.5.1 or later for TLS 1.3.
 TLS certificate-chain, hostname, and trust verification is required by
 default. `:verify :optional` has the same verification policy as `:required`;
 `:verify nil` is rejected because the pinned cl-tls-kit client driver does not

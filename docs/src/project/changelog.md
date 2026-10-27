@@ -13,33 +13,39 @@ historical release behavior, not the current API contract; see the
   `cl-websocket-kit` and SSE consumers to `sse-kit` from `cl-sse-kit`.
   See the
   [WebSocket and SSE migration guide](migration.md#websocket-and-sse-api-migration).
-- reject `:verify nil` because the pinned cl-tls-kit client driver does not
+- Reject `:verify nil` because the pinned cl-tls-kit client driver does not
   expose a supported way to disable certificate verification;
+- Replace the local HTTP/3 QPACK API with cl-http-message-kit 2.0.1. See the
+  [QPACK migration guide](migration.md#0-5-0-changes).
 
 ### Added
 
-- add an HTTPS listener on SBCL with ALPN negotiation for HTTP/2 and HTTP/1.1,
+- Add an HTTPS listener on SBCL with ALPN negotiation for HTTP/2 and HTTP/1.1,
   bounded connection and request resources, lifecycle callbacks, and graceful
   shutdown;
-- add `:session-tickets-p` to `make-http-tls-server-wrapper`, allowing server
+- Add `:session-tickets-p` to `make-http-tls-server-wrapper`, allowing server
   ticket issuance to be disabled;
 
 ### Changed
 
-- cap buffered request-body bytes across active HTTPS listener sessions;
-- destroy per-connection ticket-key stores created by TLS server wrappers when
+- Cap buffered request-body bytes across active HTTPS listener sessions;
+- Destroy per-connection ticket-key stores created by TLS server wrappers when
   their driver closes, while leaving supplied shared stores caller-owned for
   cross-connection resumption;
-- TLS server wrapper ignores record `legacy_record_version` as required by
+- Require cl-tls-kit 0.5.1 for the TLS integration and cl-weave 1.5.0 for the
+  test and coverage APIs;
+- Keep cl-tls-kit and cl-http-message-kit test helpers in separate test-only
+  ASDF systems;
+- Ignore record `legacy_record_version` in the TLS server wrapper as required by
   RFC 8446 section 5.1 while continuing to validate record content types and
   lengths;
 
 ### HTTP/2
 
-- report malformed PING frames received while awaiting an acknowledgement as
+- Report malformed PING frames received while awaiting an acknowledgement as
   `http-protocol-error` with `:http2-client` operation and the received frame
   as detail.
-- document `:http2-read` detail for DATA on a never-opened HTTP/2 client stream:
+- Document `:http2-read` detail for DATA on a never-opened HTTP/2 client stream:
   the stream ID while another request is in progress and has not failed,
   otherwise a list with `0` (the DATA frame type) followed by the stream ID.
 
