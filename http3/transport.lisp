@@ -170,6 +170,10 @@
     encoder-context
     huffman-p
     on-stream-open
+    on-response-headers
+    on-cancel
+    cancel-cleanup
+    (cancel-cleanup-ran-p nil :type boolean)
     on-body-chunk
     on-information
     on-push-promise
@@ -908,6 +912,7 @@ becomes readable again."
 
 (defun %h3-scheduler-cancel-entry (client entry condition)
   (unless (%http3-request-stream-done-p entry)
+    (%h3-scheduler-run-cancel-cleanup client entry)
     (let ((stream (%http3-request-stream-stream entry))
           (cancel (http3-client-cancel-stream client)))
       (when (and stream (null cancel))
@@ -924,6 +929,15 @@ becomes readable again."
        (%http3-request-stream-timeout entry)
        (%http3-request-stream-deadline entry))
       (%h3-scheduler-complete-entry client entry :failure condition)))
+  entry)
+(defun %h3-scheduler-run-cancel-cleanup (client entry)
+  (let ((cleanup
+          (%h3-with-scheduler-lock (client)
+            (unless (%http3-request-stream-cancel-cleanup-ran-p entry)
+              (setf (%http3-request-stream-cancel-cleanup-ran-p entry) t)
+              (%http3-request-stream-cancel-cleanup entry)))))
+    (when cleanup
+      (funcall cleanup)))
   entry)
 
 (defun %h3-scheduler-request-cancel (client entry error-code)
@@ -2494,26 +2508,37 @@ HTTP/3 API reference."
                "An HTTP/3 response cannot contain multiple trailer blocks."))
             (setf (%http3-request-stream-response-trailers entry) headers
                   (%http3-request-stream-trailers-seen-p entry) t))
-          (progn
-            (when (= status 101)
-              (%h3-transport-error
-               "HTTP/3 does not permit a 101 Switching Protocols response."))
-            (if (>= status 200)
+        (progn
+          (when (= status 101)
+            (%h3-transport-error
+             "HTTP/3 does not permit a 101 Switching Protocols response."))
+          (if (>= status 200)
+              (progn
                 (setf (%http3-request-stream-response-status entry) status
                       (%http3-request-stream-response-headers entry) headers
                       (%http3-request-stream-final-response-p entry) t)
-                (progn
-                  (when (http-kit:http-header-values headers "content-length")
-                    (%h3-invalid-header
-                     "content-length"
-                     "informational responses cannot contain content-length."))
-                  (when (%http3-request-stream-on-information entry)
-                    (funcall
-                     (%http3-request-stream-on-information entry)
-                     (http-kit:make-http-response
-                      :protocol-version "HTTP/3"
-                      :status status :headers headers :trailers nil
-                      :body (http-kit::%empty-octets))))))))))
+                (when (%http3-request-stream-on-response-headers entry)
+                  (funcall
+                   (%http3-request-stream-on-response-headers entry)
+                   status
+                   (mapcar
+                    (lambda (header)
+                      (http-kit:make-http-header
+                       (copy-seq (http-kit:http-header-name header))
+                       (copy-seq (http-kit:http-header-content header))))
+                    headers))))
+            (progn
+              (when (http-kit:http-header-values headers "content-length")
+                (%h3-invalid-header
+                 "content-length"
+                 "informational responses cannot contain content-length."))
+              (when (%http3-request-stream-on-information entry)
+                (funcall
+                 (%http3-request-stream-on-information entry)
+                 (http-kit:make-http-response
+                  :protocol-version "HTTP/3"
+                  :status status :headers headers :trailers nil
+                  :body (http-kit::%empty-octets))))))))))
   t)
 
 (defun %h3-scheduler-fields (client entry payload role)
@@ -2846,27 +2871,29 @@ HTTP/3 API reference."
                  "The peer GOAWAY excludes this HTTP/3 request stream."
                  :h3-request-rejected))))
           (setf (%http3-request-stream-started-p entry) t)
-          (when (%http3-request-stream-on-stream-open entry)
-            (funcall (%http3-request-stream-on-stream-open entry)
-                     stream stream-id
-                     (lambda (&rest arguments)
-                       (let ((error-code-supplied-p
-                              (loop for tail on arguments by #'cddr
-                                    thereis (eq (first tail) :error-code))))
-                         (apply
-                          #'(lambda (&key error-code)
-                            (cancel-http3-stream
-                             client stream
-                             :error-code (if error-code-supplied-p error-code #x10c)
-                             :timeout (%http3-request-stream-timeout entry)
-                             :deadline (%http3-request-stream-deadline entry)))
-                          arguments)))))
+          (let ((cancel-function
+                  (%h3-request-cancel-function
+                   client stream
+                   (%http3-request-stream-timeout entry)
+                   (%http3-request-stream-deadline entry))))
+            (when (%http3-request-stream-on-cancel entry)
+              (let ((cleanup
+                      (funcall (%http3-request-stream-on-cancel entry)
+                               cancel-function)))
+                (unless (or (null cleanup) (functionp cleanup))
+                  (%h3-transport-error
+                   "ON-CANCEL must return a cleanup function or NIL."
+                   (type-of cleanup)))
+                (setf (%http3-request-stream-cancel-cleanup entry) cleanup)))
+            (when (%http3-request-stream-on-stream-open entry)
+              (funcall (%http3-request-stream-on-stream-open entry)
+                       stream stream-id cancel-function)))
           entry)
       (error (condition)
-             (if stream
-                 (%h3-scheduler-fail-entry client entry condition)
-               (%h3-scheduler-complete-entry client entry :failure condition))
-             entry))))
+        (if stream
+            (%h3-scheduler-fail-entry client entry condition)
+          (%h3-scheduler-complete-entry client entry :failure condition))
+        entry))))
 
 (defun %h3-scheduler-start-pending (client)
   (let ((entries
@@ -3108,6 +3135,7 @@ HTTP/3 API reference."
         (%h3-transport-error
          "The HTTP/3 stream ended with a truncated frame."))
       (let ((response (%h3-scheduler-finish-response entry)))
+        (%h3-scheduler-run-cancel-cleanup client entry)
         (funcall (http3-client-close-stream client)
                  (%http3-request-stream-stream entry) :condition nil)
         (%h3-scheduler-complete-entry client entry :response response)
@@ -3283,6 +3311,8 @@ the HTTP/3 API reference."
             :encoder-context encoder-context
             :huffman-p huffman-p
             :on-stream-open on-stream-open
+            :on-response-headers on-response-headers
+            :on-cancel on-cancel
             :on-body-chunk on-body-chunk
             :on-information on-information
             :on-push-promise on-push-promise
@@ -3928,11 +3958,12 @@ the HTTP/3 API reference."
                            (%h3-scheduler-condition-wait
                             client (%http3-request-stream-deadline entry)
                             (function http-kit::%monotonic-time))
-                           (setf (http3-client-scheduler-owner-thread client)
-                                 (%h3-scheduler-current-thread)
-                                 owner-p t))))
+                         (setf (http3-client-scheduler-owner-thread client)
+                               (%h3-scheduler-current-thread)
+                               owner-p t))))
                    (when owner-p
                      (%h3-scheduler-owner-loop client entry))))
+        (%h3-scheduler-run-cancel-cleanup client entry)
         (when (%http3-request-stream-failure entry)
           (error (%http3-request-stream-failure entry)))
         (%http3-request-stream-response entry))
