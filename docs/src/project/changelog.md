@@ -32,8 +32,8 @@ historical release behavior, not the current API contract; see the
 - Destroy per-connection ticket-key stores created by TLS server wrappers when
   their driver closes, while leaving supplied shared stores caller-owned for
   cross-connection resumption;
-- Require cl-tls-kit 0.5.1 for the TLS integration and cl-weave 1.5.0 for the
-  test and coverage APIs;
+- Require cl-tls-kit 0.5.2 for TLS, cl-quic-kit 0.2.6 for HTTP/3, and
+  cl-weave 1.5.0 for the test and coverage APIs;
 - Keep cl-tls-kit and cl-http-message-kit test helpers in separate test-only
   ASDF systems;
 - Ignore record `legacy_record_version` in the TLS server wrapper as required by

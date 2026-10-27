@@ -20,8 +20,9 @@ accepts a method and URL convenience form. See the
 [changelog](docs/src/project/changelog.md) and [migration guide](docs/src/project/migration.md)
 for the 0.4.0 and 0.5.0 compatibility boundaries.
 
-The client uses cl-deflate-kit for compression, and the client and HTTPS
-listener use cl-tls-kit 0.5.1 or later for TLS 1.3.
+The client uses cl-deflate-kit for compression. The client and HTTPS listener
+require cl-tls-kit 0.5.2 or later for TLS 1.3, and the HTTP/3 system requires
+cl-quic-kit 0.2.6 or later.
 TLS certificate-chain, hostname, and trust verification is required by
 default. `:verify :optional` has the same verification policy as `:required`;
 `:verify nil` is rejected because the pinned cl-tls-kit client driver does not

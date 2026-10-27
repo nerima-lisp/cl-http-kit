@@ -69,14 +69,14 @@
     };
 
     cl-tls-kit = {
-      url = "github:nerima-lisp/cl-tls-kit/v0.5.1";
+      url = "github:nerima-lisp/cl-tls-kit/v0.5.2";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.cl-weave.follows = "cl-weave";
       inputs.cl-crypto-kit.follows = "cl-crypto-kit";
     };
 
     cl-quic-kit = {
-      url = "github:nerima-lisp/cl-quic-kit/9cf4cc8029c478aabf8875b9025e8b6a930ef54f";
+      url = "github:nerima-lisp/cl-quic-kit/16d6f5987ae8ff75342cfd4d5085c6b936104e96";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.cl-crypto-kit.follows = "cl-crypto-kit";
       inputs.cl-tls-kit.follows = "cl-tls-kit";
