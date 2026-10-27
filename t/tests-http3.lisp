@@ -2301,7 +2301,7 @@
            (ensure-equal
             "ON-CANCEL must return a cleanup function or NIL."
             (http-error-message failure))
-           (ensure-equal :keyword (http-protocol-error-detail failure))
+           (ensure-true (eq :keyword (http-protocol-error-detail failure)))
            (ensure-equal 1 cancel-count)
            (ensure-true (http-kit/http3:http3-client-open-p client)))
       (when (http-kit/http3:http3-client-open-p client)
