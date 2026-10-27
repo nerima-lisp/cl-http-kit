@@ -2690,6 +2690,10 @@
            (ensure-equal 0 (%https-listener-session-count context))
            (ensure-false
             (%https-listener-event-present-p context :alpn-selected nil))
+           (%https-listener-wait
+            (lambda ()
+              (and (zerop (%https-listener-connection-count server))
+                   (zerop (%https-listener-handshake-count server)))))
            (%https-listener-release-client-hello transport)
            (sb-thread:join-thread client-thread :default nil :timeout 5)
            (ensure-false (sb-thread:thread-alive-p client-thread))
