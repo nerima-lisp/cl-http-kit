@@ -2539,6 +2539,10 @@
                  (cl-tls-kit:rotate-tls13-server-ticket-key-store
                   replacement-store))
                (stop-http-server server :graceful-timeout 1)
+               (%https-listener-wait
+                (lambda ()
+                  (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p
+                   initial-store)))
                (signals error
                  (cl-tls-kit:rotate-tls13-server-ticket-key-store
                   initial-store))))
