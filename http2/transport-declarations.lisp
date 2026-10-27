@@ -117,4 +117,3 @@
 (defun http2-connection-draining-p (connection)
   (and (http2-connection-p connection)
        (%http2-connection-draining-p connection)))
-

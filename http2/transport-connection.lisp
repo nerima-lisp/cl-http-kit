@@ -2194,9 +2194,9 @@ CONTINUATION frames must still be consumed contiguously from that queue."
             (%h2-scheduler-flush-pending-writes connection wait-p)
             wire)))
 
-    
 
-    
+
+
     ))
 #+sbcl
 (progn
