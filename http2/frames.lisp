@@ -82,7 +82,6 @@
                        (return)))))
       (values (subseq buffer 0 position)
               (cond
-                ((zerop count) :data)
                 ((plusp position) :data)
                 (eof-p :eof)
                 (t :would-block))
@@ -126,7 +125,6 @@
               (cond
                 ((plusp position) :data)
                 (eof-p :eof)
-                ((zerop count) :data)
                 (t :would-block))
               eof-p))))
 
@@ -296,30 +294,11 @@
              (if (>= position count)
                  (values position :data)
                  (multiple-value-bind (octets status eof-p)
-                     (if (%h2-reader-stream reader)
-                         (%h2-reader-read-available
+                     (%h2-reader-read-available
                           (%h2-reader-stream reader)
                           (- count position)
                           (max 0 (- slice-deadline
                                     (funcall clock-function))))
-                         (let* ((vector (%h2-reader-vector reader))
-                                (source-position (%h2-reader-position reader))
-                                (available
-                                  (min (- count position)
-                                       (- (length vector)
-                                          source-position))))
-                           (if (plusp available)
-                               (values
-                                (prog1
-                                    (subseq vector source-position
-                                            (+ source-position available))
-                                  (incf (%h2-reader-position reader)
-                                        available))
-                                :data nil)
-                               (values
-                                (make-array 0
-                                            :element-type (quote (unsigned-byte 8)))
-                                :eof t))))
                    (when (plusp (length octets))
                      (replace buffer octets :start1 position)
                      (incf position (length octets)))
@@ -394,9 +373,7 @@
       (if (and (%h2-reader-stream reader)
                (%h2-reader-stateful-input-p (%h2-reader-stream reader)))
           (loop for frame = (%h2-read-frame
-                             reader max-frame-size deadline
-                             (or clock-function
-                                 (function http-kit::%monotonic-time))
+                             reader max-frame-size deadline clock-function
                              :deadline-function deadline-function
                              :on-first-byte on-first-byte
                              :on-header on-header

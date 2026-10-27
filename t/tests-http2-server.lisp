@@ -3848,3 +3848,234 @@
       (when (open-stream-p stream)
         (close stream)))
     (ensure-false (open-stream-p stream))))
+#+sbcl
+(progn
+  ;; Drive the public server entry point over a real FD stream.
+  (defun %call-with-public-http2-fd-session (handler options body)
+    (let* ((listener
+             (make-instance 'sb-bsd-sockets:inet-socket
+                            :type :stream
+                            :protocol :tcp))
+           (client-socket nil)
+           (client-stream nil)
+           (accepted-socket nil)
+           (server-stream nil)
+           (server-thread nil)
+           (server-done (sb-thread:make-semaphore :count 0))
+           (server-result nil)
+           (server-condition nil)
+           (server-fd-stream-p nil)
+           (joined-p nil))
+      (unwind-protect
+           (progn
+             (sb-bsd-sockets:socket-bind listener #(127 0 0 1) 0)
+             (sb-bsd-sockets:socket-listen listener 1)
+             (setf client-socket
+                   (make-instance 'sb-bsd-sockets:inet-socket
+                                  :type :stream
+                                  :protocol :tcp))
+             (sb-bsd-sockets:socket-connect
+              client-socket #(127 0 0 1)
+              (nth-value 1 (sb-bsd-sockets:socket-name listener)))
+             (setf client-stream
+                   (sb-bsd-sockets:socket-make-stream
+                    client-socket
+                    :input t
+                    :output t
+                    :element-type '(unsigned-byte 8)
+                    :buffering :none)
+                   server-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (unwind-protect
+                           (handler-case
+                               (progn
+                                 (setf accepted-socket
+                                       (sb-bsd-sockets:socket-accept listener)
+                                       server-stream
+                                       (sb-bsd-sockets:socket-make-stream
+                                        accepted-socket
+                                        :input t
+                                        :output t
+                                        :element-type '(unsigned-byte 8)
+                                        :buffering :none)
+                                       server-fd-stream-p
+                                       (typep server-stream 'sb-sys:fd-stream)
+                                       server-result
+                                       (multiple-value-list
+                                        (apply
+                                         #'http-kit/http2:serve-http2-session
+                                         server-stream handler
+                                         (append options
+                                                 (list :close-stream nil))))))
+                             (error (condition)
+                               (setf server-condition condition)))
+                        (sb-thread:signal-semaphore server-done)))))
+             (write-sequence
+              (concatenate-octets
+               (h2-preface)
+               (h2-frame 4 0 0 (octets)))
+              client-stream)
+             (finish-output client-stream)
+             (let ((reader (http-kit/http2::%h2-reader-for client-stream)))
+               (labels ((read-server-frame ()
+                          (sb-ext:with-timeout 5
+                            (http-kit/http2::%h2-read-frame
+                             reader http-kit/http2::+http2-default-max-frame-size+
+                             nil #'http-kit::%monotonic-time)))
+                        (wait-server ()
+                          (unless
+                              (or joined-p
+                                  (sb-thread:wait-on-semaphore
+                                   server-done :timeout 5))
+                            (error "The public HTTP/2 FD server did not finish."))
+                          (unless joined-p
+                            (sb-thread:join-thread server-thread)
+                            (setf joined-p t))
+                          (values server-result server-condition
+                                  server-fd-stream-p)))
+                 (let ((settings (read-server-frame))
+                       (ack (read-server-frame)))
+                   (ensure-equal 4
+                                 (http-kit/http2::%h2-frame-type settings))
+                   (ensure-equal 0
+                                 (http-kit/http2::%h2-frame-flags settings))
+                   (ensure-equal 4
+                                 (http-kit/http2::%h2-frame-type ack))
+                   (ensure-equal 1
+                                 (http-kit/http2::%h2-frame-flags ack)))
+                 (funcall body client-stream #'read-server-frame
+                          #'wait-server))))
+        (when (and client-stream (open-stream-p client-stream))
+          (ignore-errors (close client-stream :abort t)))
+        (when (and server-stream (open-stream-p server-stream))
+          (ignore-errors (close server-stream :abort t)))
+        (when client-socket
+          (ignore-errors (sb-bsd-sockets:socket-close client-socket)))
+        (when accepted-socket
+          (ignore-errors (sb-bsd-sockets:socket-close accepted-socket)))
+        (when server-thread
+          (unless joined-p
+            (when (sb-thread:wait-on-semaphore server-done :timeout 6)
+              (ignore-errors (sb-thread:join-thread server-thread)))))
+        (ignore-errors (sb-bsd-sockets:socket-close listener)))))
+
+  (deftest http2-server-fd-public-reader-callbacks-and-zero-timeout
+    (let* ((clock-armed-p nil)
+           (clock-call-count 0)
+           (first-clock (sb-thread:make-semaphore :count 0))
+           (release-first-clock (sb-thread:make-semaphore :count 0))
+           (retry-clock (sb-thread:make-semaphore :count 0))
+           (release-retry-clock (sb-thread:make-semaphore :count 0))
+           (seen-request nil)
+           (header-calls 0)
+           (clock-function
+             (lambda ()
+               (if (not clock-armed-p)
+                   0d0
+                   (case (incf clock-call-count)
+                     (1
+                      (sb-thread:signal-semaphore first-clock)
+                      (unless
+                          (sb-thread:wait-on-semaphore
+                           release-first-clock :timeout 5)
+                        (error "Timed out at the first HTTP/2 FD clock barrier."))
+                      1d0)
+                     (2 2d0)
+                     (3 3d0)
+                     (4
+                      (sb-thread:signal-semaphore retry-clock)
+                      (unless
+                          (sb-thread:wait-on-semaphore
+                           release-retry-clock :timeout 5)
+                        (error "Timed out at the HTTP/2 FD post-timeout barrier."))
+                      4d0)
+                     (otherwise 4d0)))))
+           (request-frame
+             (h2-frame 1 5 1
+                       (h2-header-block
+                        (cons ":method" "GET")
+                        (cons ":scheme" "https")
+                        (cons ":authority" "example.com")
+                        (cons ":path" "/fd-reader")))))
+      (%call-with-public-http2-fd-session
+       (lambda (request)
+         (setf seen-request request)
+         (make-http-response :status 204))
+       (list :request-timeout 5d0
+             :max-requests 1
+             :clock-function clock-function
+             :shutdown-p (lambda ()
+                           (incf header-calls)
+                           nil))
+       (lambda (client-stream read-server-frame wait-server)
+         (setf clock-armed-p t)
+         (ensure-true
+          (sb-thread:wait-on-semaphore first-clock :timeout 5))
+         (sb-thread:signal-semaphore release-first-clock)
+         (ensure-true
+          (sb-thread:wait-on-semaphore retry-clock :timeout 5))
+         (write-sequence request-frame client-stream)
+         (finish-output client-stream)
+         (sb-thread:signal-semaphore release-retry-clock)
+         (multiple-value-bind (result condition fd-stream-p)
+             (funcall wait-server)
+           (ensure-true fd-stream-p)
+           (ensure-false condition)
+           (ensure-equal '(1 :max-requests) result)
+           (ensure-true (plusp header-calls))
+           (ensure-equal "GET" (http-request-method seen-request))
+           (ensure-equal "/fd-reader" (http-request-target seen-request))
+           (ensure-true (>= clock-call-count 3))
+           (let* ((response (funcall read-server-frame))
+                  (fields (server-response-fields response)))
+             (ensure-equal 1
+                           (http-kit/http2::%h2-frame-type response))
+             (ensure-equal "204"
+                           (cdr (assoc ":status" fields :test #'string=)))))))))
+
+  (deftest http2-server-fd-public-reader-validates-frame-header
+    (dolist (case
+              (list (list (octets 0 #x40 1 0 0 0 0 0 0)
+                          (list 16385 16384))
+                    (list (octets 0 0 0 6 0 #x80 0 0 0)
+                          #x80000000)))
+      (destructuring-bind (frame-header expected-detail) case
+        (%call-with-public-http2-fd-session
+         (lambda (request)
+           (declare (ignore request))
+           (make-http-response :status 204))
+         nil
+         (lambda (client-stream read-server-frame wait-server)
+           (write-sequence frame-header client-stream)
+           (finish-output client-stream)
+           (multiple-value-bind (result condition fd-stream-p)
+               (funcall wait-server)
+             (ensure-true fd-stream-p)
+             (ensure-true (null result))
+             (ensure-true (typep condition 'http-protocol-error))
+             (ensure-equal :http2-read
+                           (http-kit:http-error-operation condition))
+             (ensure-equal expected-detail
+                           (http-kit:http-protocol-error-detail condition))
+             (let ((goaway (funcall read-server-frame)))
+               (ensure-equal 7
+                             (http-kit/http2::%h2-frame-type goaway))
+               (ensure-equal 0
+                             (http-kit/http2::%h2-frame-stream-id goaway)))))))))
+
+  (deftest http2-server-fd-public-reader-reports-eof
+    (%call-with-public-http2-fd-session
+     (lambda (request)
+       (declare (ignore request))
+       (make-http-response :status 204))
+     nil
+     (lambda (client-stream read-server-frame wait-server)
+       (declare (ignore read-server-frame))
+       (close client-stream)
+       (multiple-value-bind (result condition fd-stream-p)
+           (funcall wait-server)
+         (ensure-true fd-stream-p)
+         (ensure-false condition)
+         (ensure-equal '(0 :eof) result))))))
+

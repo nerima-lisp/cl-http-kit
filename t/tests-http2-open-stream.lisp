@@ -7460,3 +7460,117 @@
               (setf failure condition)))
           (ensure-true
            (typep failure (quote http-kit:http-protocol-error))))))))
+#+sbcl
+(progn
+  (defclass h2-public-slice-deadline-stream
+      (h2-manager-partial-read-timeout-stream)
+    ((read-returned-p
+       :initform nil
+       :accessor h2-public-slice-deadline-read-returned-p)
+     (clock-after-read-p
+       :initform nil
+       :accessor h2-public-slice-deadline-clock-after-read-p)
+     (same-slice-retry-p
+       :initform nil
+       :accessor h2-public-slice-deadline-same-slice-retry-p)))
+
+  (defmethod sb-gray:stream-read-sequence
+      ((stream h2-public-slice-deadline-stream) sequence
+       &optional (start 0) end)
+    (declare (ignore sequence start end))
+    (prog1
+        (call-next-method)
+      (setf (h2-public-slice-deadline-read-returned-p stream) t)))
+
+  (defmethod sb-gray:stream-listen
+      ((stream h2-public-slice-deadline-stream))
+    (when (and (h2-public-slice-deadline-read-returned-p stream)
+               (not (h2-public-slice-deadline-clock-after-read-p stream)))
+      (setf (h2-public-slice-deadline-same-slice-retry-p stream) t))
+    (call-next-method))
+
+  (deftest http2-public-generic-slice-read-deadline
+    (let* ((initial-settings
+             (h2-frame 4 0 0 (octets 0 3 0 0 0 1)))
+           (response-headers
+             (h2-frame 1 5 1
+                       (h2-header-block (cons ":status" "200"))))
+           (wire (concatenate-octets initial-settings response-headers))
+           (read-consumed (sb-thread:make-semaphore :count 0))
+           (delay (sb-thread:make-semaphore :count 0))
+           (stream
+             (make-instance 'h2-public-slice-deadline-stream
+                            :input wire
+                            :stall-after-position 1
+                            :read-consumed read-consumed))
+           (request-done (sb-thread:make-semaphore :count 0))
+           (clock-function
+             (lambda ()
+               (when (h2-public-slice-deadline-read-returned-p stream)
+                 (setf (h2-public-slice-deadline-clock-after-read-p stream)
+                       t))
+               (http-kit::%monotonic-time)))
+           (connection
+             (http-kit/http2:make-http2-connection
+              :stream stream
+              :clock-function clock-function
+              :close-stream
+              (lambda (closed-stream)
+                (declare (ignore closed-stream))
+                (h2-manager-capacity-peer-close stream))))
+           (response nil)
+           (failure nil)
+           (request-thread nil))
+      (unwind-protect
+           (progn
+             (ensure-false (typep stream 'sb-sys:fd-stream))
+             (ensure-true
+              (sb-mop:compute-applicable-methods
+               #'sb-gray:stream-listen (list stream)))
+             (setf request-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (unwind-protect
+                           (handler-case
+                               (setf response
+                                     (http-kit/http2:send-http2-request-over-connection
+                                      connection
+                                      (make-http-request
+                                       :method "GET"
+                                       :uri "https://slice-deadline.test/")
+                                      :timeout 5
+                                      :clock-function clock-function))
+                             (error (condition)
+                               (setf failure condition)))
+                        (sb-thread:signal-semaphore request-done)))))
+             (ensure-true
+              (sb-thread:wait-on-semaphore read-consumed :timeout 5))
+             (ensure-equal 1 (binary-session-input-position stream))
+             (ensure-false
+              (sb-thread:wait-on-semaphore delay :timeout 0.25))
+             (h2-manager-capacity-peer-close stream)
+             (ensure-true
+              (sb-thread:wait-on-semaphore request-done :timeout 5))
+             (sb-thread:join-thread request-thread)
+             (setf request-thread nil)
+             (ensure-false failure)
+             (ensure-equal 200 (http-response-status response))
+             (ensure-equal 0 (length (http-response-body response)))
+             (ensure-true
+              (h2-public-slice-deadline-read-returned-p stream))
+             (ensure-true
+              (h2-public-slice-deadline-clock-after-read-p stream))
+             (ensure-false
+              (h2-public-slice-deadline-same-slice-retry-p stream))
+             (ensure-equal (length wire)
+                           (binary-session-input-position stream))
+             (ensure-true
+              (http-kit/http2:http2-connection-open-p connection))
+             (http-kit/http2:close-http2-connection connection)
+             (ensure-false
+              (http-kit/http2:http2-connection-open-p connection)))
+        (h2-manager-capacity-peer-close stream)
+        (http-kit/http2:close-http2-connection connection)
+        (when request-thread
+          (sb-thread:join-thread request-thread)))))
+)
