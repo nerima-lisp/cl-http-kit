@@ -1993,6 +1993,10 @@
              (sb-thread:signal-semaphore release-session)
              (%https-listener-wait
               (lambda () (zerop (%https-listener-connection-count server))))
+             (%https-listener-wait
+              (lambda ()
+                (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p
+                 old-store)))
              (signals error
                (cl-tls-kit:rotate-tls13-server-ticket-key-store old-store))
              (stop-http-server server :graceful-timeout 1)
