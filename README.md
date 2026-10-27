@@ -29,6 +29,26 @@ default. `:verify :optional` has the same verification policy as `:required`;
 provide a supported certificate-verification bypass. Use a trusted test
 certificate when exercising HTTPS clients.
 
+## Client response and cancellation hooks
+
+| API | Behavior |
+| --- | --- |
+| `http-client-send :on-response-headers` | Receives the returned response status and headers before body chunks. Delivering them suppresses retries, authentication replay, and redirects. Informational responses use `:on-information`. |
+| `make-http-cancellation-token` and `http-client-send :cancel-token` | Register cancellation for one or more active sends. |
+| `http-client-cancel-request` | Cancel the token once and invoke its active transport handlers. |
+
+Cancellation behavior depends on the transport. The direct HTTP/1.1 stream
+transport closes the stream. HTTP/2 sends `RST_STREAM`, but a caller that owns a
+blocked synchronous frame read may not return until that read completes or its
+deadline expires. An HTTP/3 transport must provide `cancel-stream`; the built-in
+cl-quic-kit adapter does not currently provide that callback. On that adapter,
+`http-client-cancel-request` marks the token cancelled and then signals
+`http-protocol-error` with operation `:http3-transport` and detail `:unsupported`.
+It sends no stream reset or stop-sending signal, so active I/O can continue until
+it completes or its deadline expires. See the
+[API reference](https://nerima-lisp.github.io/cl-http-kit/reference/api/) for
+the transport contract.
+
 ## Quick Start
 
 After following the [ASDF setup and transport installation guide](docs/src/getting-started.md#connect-a-real-transport),
