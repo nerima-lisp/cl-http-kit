@@ -598,7 +598,7 @@ supplied through this constructor and HTTP3-OPTIONS."
   (progn
     (when (and udp-socket
                (not (and (typep udp-socket 'cl-quic-kit:udp-socket)
-                         (cl-quic-kit::udp-socket-non-blocking-p udp-socket))))
+                         (cl-quic-kit:udp-socket-non-blocking-p udp-socket))))
       (%http3-quic-adapter-error
        "HTTP/3 QUIC adapter UDP-SOCKET must be a nonblocking CL-QUIC-KIT UDP socket."
        udp-socket))
