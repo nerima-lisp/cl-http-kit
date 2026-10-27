@@ -1051,7 +1051,9 @@ active HTTP/1 and HTTP/2 sessions, including temporary copies made while
 collecting a request. It does not account for application-owned copies or
 references retained after a handler returns. Limits are finite and cannot be
 disabled with NIL.
-The handshake timeout runs from accept through TLS negotiation. The request
+The handshake timeout is an absolute deadline measured from when TCP accept
+returns an accepted stream. Connection reservation and worker dispatch count
+toward it, and TLS negotiation must complete before the deadline. The request
 timeout covers request reads, handler execution, and response writes; the idle
 timeout bounds the initial request wait and each wait between requests,
 including the HTTP/2 preface and first SETTINGS frame. A handler that finishes

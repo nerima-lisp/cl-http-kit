@@ -548,10 +548,21 @@ driver's transport callbacks."
               (%tls-timeout)
               (%tls-server-fail "TLS transport read failed." :transport-error))))))
 
+  (defun %tls-server-check-handshake-deadline (state)
+    (unless (http-tls-server-state-handshake-complete-p state)
+      (let ((deadline (http-tls-server-state-deadline state)))
+        (when (and deadline
+                   (>= (funcall
+                        (http-tls-server-state-clock-function state))
+                       deadline))
+          (%tls-timeout))))
+    nil)
   (defun %tls-server-write-record (state bytes)
     (handler-case
         (let ((stream (http-tls-server-state-transport-stream state)))
+          (%tls-server-check-handshake-deadline state)
           (write-sequence bytes stream)
+          (%tls-server-check-handshake-deadline state)
           (finish-output stream))
       (http-timeout (condition) (error condition))
       (error ()
@@ -693,6 +704,7 @@ driver's transport callbacks."
            (setf (http-tls-server-state-selected-alpn state)
                  (getf event :protocol)))
           (:send
+           (%tls-server-check-handshake-deadline state)
            (let* ((level (getf event :level))
                   (content-type
                    (%tls-server-content-type (getf event :content-type)))

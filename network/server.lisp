@@ -629,7 +629,8 @@
   nil)
 
 (defun %http-server-reserve-connection
-    (server listener raw-stream peer-address peer-port)
+    (server listener raw-stream peer-address peer-port
+      &optional (accepted-at (%http-server-now)))
   (let* ((connection
            (%make-http-server-connection
             :raw-stream raw-stream
@@ -638,7 +639,7 @@
             :peer-address peer-address
             :peer-port peer-port
             :handshake-deadline
-            (+ (%http-server-now) (http-server-handshake-timeout server))))
+            (+ accepted-at (http-server-handshake-timeout server))))
          (rejection nil))
     (%with-http-server-lock (server)
       (cond
@@ -914,31 +915,32 @@
 (defun %http-server-accept-one (server listener)
   (multiple-value-bind (raw-stream peer-address peer-port)
       (http-kit/network:accept-http-tcp-stream listener)
-    (multiple-value-bind (connection rejection)
-        (%http-server-reserve-connection
-         server listener raw-stream peer-address peer-port)
-      (cond
-        ((eq rejection :server-stopping)
-         (%with-http-cleanup
-           (close raw-stream :abort t)))
-        (rejection
-         (%http-server-reject-connection
-          server raw-stream rejection peer-address peer-port))
-        (t
-         (let ((worker-started-p nil))
-           (unwind-protect
-                (progn
-                  (%http-server-emit-event
-                   server
-                   (list :type :connection-accepted
-                         :phase :admission
-                         :peer-address peer-address
-                         :peer-port peer-port))
-                  (%http-server-start-connection-worker server connection)
-                  (setf worker-started-p t))
-             (unless worker-started-p
-               (%http-server-close-connection-stream server connection)
-               (%http-server-release-connection server connection)))))))))
+    (let ((accepted-at (%http-server-now)))
+      (multiple-value-bind (connection rejection)
+          (%http-server-reserve-connection
+           server listener raw-stream peer-address peer-port accepted-at)
+        (cond
+          ((eq rejection :server-stopping)
+           (%with-http-cleanup
+             (close raw-stream :abort t)))
+          (rejection
+           (%http-server-reject-connection
+            server raw-stream rejection peer-address peer-port))
+          (t
+           (let ((worker-started-p nil))
+             (unwind-protect
+                  (progn
+                    (%http-server-emit-event
+                     server
+                     (list :type :connection-accepted
+                           :phase :admission
+                           :peer-address peer-address
+                           :peer-port peer-port))
+                    (%http-server-start-connection-worker server connection)
+                    (setf worker-started-p t))
+               (unless worker-started-p
+                 (%http-server-close-connection-stream server connection)
+                 (%http-server-release-connection server connection))))))))))
 
 (progn
   #+sbcl

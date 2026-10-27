@@ -1933,40 +1933,42 @@
                      (close transport :abort t))
                    (%tls-server-test-remove-material material)))))
   (deftest tls-server-rejects-late-driver-send-after-handshake-deadline
-    (let* ((now 9)
-           (raw (make-instance '%tls-server-test-stream :input (octets)))
-           (state
-            (http-kit/tls::%make-http-tls-server-state
-             :driver nil
-             :provider nil
-             :transport-stream raw
-             :deadline 10
-             :clock-function (lambda () now)))
-           (driver-step-called-p nil)
-           (condition nil))
-      (unwind-protect
-          (progn
-            (%tls-server-test-with-spy
-             'cl-tls-kit:tls13-server-driver-step
-             (lambda (driver wire &key level)
-               (declare (ignore wire level))
-               (setf now 11
-                     driver-step-called-p t)
-               (values driver
-                       (list (list :type :send
-                                   :level :initial
-                                   :content-type :handshake
-                                   :wire (octets 68 65 74)))))
-             (lambda ()
-               (setf condition
-                     (%tls-server-test-condition
-                      (lambda ()
-                        (http-kit/tls::%tls-server-step-handshake-message
-                         state (octets 3 0 0 0)))))
-               (ensure-true driver-step-called-p)
-               (ensure-octets-equal (octets) (binary-test-output raw))
-               (ensure-true (typep condition 'http-timeout)))))
-        (close raw :abort t))))
+  (let* ((now 9)
+         (raw (make-instance '%tls-server-test-stream :input (octets)))
+         (state
+           (http-kit/tls::%make-http-tls-server-state
+            :driver nil
+            :provider nil
+            :transport-stream raw
+            :deadline 10
+            :clock-function (lambda () now)))
+         (driver-step-called-p nil)
+         (condition nil))
+    (unwind-protect
+         (progn
+           (%tls-server-test-with-spy
+            'cl-tls-kit:tls13-server-driver-step
+            (lambda (driver wire &key level)
+              (declare (ignore wire level))
+              (setf now 11
+                    driver-step-called-p t)
+              (values driver
+                      (list (list :type :send
+                                  :level :initial
+                                  :content-type :handshake
+                                  :wire (octets 68 65 74)))))
+            (lambda ()
+              (setf condition
+                    (handler-case
+                        (progn
+                          (http-kit/tls::%tls-server-step-handshake-message
+                           state (octets 3 0 0 0))
+                          nil)
+                      (http-timeout (caught) caught)))
+              (ensure-true driver-step-called-p)
+              (ensure-octets-equal (octets) (binary-test-output raw))
+              (ensure-true (typep condition 'http-timeout)))))
+      (close raw :abort t))))
 )
 
 #+sbcl

@@ -2800,21 +2800,21 @@
               110
               (http-kit::%http-server-connection-handshake-deadline connection))
              (ensure-equal 100 accepted-at))
-        (unwind-protect
-             (sb-ext:without-package-locks
-               (setf (fdefinition 'http-kit/network:accept-http-tcp-stream)
-                     original-accept
-                     (fdefinition 'http-kit::%http-server-reserve-connection)
-                     original-reserve
-                     (fdefinition 'http-kit::%http-server-start-connection-worker)
-                     original-start-worker))
+        (progn
+          (sb-thread:signal-semaphore release-reservation)
           (unwind-protect
-               (setf http-kit::*http-server-clock-function* original-clock)
+               (when (and thread (sb-thread:thread-alive-p thread))
+                 (sb-thread:join-thread thread :default nil))
             (unwind-protect
-                 (sb-thread:signal-semaphore release-reservation)
+                 (sb-ext:without-package-locks
+                   (setf (fdefinition 'http-kit/network:accept-http-tcp-stream)
+                         original-accept
+                         (fdefinition 'http-kit::%http-server-reserve-connection)
+                         original-reserve
+                         (fdefinition 'http-kit::%http-server-start-connection-worker)
+                         original-start-worker))
               (unwind-protect
-                   (when (and thread (sb-thread:thread-alive-p thread))
-                     (sb-thread:join-thread thread :default nil :timeout 5))
+                   (setf http-kit::*http-server-clock-function* original-clock)
                 (unwind-protect
                      (when connection
                        (http-kit::%http-server-release-connection server connection))
