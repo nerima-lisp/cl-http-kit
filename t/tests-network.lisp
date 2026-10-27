@@ -341,6 +341,16 @@
       (close-http-tcp-listener listener))))
 
 #+sbcl
+(deftest native-network-accepted-stream-socket-mode-skips-untracked-stream
+  (let ((stream (make-string-input-stream "untracked")))
+    (unwind-protect
+         (ensure-equal
+          nil
+          (http-kit/network::%network-set-accepted-stream-socket-non-blocking-mode
+           stream nil))
+      (close stream))))
+
+#+sbcl
 (deftest native-network-http1-listener-service
   (let ((listener (open-http-tcp-listener
                    :host "127.0.0.1"
