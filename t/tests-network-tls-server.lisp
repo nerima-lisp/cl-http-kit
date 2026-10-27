@@ -2230,6 +2230,78 @@
       (setf (http-kit/tls::http-tls-server-state-handshake-complete-p state) t)
       (ensure-false
        (http-kit/tls::%tls-server-check-handshake-deadline state))))
+  (deftest tls-server-does-not-send-alpn-alert-after-handshake-deadline
+           (let* ((listener
+                   (make-instance (quote sb-bsd-sockets:inet-socket)
+                                  :type :stream
+                                  :protocol :tcp))
+                  (client-socket
+                   (make-instance (quote sb-bsd-sockets:inet-socket)
+                                  :type :stream
+                                  :protocol :tcp))
+                  (server-socket nil)
+                  (transport nil)
+                  (received (make-array 0
+                                        :element-type (quote (unsigned-byte 8))
+                                        :adjustable t
+                                        :fill-pointer 0))
+                  (condition nil))
+             (unwind-protect
+                 (progn
+                   (sb-bsd-sockets:socket-bind listener #(127 0 0 1) 0)
+                   (sb-bsd-sockets:socket-listen listener 1)
+                   (multiple-value-bind (address port)
+                       (sb-bsd-sockets:socket-name listener)
+                     (sb-bsd-sockets:socket-connect client-socket address port))
+                   (setf server-socket (sb-bsd-sockets:socket-accept listener)
+                         transport
+                         (sb-bsd-sockets:socket-make-stream
+                          server-socket
+                          :input nil
+                          :output t
+                          :element-type (quote (unsigned-byte 8))
+                          :buffering :full)
+                         server-socket nil)
+                   (sb-bsd-sockets:socket-close listener)
+                   (setf listener nil
+                         (sb-bsd-sockets:non-blocking-mode client-socket) t)
+                   (let ((state
+                          (http-kit/tls::%make-http-tls-server-state
+                           :driver nil
+                           :provider nil
+                           :transport-stream transport
+                           :deadline 10
+                           :clock-function (lambda () 10))))
+                     (setf (http-kit/tls::http-tls-server-state-handshake-complete-p state) t
+                           (http-kit/tls::http-tls-server-state-write-state state) :write-state)
+                     (%tls-server-test-with-spy
+                      (quote cl-tls-kit:encrypt-tls13-traffic-record)
+                      (lambda (plaintext traffic-state)
+                        (declare (ignore plaintext traffic-state))
+                        #(23 3 3 0 2 2 120))
+                      (lambda ()
+                        (setf condition
+                              (handler-case
+                                  (progn
+                                    (http-kit/tls::%tls-server-handshake state)
+                                    nil)
+                                (http-timeout (caught) caught)
+                                (http-protocol-error (caught) caught)))))
+                     (when (open-stream-p transport)
+                       (close transport :abort t))
+                     (setf transport nil)
+                     (http-kit/tls::%tls-server-backpressure-drain
+                      client-socket received)
+                     (ensure-true (typep condition (quote http-timeout)))
+                     (ensure-equal 0 (length received))))
+               (when (and transport (open-stream-p transport))
+                 (close transport :abort t))
+               (when server-socket
+                 (sb-bsd-sockets:socket-close server-socket))
+               (when client-socket
+                 (sb-bsd-sockets:socket-close client-socket))
+               (when listener
+                 (sb-bsd-sockets:socket-close listener)))))
   (deftest tls-server-write-record-without-deadline
     (let* ((wire (octets 22 3 3 0 1 1))
            (raw (make-instance '%tls-server-test-stream :input (octets)))
