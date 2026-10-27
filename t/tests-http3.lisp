@@ -2272,6 +2272,40 @@
            (ensure-equal (octets 1 2 3) (http-response-body response))
            (ensure-true (http3-test-stream-closed-p request-stream)))
       (http-kit/http3:close-http3-client client))))
+(deftest http3-client-native-scheduler-rejects-invalid-cancel-cleanup
+  (let* ((cancel-count 0)
+         (client
+           (http3-test-make-native-client
+            :cancel-stream
+            (lambda (stream &key error-code timeout deadline)
+              (declare (ignore stream error-code timeout deadline))
+              (incf cancel-count))
+            :try-read-stream
+            (lambda (stream &key timeout deadline)
+              (declare (ignore stream timeout deadline))
+              (values nil nil :would-block))))
+    (unwind-protect
+         (let ((failure
+                 (http3-boundary-error
+                  (lambda ()
+                    (http-kit/http3:send-http3-request
+                     client
+                     (make-http-request
+                      :method "GET"
+                      :uri "https://example.test/invalid-cancel-cleanup")
+                     :on-cancel
+                     (lambda (cancel)
+                       (declare (ignore cancel))
+                       :invalid-cleanup))))))
+           (ensure-equal :http3-transport (http-error-operation failure))
+           (ensure-equal
+            "ON-CANCEL must return a cleanup function or NIL."
+            (http-error-message failure))
+           (ensure-equal :keyword (http-protocol-error-detail failure))
+           (ensure-equal 1 cancel-count)
+           (ensure-true (http-kit/http3:http3-client-open-p client)))
+      (when (http-kit/http3:http3-client-open-p client)
+        (http-kit/http3:close-http3-client client))))))
 (deftest http3-client-native-scheduler-preserves-response-after-peer-stops-request
   (let* ((quic (make-http3-quic-adapter-test-client))
          (response-wire (http3-test-native-response-wire (octets 7 8)))
