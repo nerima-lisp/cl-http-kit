@@ -705,6 +705,24 @@
   (%with-http-server-lock (server)
     (setf (%http-server-connection-tls-stream connection) stream))
   stream)
+(defun %http-server-open-tls-stream (server connection raw-stream)
+  (let ((wrapper
+          (%http-server-rotate-ticket-key-store-if-due server connection)))
+    #+sbcl
+    (http-kit/network::%network-call-with-accepted-stream-socket-non-blocking-mode
+     raw-stream
+     (lambda ()
+       (funcall wrapper
+                raw-stream
+                :timeout (http-server-handshake-timeout server)
+                :deadline
+                (%http-server-connection-handshake-deadline connection))))
+    #-sbcl
+    (funcall wrapper
+             raw-stream
+             :timeout (http-server-handshake-timeout server)
+             :deadline
+             (%http-server-connection-handshake-deadline connection))))
 
 (defun %http-server-session-error-callback
     (server connection protocol reported-p)
@@ -782,13 +800,7 @@
          (handler-case
              (progn
                (setf tls-stream
-                     (funcall (%http-server-rotate-ticket-key-store-if-due
-                               server connection)
-                              raw-stream
-                              :timeout (http-server-handshake-timeout server)
-                              :deadline
-                              (%http-server-connection-handshake-deadline
-                               connection)))
+                     (%http-server-open-tls-stream server connection raw-stream))
                (%http-server-set-tls-stream server connection tls-stream)
                (%http-server-release-handshake server connection)
                (setf phase :alpn)

@@ -126,6 +126,18 @@
     (sb-thread:with-mutex (*network-stream-sockets-lock*)
       (gethash stream *network-stream-sockets*)))
 
+  (defun %network-call-with-accepted-stream-socket-non-blocking-mode
+      (stream thunk)
+    (let ((socket (%network-stream-socket stream)))
+      (if socket
+          (let ((previous-mode (sb-bsd-sockets:non-blocking-mode socket)))
+            (setf (sb-bsd-sockets:non-blocking-mode socket) t)
+            (prog1 (funcall thunk)
+              (when (open-stream-p stream)
+                (setf (sb-bsd-sockets:non-blocking-mode socket)
+                      previous-mode))))
+          (funcall thunk))))
+
   (defun %network-shutdown-socket (socket)
     (when socket
       (handler-case
@@ -268,8 +280,6 @@ stream's read timeout after a connection is accepted."
                                          clock-function)
                (declare (ignore ignored-address))
                (setf accepted-socket socket)
-               ;; FD stream writes need a nonblocking descriptor to honor deadlines.
-               (setf (sb-bsd-sockets:non-blocking-mode socket) t)
                (let ((remaining (%network-remaining effective-deadline
                                                       clock-function
                                                       :accept)))
@@ -598,10 +608,13 @@ Returns the number of accepted connections and either :MAX-CONNECTIONS or
                             (unwind-protect
                                  (let ((session-stream
                                          (if stream-wrapper
-                                             (funcall stream-wrapper
-                                                      stream
-                                                      :timeout accept-timeout
-                                                      :deadline accept-deadline)
+                                             (%network-call-with-accepted-stream-socket-non-blocking-mode
+                                              stream
+                                              (lambda ()
+                                                (funcall stream-wrapper
+                                                         stream
+                                                         :timeout accept-timeout
+                                                         :deadline accept-deadline)))
                                              stream)))
                                    (unless (streamp session-stream)
                                      (%network-listener-error :serve

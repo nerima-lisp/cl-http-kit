@@ -2027,7 +2027,8 @@
       ((stream %tls-server-backpressure-observer-stream))
     (sb-thread:signal-semaphore
      (%tls-server-backpressure-observer-stream-flush-entered stream))
-    (finish-output (%tls-server-backpressure-observer-stream-stream stream)))
+    (finish-output
+     (%tls-server-backpressure-observer-stream-stream stream)))
 
   (defun %tls-server-backpressure-drain (socket output)
     (let ((buffer (make-array 4096
@@ -2045,148 +2046,173 @@
       output))
 
   (deftest tls-server-aborts-backpressured-record-flush-after-handshake-deadline
-  (let* ((listener
-           (make-instance (quote sb-bsd-sockets:inet-socket)
-                          :type :stream
-                          :protocol :tcp))
-         (client-socket
-           (make-instance (quote sb-bsd-sockets:inet-socket)
-                          :type :stream
-                          :protocol :tcp))
-         (server-socket nil)
-         (server-stream nil)
-         (transport nil)
-         (finish-entered (sb-thread:make-semaphore :count 0))
-         (writer-done (sb-thread:make-semaphore :count 0))
-         (deadline nil)
-         (writer-result nil)
-         (writer-error nil)
-         (writer-thread nil)
-         (received (make-array 0
-                               :element-type (quote (unsigned-byte 8))
-                               :adjustable t
-                               :fill-pointer 0))
-         (buffer-full-p nil)
-         (filled-bytes 0)
-         (completed-before-peer-read nil)
-         (record (octets 22 3 3 0 3 68 65 74)))
-    (unwind-protect
-         (progn
-           (sb-bsd-sockets:socket-bind listener #(127 0 0 1) 0)
-           (sb-bsd-sockets:socket-listen listener 1)
-           (multiple-value-bind (address port)
-               (sb-bsd-sockets:socket-name listener)
-             (sb-bsd-sockets:socket-connect client-socket address port))
-           (setf server-socket (sb-bsd-sockets:socket-accept listener)
-                 (sb-bsd-sockets:sockopt-receive-buffer client-socket) 4096
-                 (sb-bsd-sockets:sockopt-send-buffer server-socket) 4096)
-           (let ((previous-mode
-                   (sb-bsd-sockets:non-blocking-mode server-socket))
-                 (payload (make-array 4096
-                                      :element-type (quote (unsigned-byte 8))
-                                      :initial-element 0))
-                 (no-progress-count 0))
-             (unwind-protect
-                  (progn
-                    (setf (sb-bsd-sockets:non-blocking-mode server-socket) t)
-                    (loop repeat 16384
-                          for sent =
-                            (sb-bsd-sockets:socket-send
-                             server-socket payload (length payload))
-                          do (if (and sent (plusp sent))
-                                 (progn
+    (let* ((listener
+             (make-instance 'sb-bsd-sockets:inet-socket
+                            :type :stream
+                            :protocol :tcp))
+           (client-socket
+             (make-instance 'sb-bsd-sockets:inet-socket
+                            :type :stream
+                            :protocol :tcp))
+           (server-socket nil)
+           (server-stream nil)
+           (transport nil)
+           (finish-entered (sb-thread:make-semaphore :count 0))
+           (writer-done (sb-thread:make-semaphore :count 0))
+           (deadline nil)
+           (writer-result nil)
+           (writer-error nil)
+           (writer-thread nil)
+           (received (make-array 0
+                                 :element-type '(unsigned-byte 8)
+                                 :adjustable t
+                                 :fill-pointer 0))
+           (buffer-full-p nil)
+           (filled-bytes 0)
+           (completed-before-peer-read nil)
+           (writer-finished-p nil)
+           (record (octets 22 3 3 0 3 68 65 74)))
+      (unwind-protect
+           (progn
+             (sb-bsd-sockets:socket-bind listener #(127 0 0 1) 0)
+             (sb-bsd-sockets:socket-listen listener 1)
+             (multiple-value-bind (address port)
+                 (sb-bsd-sockets:socket-name listener)
+               (sb-bsd-sockets:socket-connect client-socket address port))
+             (setf server-socket (sb-bsd-sockets:socket-accept listener)
+                   (sb-bsd-sockets:sockopt-receive-buffer client-socket) 4096
+                   (sb-bsd-sockets:sockopt-send-buffer server-socket) 4096)
+             (let ((previous-mode
+                     (sb-bsd-sockets:non-blocking-mode server-socket))
+                   (payload (make-array 4096 :element-type '(unsigned-byte 8)
+                                        :initial-element 0))
+                   (server-fd
+                     (sb-bsd-sockets:socket-file-descriptor server-socket)))
+               (unwind-protect
+                    (progn
+                      (setf (sb-bsd-sockets:non-blocking-mode server-socket) t)
+                      (loop repeat 16384
+                            for sent =
+                              (sb-bsd-sockets:socket-send
+                               server-socket payload (length payload))
+                            do (if (and sent (plusp sent))
                                    (incf filled-bytes sent)
-                                   (setf no-progress-count 0))
-                                 (progn
-                                   (incf no-progress-count)
-                                   (sleep 0.01d0)
-                                   (when (>= no-progress-count 50)
-                                     (setf buffer-full-p t)
-                                     (return)))))
-                    (ensure-true buffer-full-p)
-                    (ensure-true (plusp filled-bytes)))
-               (setf (sb-bsd-sockets:non-blocking-mode server-socket)
-                     previous-mode)))
-           (sb-bsd-sockets:socket-close listener)
-           (setf listener nil
-                 (sb-bsd-sockets:non-blocking-mode server-socket) t
-                 server-stream
-                 (sb-bsd-sockets:socket-make-stream
-                  server-socket
-                  :input nil
-                  :output t
-                  :element-type (quote (unsigned-byte 8))
-                  :buffering :full)
-                 server-socket nil
-                 transport
-                 (make-instance (quote %tls-server-backpressure-stream)
-                :stream
-                (make-instance (quote %tls-server-backpressure-observer-stream)
-                               :stream server-stream
-                               :flush-entered finish-entered)))
-           (setf deadline
-                 (+ (http-kit/tls::%tls-monotonic-time) 1.5d0))
-           (let ((state
-                   (http-kit/tls::%make-http-tls-server-state
-                    :driver nil
-                    :provider nil
-                    :transport-stream transport
-                    :deadline deadline)))
-             (setf writer-thread
-                   (sb-thread:make-thread
-                    (lambda ()
-                      (unwind-protect
-                           (setf writer-result
-                                 (handler-case
-                                     (progn
-                                       (http-kit/tls::%tls-server-write-record
-                                        state record)
-                                       :returned)
-                                   (http-timeout () :timed-out)
-                                   (error (condition)
-                                     (setf writer-error condition)
-                                     :error)))
-                        (sb-thread:signal-semaphore writer-done)))
-                    :name "TLS backpressured deadline writer")))
-           (let ((finish-entered-p
-                   (sb-thread:wait-on-semaphore finish-entered :timeout 2)))
-             (unless finish-entered-p
+                                   (unless
+                                         (sb-sys:wait-until-fd-usable
+                                          server-fd :output 0.05d0)
+                                       (when
+                                           (loop repeat 20
+                                                 always
+                                                 (and
+                                                  (not
+                                                   (sb-sys:wait-until-fd-usable
+                                                    server-fd :output 0.05d0))
+                                                  (let ((probe-sent
+                                                         (sb-bsd-sockets:socket-send
+                                                          server-socket payload 1)))
+                                                    (if (and probe-sent
+                                                             (plusp probe-sent))
+                                                        (progn
+                                                          (incf filled-bytes
+                                                                probe-sent)
+                                                          nil)
+                                                        t))))
+                                         (setf buffer-full-p t)
+                                         (return)))))
+                      (ensure-true buffer-full-p)
+                      (ensure-true (plusp filled-bytes)))
+                 (setf (sb-bsd-sockets:non-blocking-mode server-socket)
+                       previous-mode)))
+             (sb-bsd-sockets:socket-close listener)
+             (setf listener nil
+                   (sb-bsd-sockets:non-blocking-mode server-socket) t
+                   server-stream
+                   (sb-bsd-sockets:socket-make-stream
+                    server-socket
+                    :input nil
+                    :output t
+                    :element-type '(unsigned-byte 8)
+                    :buffering :full)
+                   server-socket nil
+                   transport
+                   (make-instance '%tls-server-backpressure-stream
+                                  :stream
+                                  (make-instance '%tls-server-backpressure-observer-stream
+                                                 :stream server-stream
+                                                 :flush-entered finish-entered)))
+             (setf deadline
+                   (+ (http-kit/tls::%tls-monotonic-time) 1.5d0))
+             (let ((state
+                     (http-kit/tls::%make-http-tls-server-state
+                      :driver nil
+                      :provider nil
+                      :transport-stream transport
+                      :deadline deadline)))
+               (setf writer-thread
+                     (sb-thread:make-thread
+                      (lambda ()
+                        (unwind-protect
+                             (setf writer-result
+                                   (handler-case
+                                       (progn
+                                         (http-kit/tls::%tls-server-write-record
+                                          state record)
+                                         :returned)
+                                     (http-timeout () :timed-out)
+                                     (error (condition)
+                                       (setf writer-error condition)
+                                       :error)))
+                          (sb-thread:signal-semaphore writer-done)))
+                      :name "TLS backpressured deadline writer")))
+             (unless (sb-thread:wait-on-semaphore finish-entered :timeout 2)
                (error "TLS writer did not enter finish-output: ~S ~S"
                       writer-result
-                      writer-error)))
-           (ensure-true
-            (< (http-kit/tls::%tls-monotonic-time) deadline))
-           (ensure-false
-            (sb-thread:wait-on-semaphore writer-done :timeout 0.05))
-           (setf completed-before-peer-read
-                 (sb-thread:wait-on-semaphore writer-done :timeout 2.5)
-                 (sb-bsd-sockets:non-blocking-mode client-socket) t)
-           (unless completed-before-peer-read
-             (%tls-server-backpressure-drain client-socket received)
+                      writer-error))
              (ensure-true
-              (sb-thread:wait-on-semaphore writer-done :timeout 2)))
-           (%tls-server-backpressure-drain client-socket received)
-           (ensure-equal nil (find-if-not (function zerop) received))
-           (ensure-true completed-before-peer-read)
-           (ensure-equal :timed-out writer-result)
-           (ensure-false writer-error)
-           (ensure-true
-            (%tls-server-backpressure-stream-aborted-p transport))
-           (ensure-false (open-stream-p transport)))
-      (when (and writer-thread (sb-thread:thread-alive-p writer-thread))
+              (< (http-kit/tls::%tls-monotonic-time) deadline))
+             (ensure-equal nil
+              (when (sb-thread:wait-on-semaphore writer-done :timeout 0.05d0)
+                (list writer-result writer-error)))
+             (setf completed-before-peer-read
+                   (sb-thread:wait-on-semaphore writer-done :timeout 2.5))
+             (setf (sb-bsd-sockets:non-blocking-mode client-socket) t)
+             (unless completed-before-peer-read
+               (loop repeat 300
+                     do (%tls-server-backpressure-drain client-socket received)
+                        (setf writer-finished-p
+                              (sb-thread:wait-on-semaphore writer-done
+                                                           :timeout 0.001d0))
+                        (when writer-finished-p
+                          (return))
+                        (sb-sys:wait-until-fd-usable
+                         (sb-bsd-sockets:socket-file-descriptor client-socket)
+                         :input 0.01d0))
+               (unless writer-finished-p
+                 (setf writer-finished-p
+                       (sb-thread:wait-on-semaphore writer-done :timeout 2)))
+               (ensure-true writer-finished-p))
+             (%tls-server-backpressure-drain client-socket received)
+             (ensure-equal nil (find-if-not (function zerop) received))
+             (ensure-true completed-before-peer-read)
+             (ensure-equal :timed-out writer-result)
+             (ensure-false writer-error)
+             (ensure-true
+              (%tls-server-backpressure-stream-aborted-p transport))
+             (ensure-false (open-stream-p transport)))
+        (when (and writer-thread (sb-thread:thread-alive-p writer-thread))
+          (when (and transport (open-stream-p transport))
+            (close transport :abort t))
+          (sb-thread:join-thread writer-thread :timeout 2 :default nil))
         (when (and transport (open-stream-p transport))
           (close transport :abort t))
-        (sb-thread:join-thread writer-thread :timeout 2 :default nil))
-      (when (and transport (open-stream-p transport))
-        (close transport :abort t))
-      (when (and server-stream (open-stream-p server-stream))
-        (close server-stream :abort t))
-      (when server-socket
-        (sb-bsd-sockets:socket-close server-socket))
-      (when client-socket
-        (sb-bsd-sockets:socket-close client-socket))
-      (when listener
-        (sb-bsd-sockets:socket-close listener))))))
+        (when (and server-stream (open-stream-p server-stream))
+          (close server-stream :abort t))
+        (when server-socket
+          (sb-bsd-sockets:socket-close server-socket))
+        (when client-socket
+          (sb-bsd-sockets:socket-close client-socket))
+        (when listener
+          (sb-bsd-sockets:socket-close listener))))))
 )
 
 #+sbcl
