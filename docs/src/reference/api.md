@@ -17,6 +17,8 @@ The URI structure type.
 
 ### `http-uri-p`
 
+Return true when the object is an HTTP-URI.
+
 ### `make-http-uri`
 
 Construct a URI. The signature is
@@ -63,6 +65,8 @@ The header structure type. It contains a name and a trimmed string content.
 
 ### `http-header-p`
 
+Return true when the object is an HTTP-HEADER.
+
 ### `make-http-header`
 
 Construct a header with make-http-header (name content). Names must be
@@ -98,6 +102,8 @@ present. Inputs follow `http-header-values`.
 The request structure type.
 
 ### `http-request-p`
+
+Return true when the object is an HTTP-REQUEST.
 
 ### `make-http-request`
 
@@ -172,6 +178,8 @@ The response structure type.
 
 ### `http-response-p`
 
+Return true when the object is an HTTP-RESPONSE.
+
 ### `make-http-response`
 
 ```lisp
@@ -213,6 +221,8 @@ an empty octet vector.
 The streaming response type accepted by a `serve-http1-session` handler.
 
 ### `http-response-stream-p`
+
+Return true when the object is an HTTP-RESPONSE-STREAM.
 
 ### `make-http-response-stream`
 
@@ -364,6 +374,8 @@ It returns the number of final responses written and one of `:eof`, `:close`,
 The deterministic recording-session structure type.
 
 ### `recording-session-p`
+
+Return true when the object is a RECORDING-SESSION.
 
 ### `make-recording-session`
 
@@ -520,6 +532,8 @@ The optional package name is HTTP-KIT/HTTP2.
 The HTTP/2 client structure type.
 
 ### `http2-client-p`
+
+Return true when the object is an HTTP2-CLIENT.
 
 ### `make-http2-client`
 
@@ -1167,6 +1181,8 @@ The metrics adapter structure type.
 
 ### `http-metrics-p`
 
+Return true when the object is an HTTP-METRICS value.
+
 ### `make-http-metrics`
 
 Construct metrics with make-http-metrics (&optional registry). When registry
@@ -1316,6 +1332,8 @@ decoded.
 The multipart-part structure type.
 
 ### `http-multipart-part-p`
+
+Return true when the object is an HTTP-MULTIPART-PART.
 
 ### `make-http-multipart-part`
 
@@ -1684,11 +1702,15 @@ protocol ID, host, port, expiry time, and persistence flag.
 
 ### `http-alternative-service-p`
 
+Return true when the object is an alternative-service record.
+
 ### `http-alternative-service-store`
 
 The in-memory RFC 7838 alternative-service store type.
 
 ### `http-alternative-service-store-p`
+
+Return true when the object is an alternative-service store.
 
 ### `make-http-alternative-service-store`
 
@@ -1754,6 +1776,8 @@ Return the cache entry snapshot.
 The cache-entry structure type.
 
 ### `http-cache-entry-p`
+
+Return true when the object is an HTTP-CACHE-ENTRY.
 
 ### `http-cache-entry-key`
 
@@ -1938,6 +1962,8 @@ operations may be used concurrently from multiple SBCL threads.
 The high-level client structure type.
 
 ### `http-client-p`
+
+Return true when the object is an HTTP-CLIENT.
 
 ### `make-http-client`
 
