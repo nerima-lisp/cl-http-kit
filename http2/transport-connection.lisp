@@ -1710,42 +1710,42 @@ CONTINUATION frames must still be consumed contiguously from that queue."
     (connection entry condition clock-function &optional
                 (reset-error-code 8) only-if-active-p)
   (let ((reset-p nil))
-    (%h2-with-scheduler-lock (connection)
-      (unless (or (%h2-batch-entry-local-retired-p entry)
-                  (%h2-peer-stream-reset-condition-p
-                   (%h2-batch-entry-error entry))
-                  (and only-if-active-p
-                       (%h2-batch-entry-response entry)))
-        (let ((reserved-p
-                (eq (%h2-batch-entry-request-state entry) :reserved)))
-          (setf (%h2-batch-entry-local-retired-p entry) t)
-          (unless (%h2-batch-entry-error entry)
-            (setf (%h2-batch-entry-error entry) condition))
-          (when reserved-p
-            (setf (%h2-batch-entry-request-state entry) :cancelled))
-          (setf reset-p
-                (and (not reserved-p)
-                     (member entry
-                             (%http2-connection-scheduler-entries connection)
-                             :test #'eq)))
-          (%h2-scheduler-remove-entry connection entry)
-          (setf (%h2-batch-entry-body-limit-error-pending-p entry) nil
-                (%h2-batch-entry-body-vector entry)
-                (make-array 0 :element-type '(unsigned-byte 8)
-                            :adjustable t :fill-pointer 0)
-                (%h2-batch-entry-body-length entry) 0
-                (%h2-batch-entry-pending-response entry) nil
-                (%h2-batch-entry-response entry) nil))
-        (%h2-scheduler-broadcast connection)))
     (handler-case
-        (when reset-p
-          (%h2-send-rst-stream
-           (%h2-scheduler-control-writer connection clock-function)
-           (%h2-batch-entry-stream-id entry) reset-error-code))
+        (%h2-with-scheduler-lock (connection)
+          (unless (or (%h2-batch-entry-local-retired-p entry)
+                      (%h2-peer-stream-reset-condition-p
+                       (%h2-batch-entry-error entry))
+                      (and only-if-active-p
+                           (%h2-batch-entry-response entry)))
+            (let ((reserved-p
+                    (eq (%h2-batch-entry-request-state entry) :reserved)))
+              (setf (%h2-batch-entry-local-retired-p entry) t)
+              (unless (%h2-batch-entry-error entry)
+                (setf (%h2-batch-entry-error entry) condition))
+              (when reserved-p
+                (setf (%h2-batch-entry-request-state entry) :cancelled))
+              (setf reset-p
+                    (and (not reserved-p)
+                         (member entry
+                                 (%http2-connection-scheduler-entries connection)
+                                 :test #'eq)))
+              (when reset-p
+                (%h2-send-rst-stream
+                 (%h2-scheduler-control-writer connection clock-function)
+                 (%h2-batch-entry-stream-id entry) reset-error-code))
+              (%h2-scheduler-remove-entry connection entry)
+              (setf (%h2-batch-entry-body-limit-error-pending-p entry) nil
+                    (%h2-batch-entry-body-vector entry)
+                    (make-array 0 :element-type '(unsigned-byte 8)
+                                :adjustable t :fill-pointer 0)
+                    (%h2-batch-entry-body-length entry) 0
+                    (%h2-batch-entry-pending-response entry) nil
+                    (%h2-batch-entry-response entry) nil))
+            (%h2-scheduler-broadcast connection)))
       (error (reset-condition)
-             (%h2-scheduler-fail-connection connection reset-condition)
-             (error reset-condition)))))
-
+        (when reset-p
+          (%h2-scheduler-fail-connection connection reset-condition))
+        (error reset-condition)))))
 (defun %h2-scheduler-run-entry-callbacks
     (connection entry clock-function)
   (loop for event = (%h2-scheduler-pop-callback connection entry)
