@@ -171,18 +171,29 @@
                          (let ((wire (subseq record-buffer 0 record-length)))
                            (setf (fill-pointer record-buffer) 0)
                            (return (values wire :data)))))))
-                 (unless (listen stream)
-                   (return (values nil :would-block)))
-                 (let ((byte (read-byte stream nil :eof)))
-                   (when (eq byte :eof)
-                     (if (zerop (fill-pointer record-buffer))
-                         (return (values nil :eof))
-                         (%tls-protocol-error
-                          (if (< (fill-pointer record-buffer) 5)
-                              "The TLS transport ended in a record header."
-                              "The TLS transport ended in a record body.")
-                          :truncated-record)))
-                   (vector-push-extend byte record-buffer)))))
+                 (let ((byte
+                         #+sbcl
+                         (handler-case
+                             (sb-ext:with-timeout 0.001d0
+                               (read-byte stream nil :eof))
+                           (sb-ext:timeout () :would-block))
+                         #-sbcl
+                         (if (listen stream)
+                             (read-byte stream nil :eof)
+                             :would-block)))
+                   (cond
+                     ((eq byte :would-block)
+                      (return (values nil :would-block)))
+                     ((eq byte :eof)
+                      (if (zerop (fill-pointer record-buffer))
+                          (return (values nil :eof))
+                          (%tls-protocol-error
+                           (if (< (fill-pointer record-buffer) 5)
+                               "The TLS transport ended in a record header."
+                               "The TLS transport ended in a record body.")
+                           :truncated-record)))
+                     (t
+                      (vector-push-extend byte record-buffer)))))))
       (list :read
             (lambda (driver)
               (declare (ignore driver))

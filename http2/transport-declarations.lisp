@@ -32,7 +32,7 @@
                        peer-max-concurrent-streams peer-max-header-list-size
                        peer-initial-window-size peer-enable-connect-protocol-p
                        peer-connection-window-size
-                       peer-stream-windows session-started-p
+                       peer-stream-windows session-started-p scheduler-reader
                        goaway-last-stream-id closed-p max-control-frames
                        max-control-window max-pending-information-callbacks
                        control-frame-times)))
@@ -55,6 +55,11 @@
   (peer-connection-window-size +http2-default-window-size+)
   (peer-stream-windows nil)
   (session-started-p nil)
+  (session-start-state :not-started)
+  (scheduler-reader nil)
+  (scheduler-header-block-state nil)
+  (scheduler-write-queue nil)
+  (scheduler-write-queue-tail nil)
   (goaway-last-stream-id nil)
   (local-goaway-last-stream-id nil)
   (draining-p nil)
@@ -67,6 +72,8 @@
   #-sbcl (scheduler-lock nil)
   #+sbcl (writer-lock (sb-thread:make-mutex :name "HTTP/2 writer"))
   #-sbcl (writer-lock nil)
+  #+sbcl (close-lock (sb-thread:make-mutex :name "HTTP/2 close"))
+  #-sbcl (close-lock nil)
   #+sbcl (scheduler-condition (sb-thread:make-waitqueue))
   #-sbcl (scheduler-condition nil)
   (scheduler-reader-active-p nil)

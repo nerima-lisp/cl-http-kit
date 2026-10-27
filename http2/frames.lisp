@@ -22,43 +22,44 @@
   (defgeneric %h2-reader-read-available (stream count timeout))
 
   (defmethod %h2-reader-read-available ((stream stream) count timeout)
-  (let ((buffer (make-array count :element-type (quote (unsigned-byte 8))))
-        (position 0)
-        (eof-p nil)
-        (timeout (if timeout (min timeout 0.1d0) 0.1d0)))
-    #+sbcl
-    (handler-case
-        (sb-ext:with-timeout timeout
-          (loop while (< position count)
-                do (let ((octet (read-byte stream nil :eof)))
-                     (if (eq octet :eof)
-                         (progn
-                           (setf eof-p t)
-                           (return))
-                         (progn
-                           (setf (aref buffer position) octet)
-                           (incf position)
-                           (unless (listen stream)
-                             (return)))))))
-      (sb-ext:timeout () nil))
-    #-sbcl
-    (loop while (< position count)
-          do (let ((octet (read-byte stream nil :eof)))
-               (if (eq octet :eof)
-                   (progn
-                     (setf eof-p t)
-                     (return))
-                   (progn
-                     (setf (aref buffer position) octet)
-                     (incf position)
-                     (unless (listen stream)
-                       (return))))))
-    (values (subseq buffer 0 position)
-            (cond
-              ((plusp position) :data)
-              (eof-p :eof)
-              (t :would-block))
-            eof-p))))
+    (let ((buffer (make-array count :element-type (quote (unsigned-byte 8))))
+          (one-byte (make-array 1 :element-type (quote (unsigned-byte 8))))
+          (position 0)
+          (eof-p nil)
+          (timeout (if timeout (min timeout 0.1d0) 0.1d0)))
+      (flet ((read-one ()
+               (if (= (read-sequence one-byte stream) 1)
+                   (aref one-byte 0)
+                   :eof)))
+        #+sbcl
+        (handler-case
+            (sb-ext:with-timeout timeout
+              (loop while (< position count)
+                    do (let ((octet (read-one)))
+                         (if (eq octet :eof)
+                             (progn
+                               (setf eof-p t)
+                               (return))
+                             (progn
+                               (setf (aref buffer position) octet)
+                               (incf position))))))
+          (sb-ext:timeout () nil))
+        #-sbcl
+        (loop while (< position count)
+              do (let ((octet (read-one)))
+                   (if (eq octet :eof)
+                       (progn
+                         (setf eof-p t)
+                         (return))
+                       (progn
+                         (setf (aref buffer position) octet)
+                         (incf position)))))
+        (values (subseq buffer 0 position)
+                (cond
+                  ((plusp position) :data)
+                  (eof-p :eof)
+                  (t :would-block))
+                eof-p)))))
 
 (defun %h2-reader-for (input)
   (cond
@@ -217,7 +218,7 @@
          (if active-deadline
              (min active-deadline (+ now 0.1d0))
              (+ now 0.1d0)))
-       (header (%h2-reader-frame-header reader))
+       (header (progn (http-kit::%check-deadline active-deadline clock-function :read) (%h2-reader-frame-header reader)))
        (header-position (%h2-reader-frame-header-position reader))
        (metadata (%h2-reader-frame-metadata reader))
        (payload (%h2-reader-frame-payload reader))
