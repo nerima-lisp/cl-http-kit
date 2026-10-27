@@ -2213,13 +2213,14 @@
           (sb-bsd-sockets:socket-close client-socket))
         (when listener
           (sb-bsd-sockets:socket-close listener)))))
-  (deftest tls-server-check-handshake-deadline-skips-completed-handshake
+  (deftest tls-server-check-handshake-deadline-follows-handoff
     (let ((state
             (http-kit/tls::%make-http-tls-server-state
              :driver nil
              :provider nil
              :deadline 10
              :clock-function (lambda () 10))))
+      (setf (http-kit/tls::http-tls-server-state-handshake-complete-p state) t)
       (let ((condition
               (handler-case
                   (progn
@@ -2227,7 +2228,7 @@
                     nil)
                 (http-timeout (condition) condition))))
         (ensure-true (typep condition 'http-timeout)))
-      (setf (http-kit/tls::http-tls-server-state-handshake-complete-p state) t)
+      (setf (http-kit/tls::http-tls-server-state-handshake-deadline-active-p state) nil)
       (ensure-false
        (http-kit/tls::%tls-server-check-handshake-deadline state))))
   (deftest tls-server-does-not-send-alpn-alert-after-handshake-deadline
@@ -2359,7 +2360,8 @@
                (http-kit/tls::%make-http-tls-server-state
                 :driver nil :provider nil :transport-stream raw)))
         (when (first case)
-          (setf (http-kit/tls::http-tls-server-state-handshake-complete-p state) t))
+          (setf (http-kit/tls::http-tls-server-state-handshake-complete-p state) t
+                (http-kit/tls::http-tls-server-state-handshake-deadline-active-p state) nil))
         (unwind-protect
              (let ((condition
                      (handler-case
