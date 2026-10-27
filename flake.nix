@@ -16,7 +16,7 @@
     };
 
     cl-http-message-kit = {
-      url = "github:nerima-lisp/cl-http-message-kit/874662c25187403604497c26723c309a9005d6d6";
+      url = "github:nerima-lisp/cl-http-message-kit/v2.0.1";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.cl-weave.follows = "cl-weave";
       inputs.cl-hpack-codec-kit.follows = "cl-hpack-codec-kit";
