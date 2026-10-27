@@ -825,7 +825,8 @@
          (chunks nil)
          (information-statuses nil))
     (setf (http-kit/http2::%h2-batch-entry-body-vector entry) (octets 120)
-          (http-kit/http2::%h2-batch-entry-body-length entry) 1)
+          (http-kit/http2::%h2-batch-entry-body-length entry) 1
+          (http-kit/http2::%h2-batch-entry-request-state entry) :written)
     (setf (http-kit/http2::%http2-connection-scheduler-entries connection)
           (list entry))
     (ensure-true
@@ -912,7 +913,8 @@
            (callback-error nil)
            (before (copy-seq (binary-session-output stream))))
       (setf (http-kit/http2::%h2-batch-entry-body-vector entry) (octets 120)
-            (http-kit/http2::%h2-batch-entry-body-length entry) 1)
+            (http-kit/http2::%h2-batch-entry-body-length entry) 1
+            (http-kit/http2::%h2-batch-entry-request-state entry) :written)
       (setf (http-kit/http2::%http2-connection-scheduler-entries connection)
             (list entry))
       (ensure-true
@@ -1000,6 +1002,7 @@
            connection) 1
           (http-kit/http2::%http2-connection-scheduler-entries connection)
           (list entry)
+          (http-kit/http2::%h2-batch-entry-request-state entry) :written
           (http-kit/http2::%h2-batch-entry-error entry) existing-error
           (http-kit/http2::%h2-batch-entry-callback-events entry)
           (list (list :body #'identity (octets 97 98) 2 nil)))
@@ -1062,6 +1065,7 @@
            (observed nil))
       (setf (http-kit/http2::%http2-connection-scheduler-entries failing-connection)
             (list entry)
+            (http-kit/http2::%h2-batch-entry-request-state entry) :written
             (h2-control-write-failure-armed-p failing-stream) t)
       (handler-case
           (http-kit/http2::%h2-scheduler-retire-entry
@@ -1077,7 +1081,8 @@
              (make-condition 'simple-error
                              :format-control "Retired entry response.")))
       (setf (http-kit/http2::%http2-connection-scheduler-entries connection)
-            (list entry))
+            (list entry)
+            (http-kit/http2::%h2-batch-entry-request-state entry) :written)
       (http-kit/http2::%h2-scheduler-retire-entry
        connection entry retirement-error clock)
       (http-kit/http2::%h2-scheduler-mark-response connection entry response)
@@ -1454,6 +1459,7 @@
     (setf (http-kit/http2::%http2-connection-next-stream-id connection) 3
           (http-kit/http2::%http2-connection-scheduler-entries connection)
           (list entry)
+          (http-kit/http2::%h2-batch-entry-request-state entry) :written
           (http-kit/http2::%h2-batch-entry-response-headers-callback-complete-p
            entry) t
           (http-kit/http2::%h2-batch-entry-pending-body-callback-count entry) 1
@@ -2381,6 +2387,7 @@
          (progn
            (setf (http-kit/http2::%http2-connection-scheduler-entries connection)
                  (list entry)
+                 (http-kit/http2::%h2-batch-entry-request-state entry) :written
                  (http-kit/http2::%h2-batch-entry-callback-events entry)
                  (list (list :information #'identity
                              (make-http-response :status 103))

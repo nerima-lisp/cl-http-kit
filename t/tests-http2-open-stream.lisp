@@ -41,6 +41,16 @@
             do (vector-push-extend (aref sequence index) output)))
     sequence)
 
+  (defclass scheduler-write-failure-stream (binary-session-stream)
+    ((write-error
+       :initarg :write-error
+       :reader scheduler-write-failure-stream-error)))
+
+  (defmethod sb-gray:stream-write-sequence
+      ((stream scheduler-write-failure-stream) sequence &optional start end)
+    (declare (ignore sequence start end))
+    (error (scheduler-write-failure-stream-error stream)))
+
   (defmethod sb-gray:stream-finish-output ((stream binary-session-stream))
     (declare (ignore stream))
     nil)
@@ -2531,8 +2541,16 @@
                 (sb-thread:join-thread request-thread)
                 (setf request-thread nil)))
              (ensure-true (typep request-error 'http-connection-error))
-             (ensure-equal :http2-read (http-error-operation request-error))
-             (ensure-equal :eof (http-connection-error-cause request-error))
+             (ensure-equal
+              (if (eq mode :ping-write-fails-before-reader-eof)
+                  :http2-write
+                  :http2-read)
+              (http-error-operation request-error))
+             (ensure-equal
+              (if (eq mode :ping-write-fails-before-reader-eof)
+                  :test-write-failure
+                  :eof)
+              (http-connection-error-cause request-error))
              (if (eq mode :ping-write-fails-before-reader-eof)
                  (progn
                    (ensure-true (typep ping-error 'http-connection-error))
@@ -3613,8 +3631,13 @@
 (deftest http2-scheduler-extra-runtime-edge-boundaries
   (let ((request (make-http-request :method "GET"
                                     :uri "https://scheduler.test/edge")))
-    (labels ((make-connection (input)
-               (let* ((stream (make-instance 'binary-session-stream :input input))
+    (labels ((make-connection (input &optional write-error)
+               (let* ((stream
+                        (if write-error
+                            (make-instance 'scheduler-write-failure-stream
+                                           :input input
+                                           :write-error write-error)
+                            (make-instance 'binary-session-stream :input input)))
                       (closes (list 0))
                       (connection
                         (http-kit/http2:make-http2-connection
@@ -3624,7 +3647,14 @@
                            (ensure-true (eq received stream))
                            (incf (car closes))))))
                  (values stream connection closes)))
-             (entry (request stream-id &key error) (let ((entry (http-kit/http2::%make-h2-batch-entry :request request :stream-id stream-id))) (setf (http-kit/http2::%h2-batch-entry-error entry) error) entry)))
+             (entry (request stream-id &key error)
+               (let ((entry
+                       (http-kit/http2::%make-h2-batch-entry
+                        :request request :stream-id stream-id)))
+                 (setf (http-kit/http2::%h2-batch-entry-request-state entry)
+                       :written
+                       (http-kit/http2::%h2-batch-entry-error entry) error)
+                 entry)))
       (multiple-value-bind (stream connection closes)
           (make-connection (octets))
         (let* ((active-entry (entry request 1))
@@ -3654,9 +3684,7 @@
           (http-kit/http2:close-http2-connection connection)
           (ensure-equal 1 (car closes))))
       (dolist (timeout-p '(nil t))
-        (multiple-value-bind (stream connection closes)
-            (make-connection (octets))
-          (let* ((failure
+        (let* ((failure
                    (if timeout-p
                        (make-condition 'http-kit:http-timeout
                                        :message "scheduled request write timed out"
@@ -3664,25 +3692,14 @@
                        (make-condition 'http-kit:http-connection-error
                                        :message "scheduled request write failed"
                                        :operation :http2-write
-                                       :cause :test-write)))
-                 (observed
-                   (handler-case
-                       (http-kit/http2::%h2-scheduler-open-entry
-                        connection request nil nil
-                        (http-kit/http2::%http2-connection-max-header-bytes
-                         connection)
-                        (http-kit/http2::%http2-connection-max-fields connection)
-                        (http-kit/http2::%http2-connection-max-body-bytes
-                         connection)
-                        nil #'http-kit::%monotonic-time nil nil nil nil t nil
-                        (lambda (wire)
-                          (ensure-true (plusp (length wire)))
-                          (error failure))
-                        (lambda () nil)
-                        (lambda () (error "Unexpected request cancellation."))
-                        (lambda (opened-entry)
-                          (declare (ignore opened-entry))))
-                     (http-kit:http-error (condition) condition))))
+                                       :cause :test-write))))
+          (multiple-value-bind (stream connection closes)
+              (make-connection (octets) failure)
+            (let ((observed
+                    (handler-case
+                        (http-kit/http2:send-http2-request-over-connection
+                         connection request)
+                      (http-kit:http-error (condition) condition))))
             (ensure-true (eq failure observed))
             (ensure-false
              (http-kit/http2::%http2-connection-scheduler-entries connection))
@@ -3695,9 +3712,8 @@
             (ensure-false
              (http-kit/http2::%http2-connection-session-started-p connection))
             (ensure-equal 0 (length (binary-session-output stream)))
-            (ensure-true (http-kit/http2:http2-connection-open-p connection))
-            (http-kit/http2:close-http2-connection connection)
-            (ensure-equal 1 (car closes)))))
+            (ensure-false (http-kit/http2:http2-connection-open-p connection))
+            (ensure-equal 1 (car closes))))))
       (multiple-value-bind (stream connection closes)
           (make-connection (octets))
         (http-kit/http2:close-http2-connection connection)
@@ -4497,7 +4513,9 @@
            (progn
              (setf (http-kit/http2::%http2-connection-next-stream-id connection) 3
                    (http-kit/http2::%http2-connection-scheduler-entries connection)
-                   (list entry))
+                   (list entry)
+                   (http-kit/http2::%h2-batch-entry-request-state entry)
+                   :written)
              (ensure-true
               (http-kit/http2::%h2-cancel-http2-stream
                connection 1 :only-if-active-p t))
@@ -4509,6 +4527,832 @@
                (ensure-equal 1 (http-kit/http2::%h2-u32 output 5))))
         (http-kit/http2:close-http2-connection connection))))
 )
+
+#+sbcl
+(deftest http2-public-peer-capacity-reader-cancel-preserves-partial-frame-and-reuses-connection
+  (let* ((initial-settings
+           (h2-frame 4 0 0 (octets 0 3 0 0 0 1)))
+         (stream
+           (make-instance 'h2-manager-capacity-peer-stream
+                          :input initial-settings))
+         (connection nil)
+         (manager
+           (http-kit/http2:make-http2-connection-manager
+            :open-connection
+            (lambda (request &key timeout deadline proxy-plan proxy)
+              (declare (ignore request timeout deadline proxy-plan proxy))
+              (setf connection
+                    (http-kit/http2:make-http2-connection
+                     :stream stream
+                     :max-concurrent-streams 2
+                     :close-stream
+                     (lambda (closed-stream)
+                       (ensure-true (eq stream closed-stream))
+                       (h2-manager-capacity-peer-close stream)))))))
+         (transport
+           (http-kit/http2:make-http2-connection-manager-transport manager))
+         (first-headers-entered (sb-thread:make-semaphore :count 0))
+         (release-first-headers (sb-thread:make-semaphore :count 0))
+         (first-release-signaled-p nil)
+         (first-response nil)
+         (first-failure nil)
+         (first-done (sb-thread:make-semaphore :count 0))
+         (second-cancel-registered (sb-thread:make-semaphore :count 0))
+         (second-cancel nil)
+         (second-response nil)
+         (second-failure nil)
+         (second-done (sb-thread:make-semaphore :count 0))
+         (third-response nil)
+         (third-failure nil)
+         (third-done (sb-thread:make-semaphore :count 0))
+         (first-thread nil)
+         (second-thread nil)
+         (third-thread nil))
+    (unwind-protect
+         (progn
+           (setf first-thread
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (unwind-protect
+                         (handler-case
+                             (setf first-response
+                                   (sb-ext:with-timeout 10
+                                     (funcall
+                                      transport
+                                      (make-http-request
+                                       :method "GET"
+                                       :uri "http://peer-reader.test/first")
+                                      :connection-key "peer-reader-cancel.test"
+                                      :on-response-headers
+                                      (lambda (status headers)
+                                        (declare (ignore headers))
+                                        (ensure-equal 200 status)
+                                        (sb-thread:signal-semaphore
+                                         first-headers-entered)
+                                        (ensure-true
+                                         (sb-thread:wait-on-semaphore
+                                          release-first-headers :timeout 10))))))
+                           (error (condition)
+                             (setf first-failure condition)))
+                      (sb-thread:signal-semaphore first-done)))))
+           (ensure-true
+            (sb-thread:wait-on-semaphore first-headers-entered :timeout 5))
+           (ensure-equal '(1)
+                         (h2-manager-capacity-peer-output-header-ids stream))
+           (ensure-true
+            (sb-thread:wait-on-semaphore
+             (h2-manager-capacity-peer-header-available stream) :timeout 0.001))
+           (loop while
+                 (sb-thread:wait-on-semaphore
+                  (h2-manager-capacity-peer-input-read-waiting stream)
+                  :timeout 0.000001))
+           (setf second-thread
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (unwind-protect
+                         (handler-case
+                             (setf second-response
+                                   (sb-ext:with-timeout 10
+                                     (funcall
+                                      transport
+                                      (make-http-request
+                                       :method "GET"
+                                       :uri "http://peer-reader.test/cancelled")
+                                      :connection-key "peer-reader-cancel.test"
+                                      :on-cancel
+                                      (lambda (cancel-function)
+                                        (setf second-cancel cancel-function)
+                                        (sb-thread:signal-semaphore
+                                         second-cancel-registered)
+                                        nil))))
+                           (error (condition)
+                             (setf second-failure condition)))
+                      (sb-thread:signal-semaphore second-done)))))
+           (ensure-true
+            (sb-thread:wait-on-semaphore second-cancel-registered :timeout 5))
+           (ensure-true
+            (sb-thread:wait-on-semaphore
+             (h2-manager-capacity-peer-input-read-waiting stream) :timeout 5))
+           (let ((ping-frame (h2-frame 6 0 0 (octets 1 2 3 4 5 6 7 8))))
+             (h2-manager-capacity-peer-feed stream (subseq ping-frame 0 4))
+             (ensure-true
+              (sb-thread:wait-on-semaphore
+               (h2-manager-capacity-peer-input-read-waiting stream) :timeout 5))
+             (ensure-true (functionp second-cancel))
+             (funcall second-cancel))
+           (ensure-true (sb-thread:wait-on-semaphore second-done :timeout 1))
+           (ensure-false second-response)
+           (ensure-true (typep second-failure 'http-kit:http-connection-error))
+           (let ((cause
+                   (http-kit:http-connection-error-cause second-failure)))
+             (ensure-true (consp cause))
+             (ensure-equal :local-cancel (first cause)))
+           (ensure-equal '(1)
+                         (h2-manager-capacity-peer-output-header-ids stream))
+           (ensure-false
+            (some (lambda (frame)
+                    (and (= 3 (http-kit/http2::%h2-frame-type frame))
+                         (= 3 (http-kit/http2::%h2-frame-stream-id frame))))
+                  (h2-output-frames stream)))
+           (ensure-true (http-kit/http2:http2-connection-open-p connection))
+           (setf first-release-signaled-p t)
+           (sb-thread:signal-semaphore release-first-headers)
+           (let ((ping-frame (h2-frame 6 0 0 (octets 1 2 3 4 5 6 7 8))))
+             (h2-manager-capacity-peer-feed
+              stream
+              (concatenate-octets
+               (subseq ping-frame 4)
+               (h2-frame 0 1 1 (octets 65)))))
+           (ensure-true (sb-thread:wait-on-semaphore first-done :timeout 5))
+           (sb-thread:join-thread first-thread)
+           (setf first-thread nil)
+           (ensure-false first-failure)
+           (ensure-equal 200 (http-response-status first-response))
+           (ensure-equal (octets 65) (http-response-body first-response))
+           (setf third-thread
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (unwind-protect
+                         (handler-case
+                             (setf third-response
+                                   (sb-ext:with-timeout 10
+                                     (funcall
+                                      transport
+                                      (make-http-request
+                                       :method "GET"
+                                       :uri "http://peer-reader.test/after-cancel")
+                                      :connection-key "peer-reader-cancel.test")))
+                           (error (condition)
+                             (setf third-failure condition)))
+                      (sb-thread:signal-semaphore third-done)))))
+           (ensure-true
+            (sb-thread:wait-on-semaphore
+             (h2-manager-capacity-peer-header-available stream) :timeout 5))
+           (ensure-equal '(1 3)
+                         (h2-manager-capacity-peer-output-header-ids stream))
+           (h2-manager-capacity-peer-feed
+            stream (h2-frame 0 1 3 (octets)))
+           (ensure-true (sb-thread:wait-on-semaphore third-done :timeout 5))
+           (sb-thread:join-thread third-thread)
+           (setf third-thread nil)
+           (ensure-false third-failure)
+           (ensure-equal 201 (http-response-status third-response))
+           (ensure-true (http-kit/http2:http2-connection-open-p connection)))
+      (unless first-release-signaled-p
+        (setf first-release-signaled-p t)
+        (sb-thread:signal-semaphore release-first-headers))
+      (h2-manager-capacity-peer-close stream)
+      (http-kit/http2:close-http2-connection-manager manager)
+      (dolist (thread (list first-thread second-thread third-thread))
+        (when thread
+          (sb-thread:join-thread thread))))))
+
+#+sbcl
+(deftest http2-public-peer-capacity-wait-times-out-on-an-active-request
+  (let* ((stream
+           (make-instance 'h2-manager-capacity-peer-stream
+                          :input (h2-frame 4 0 0 (octets 0 3 0 0 0 1))))
+         (connection nil)
+         (manager
+           (http-kit/http2:make-http2-connection-manager
+            :open-connection
+            (lambda (request &key timeout deadline proxy-plan proxy)
+              (declare (ignore request timeout deadline proxy-plan proxy))
+              (setf connection
+                    (http-kit/http2:make-http2-connection
+                     :stream stream
+                     :max-concurrent-streams 2
+                     :close-stream
+                     (lambda (closed-stream)
+                       (ensure-true (eq stream closed-stream))
+                       (h2-manager-capacity-peer-close stream)))))))
+         (transport
+           (http-kit/http2:make-http2-connection-manager-transport manager))
+         (first-headers-entered (sb-thread:make-semaphore :count 0))
+         (release-first-headers (sb-thread:make-semaphore :count 0))
+         (first-release-signaled-p nil)
+         (first-response nil)
+         (first-failure nil)
+         (first-done (sb-thread:make-semaphore :count 0))
+         (second-failure nil)
+         (second-response nil)
+         (second-done (sb-thread:make-semaphore :count 0))
+         (first-thread nil)
+         (second-thread nil))
+    (unwind-protect
+         (progn
+           (setf first-thread
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (unwind-protect
+                         (handler-case
+                             (setf first-response
+                                   (sb-ext:with-timeout 10
+                                     (funcall
+                                      transport
+                                      (make-http-request
+                                       :method "GET"
+                                       :uri "http://peer-deadline.test/first")
+                                      :connection-key "peer-deadline.test"
+                                      :on-response-headers
+                                      (lambda (status headers)
+                                        (declare (ignore headers))
+                                        (ensure-equal 200 status)
+                                        (sb-thread:signal-semaphore
+                                         first-headers-entered)
+                                        (ensure-true
+                                         (sb-thread:wait-on-semaphore
+                                          release-first-headers :timeout 10))))))
+                           (error (condition)
+                             (setf first-failure condition)))
+                      (sb-thread:signal-semaphore first-done)))))
+           (ensure-true
+            (sb-thread:wait-on-semaphore first-headers-entered :timeout 5))
+           (loop while
+                 (sb-thread:wait-on-semaphore
+                  (h2-manager-capacity-peer-input-read-waiting stream)
+                  :timeout 0.000001))
+           (setf second-thread
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (unwind-protect
+                         (handler-case
+                             (setf second-response
+                                   (sb-ext:with-timeout 5
+                                     (funcall
+                                      transport
+                                      (make-http-request
+                                       :method "GET"
+                                       :uri "http://peer-deadline.test/timeout")
+                                      :connection-key "peer-deadline.test"
+                                      :timeout 0.2)))
+                           (error (condition)
+                             (setf second-failure condition)))
+                      (sb-thread:signal-semaphore second-done)))))
+           (ensure-true
+            (sb-thread:wait-on-semaphore
+             (h2-manager-capacity-peer-input-read-waiting stream) :timeout 5))
+           (ensure-true (sb-thread:wait-on-semaphore second-done :timeout 2))
+           (ensure-false second-response)
+           (ensure-true (typep second-failure 'http-kit:http-timeout))
+           (ensure-true (http-kit/http2:http2-connection-open-p connection))
+           (setf first-release-signaled-p t)
+           (sb-thread:signal-semaphore release-first-headers)
+           (h2-manager-capacity-peer-feed
+            stream (h2-frame 0 1 1 (octets 65)))
+           (ensure-true (sb-thread:wait-on-semaphore first-done :timeout 5))
+           (sb-thread:join-thread first-thread)
+           (setf first-thread nil)
+           (ensure-false first-failure)
+           (ensure-equal 200 (http-response-status first-response))
+           (ensure-equal (octets 65) (http-response-body first-response)))
+      (unless first-release-signaled-p
+        (setf first-release-signaled-p t)
+        (sb-thread:signal-semaphore release-first-headers))
+      (h2-manager-capacity-peer-close stream)
+      (http-kit/http2:close-http2-connection-manager manager)
+      (dolist (thread (list first-thread second-thread))
+        (when thread
+          (sb-thread:join-thread thread))))))
+
+#+sbcl
+(deftest http2-public-peer-capacity-wait-exits-on-connection-close
+  (let* ((stream
+           (make-instance 'h2-manager-capacity-peer-stream
+                          :input (h2-frame 4 0 0 (octets 0 3 0 0 0 1))))
+         (connection nil)
+         (manager
+           (http-kit/http2:make-http2-connection-manager
+            :open-connection
+            (lambda (request &key timeout deadline proxy-plan proxy)
+              (declare (ignore request timeout deadline proxy-plan proxy))
+              (setf connection
+                    (http-kit/http2:make-http2-connection
+                     :stream stream
+                     :max-concurrent-streams 2
+                     :close-stream
+                     (lambda (closed-stream)
+                       (ensure-true (eq stream closed-stream))
+                       (h2-manager-capacity-peer-close stream)))))))
+         (transport
+           (http-kit/http2:make-http2-connection-manager-transport manager))
+         (first-headers-entered (sb-thread:make-semaphore :count 0))
+         (release-first-headers (sb-thread:make-semaphore :count 0))
+         (first-release-signaled-p nil)
+         (first-response nil)
+         (first-failure nil)
+         (first-done (sb-thread:make-semaphore :count 0))
+         (second-response nil)
+         (second-failure nil)
+         (second-done (sb-thread:make-semaphore :count 0))
+         (close-done (sb-thread:make-semaphore :count 0))
+         (first-thread nil)
+         (second-thread nil)
+         (close-thread nil))
+    (unwind-protect
+         (progn
+           (setf first-thread
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (unwind-protect
+                         (handler-case
+                             (setf first-response
+                                   (sb-ext:with-timeout 10
+                                     (funcall
+                                      transport
+                                      (make-http-request
+                                       :method "GET"
+                                       :uri "http://peer-close.test/first")
+                                      :connection-key "peer-close.test"
+                                      :on-response-headers
+                                      (lambda (status headers)
+                                        (declare (ignore headers))
+                                        (ensure-equal 200 status)
+                                        (sb-thread:signal-semaphore
+                                         first-headers-entered)
+                                        (ensure-true
+                                         (sb-thread:wait-on-semaphore
+                                          release-first-headers :timeout 10))))))
+                           (error (condition)
+                             (setf first-failure condition)))
+                      (sb-thread:signal-semaphore first-done)))))
+           (ensure-true
+            (sb-thread:wait-on-semaphore first-headers-entered :timeout 5))
+           (loop while
+                 (sb-thread:wait-on-semaphore
+                  (h2-manager-capacity-peer-input-read-waiting stream)
+                  :timeout 0.000001))
+           (setf second-thread
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (unwind-protect
+                         (handler-case
+                             (setf second-response
+                                   (sb-ext:with-timeout 10
+                                     (funcall
+                                      transport
+                                      (make-http-request
+                                       :method "GET"
+                                       :uri "http://peer-close.test/waiter")
+                                      :connection-key "peer-close.test")))
+                           (error (condition)
+                             (setf second-failure condition)))
+                      (sb-thread:signal-semaphore second-done)))))
+           (ensure-true
+            (sb-thread:wait-on-semaphore
+             (h2-manager-capacity-peer-input-read-waiting stream) :timeout 5))
+           (setf close-thread
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (unwind-protect
+                         (http-kit/http2:close-http2-connection connection)
+                      (sb-thread:signal-semaphore close-done)))))
+           (ensure-true (sb-thread:wait-on-semaphore close-done :timeout 1))
+           (ensure-true (sb-thread:wait-on-semaphore second-done :timeout 1))
+           (ensure-false second-response)
+           (ensure-true (typep second-failure 'http-kit:http-connection-error))
+           (ensure-false (http-kit/http2:http2-connection-open-p connection))
+           (setf first-release-signaled-p t)
+           (sb-thread:signal-semaphore release-first-headers)
+           (ensure-true (sb-thread:wait-on-semaphore first-done :timeout 5))
+           (sb-thread:join-thread first-thread)
+           (setf first-thread nil)
+           (ensure-true first-failure))
+      (unless first-release-signaled-p
+        (setf first-release-signaled-p t)
+        (sb-thread:signal-semaphore release-first-headers))
+      (h2-manager-capacity-peer-close stream)
+      (http-kit/http2:close-http2-connection-manager manager)
+      (dolist (thread (list first-thread second-thread close-thread))
+        (when thread
+          (sb-thread:join-thread thread))))))
+
+#+sbcl
+(deftest http2-public-connection-manager-reserves-racing-peer-capacity-slots
+  (let* ((stream
+           (make-instance 'h2-manager-capacity-peer-stream
+                          :input (h2-frame 4 0 0 (octets 0 3 0 0 0 1))
+                          :response-end-stream-p t))
+         (connection nil)
+         (manager
+           (http-kit/http2:make-http2-connection-manager
+            :open-connection
+            (lambda (request &key timeout deadline proxy-plan proxy)
+              (declare (ignore request timeout deadline proxy-plan proxy))
+              (setf connection
+                    (http-kit/http2:make-http2-connection
+                     :stream stream
+                     :max-concurrent-streams 8
+                     :close-stream
+                     (lambda (closed-stream)
+                       (ensure-true (eq stream closed-stream))
+                       (h2-manager-capacity-peer-close stream)))))))
+         (transport
+           (http-kit/http2:make-http2-connection-manager-transport manager))
+         (first-headers-entered (sb-thread:make-semaphore :count 0))
+         (release-first-headers (sb-thread:make-semaphore :count 0))
+         (first-release-signaled-p nil)
+         (first-response nil)
+         (first-failure nil)
+         (first-done (sb-thread:make-semaphore :count 0))
+         (waiters-registered (sb-thread:make-semaphore :count 0))
+         (responses (make-array 4 :initial-element nil))
+         (failures (make-array 4 :initial-element nil))
+         (waiter-done
+           (make-array 4 :initial-contents
+                       (loop repeat 4 collect
+                         (sb-thread:make-semaphore :count 0))))
+         (waiter-threads (make-array 4 :initial-element nil))
+         (first-thread nil))
+    (unwind-protect
+         (progn
+           (setf first-thread
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (unwind-protect
+                         (handler-case
+                             (setf first-response
+                                   (sb-ext:with-timeout 10
+                                     (funcall
+                                      transport
+                                      (make-http-request
+                                       :method "GET"
+                                       :uri "http://peer-race.test/first")
+                                      :connection-key "peer-race.test"
+                                      :on-response-headers
+                                      (lambda (status headers)
+                                        (declare (ignore headers))
+                                        (ensure-equal 200 status)
+                                        (sb-thread:signal-semaphore
+                                         first-headers-entered)
+                                        (ensure-true
+                                         (sb-thread:wait-on-semaphore
+                                          release-first-headers :timeout 10))))))
+                           (error (condition)
+                             (setf first-failure condition)))
+                      (sb-thread:signal-semaphore first-done)))))
+           (ensure-true
+            (sb-thread:wait-on-semaphore first-headers-entered :timeout 5))
+           (ensure-true
+            (sb-thread:wait-on-semaphore
+             (h2-manager-capacity-peer-header-available stream) :timeout 5))
+           (loop for index below 4
+                 do (setf (aref waiter-threads index)
+                          (sb-thread:make-thread
+                           (let ((request-index index))
+                             (lambda ()
+                               (unwind-protect
+                                    (handler-case
+                                        (setf (aref responses request-index)
+                                              (sb-ext:with-timeout 10
+                                                (funcall
+                                                 transport
+                                                 (make-http-request
+                                                  :method "GET"
+                                                  :uri
+                                                  (format nil
+                                                          "http://peer-race.test/w~D"
+                                                          request-index))
+                                                 :connection-key "peer-race.test"
+                                                 :on-cancel
+                                                 (lambda (cancel-function)
+                                                   (declare (ignore cancel-function))
+                                                   (sb-thread:signal-semaphore
+                                                    waiters-registered)
+                                                   nil))))
+                                      (error (condition)
+                                        (setf (aref failures request-index)
+                                              condition)))
+                                 (sb-thread:signal-semaphore
+                                  (aref waiter-done request-index))))))))
+           (loop repeat 4
+                 do (ensure-true
+                     (sb-thread:wait-on-semaphore waiters-registered :timeout 5)))
+           (loop while
+                 (sb-thread:wait-on-semaphore
+                  (h2-manager-capacity-peer-input-read-waiting stream)
+                  :timeout 0.000001))
+           (ensure-true
+            (sb-thread:wait-on-semaphore
+             (h2-manager-capacity-peer-input-read-waiting stream) :timeout 5))
+           (h2-manager-capacity-peer-feed
+            stream (h2-frame 4 0 0 (octets 0 3 0 0 0 5)))
+           (loop repeat 4
+                 do (ensure-true
+                     (sb-thread:wait-on-semaphore
+                      (h2-manager-capacity-peer-header-available stream)
+                      :timeout 5)))
+           (loop for index below 4
+                 do (ensure-true
+                     (sb-thread:wait-on-semaphore
+                      (aref waiter-done index) :timeout 5)))
+           (loop for index below 4
+                 do (sb-thread:join-thread (aref waiter-threads index))
+                    (setf (aref waiter-threads index) nil)
+                    (ensure-false (aref failures index))
+                    (ensure-true
+                     (member (http-response-status (aref responses index))
+                             '(200 201 202))))
+           (setf first-release-signaled-p t)
+           (sb-thread:signal-semaphore release-first-headers)
+           (ensure-true (sb-thread:wait-on-semaphore first-done :timeout 5))
+           (sb-thread:join-thread first-thread)
+           (setf first-thread nil)
+           (ensure-false first-failure)
+           (ensure-equal 200 (http-response-status first-response))
+           (ensure-equal '(1 3 5 7 9)
+                         (h2-manager-capacity-peer-output-header-ids stream))
+           (ensure-true (http-kit/http2:http2-connection-open-p connection))
+           (ensure-equal
+            1
+            (http-kit/http2:http2-connection-manager-connection-count manager)))
+      (unless first-release-signaled-p
+        (setf first-release-signaled-p t)
+        (sb-thread:signal-semaphore release-first-headers))
+      (h2-manager-capacity-peer-close stream)
+      (http-kit/http2:close-http2-connection-manager manager)
+      (when first-thread
+        (sb-thread:join-thread first-thread))
+      (loop for thread across waiter-threads
+            when thread do (sb-thread:join-thread thread)))))
+
+#+sbcl
+(deftest http2-public-connection-manager-keeps-peer-streams-after-request-header-limit
+  (let* ((stream
+           (make-instance 'h2-manager-capacity-peer-stream
+                          :input (h2-frame 4 0 0 (octets))
+                          :response-end-stream-p nil))
+         (connection nil)
+         (manager
+           (http-kit/http2:make-http2-connection-manager
+            :open-connection
+            (lambda (request &key timeout deadline proxy-plan proxy)
+              (declare (ignore request timeout deadline proxy-plan proxy))
+              (setf connection
+                    (http-kit/http2:make-http2-connection
+                     :stream stream
+                     :max-concurrent-streams 2
+                     :max-header-bytes 512
+                     :close-stream
+                     (lambda (closed-stream)
+                       (ensure-true (eq stream closed-stream))
+                       (h2-manager-capacity-peer-close stream)))))))
+         (transport
+           (http-kit/http2:make-http2-connection-manager-transport manager))
+         (first-headers-entered (sb-thread:make-semaphore :count 0))
+         (release-first-headers (sb-thread:make-semaphore :count 0))
+         (first-release-signaled-p nil)
+         (first-response nil)
+         (first-failure nil)
+         (first-done (sb-thread:make-semaphore :count 0))
+         (third-response nil)
+         (third-failure nil)
+         (third-done (sb-thread:make-semaphore :count 0))
+         (first-thread nil)
+         (third-thread nil))
+    (unwind-protect
+         (progn
+           (setf first-thread
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (unwind-protect
+                         (handler-case
+                             (setf first-response
+                                   (sb-ext:with-timeout 10
+                                     (funcall
+                                      transport
+                                      (make-http-request
+                                       :method "GET"
+                                       :uri "http://header-limit.test/active")
+                                      :connection-key "header-limit.test"
+                                      :on-response-headers
+                                      (lambda (status headers)
+                                        (declare (ignore headers))
+                                        (ensure-equal 200 status)
+                                        (sb-thread:signal-semaphore
+                                         first-headers-entered)
+                                        (ensure-true
+                                         (sb-thread:wait-on-semaphore
+                                          release-first-headers :timeout 10))))))
+                           (error (condition)
+                             (setf first-failure condition)))
+                      (sb-thread:signal-semaphore first-done)))))
+           (ensure-true
+            (sb-thread:wait-on-semaphore first-headers-entered :timeout 5))
+           (ensure-true
+            (sb-thread:wait-on-semaphore
+             (h2-manager-capacity-peer-header-available stream) :timeout 5))
+           (let ((failure
+                   (handler-case
+                       (progn
+                         (funcall
+                          transport
+                          (make-http-request
+                           :method "GET"
+                           :uri "http://header-limit.test/oversized"
+                           :headers
+                           (list
+                            (make-http-header
+                             "x-too-large"
+                             (make-string 1024 :initial-element #\a))))
+                          :connection-key "header-limit.test")
+                         nil)
+                     (error (condition) condition))))
+             (ensure-true (typep failure 'http-kit:http-size-limit-exceeded))
+             (ensure-equal :headers
+                           (http-kit:http-size-limit-exceeded-kind failure)))
+           (ensure-equal '(1)
+                         (h2-manager-capacity-peer-output-header-ids stream))
+           (ensure-true (http-kit/http2:http2-connection-open-p connection))
+           (setf first-release-signaled-p t)
+           (sb-thread:signal-semaphore release-first-headers)
+           (h2-manager-capacity-peer-feed
+            stream (h2-frame 0 1 1 (octets 65)))
+           (ensure-true (sb-thread:wait-on-semaphore first-done :timeout 5))
+           (sb-thread:join-thread first-thread)
+           (setf first-thread nil)
+           (ensure-false first-failure)
+           (ensure-equal (octets 65) (http-response-body first-response))
+           (setf third-thread
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (unwind-protect
+                         (handler-case
+                             (setf third-response
+                                   (sb-ext:with-timeout 10
+                                     (funcall
+                                      transport
+                                      (make-http-request
+                                       :method "GET"
+                                       :uri "http://header-limit.test/after")
+                                      :connection-key "header-limit.test")))
+                           (error (condition)
+                             (setf third-failure condition)))
+                      (sb-thread:signal-semaphore third-done)))))
+           (ensure-true
+            (sb-thread:wait-on-semaphore
+             (h2-manager-capacity-peer-header-available stream) :timeout 5))
+           (let ((header-ids
+                   (h2-manager-capacity-peer-output-header-ids stream)))
+             (ensure-equal 2 (length header-ids))
+             (ensure-equal 1 (first header-ids))
+             (ensure-true (> (second header-ids) 1)))
+           (h2-manager-capacity-peer-feed
+            stream (h2-frame 0 1 3 (octets)))
+           (ensure-true (sb-thread:wait-on-semaphore third-done :timeout 5))
+           (sb-thread:join-thread third-thread)
+           (setf third-thread nil)
+           (ensure-false third-failure)
+           (ensure-equal 201 (http-response-status third-response))
+           (ensure-true (http-kit/http2:http2-connection-open-p connection))
+           (ensure-equal
+            1
+            (http-kit/http2:http2-connection-manager-connection-count manager)))
+      (unless first-release-signaled-p
+        (setf first-release-signaled-p t)
+        (sb-thread:signal-semaphore release-first-headers))
+      (h2-manager-capacity-peer-close stream)
+      (http-kit/http2:close-http2-connection-manager manager)
+      (dolist (thread (list first-thread third-thread))
+        (when thread
+          (sb-thread:join-thread thread))))))
+
+#+sbcl
+(deftest http2-public-extended-connect-initial-settings-wait-can-be-cancelled
+  (let* ((stream (make-instance 'h2-manager-capacity-peer-stream
+                                :input (octets)))
+         (connection nil)
+         (manager
+           (http-kit/http2:make-http2-connection-manager
+            :open-connection
+            (lambda (request &key timeout deadline proxy-plan proxy)
+              (declare (ignore request timeout deadline proxy-plan proxy))
+              (setf connection
+                    (http-kit/http2:make-http2-connection
+                     :stream stream
+                     :close-stream
+                     (lambda (closed-stream)
+                       (ensure-true (eq stream closed-stream))
+                       (h2-manager-capacity-peer-close stream)))))))
+         (transport
+           (http-kit/http2:make-http2-connection-manager-transport manager))
+         (cancel-registered (sb-thread:make-semaphore :count 0))
+         (cancel-function nil)
+         (response nil)
+         (failure nil)
+         (done (sb-thread:make-semaphore :count 0))
+         (thread nil))
+    (unwind-protect
+         (progn
+           (setf thread
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (unwind-protect
+                         (handler-case
+                             (setf response
+                                   (sb-ext:with-timeout 10
+                                     (funcall
+                                      transport
+                                      (make-http-request
+                                       :method "CONNECT"
+                                       :protocol "websocket"
+                                       :uri "https://extended-settings.test/socket")
+                                      :connection-key "extended-settings-cancel.test"
+                                      :on-cancel
+                                      (lambda (function)
+                                        (setf cancel-function function)
+                                        (sb-thread:signal-semaphore
+                                         cancel-registered)
+                                        nil))))
+                           (error (condition)
+                             (setf failure condition)))
+                      (sb-thread:signal-semaphore done)))))
+           (ensure-true
+            (sb-thread:wait-on-semaphore cancel-registered :timeout 5))
+           (ensure-true
+            (sb-thread:wait-on-semaphore
+             (h2-manager-capacity-peer-input-read-waiting stream) :timeout 5))
+           (ensure-true (functionp cancel-function))
+           (funcall cancel-function)
+           (ensure-true (sb-thread:wait-on-semaphore done :timeout 1))
+           (ensure-false response)
+           (ensure-true (typep failure 'http-kit:http-connection-error))
+           (ensure-equal :local-cancel
+                         (first
+                          (http-kit:http-connection-error-cause failure)))
+           (ensure-true (http-kit/http2:http2-connection-open-p connection))
+           (ensure-equal nil
+                         (h2-manager-capacity-peer-output-header-ids stream)))
+      (h2-manager-capacity-peer-close stream)
+      (http-kit/http2:close-http2-connection-manager manager)
+      (when thread
+        (sb-thread:join-thread thread)))))
+
+#+sbcl
+(deftest http2-public-extended-connect-initial-settings-wait-can-be-closed
+  (let* ((stream (make-instance 'h2-manager-capacity-peer-stream
+                                :input (octets)))
+         (connection nil)
+         (manager
+           (http-kit/http2:make-http2-connection-manager
+            :open-connection
+            (lambda (request &key timeout deadline proxy-plan proxy)
+              (declare (ignore request timeout deadline proxy-plan proxy))
+              (setf connection
+                    (http-kit/http2:make-http2-connection
+                     :stream stream
+                     :close-stream
+                     (lambda (closed-stream)
+                       (ensure-true (eq stream closed-stream))
+                       (h2-manager-capacity-peer-close stream)))))))
+         (transport
+           (http-kit/http2:make-http2-connection-manager-transport manager))
+         (response nil)
+         (failure nil)
+         (request-done (sb-thread:make-semaphore :count 0))
+         (close-done (sb-thread:make-semaphore :count 0))
+         (request-thread nil)
+         (close-thread nil))
+    (unwind-protect
+         (progn
+           (setf request-thread
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (unwind-protect
+                         (handler-case
+                             (setf response
+                                   (sb-ext:with-timeout 10
+                                     (funcall
+                                      transport
+                                      (make-http-request
+                                       :method "CONNECT"
+                                       :protocol "websocket"
+                                       :uri "https://extended-close.test/socket")
+                                      :connection-key "extended-settings-close.test")))
+                           (error (condition)
+                             (setf failure condition)))
+                      (sb-thread:signal-semaphore request-done)))))
+           (ensure-true
+            (sb-thread:wait-on-semaphore
+             (h2-manager-capacity-peer-input-read-waiting stream) :timeout 5))
+           (setf close-thread
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (unwind-protect
+                         (http-kit/http2:close-http2-connection connection)
+                      (sb-thread:signal-semaphore close-done)))))
+           (ensure-true (sb-thread:wait-on-semaphore close-done :timeout 1))
+           (ensure-true (sb-thread:wait-on-semaphore request-done :timeout 1))
+           (ensure-false response)
+           (ensure-true failure)
+           (ensure-false (http-kit/http2:http2-connection-open-p connection))
+           (ensure-equal nil
+                         (h2-manager-capacity-peer-output-header-ids stream)))
+      (h2-manager-capacity-peer-close stream)
+      (http-kit/http2:close-http2-connection-manager manager)
+      (dolist (thread (list request-thread close-thread))
+        (when thread
+          (sb-thread:join-thread thread))))))
 
 #+sbcl
 (deftest http2-public-connection-coalesces-delayed-body-callbacks
@@ -5308,6 +6152,9 @@
      (input-ready
        :initform (sb-thread:make-waitqueue :name "HTTP/2 capacity peer input")
        :reader h2-manager-capacity-peer-input-ready)
+     (input-read-waiting
+       :initform (sb-thread:make-semaphore :count 0)
+       :reader h2-manager-capacity-peer-input-read-waiting)
      (output-lock
        :initform (sb-thread:make-mutex :name "HTTP/2 capacity peer output")
        :reader h2-manager-capacity-peer-output-lock)
@@ -5320,6 +6167,10 @@
      (seen-header-stream-ids
        :initform (make-hash-table :test #'eql)
        :reader h2-manager-capacity-peer-seen-header-stream-ids)
+     (response-end-stream-p
+       :initarg :response-end-stream-p
+       :initform nil
+       :reader h2-manager-capacity-peer-response-end-stream-p)
      (closed-p
        :initform nil
        :accessor h2-manager-capacity-peer-closed-p)))
@@ -5333,8 +6184,11 @@
         (loop while (and (>= (binary-session-input-position stream)
                              (length (binary-session-input stream)))
                          (not (h2-manager-capacity-peer-closed-p stream)))
-              do (sb-thread:condition-wait
-                  (h2-manager-capacity-peer-input-ready stream) lock))
+              do (progn
+                   (sb-thread:signal-semaphore
+                    (h2-manager-capacity-peer-input-read-waiting stream))
+                   (sb-thread:condition-wait
+                    (h2-manager-capacity-peer-input-ready stream) lock)))
         (let* ((input (binary-session-input stream))
                (position (binary-session-input-position stream))
                (count (min (- end start) (- (length input) position))))
@@ -5395,14 +6249,18 @@
                     (h2-manager-capacity-peer-feed
                      stream
                      (h2-frame
-                      1 4 stream-id
+                      1 (if (h2-manager-capacity-peer-response-end-stream-p
+                             stream)
+                            5
+                            4)
+                      stream-id
                       (h2-header-block
                        (cons ":status"
                              (case stream-id
                                (1 "200")
                                (3 "201")
                                (5 "202")
-                               (otherwise "500"))))))
+                               (otherwise "200"))))))
                     (sb-thread:signal-semaphore
                      (h2-manager-capacity-peer-header-available stream)))))))
           result))))
@@ -5839,3 +6697,43 @@
         (when second-thread
           (sb-thread:join-thread second-thread)))))
 )
+#+sbcl (progn
+  (defmethod sb-gray:stream-read-byte
+      ((stream binary-session-stream))
+    (let ((input (binary-session-input stream))
+          (position (binary-session-input-position stream)))
+      (if (< position (length input))
+          (prog1 (aref input position)
+            (incf (binary-session-input-position stream)))
+          :eof)))
+
+  (defmethod sb-gray:stream-listen
+      ((stream binary-session-stream))
+    (< (binary-session-input-position stream)
+       (length (binary-session-input stream))))
+
+  (defmethod sb-gray:stream-read-byte
+      ((stream h2-manager-capacity-peer-stream))
+    (let ((lock (h2-manager-capacity-peer-input-lock stream)))
+      (sb-thread:with-mutex (lock)
+        (loop while (and (>= (binary-session-input-position stream)
+                             (length (binary-session-input stream)))
+                         (not (h2-manager-capacity-peer-closed-p stream)))
+              do (progn
+                   (sb-thread:signal-semaphore
+                    (h2-manager-capacity-peer-input-read-waiting stream))
+                   (sb-thread:condition-wait
+                    (h2-manager-capacity-peer-input-ready stream) lock)))
+        (let* ((input (binary-session-input stream))
+               (position (binary-session-input-position stream)))
+          (if (< position (length input))
+              (prog1 (aref input position)
+                (incf (binary-session-input-position stream)))
+              :eof)))))
+
+  (defmethod sb-gray:stream-listen
+      ((stream h2-manager-capacity-peer-stream))
+    (let ((lock (h2-manager-capacity-peer-input-lock stream)))
+      (sb-thread:with-mutex (lock)
+        (< (binary-session-input-position stream)
+           (length (binary-session-input stream)))))))

@@ -362,7 +362,8 @@
                    (ensure-equal before (binary-session-output stream))
                    (ensure-equal (length initial-input) (binary-session-input-position stream))
                    (ensure-false opened)
-                   (ensure-equal 1 closes))
+                   (ensure-equal 0 closes)
+                   (ensure-true (http-kit/http2:http2-connection-open-p connection)))
                  (progn
                    (ensure-equal 200 (http-response-status result))
                    (ensure-equal (octets) (http-response-body result))
