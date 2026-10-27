@@ -2860,6 +2860,297 @@
                      connection)
                     :test #'eq)))
       (http-kit/http2:close-http2-connection connection))))
+(progn
+  #+sbcl
+  (deftest http2-coverage-cancel-http2-stream-validation-and-untracked-reset
+    (let* ((stream (make-instance 'binary-session-stream :input (octets)))
+           (connection (http-kit/http2:make-http2-connection :stream stream)))
+      (unwind-protect
+           (progn
+             (let ((failure
+                     (handler-case
+                         (progn
+                           (http-kit/http2::%h2-cancel-http2-stream :invalid 1)
+                           nil)
+                       (http-protocol-error (condition) condition))))
+               (ensure-true (typep failure 'http-protocol-error))
+               (ensure-equal :http2-client (http-error-operation failure))
+               (ensure-equal 'keyword
+                             (http-protocol-error-detail failure)))
+             (let ((failure
+                     (handler-case
+                         (progn
+                           (http-kit/http2::%h2-cancel-http2-stream connection 2)
+                           nil)
+                       (http-protocol-error (condition) condition))))
+               (ensure-true (typep failure 'http-protocol-error))
+               (ensure-equal :http2-write (http-error-operation failure))
+               (ensure-equal 2 (http-protocol-error-detail failure)))
+             (setf (http-kit/http2::%http2-connection-next-stream-id connection) 3)
+             (http-kit/http2::%h2-cancel-http2-stream
+              connection 1 :clock-function (lambda () 0))
+             (let* ((reader
+                      (http-kit/http2::%h2-reader-for
+                       (binary-session-output stream)))
+                    (reset (http-kit/http2::%h2-read-frame reader 16384 nil nil)))
+               (ensure-equal 3 (http-kit/http2::%h2-frame-type reset))
+               (ensure-equal 1 (http-kit/http2::%h2-frame-stream-id reset))
+               (ensure-equal (octets 0 0 0 8)
+                             (http-kit/http2::%h2-frame-payload reset))))
+        (http-kit/http2:close-http2-connection connection))))
+
+  #+sbcl
+  (deftest http2-coverage-scheduler-pump-until-already-settled
+    (let* ((stream (make-instance 'binary-session-stream :input (octets)))
+           (connection (http-kit/http2:make-http2-connection :stream stream))
+           (reader (http-kit/http2::%h2-reader-for stream)))
+      (unwind-protect
+           (progn
+             (ensure-false
+              (http-kit/http2::%h2-scheduler-pump-until
+               connection (lambda () t) reader nil nil (lambda () 0)))
+             (ensure-equal 0 (binary-session-input-position stream))
+             (ensure-true (http-kit/http2:http2-connection-open-p connection)))
+        (http-kit/http2:close-http2-connection connection))))
+
+  #+sbcl
+  (deftest http2-coverage-scheduler-accept-fragmented-headers
+    (let* ((stream (make-instance 'binary-session-stream :input (octets)))
+           (connection (http-kit/http2:make-http2-connection :stream stream))
+           (clock (lambda () 0))
+           (block (h2-header-block (cons ":status" "200")
+                                   (cons "content-length" "0")))
+           (split (max 1 (floor (length block) 2)))
+           (entry
+             (http-kit/http2::%make-h2-batch-entry
+              :request (make-http-request :method "GET"
+                                          :uri "https://example.com/fragmented")
+              :stream-id 1)))
+      (unwind-protect
+           (progn
+             (ensure-true (< split (length block)))
+             (setf (http-kit/http2::%http2-connection-scheduler-first-peer-frame-p
+                    connection)
+                   nil
+                   (http-kit/http2::%http2-connection-session-started-p connection)
+                   t
+                   (http-kit/http2::%http2-connection-next-stream-id connection) 3
+                   (http-kit/http2::%http2-connection-scheduler-last-opened-stream-id
+                    connection)
+                   1
+                   (http-kit/http2::%http2-connection-scheduler-entries connection)
+                   (list entry)
+                   (http-kit/http2::%h2-batch-entry-request-state entry)
+                   :written
+                   (http-kit/http2::%h2-batch-entry-body-sent-p entry)
+                   t)
+             (http-kit/http2::%h2-scheduler-accept-frame
+              connection (h2-frame-object 1 1 1 (subseq block 0 split))
+              nil nil nil clock)
+             (ensure-true
+              (http-kit/http2::%http2-connection-scheduler-header-block-state
+               connection))
+             (http-kit/http2::%h2-scheduler-accept-frame
+              connection (h2-frame-object 9 4 1 (subseq block split))
+              nil nil nil clock)
+             (ensure-false
+              (http-kit/http2::%http2-connection-scheduler-header-block-state
+               connection))
+             (ensure-equal 200
+                           (http-response-status
+                            (http-kit/http2::%h2-batch-entry-response entry)))
+             (ensure-equal (octets)
+                           (http-response-body
+                            (http-kit/http2::%h2-batch-entry-response entry)))
+             (ensure-false
+              (http-kit/http2::%http2-connection-scheduler-entries connection)))
+        (http-kit/http2:close-http2-connection connection)))
+    (let* ((stream (make-instance 'binary-session-stream :input (octets)))
+           (connection (http-kit/http2:make-http2-connection :stream stream))
+           (clock (lambda () 0))
+           (block (h2-header-block (cons ":status" "200")))
+           (split (max 1 (floor (length block) 2))))
+      (unwind-protect
+           (progn
+             (setf (http-kit/http2::%http2-connection-scheduler-first-peer-frame-p
+                    connection)
+                   nil)
+             (http-kit/http2::%h2-scheduler-accept-frame
+              connection (h2-frame-object 1 0 1 (subseq block 0 split))
+              nil nil nil clock)
+             (let ((failure
+                     (handler-case
+                         (progn
+                           (http-kit/http2::%h2-scheduler-accept-frame
+                            connection (h2-frame-object 9 4 3 (subseq block split))
+                            nil nil nil clock)
+                           nil)
+                       (http-protocol-error (condition) condition))))
+               (ensure-true (typep failure 'http-protocol-error))
+               (ensure-equal :http2-headers (http-error-operation failure))
+               (ensure-equal '(9 3 1)
+                             (http-protocol-error-detail failure)))
+             (let ((failure
+                     (handler-case
+                         (progn
+                           (http-kit/http2::%h2-scheduler-accept-frame
+                            connection (h2-frame-object 9 8 1 (subseq block split))
+                            nil nil nil clock)
+                           nil)
+                       (http-protocol-error (condition) condition))))
+               (ensure-true (typep failure 'http-protocol-error))
+               (ensure-equal :http2-headers (http-error-operation failure))
+               (ensure-equal 8 (http-protocol-error-detail failure))))
+        (http-kit/http2:close-http2-connection connection))))
+
+  #+sbcl
+  (deftest http2-coverage-scheduler-abandon-unwritten-session
+    (let* ((stream (make-instance 'binary-session-stream :input (octets)))
+           (connection (http-kit/http2:make-http2-connection :stream stream))
+           (entry (http-kit/http2::%make-h2-batch-entry :stream-id 1))
+           (failure (make-condition 'simple-error
+                                    :format-control "Unwritten request.")))
+      (unwind-protect
+           (progn
+             (setf (http-kit/http2::%http2-connection-session-start-state connection)
+                   :starting
+                   (http-kit/http2::%http2-connection-scheduler-entries connection)
+                   (list entry)
+                   (http-kit/http2::%h2-batch-entry-request-state entry)
+                   :reserved)
+             (http-kit/http2::%h2-scheduler-abandon-unwritten-entry
+              connection entry failure t)
+             (ensure-equal :not-started
+                           (http-kit/http2::%http2-connection-session-start-state
+                            connection))
+             (ensure-true (http-kit/http2::%h2-batch-entry-local-retired-p entry))
+             (ensure-equal :cancelled
+                           (http-kit/http2::%h2-batch-entry-request-state entry))
+             (ensure-true (eq failure (http-kit/http2::%h2-batch-entry-error entry)))
+             (ensure-false
+              (http-kit/http2::%http2-connection-scheduler-entries connection)))
+        (http-kit/http2:close-http2-connection connection)))
+    (let* ((stream (make-instance 'binary-session-stream :input (octets)))
+           (connection (http-kit/http2:make-http2-connection :stream stream))
+           (entry (http-kit/http2::%make-h2-batch-entry :stream-id 1)))
+      (unwind-protect
+           (progn
+             (setf (http-kit/http2::%http2-connection-session-start-state connection)
+                   :starting
+                   (http-kit/http2::%h2-batch-entry-request-state entry)
+                   :cancelled)
+             (http-kit/http2::%h2-scheduler-flush-write
+              connection (list (octets 1) nil (lambda () 0) entry t t))
+             (ensure-equal :not-started
+                           (http-kit/http2::%http2-connection-session-start-state
+                            connection))
+             (ensure-equal 0 (length (binary-session-output stream)))
+             (ensure-true (http-kit/http2:http2-connection-open-p connection)))
+        (http-kit/http2:close-http2-connection connection)))
+    (let* ((stream (make-instance 'binary-session-stream :input (octets)))
+           (connection (http-kit/http2:make-http2-connection :stream stream))
+           (entry (http-kit/http2::%make-h2-batch-entry :stream-id 1))
+           (clock (lambda () 1))
+           (failure nil))
+      (unwind-protect
+           (progn
+             (setf (http-kit/http2::%http2-connection-session-start-state connection)
+                   :starting
+                   (http-kit/http2::%http2-connection-scheduler-entries connection)
+                   (list entry)
+                   (http-kit/http2::%h2-batch-entry-request-state entry)
+                   :reserved)
+             (handler-case
+                 (http-kit/http2::%h2-scheduler-flush-write
+                  connection (list (octets 1) 0 clock entry t t))
+               (http-kit:http-timeout (condition)
+                 (setf failure condition)))
+             (ensure-true (typep failure 'http-kit:http-timeout))
+             (ensure-equal :not-started
+                           (http-kit/http2::%http2-connection-session-start-state
+                            connection))
+             (ensure-equal :cancelled
+                           (http-kit/http2::%h2-batch-entry-request-state entry))
+             (ensure-true (eq failure (http-kit/http2::%h2-batch-entry-error entry)))
+             (ensure-false
+              (http-kit/http2::%http2-connection-scheduler-entries connection))
+             (ensure-equal 0 (length (binary-session-output stream)))
+             (ensure-true (http-kit/http2:http2-connection-open-p connection)))
+        (http-kit/http2:close-http2-connection connection))))
+
+  #+sbcl
+  (deftest http2-coverage-scheduler-wait-for-capacity-states
+    (labels ((wait-for-capacity (connection cancelled-p)
+               (http-kit/http2::%h2-scheduler-wait-for-capacity
+                connection nil (lambda () 0) cancelled-p
+                (lambda ()
+                  (make-condition 'http-kit:http-connection-error
+                                  :message "The test request was cancelled."
+                                  :operation :http2-write
+                                  :cause :local-cancel))))
+             (new-connection (&optional (input (octets)))
+               (http-kit/http2:make-http2-connection
+                :stream (make-instance 'binary-session-stream :input input))))
+      (let ((connection (new-connection)))
+        (unwind-protect
+             (progn
+               (ensure-false (wait-for-capacity connection (lambda () nil)))
+               (ensure-true (http-kit/http2:http2-connection-open-p connection)))
+          (http-kit/http2:close-http2-connection connection)))
+      (let ((connection (new-connection)))
+        (unwind-protect
+             (let ((failure
+                     (handler-case
+                         (progn
+                           (wait-for-capacity connection (lambda () t))
+                           nil)
+                       (http-kit:http-connection-error (condition) condition))))
+               (ensure-true (typep failure 'http-kit:http-connection-error))
+               (ensure-equal :local-cancel
+                             (http-kit:http-connection-error-cause failure))
+               (ensure-true (http-kit/http2:http2-connection-open-p connection)))
+          (http-kit/http2:close-http2-connection connection)))
+      (let* ((input (h2-frame 4 0 0 (octets 0 3 0 0 0 2)))
+             (connection (new-connection input)))
+        (unwind-protect
+             (progn
+               (setf (http-kit/http2::%http2-connection-peer-max-concurrent-streams
+                      connection)
+                     0)
+               (ensure-false (wait-for-capacity connection (lambda () nil)))
+               (ensure-equal 2
+                             (http-kit/http2::%http2-connection-peer-max-concurrent-streams
+                              connection))
+               (ensure-true (http-kit/http2:http2-connection-open-p connection)))
+          (http-kit/http2:close-http2-connection connection)))
+      (let ((connection (new-connection)))
+        (unwind-protect
+             (progn
+               (setf (http-kit/http2::%http2-connection-goaway-last-stream-id
+                      connection)
+                     0)
+               (let ((failure
+                       (handler-case
+                           (progn
+                             (wait-for-capacity connection (lambda () nil))
+                             nil)
+                         (http-kit:http-connection-error (condition) condition))))
+                 (ensure-true (typep failure 'http-kit:http-connection-error))
+                 (ensure-equal '(:goaway 0 1)
+                               (http-kit:http-connection-error-cause failure))))
+          (http-kit/http2:close-http2-connection connection)))
+      (let ((connection (new-connection)))
+        (http-kit/http2:close-http2-connection connection)
+        (let ((failure
+                (handler-case
+                    (progn
+                      (wait-for-capacity connection (lambda () nil))
+                      nil)
+                  (http-kit:http-connection-error (condition) condition))))
+          (ensure-true (typep failure 'http-kit:http-connection-error))
+          (ensure-equal :closed
+                        (http-kit:http-connection-error-cause failure))))))
+)
 #+sbcl
 (deftest http2-coverage-request-body-unscheduled-trailer-headers
   (let* ((stream
