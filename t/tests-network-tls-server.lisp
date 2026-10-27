@@ -645,6 +645,71 @@
                      (ensure-equal 42 value))))))
           (close stream :abort t)))))
   (deftest tls-fd-transport-preserves-partial-record-across-read-slices
+  (flet ((call-with-cleanups (body &rest cleanup-thunks)
+           (let ((body-values nil)
+                 (body-condition nil)
+                 (cleanup-conditions nil))
+             (unwind-protect
+                  (handler-case
+                      (setf body-values
+                            (multiple-value-list (funcall body)))
+                    (error (condition)
+                      (setf body-condition condition)))
+               (dolist (cleanup cleanup-thunks)
+                 (handler-case
+                     (funcall cleanup)
+                   (error (condition)
+                     (push condition cleanup-conditions)))))
+             (cond
+               (body-condition
+                (error body-condition))
+               (cleanup-conditions
+                (error "TLS test cleanup failed: ~{~A~^; ~}"
+                       (nreverse
+                        (mapcar (function princ-to-string)
+                                cleanup-conditions))))
+               (t
+                (values-list body-values))))))
+    (let ((body-condition nil)
+          (cleanup-condition nil)
+          (cleanup-count 0))
+      (handler-case
+          (call-with-cleanups
+           (lambda () (error "primary TLS test failure"))
+           (lambda ()
+             (incf cleanup-count)
+             (error "first cleanup failure"))
+           (lambda ()
+             (incf cleanup-count)
+             (error "second cleanup failure")))
+        (error (condition)
+          (setf body-condition condition)))
+      (ensure-equal 2 cleanup-count)
+      (ensure-true
+       (search "primary TLS test failure"
+               (princ-to-string body-condition)))
+      (ensure-false
+       (search "cleanup failure"
+               (princ-to-string body-condition)))
+      (setf cleanup-count 0)
+      (handler-case
+          (call-with-cleanups
+           (lambda () (values :success 42))
+           (lambda ()
+             (incf cleanup-count)
+             (error "first cleanup failure"))
+           (lambda ()
+             (incf cleanup-count)
+             (error "second cleanup failure")))
+        (error (condition)
+          (setf cleanup-condition condition)))
+      (ensure-equal 2 cleanup-count)
+      (ensure-true
+       (search "first cleanup failure"
+               (princ-to-string cleanup-condition)))
+      (ensure-true
+       (search "second cleanup failure"
+               (princ-to-string cleanup-condition))))
     (let* ((listener
              (make-instance (quote sb-bsd-sockets:inet-socket)
                             :type :stream
@@ -664,90 +729,109 @@
            (send-rest (sb-thread:make-semaphore :count 0))
            (rest-write-ready (sb-thread:make-semaphore :count 0))
            (server-done (sb-thread:make-semaphore :count 0)))
-      (unwind-protect
-           (progn
-             (sb-bsd-sockets:socket-bind listener #(127 0 0 1) 0)
-             (sb-bsd-sockets:socket-listen listener 1)
-             (setf port
-                   (nth-value 1 (sb-bsd-sockets:socket-name listener))
-                   client-socket
-                   (make-instance (quote sb-bsd-sockets:inet-socket)
-                                  :type :stream
-                                  :protocol :tcp))
-             (sb-bsd-sockets:socket-connect
-              client-socket #(127 0 0 1) port)
-             (setf client-stream
-                   (sb-bsd-sockets:socket-make-stream
-                    client-socket
-                    :input t
-                    :output t
-                    :element-type (quote (unsigned-byte 8))
-                    :buffering :none)
-                   server-thread
-                   (sb-thread:make-thread
-                    (lambda ()
-                      (unwind-protect
-                           (handler-case
-                               (progn
-                                 (setf accepted-socket
-                                       (sb-bsd-sockets:socket-accept listener)
-                                       server-stream
-                                       (sb-bsd-sockets:socket-make-stream
-                                        accepted-socket
-                                        :input t
-                                        :output t
-                                        :element-type
-                                        (quote (unsigned-byte 8))
-                                        :buffering :none))
-                                 (write-sequence
-                                  (subseq record-wire 0 4) server-stream)
-                                 (finish-output server-stream)
-                                 (sb-thread:signal-semaphore first-write-ready)
-                                 (unless
-                                     (sb-thread:wait-on-semaphore
-                                      send-rest :timeout 5)
-                                   (error
-                                    "The TLS test timed out before sending the remainder."))
-                                 (write-sequence
-                                  (subseq record-wire 4) server-stream)
-                                 (finish-output server-stream)
-                                 (sb-thread:signal-semaphore rest-write-ready))
-                             (error (condition)
-                               (setf server-error condition)))
-                        (sb-thread:signal-semaphore server-done)))))
-             (setf transport (http-kit/tls::%tls-transport client-stream)
-                   read-function (getf transport :read)
-                   enable-application-read
-                   (getf transport :enable-application-read))
-             (funcall enable-application-read)
-             (ensure-true
-              (sb-thread:wait-on-semaphore first-write-ready :timeout 5))
-             (ensure-equal :would-block (funcall read-function nil))
-             (sb-thread:signal-semaphore send-rest)
-             (ensure-true
-              (sb-thread:wait-on-semaphore rest-write-ready :timeout 5))
-             (ensure-equal record-wire (funcall read-function nil))
-             (ensure-true
-              (sb-thread:wait-on-semaphore server-done :timeout 5))
-             (sb-thread:join-thread server-thread)
-             (setf server-thread nil)
-             (ensure-false server-error))
-        (when server-thread
-          (sb-thread:signal-semaphore send-rest)
-          (when client-stream
-            (ignore-errors (close client-stream :abort t)))
-          (when server-stream
-            (ignore-errors (close server-stream :abort t)))
-          (sb-thread:join-thread server-thread))
-        (when client-stream
-          (ignore-errors (close client-stream :abort t)))
-        (when server-stream
-          (ignore-errors (close server-stream :abort t)))
-        (when client-socket
-          (ignore-errors (sb-bsd-sockets:socket-close client-socket)))
-        (when accepted-socket
-          (ignore-errors (sb-bsd-sockets:socket-close accepted-socket)))
-        (ignore-errors (sb-bsd-sockets:socket-close listener)))))
+      (call-with-cleanups
+       (lambda ()
+         (progn
+           (sb-bsd-sockets:socket-bind listener #(127 0 0 1) 0)
+           (sb-bsd-sockets:socket-listen listener 1)
+           (setf port
+                 (nth-value 1 (sb-bsd-sockets:socket-name listener))
+                 client-socket
+                 (make-instance (quote sb-bsd-sockets:inet-socket)
+                                :type :stream
+                                :protocol :tcp))
+           (sb-bsd-sockets:socket-connect
+            client-socket #(127 0 0 1) port)
+           (setf client-stream
+                 (sb-bsd-sockets:socket-make-stream
+                  client-socket
+                  :input t
+                  :output t
+                  :element-type (quote (unsigned-byte 8))
+                  :buffering :none)
+                 server-thread
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (unwind-protect
+                         (handler-case
+                             (progn
+                               (setf accepted-socket
+                                     (sb-bsd-sockets:socket-accept listener)
+                                     server-stream
+                                     (sb-bsd-sockets:socket-make-stream
+                                      accepted-socket
+                                      :input t
+                                      :output t
+                                      :element-type
+                                      (quote (unsigned-byte 8))
+                                      :buffering :none))
+                               (write-sequence
+                                (subseq record-wire 0 4) server-stream)
+                               (finish-output server-stream)
+                               (sb-thread:signal-semaphore first-write-ready)
+                               (unless
+                                   (sb-thread:wait-on-semaphore
+                                    send-rest :timeout 5)
+                                 (error
+                                  "The TLS test timed out before sending the remainder."))
+                               (write-sequence
+                                (subseq record-wire 4) server-stream)
+                               (finish-output server-stream)
+                               (sb-thread:signal-semaphore rest-write-ready))
+                           (error (condition)
+                             (setf server-error condition)))
+                      (sb-thread:signal-semaphore server-done)))))
+           (setf transport (http-kit/tls::%tls-transport client-stream)
+                 read-function (getf transport :read)
+                 enable-application-read
+                 (getf transport :enable-application-read))
+           (funcall enable-application-read)
+           (ensure-true
+            (sb-thread:wait-on-semaphore first-write-ready :timeout 5))
+           (ensure-equal :would-block (funcall read-function nil))
+           (sb-thread:signal-semaphore send-rest)
+           (ensure-true
+            (sb-thread:wait-on-semaphore rest-write-ready :timeout 5))
+           (ensure-equal record-wire (funcall read-function nil))
+           (ensure-true
+            (sb-thread:wait-on-semaphore server-done :timeout 5))
+           (sb-thread:join-thread server-thread)
+           (setf server-thread nil)
+           (ensure-false server-error)))
+       (lambda ()
+         (when server-thread
+           (sb-thread:signal-semaphore send-rest)))
+       (lambda ()
+         (when client-stream
+           (let ((stream-closed-p nil))
+             (unwind-protect
+                  (progn
+                    (close client-stream :abort t)
+                    (setf stream-closed-p t))
+               (unless stream-closed-p
+                 (when client-socket
+                   (sb-bsd-sockets:socket-close client-socket)))))))
+       (lambda ()
+         (when (and client-socket (null client-stream))
+           (sb-bsd-sockets:socket-close client-socket)))
+       (lambda ()
+         (when server-stream
+           (let ((stream-closed-p nil))
+             (unwind-protect
+                  (progn
+                    (close server-stream :abort t)
+                    (setf stream-closed-p t))
+               (unless stream-closed-p
+                 (when accepted-socket
+                   (sb-bsd-sockets:socket-close accepted-socket)))))))
+       (lambda ()
+         (when (and accepted-socket (null server-stream))
+           (sb-bsd-sockets:socket-close accepted-socket)))
+       (lambda ()
+         (sb-bsd-sockets:socket-close listener))
+       (lambda ()
+         (when server-thread
+           (sb-thread:join-thread server-thread)))))))
   (deftest tls-client-driver-error-boundaries
   (let* ((raw (make-instance '%tls-server-test-stream :input (octets)))
          (stream (http-kit/tls::%make-http-tls-stream :client raw)))
