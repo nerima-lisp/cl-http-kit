@@ -42,12 +42,13 @@
            (timeout (if timeout (min timeout 0.1d0) 0.1d0))
            (deadline (+ (http-kit::%monotonic-time) timeout))
            (listen-supported-p
-             #+sbcl
-             (not (null (sb-mop:compute-applicable-methods
-                         #'sb-gray:stream-listen
-                         (list stream))))
-             #-sbcl
-             t))
+             (progn
+               #+sbcl
+               (not (null (sb-mop:compute-applicable-methods
+                           #'sb-gray:stream-listen
+                           (list stream))))
+               #-sbcl
+               t)))
       (loop while (< position count)
             do (let* ((remaining (- deadline
                                     (http-kit::%monotonic-time)))
