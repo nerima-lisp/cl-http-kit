@@ -644,6 +644,231 @@
                      (ensure-equal nil condition)
                      (ensure-equal 42 value))))))
           (close stream :abort t)))))
+  (deftest tls-public-upgrader-http2-reader-status-boundaries
+  (labels ((public-request (reader-function &optional timeout)
+             (let ((raw (%tls-server-test-controlled-stream (octets)))
+                   (read-count 0))
+               (%tls-server-test-call-with-public-client-fixture
+                raw
+                (lambda (actual-driver)
+                  (incf read-count)
+                  (funcall reader-function actual-driver))
+                (lambda (tls-stream driver transport written)
+                  (declare (ignore driver transport written))
+                  (let ((connection
+                          (http-kit/http2:make-http2-connection
+                           :stream tls-stream
+                           :close-stream
+                           (lambda (stream)
+                             (close stream :abort t)))))
+                    (unwind-protect
+                         (values
+                          (handler-case
+                              (http-kit/http2:send-http2-request-over-connection
+                               connection
+                               (make-http-request
+                                :method "GET"
+                                :uri "https://example.test/")
+                               :timeout timeout)
+                            (error (condition) condition))
+                          read-count)
+                      (http-kit/http2:close-http2-connection connection))))))))
+    (let ((response-wire (h2-response-wire (octets)))
+          (driver-reads 0))
+      (multiple-value-bind (result read-count)
+          (public-request
+           (lambda (driver)
+             (declare (ignore driver))
+             (if (= (incf driver-reads) 1)
+                 (values :data response-wire)
+                 (values :would-block nil)))
+           1d0)
+        (ensure-equal 200 (http-response-status result))
+        (ensure-equal 1 read-count)
+        (ensure-equal 1 driver-reads)))
+    (multiple-value-bind (condition read-count)
+        (public-request
+         (lambda (driver)
+           (declare (ignore driver))
+           (values :eof nil)))
+      (ensure-true (typep condition 'http-connection-error))
+      (ensure-equal :eof (http-connection-error-cause condition))
+      (ensure-equal :http2-read (http-error-operation condition))
+      (ensure-true (plusp read-count)))
+    (multiple-value-bind (condition read-count)
+        (public-request
+         (lambda (driver)
+           (declare (ignore driver))
+           (values :would-block nil))
+         0.03d0)
+      (ensure-true (typep condition 'http-timeout))
+      (ensure-equal :read (http-timeout-kind condition))
+      (ensure-true (plusp read-count)))
+    (multiple-value-bind (condition read-count)
+        (public-request
+         (lambda (driver)
+           (declare (ignore driver))
+           (values :data (octets)))
+         0.03d0)
+      (ensure-true (typep condition 'http-timeout))
+      (ensure-equal :read (http-timeout-kind condition))
+      (ensure-true (> read-count 1)))
+    (dolist (case (list (list :eof :missing-close-notify)
+                        (list '(:peer-alert 42) '(:peer-alert 42))))
+      (destructuring-bind (reason expected-detail) case
+        (multiple-value-bind (condition read-count)
+            (public-request
+             (lambda (driver)
+               (declare (ignore driver))
+               (error
+                (make-condition 'cl-tls-kit:tls13-client-driver-error
+                                :reason reason)))
+             1d0)
+          (ensure-true (typep condition 'http-protocol-error))
+          (ensure-equal expected-detail
+                        (http-protocol-error-detail condition))
+          (ensure-true (plusp read-count)))))))
+  (deftest tls-public-upgrader-application-record-read-boundaries
+  (labels ((with-public-record-reader (input action)
+             (let ((raw (%tls-server-test-controlled-stream input)))
+               (%tls-server-test-call-with-public-client-fixture
+                raw
+                (lambda (actual-driver)
+                  (declare (ignore actual-driver))
+                  (values :would-block nil))
+                (lambda (tls-stream driver transport written)
+                  (declare (ignore written))
+                  (ensure-true
+                   (typep tls-stream 'http-kit/tls::http-tls-stream))
+                  (ensure-true (functionp (getf transport :read)))
+                  (funcall action raw driver (getf transport :read)))))))
+    (let ((wire (octets 22 3 3 0 3 1 2 3)))
+      (with-public-record-reader
+       (subseq wire 0 4)
+       (lambda (raw driver read-record)
+         (ensure-equal :would-block (funcall read-record driver))
+         (%tls-upgrader-controlled-stream-feed raw (subseq wire 4))
+         (ensure-octets-equal wire (funcall read-record driver)))))
+    (let* ((length (1+ cl-tls-kit:+tls-plaintext-limit+))
+           (header
+             (octets 23 3 3 (ldb (byte 8 8) length)
+                     (ldb (byte 8 0) length))))
+      (with-public-record-reader
+       header
+       (lambda (raw driver read-record)
+         (declare (ignore raw))
+         (let ((condition
+                 (%tls-server-test-condition
+                  (lambda () (funcall read-record driver)))))
+           (ensure-equal :record-overflow
+                         (http-protocol-error-detail condition))))))
+    (with-public-record-reader
+     (octets)
+     (lambda (raw driver read-record)
+       (%tls-upgrader-controlled-stream-mark-eof raw)
+       (ensure-equal nil (funcall read-record driver))))
+    (with-public-record-reader
+     (octets 22 3 3)
+     (lambda (raw driver read-record)
+       (%tls-upgrader-controlled-stream-mark-eof raw)
+       (let ((condition
+               (%tls-server-test-condition
+                (lambda () (funcall read-record driver)))))
+         (ensure-equal :truncated-record
+                       (http-protocol-error-detail condition)))))
+    (with-public-record-reader
+     (octets 22 3 3 0 3 1)
+     (lambda (raw driver read-record)
+       (%tls-upgrader-controlled-stream-mark-eof raw)
+       (let ((condition
+               (%tls-server-test-condition
+                (lambda () (funcall read-record driver)))))
+         (ensure-equal :truncated-record
+                       (http-protocol-error-detail condition)))))))
+  (progn
+  (defclass %tls-upgrader-controlled-stream (binary-test-stream)
+    ((eof-p :initform nil
+            :accessor %tls-upgrader-controlled-stream-eof-p)))
+
+  (defmethod sb-gray:stream-listen ((stream %tls-upgrader-controlled-stream))
+    (or (%tls-upgrader-controlled-stream-eof-p stream)
+        (< (http-kit/test-core::binary-test-input-position stream)
+           (length (http-kit/test-core::binary-test-input stream)))))
+
+  (defun %tls-server-test-controlled-stream (octets)
+    (make-instance
+     '%tls-upgrader-controlled-stream
+     :input (make-array (length octets)
+                        :element-type '(unsigned-byte 8)
+                        :initial-contents octets
+                        :adjustable t
+                        :fill-pointer t)))
+
+  (defun %tls-upgrader-controlled-stream-feed (stream octets)
+    (loop for octet across octets
+          do (vector-push-extend
+              octet (http-kit/test-core::binary-test-input stream)))
+    stream)
+
+  (defun %tls-upgrader-controlled-stream-mark-eof (stream)
+    (setf (%tls-upgrader-controlled-stream-eof-p stream) t)
+    stream)
+
+  (defun %tls-server-test-call-with-public-client-fixture
+      (raw read-function action)
+    (let ((driver nil)
+          (captured-transport nil)
+          (written nil)
+          (tls-stream nil)
+          (upgrader
+            (make-http-tls-upgrader :verify :optional
+                                    :trust-anchors #()
+                                    :alpn-protocols '("h2")))
+          (original-maker (fdefinition 'cl-tls-kit:make-tls13-client-driver))
+          (original-connect
+            (fdefinition 'cl-tls-kit:tls13-client-driver-connect))
+          (original-read
+            (fdefinition 'cl-tls-kit:tls13-client-driver-read-application-data))
+          (original-write
+            (fdefinition 'cl-tls-kit:tls13-client-driver-write)))
+      (unwind-protect
+           (progn
+             (setf (fdefinition 'cl-tls-kit:make-tls13-client-driver)
+                   (lambda (&rest arguments &key transport &allow-other-keys)
+                     (setf captured-transport transport
+                           driver (apply original-maker arguments)))
+                   (fdefinition 'cl-tls-kit:tls13-client-driver-connect)
+                   (lambda (&rest arguments)
+                     (declare (ignore arguments))
+                     nil)
+                   (fdefinition
+                    'cl-tls-kit:tls13-client-driver-read-application-data)
+                   (lambda (actual-driver)
+                     (funcall read-function actual-driver))
+                   (fdefinition 'cl-tls-kit:tls13-client-driver-write)
+                   (lambda (actual-driver bytes)
+                     (declare (ignore actual-driver))
+                     (push (copy-seq bytes) written)))
+             (setf tls-stream
+                   (funcall
+                    upgrader raw
+                    (http-request-uri
+                     (make-http-request :method "GET"
+                                        :uri "https://example.test/"))
+                    :timeout 1d0))
+             (funcall action tls-stream driver captured-transport
+                      (nreverse written)))
+        (when tls-stream
+          (close tls-stream :abort t))
+        (setf (fdefinition 'cl-tls-kit:make-tls13-client-driver) original-maker
+              (fdefinition 'cl-tls-kit:tls13-client-driver-connect)
+              original-connect
+              (fdefinition
+               'cl-tls-kit:tls13-client-driver-read-application-data)
+              original-read
+              (fdefinition 'cl-tls-kit:tls13-client-driver-write)
+              original-write))))
+)
   (deftest tls-fd-transport-preserves-partial-record-across-read-slices
   (flet ((call-with-cleanups (body &rest cleanup-thunks)
            (let ((body-values nil)

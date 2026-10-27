@@ -354,48 +354,38 @@
            (deadline
              (+ (%tls-monotonic-time)
                 (if timeout (min timeout 0.1d0) 0.1d0))))
-      (cond
-        ((typep driver 'http-tls-server-state)
-         (values empty :would-block nil))
-        ((zerop count)
-         (values empty :data nil))
-        (t
-         (loop
-           (let* ((input (%tls-stream-input stream))
-                  (position (%tls-stream-input-position stream))
-                  (length (length input)))
-             (when (< position length)
-               (let* ((end (+ position (min count (- length position))))
-                      (slice (subseq input position end)))
-                 (setf (%tls-stream-input-position stream) end)
-                 (return (values slice :data nil)))))
-           (handler-case
-               (multiple-value-bind (status plaintext)
-                   (cl-tls-kit:tls13-client-driver-read-application-data driver)
-                 (case status
-                   (:eof (return (values empty :eof t)))
-                   (:would-block
-                    (let ((remaining (- deadline (%tls-monotonic-time))))
-                      (if (plusp remaining)
-                          (sleep (min 0.001d0 remaining))
-                          (return (values empty :would-block nil)))))
-                   (:data
-                    (setf (%tls-stream-input stream) plaintext
-                          (%tls-stream-input-position stream) 0)
-                    (when (and (zerop (length plaintext))
-                               (>= (%tls-monotonic-time) deadline))
-                      (return (values empty :would-block nil))))
-                   (otherwise
-                    (%tls-protocol-error
-                     "The TLS driver returned an invalid read status."
-                     :invalid-read-status))))
-             (cl-tls-kit:tls13-client-driver-error (condition)
-               (if (eq (cl-tls-kit:tls13-client-driver-error-reason condition)
-                       :eof)
-                   (%tls-protocol-error
-                    "The TLS transport ended without close_notify."
-                    :missing-close-notify)
-                   (%tls-driver-error condition)))))))))
+      (loop
+        (let* ((input (%tls-stream-input stream))
+               (position (%tls-stream-input-position stream))
+               (length (length input)))
+          (when (< position length)
+            (let* ((end (+ position (min count (- length position))))
+                   (slice (subseq input position end)))
+              (setf (%tls-stream-input-position stream) end)
+              (return (values slice :data nil)))))
+        (handler-case
+            (multiple-value-bind (status plaintext)
+                (cl-tls-kit:tls13-client-driver-read-application-data driver)
+              (case status
+                (:eof (return (values empty :eof t)))
+                (:would-block
+                 (let ((remaining (- deadline (%tls-monotonic-time))))
+                   (if (plusp remaining)
+                       (sleep (min 0.001d0 remaining))
+                       (return (values empty :would-block nil)))))
+                (:data
+                 (setf (%tls-stream-input stream) plaintext
+                       (%tls-stream-input-position stream) 0)
+                 (when (and (zerop (length plaintext))
+                            (>= (%tls-monotonic-time) deadline))
+                   (return (values empty :would-block nil))))))
+          (cl-tls-kit:tls13-client-driver-error (condition)
+            (if (eq (cl-tls-kit:tls13-client-driver-error-reason condition)
+                    :eof)
+                (%tls-protocol-error
+                 "The TLS transport ended without close_notify."
+                 :missing-close-notify)
+                (%tls-driver-error condition)))))))
 
   (defmethod sb-gray:stream-read-sequence
       ((stream http-tls-stream) sequence &optional (start 0) end)
