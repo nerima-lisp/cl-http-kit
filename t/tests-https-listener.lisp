@@ -1794,6 +1794,10 @@
              (ensure-true
               (cl-tls-kit:tls13-server-ticket-key-store-p external-store))
              (stop-http-server owned-server :graceful-timeout 1)
+             (%https-listener-wait
+              (lambda ()
+                (cl-tls-kit::tls13-server-ticket-key-store-destroyed-p
+                 current-owned-store)))
              (signals error
                (cl-tls-kit:rotate-tls13-server-ticket-key-store
                 current-owned-store))
