@@ -1907,8 +1907,8 @@
                                 (muffle-warning warning))))
                           (%tls-server-test-with-spy
                            'http-kit/tls::%tls-server-send-close-notify
-                           (lambda (state)
-                             (declare (ignore state))
+                           (lambda (state &key allow-closing)
+                             (declare (ignore state allow-closing))
                              (error close-condition))
                            (lambda ()
                              (handler-case
@@ -2668,6 +2668,171 @@
              (setf failure-signaled-p t)))))
       (ensure-true failure-signaled-p)
       (ensure-true (%tls-server-test-zeroed-octets-p (list failure-secret))))))
+#+sbcl
+(progn
+  (deftest tls-server-zeroizes-unprocessed-secret-after-send-timeout
+    (let* ((raw (make-instance '%tls-server-test-stream :input (octets)))
+           (secret (make-array 32
+                               :element-type '(unsigned-byte 8)
+                               :initial-element 47))
+           (state
+             (http-kit/tls::%make-http-tls-server-state
+              :driver nil
+              :provider nil
+              :transport-stream raw
+              :deadline 10
+              :clock-function (lambda () 10)))
+           (condition
+             (handler-case
+                 (progn
+                   (http-kit/tls::%tls-server-handle-events
+                    state
+                    (list (list :type :send
+                                :level :initial
+                                :content-type :handshake
+                                :wire (octets 1))
+                          (list :type :secret
+                                :direction :read
+                                :level :application
+                                :secret secret)))
+                   nil)
+               (http-timeout (caught) caught))))
+      (ensure-true (typep condition 'http-timeout))
+      (ensure-true (%tls-server-test-zeroed-octets-p (list secret)))
+      (ensure-equal (octets) (binary-test-output raw))
+      (close raw :abort t)))
+
+  (deftest tls-server-serializes-write-and-close-traffic-state
+    (let* ((provider (cl-tls-kit:make-cl-crypto-kit-provider))
+           (state
+             (http-kit/tls::%make-http-tls-server-state
+              :driver nil
+              :provider provider
+              :transport-stream
+              (make-instance '%tls-server-test-stream :input (octets))))
+           (raw (http-kit/tls::http-tls-server-state-transport-stream state))
+           (tls-stream (http-kit/tls::%make-http-tls-stream state raw))
+           (traffic-state nil)
+           (key-material nil)
+           (monitor-lock (sb-thread:make-mutex :name "TLS race test monitor"))
+           (encrypt-entered (sb-thread:make-semaphore :count 0))
+           (second-encrypt-entered (sb-thread:make-semaphore :count 0))
+           (close-notify-entered (sb-thread:make-semaphore :count 0))
+           (release-first-encrypt (sb-thread:make-semaphore :count 0))
+           (writer-done (sb-thread:make-semaphore :count 0))
+           (closer-done (sb-thread:make-semaphore :count 0))
+           (original-encrypt (fdefinition 'cl-tls-kit:encrypt-tls13-traffic-record))
+           (original-close-notify (fdefinition 'http-kit/tls::%tls-server-send-close-notify))
+           (encrypt-count 0)
+           (observed-sequences nil)
+           (zeroized-key-used-p nil)
+           (overlapped-p nil)
+           (writer-result nil)
+           (writer-error nil)
+           (close-result nil)
+           (close-error nil)
+           (writer-thread nil)
+           (closer-thread nil))
+      (multiple-value-setq (traffic-state key-material)
+        (%tls-server-test-traffic-state provider 37))
+      (setf (http-kit/tls::http-tls-server-state-write-state state) traffic-state
+            (http-kit/tls::http-tls-server-state-handshake-complete-p state) t
+            (http-kit/tls::http-tls-server-state-selected-alpn state) "h2")
+      (unwind-protect
+           (progn
+             (setf (fdefinition 'cl-tls-kit:encrypt-tls13-traffic-record)
+                   (lambda (plaintext candidate)
+                     (let ((call-index
+                             (sb-thread:with-mutex (monitor-lock)
+                               (incf encrypt-count)
+                               (push
+                                (cl-tls-kit:tls13-traffic-state-sequence-number candidate)
+                                observed-sequences)
+                               (when (or (null (cl-tls-kit:tls13-traffic-state-key candidate))
+                                         (%tls-server-test-zeroed-octets-p
+                                          (list (cl-tls-kit:tls13-traffic-state-key candidate))))
+                                 (setf zeroized-key-used-p t))
+                               encrypt-count)))
+                       (when (= call-index 1)
+                         (sb-thread:signal-semaphore encrypt-entered)
+                         (unless (sb-thread:wait-on-semaphore
+                                  release-first-encrypt :timeout 4)
+                           (error "The TLS race test writer was not released."))
+                         (sb-thread:with-mutex (monitor-lock)
+                           (when (%tls-server-test-zeroed-octets-p key-material)
+                             (setf zeroized-key-used-p t))))
+                       (when (= call-index 2)
+                         (sb-thread:signal-semaphore second-encrypt-entered))
+                       (funcall original-encrypt plaintext candidate))))
+             (setf (fdefinition 'http-kit/tls::%tls-server-send-close-notify)
+                   (lambda (candidate &rest arguments)
+                     (sb-thread:signal-semaphore close-notify-entered)
+                     (apply original-close-notify candidate arguments)))
+             (setf writer-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (unwind-protect
+                           (handler-case
+                               (progn
+                                 (http-kit/tls::%tls-server-write-application-data
+                                  state (octets 5) 0 1)
+                                 (setf writer-result :returned))
+                             (error (condition)
+                               (setf writer-error condition)))
+                        (sb-thread:signal-semaphore writer-done))
+                    :name "TLS application writer")))
+             (unless (sb-thread:wait-on-semaphore encrypt-entered :timeout 2)
+               (error "The TLS race test writer did not enter encryption."))
+             (setf closer-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (unwind-protect
+                           (handler-case
+                               (progn
+                                 (close tls-stream)
+                                 (setf close-result :returned))
+                             (error (condition)
+                               (setf close-error condition)))
+                        (sb-thread:signal-semaphore closer-done))
+                    :name "TLS concurrent closer")))
+             (unless (sb-thread:wait-on-semaphore close-notify-entered :timeout 2)
+               (error "The TLS race test closer did not reach close_notify."))
+             (setf overlapped-p
+                   (sb-thread:wait-on-semaphore
+                    second-encrypt-entered :timeout 1d0))
+             (when overlapped-p
+               (unless (sb-thread:wait-on-semaphore closer-done :timeout 3)
+                 (error "The TLS race test closer did not finish after concurrent encryption.")))
+             (sb-thread:signal-semaphore release-first-encrypt)
+             (unless (sb-thread:wait-on-semaphore writer-done :timeout 3)
+               (error "The TLS race test writer did not finish."))
+             (unless (or overlapped-p
+                         (sb-thread:wait-on-semaphore closer-done :timeout 3))
+               (error "The TLS race test closer did not finish."))
+             (sb-thread:join-thread writer-thread :timeout 2 :default nil)
+             (sb-thread:join-thread closer-thread :timeout 2 :default nil)
+             (ensure-false overlapped-p)
+             (ensure-equal (list 0 1) (reverse observed-sequences))
+             (ensure-false zeroized-key-used-p)
+             (ensure-equal :returned writer-result)
+             (ensure-false writer-error)
+             (ensure-equal :returned close-result)
+             (ensure-false close-error)
+             (ensure-true (%tls-server-test-zeroed-octets-p key-material))
+             (ensure-false (open-stream-p tls-stream)))
+        (sb-thread:signal-semaphore release-first-encrypt)
+        (when writer-thread
+          (sb-thread:join-thread writer-thread :timeout 3 :default nil))
+        (when closer-thread
+          (sb-thread:join-thread closer-thread :timeout 3 :default nil))
+        (setf (fdefinition 'cl-tls-kit:encrypt-tls13-traffic-record)
+              original-encrypt
+              (fdefinition 'http-kit/tls::%tls-server-send-close-notify)
+              original-close-notify)
+        (when (open-stream-p raw)
+          (close raw :abort t))
+        (http-kit/tls::%tls-server-clear-traffic-states state)))))
+
 
 
 

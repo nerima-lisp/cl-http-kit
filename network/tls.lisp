@@ -492,10 +492,21 @@ driver's transport callbacks."
 (progn
   (defstruct (http-tls-server-state
               (:constructor %make-http-tls-server-state))
+    "TLS adapter lock order is server connection lock, READ-LOCK, then WRITE-LOCK.
+Server lifecycle code releases the connection lock before waiting on TLS locks.
+Operations may take LIFECYCLE-LOCK while holding a direction lock; close releases
+it before waiting on direction locks."
     driver provider transport-stream deadline
     (clock-function (function %tls-monotonic-time))
     (phase :initial)
     suite read-state write-state
+    #+sbcl (read-lock (sb-thread:make-mutex :name "TLS server read"))
+    #+sbcl (write-lock (sb-thread:make-mutex :name "TLS server write"))
+    #+sbcl (lifecycle-lock (sb-thread:make-mutex :name "TLS server lifecycle"))
+    #+sbcl (lifecycle-waitqueue
+           (sb-thread:make-waitqueue :name "TLS server lifecycle"))
+    (closing-p nil)
+    (closed-p nil)
     (selected-alpn nil)
     (handshake-buffer
      (make-array 0
@@ -515,6 +526,75 @@ driver's transport callbacks."
   (defmethod print-object ((state http-tls-server-state) output)
     (print-unreadable-object (state output :type t)
       (write-string "TLS server state" output)))
+
+  (defun %tls-server-check-open-state (state allow-closing allow-closed)
+    #+sbcl
+    (sb-thread:with-mutex
+        ((http-tls-server-state-lifecycle-lock state))
+      (when (or (and (http-tls-server-state-closed-p state)
+                     (not allow-closed))
+                (and (http-tls-server-state-closing-p state)
+                     (not allow-closing)))
+        (%tls-protocol-error "TLS server stream is closing." :closed)))
+    #-sbcl
+    (when (or (and (http-tls-server-state-closed-p state)
+                   (not allow-closed))
+              (and (http-tls-server-state-closing-p state)
+                   (not allow-closing)))
+      (%tls-protocol-error "TLS server stream is closing." :closed))
+    nil)
+
+  (defun %tls-server-call-with-direction-lock
+      (state direction thunk &key allow-closing)
+    #+sbcl
+    (let ((lock
+            (ecase direction
+              (:read (http-tls-server-state-read-lock state))
+              (:write (http-tls-server-state-write-lock state)))))
+      (sb-thread:with-mutex (lock)
+        (%tls-server-check-open-state state allow-closing nil)
+        (funcall thunk)))
+    #-sbcl
+    (funcall thunk))
+
+  (defun %tls-server-call-with-direction-locks
+      (state thunk &key allow-closing allow-closed)
+    #+sbcl
+    (sb-thread:with-mutex ((http-tls-server-state-read-lock state))
+      (sb-thread:with-mutex ((http-tls-server-state-write-lock state))
+        (%tls-server-check-open-state state allow-closing allow-closed)
+        (funcall thunk)))
+    #-sbcl
+    (funcall thunk))
+
+  (defun %tls-server-begin-close (state)
+    #+sbcl
+    (sb-thread:with-mutex ((http-tls-server-state-lifecycle-lock state))
+      (cond
+        ((http-tls-server-state-closed-p state) nil)
+        ((http-tls-server-state-closing-p state)
+         (loop until (http-tls-server-state-closed-p state)
+               do (sb-thread:condition-wait
+                   (http-tls-server-state-lifecycle-waitqueue state)
+                   (http-tls-server-state-lifecycle-lock state)))
+         nil)
+        (t
+         (setf (http-tls-server-state-closing-p state) t)
+         t)))
+    #-sbcl
+    (unless (http-tls-server-state-closed-p state)
+      (setf (http-tls-server-state-closing-p state) t)
+      t))
+
+  (defun %tls-server-finish-close (state)
+    #+sbcl
+    (sb-thread:with-mutex ((http-tls-server-state-lifecycle-lock state))
+      (setf (http-tls-server-state-closed-p state) t)
+      (sb-thread:condition-broadcast
+       (http-tls-server-state-lifecycle-waitqueue state)))
+    #-sbcl
+    (setf (http-tls-server-state-closed-p state) t)
+    nil)
 
   (defun %tls-server-fail (message detail)
     (%tls-protocol-error message detail))
@@ -581,7 +661,7 @@ driver's transport callbacks."
                      (>= (funcall clock-function) deadline))
             (%tls-timeout))
           result))))
-  (defun %tls-server-write-record (state bytes)
+  (defun %tls-server-write-record-unlocked (state bytes)
     (let ((stream (http-tls-server-state-transport-stream state)))
       (flet ((write-with-deadline (thunk)
                (if (http-tls-server-state-handshake-deadline-active-p state)
@@ -608,6 +688,12 @@ driver's transport callbacks."
                        (%tls-server-fail "TLS transport write failed." :transport-error)))
           (error ()
             (%tls-server-fail "TLS transport write failed." :transport-error))))))
+
+  (defun %tls-server-write-record (state bytes &key allow-closing)
+    (%tls-server-call-with-direction-lock
+     state :write
+     (lambda () (%tls-server-write-record-unlocked state bytes))
+     :allow-closing allow-closing))
 
 
   (defun %tls-server-content-type (name)
@@ -641,8 +727,8 @@ driver's transport callbacks."
                (%tls-server-fail "TLS traffic key setup failed."
                                  :traffic-key-setup-failed)))))
 
-  (progn
-(defun %tls-server-send-plaintext (state level content-type fragment)
+  (defun %tls-server-send-plaintext-unlocked
+      (state level content-type fragment)
   (handler-case
       (let* ((plaintext (cl-tls-kit:make-tls-plaintext content-type fragment))
              (wire (if (eq level :initial)
@@ -656,18 +742,27 @@ driver's transport callbacks."
                           :invalid-driver-state))
                        (cl-tls-kit:encrypt-tls13-traffic-record
                         plaintext traffic-state)))))
-        (%tls-server-write-record state wire))
+        (%tls-server-write-record-unlocked state wire))
     (http-timeout (condition) (error condition))
     (http-protocol-error (condition) (error condition))
     (error ()
            (%tls-server-fail "TLS record protection failed."
                              :record-protection-failed))))
+
+(defun %tls-server-send-plaintext
+    (state level content-type fragment &key allow-closing)
+  (%tls-server-call-with-direction-lock
+   state :write
+   (lambda ()
+     (%tls-server-send-plaintext-unlocked
+      state level content-type fragment))
+   :allow-closing allow-closing))
 (defun %tls-server-fatal-alert (state description)
     (let ((level
             (cond ((http-tls-server-state-handshake-complete-p state) :application)
                   ((http-tls-server-state-write-state state) :handshake)
                   (t :initial))))
-      (%tls-server-send-plaintext
+      (%tls-server-send-plaintext-unlocked
        state level cl-tls-kit:+tls-content-type-alert+ (vector 2 description))))
 
   (defun %tls-server-record-overflow (state)
@@ -694,20 +789,22 @@ driver's transport callbacks."
       (http-protocol-error (condition)
         (if (eq (http-kit:http-protocol-error-detail condition)
                 :record-overflow)
-            (%tls-server-record-overflow state)
+            (%tls-server-call-with-direction-lock
+             state :write
+             (lambda () (%tls-server-record-overflow state)))
             (error condition)))))
 
-  (defun %tls-server-decrypt-record (state wire)
+  (defun %tls-server-decrypt-record-unlocked (state wire)
     (let ((plaintext
            (handler-case
                (nth-value 0
                           (cl-tls-kit:decrypt-tls13-traffic-record
                            wire (http-tls-server-state-read-state state)))
              (cl-tls-kit:tls-record-overflow ()
-                                             (return-from %tls-server-decrypt-record
+                                             (return-from %tls-server-decrypt-record-unlocked
                                                           (%tls-server-record-overflow state)))
              (error ()
-                    (return-from %tls-server-decrypt-record
+                    (return-from %tls-server-decrypt-record-unlocked
                                  (%tls-server-authentication-failure state))))))
       (when (> (- (length wire) 5 16)
                (1+ cl-tls-kit:+tls-plaintext-limit+))
@@ -720,7 +817,12 @@ driver's transport callbacks."
           (error ()
                  (%tls-server-fail "TLS driver state could not be updated."
                                    :invalid-driver-state))))
-      plaintext)))
+      plaintext))
+
+  (defun %tls-server-decrypt-record (state wire)
+    (%tls-server-call-with-direction-locks
+     state
+     (lambda () (%tls-server-decrypt-record-unlocked state wire))))
 
   (defun %tls-server-zeroize-octets (octets)
     (when (typep octets (quote (vector (unsigned-byte 8))))
@@ -739,7 +841,7 @@ driver's transport callbacks."
             (cl-tls-kit:tls13-traffic-state-iv traffic-state) nil))
     nil)
 
-  (defun %tls-server-clear-traffic-states (state)
+  (defun %tls-server-clear-traffic-states-unlocked (state)
     (when state
       (%tls-server-clear-traffic-state
        (http-tls-server-state-read-state state))
@@ -749,75 +851,115 @@ driver's transport callbacks."
             (http-tls-server-state-write-state state) nil))
     nil)
 
-  (defun %tls-server-handle-events (state events)
-    (let ((alert-p nil))
-      (dolist (event events)
-        (case (getf event :type)
-          (:cipher-suite
-           (setf (http-tls-server-state-suite state) (getf event :suite)))
-          (:secret
-           (let* ((direction (getf event :direction))
-                  (secret (getf event :secret)))
-             (unless (member direction (quote (:read :write)))
-               (%tls-server-zeroize-octets secret)
-               (%tls-server-fail
-                "TLS driver returned an invalid secret direction."
-                :invalid-driver-state))
-             (let ((traffic-state nil)
-                   (installed-p nil))
-               (unwind-protect
-                    (progn
-                      (setf traffic-state
-                            (%tls-server-traffic-state state secret))
-                      (case direction
-                        (:read
-                         (let ((old-state
-                                 (http-tls-server-state-read-state state)))
-                           (setf (http-tls-server-state-read-state state)
-                                 traffic-state
-                                 installed-p t)
-                           (unless (eq old-state traffic-state)
-                             (%tls-server-clear-traffic-state old-state))))
-                        (:write
-                         (let ((old-state
-                                 (http-tls-server-state-write-state state)))
-                           (setf (http-tls-server-state-write-state state)
-                                 traffic-state
-                                 installed-p t)
-                           (unless (eq old-state traffic-state)
-                             (%tls-server-clear-traffic-state old-state)))))
-                      (when (eq (getf event :level) :handshake)
-                        (setf (http-tls-server-state-phase state) :handshake)))
-                 (unless installed-p
-                   (%tls-server-zeroize-octets secret))))))
-          (:alpn
-           (setf (http-tls-server-state-selected-alpn state)
-                 (getf event :protocol)))
-          (:send
-           (%tls-server-check-handshake-deadline state)
-           (let* ((level (getf event :level))
-                  (content-type
-                   (%tls-server-content-type (getf event :content-type)))
-                  (wire (getf event :wire)))
-             (when (and (eq level :initial)
-                        (= content-type cl-tls-kit:+tls-content-type-handshake+)
-                        (plusp (length wire))
-                        (= (aref wire 0) 2))
-               (let ((message (cl-tls-kit:decode-handshake wire)))
-                 (when (typep message 'cl-tls-kit:tls13-hello-retry-request)
-                   (setf (http-tls-server-state-hello-retry-request-sent-p state)
-                         t))))
-             (%tls-server-send-plaintext state level content-type wire)
-             (when (= content-type cl-tls-kit:+tls-content-type-alert+)
-               (setf alert-p t))))
-          (:handshake-complete
-           (setf (http-tls-server-state-handshake-complete-p state) t
-                 (http-tls-server-state-phase state) :application))
-          ((:ticket-issued :alert :peer-quic-transport-parameters) nil)))
-      (when alert-p
-        (%tls-server-fail "TLS handshake failed." :handshake-failed))))
+  (defun %tls-server-clear-traffic-states (state)
+    (when state
+      (%tls-server-call-with-direction-locks
+       state
+       (lambda () (%tls-server-clear-traffic-states-unlocked state))
+       :allow-closing t
+       :allow-closed t))
+    nil)
 
-  (defun %tls-server-step-handshake-message (state wire)
+  (defun %tls-server-zeroize-event-secrets (events)
+    (dolist (event events)
+      (when (eq (getf event :type) :secret)
+        (%tls-server-zeroize-octets (getf event :secret))))
+    nil)
+
+  (defun %tls-server-handle-events-unlocked (state events)
+    (let ((remaining events)
+          (alert-p nil))
+      (unwind-protect
+           (progn
+             (loop while remaining
+                   for event = (pop remaining)
+                   do (case (getf event :type)
+                        (:cipher-suite
+                         (setf (http-tls-server-state-suite state)
+                               (getf event :suite)))
+                        (:secret
+                         (let* ((direction (getf event :direction))
+                                (secret (getf event :secret)))
+                           (unless (member direction (quote (:read :write)))
+                             (%tls-server-zeroize-octets secret)
+                             (%tls-server-fail
+                              "TLS driver returned an invalid secret direction."
+                              :invalid-driver-state))
+                           (let ((traffic-state nil)
+                                 (installed-p nil))
+                             (unwind-protect
+                                  (progn
+                                    (setf traffic-state
+                                          (%tls-server-traffic-state state secret))
+                                    (case direction
+                                      (:read
+                                       (let ((old-state
+                                               (http-tls-server-state-read-state
+                                                state)))
+                                         (setf (http-tls-server-state-read-state state)
+                                               traffic-state
+                                               installed-p t)
+                                         (unless (eq old-state traffic-state)
+                                           (%tls-server-clear-traffic-state
+                                            old-state))))
+                                      (:write
+                                       (let ((old-state
+                                               (http-tls-server-state-write-state
+                                                state)))
+                                         (setf (http-tls-server-state-write-state state)
+                                               traffic-state
+                                               installed-p t)
+                                         (unless (eq old-state traffic-state)
+                                           (%tls-server-clear-traffic-state
+                                            old-state)))))
+                                    (when (eq (getf event :level) :handshake)
+                                      (setf (http-tls-server-state-phase state)
+                                            :handshake)))
+                               (unless installed-p
+                                 (%tls-server-zeroize-octets secret))))))
+                        (:alpn
+                         (setf (http-tls-server-state-selected-alpn state)
+                               (getf event :protocol)))
+                        (:send
+                         (%tls-server-check-handshake-deadline state)
+                         (let* ((level (getf event :level))
+                                (content-type
+                                 (%tls-server-content-type
+                                  (getf event :content-type)))
+                                (wire (getf event :wire)))
+                           (when (and (eq level :initial)
+                                      (= content-type
+                                         cl-tls-kit:+tls-content-type-handshake+)
+                                      (plusp (length wire))
+                                      (= (aref wire 0) 2))
+                             (let ((message (cl-tls-kit:decode-handshake wire)))
+                               (when (typep
+                                      message
+                                      'cl-tls-kit:tls13-hello-retry-request)
+                                 (setf
+                                  (http-tls-server-state-hello-retry-request-sent-p
+                                   state)
+                                  t))))
+                           (%tls-server-send-plaintext-unlocked
+                            state level content-type wire)
+                           (when (= content-type
+                                    cl-tls-kit:+tls-content-type-alert+)
+                             (setf alert-p t))))
+                        (:handshake-complete
+                         (setf (http-tls-server-state-handshake-complete-p state) t
+                               (http-tls-server-state-phase state) :application))
+                        ((:ticket-issued :alert :peer-quic-transport-parameters)
+                         nil)))
+             (when alert-p
+               (%tls-server-fail "TLS handshake failed." :handshake-failed)))
+        (%tls-server-zeroize-event-secrets remaining))))
+
+  (defun %tls-server-handle-events (state events)
+    (%tls-server-call-with-direction-locks
+     state
+     (lambda () (%tls-server-handle-events-unlocked state events))))
+
+  (defun %tls-server-step-handshake-message-unlocked (state wire)
     (when (and (eq (http-tls-server-state-phase state) :initial)
                (not (http-tls-server-state-client-hello-received-p state))
                (plusp (length wire))
@@ -837,13 +979,18 @@ driver's transport callbacks."
              (http-tls-server-state-driver state) wire
              :level (http-tls-server-state-phase state))
           (setf (http-tls-server-state-driver state) driver)
-          (%tls-server-handle-events state events))
+          (%tls-server-handle-events-unlocked state events))
       (http-protocol-error (condition) (error condition))
       #+sbcl (sb-ext:timeout () (%tls-timeout))
       (error (condition)
              (when (typep condition 'http-timeout)
                (error condition))
              (%tls-server-fail "TLS handshake failed." :handshake-failed))))
+
+  (defun %tls-server-step-handshake-message (state wire)
+    (%tls-server-call-with-direction-locks
+     state
+     (lambda () (%tls-server-step-handshake-message-unlocked state wire))))
 
   (defun %tls-server-feed-handshake (state fragment)
   (let ((position 0))
@@ -883,7 +1030,7 @@ driver's transport callbacks."
                                    :element-type '(unsigned-byte 8)
                                    :adjustable t
                                    :fill-pointer 0))
-                 (%tls-server-step-handshake-message state wire))))
+                 (%tls-server-step-handshake-message-unlocked state wire))))
       (loop
         for buffer = (http-tls-server-state-handshake-buffer state)
         do (when (>= (fill-pointer buffer) 4)
@@ -933,7 +1080,7 @@ driver's transport callbacks."
        (t (%tls-server-fail "TLS peer sent an unsupported record."
                             :unsupported-record-type)))))
 
-  (defun %tls-server-process-record (state wire)
+  (defun %tls-server-process-record-unlocked (state wire)
     (let* ((outer-type (aref wire 0))
            (read-state (http-tls-server-state-read-state state)))
       (cond
@@ -953,7 +1100,7 @@ driver's transport callbacks."
           (%tls-server-fail "TLS peer sent an unprotected record after encryption began."
                             :unexpected-record))
         (%tls-server-dispatch-plaintext
-         state (%tls-server-decrypt-record state wire)))
+         state (%tls-server-decrypt-record-unlocked state wire)))
        (t
         (unless (member outer-type
                         (list cl-tls-kit:+tls-content-type-handshake+
@@ -972,7 +1119,12 @@ driver's transport callbacks."
                  (%tls-server-fail "TLS plaintext record is invalid."
                                    :invalid-record)))))))
 
-  (defun %tls-server-fill (state)
+  (defun %tls-server-process-record (state wire)
+    (%tls-server-call-with-direction-locks
+     state
+     (lambda () (%tls-server-process-record-unlocked state wire))))
+
+  (defun %tls-server-fill-unlocked (state)
     (loop
      (when (< (http-tls-server-state-input-position state)
               (length (http-tls-server-state-input-buffer state)))
@@ -982,9 +1134,30 @@ driver's transport callbacks."
        (unless wire
          (%tls-server-fail "TLS transport ended without close_notify."
                            :missing-close-notify))
-       (%tls-server-process-record state wire))))
+       (%tls-server-call-with-direction-lock
+        state :write
+        (lambda () (%tls-server-process-record-unlocked state wire))))))
 
-  (defun %tls-server-write-application-data (state sequence start end)
+  (defun %tls-server-fill (state)
+    (%tls-server-call-with-direction-lock
+     state :read
+     (lambda () (%tls-server-fill-unlocked state))))
+
+  (defun %tls-server-read-byte (state)
+    (%tls-server-call-with-direction-lock
+     state :read
+     (lambda ()
+       (unless (< (http-tls-server-state-input-position state)
+                  (length (http-tls-server-state-input-buffer state)))
+         (unless (%tls-server-fill-unlocked state)
+           (return-from %tls-server-read-byte :eof)))
+       (prog1
+           (aref (http-tls-server-state-input-buffer state)
+                 (http-tls-server-state-input-position state))
+         (incf (http-tls-server-state-input-position state))))))
+
+  (defun %tls-server-write-application-data-unlocked
+      (state sequence start end)
     (handler-case
         (progn
           (loop for position from start below end
@@ -997,7 +1170,7 @@ driver's transport callbacks."
                 for wire =
                   (cl-tls-kit:encrypt-tls13-traffic-record
                    plaintext (http-tls-server-state-write-state state))
-                do (%tls-server-write-record state wire))
+                do (%tls-server-write-record-unlocked state wire))
           sequence)
       (http-timeout (condition) (error condition))
       (http-protocol-error (condition) (error condition))
@@ -1005,13 +1178,25 @@ driver's transport callbacks."
         (%tls-server-fail "TLS application record encryption failed."
                           :record-encryption-failed))))
 
-  (defun %tls-server-send-close-notify (state)
+  (defun %tls-server-write-application-data (state sequence start end)
+    (%tls-server-call-with-direction-lock
+     state :write
+     (lambda ()
+       (%tls-server-write-application-data-unlocked state sequence start end))))
+
+  (defun %tls-server-send-close-notify-unlocked (state)
     (unless (http-tls-server-state-close-sent-p state)
       (when (http-tls-server-state-write-state state)
-        (%tls-server-send-plaintext
+        (%tls-server-send-plaintext-unlocked
          state :application cl-tls-kit:+tls-content-type-alert+ #(1 0))
         (setf (http-tls-server-state-close-sent-p state) t)))
     t)
+
+  (defun %tls-server-send-close-notify (state &key allow-closing)
+    (%tls-server-call-with-direction-lock
+     state :write
+     (lambda () (%tls-server-send-close-notify-unlocked state))
+     :allow-closing allow-closing))
 
   (defun %tls-server-reject-missing-alpn (state)
     (%tls-server-send-plaintext
@@ -1039,16 +1224,7 @@ driver's transport callbacks."
     (defmethod sb-gray:stream-read-byte ((stream http-tls-stream))
       (let ((driver (%tls-stream-driver stream)))
         (if (typep driver 'http-tls-server-state)
-            (let ((state driver))
-              (if (< (http-tls-server-state-input-position state)
-                     (length (http-tls-server-state-input-buffer state)))
-                  (prog1
-                      (aref (http-tls-server-state-input-buffer state)
-                            (http-tls-server-state-input-position state))
-                    (incf (http-tls-server-state-input-position state)))
-                  (if (%tls-server-fill state)
-                      (sb-gray:stream-read-byte stream)
-                      :eof)))
+            (%tls-server-read-byte driver)
             (let ((input (%tls-stream-input stream))
                   (position (%tls-stream-input-position stream)))
               (if (< position (length input))
@@ -1092,37 +1268,75 @@ driver's transport callbacks."
               (error () nil)))))
       nil)
 
+    (defun %tls-server-close-adapter (stream state driver abort)
+      (when (%tls-server-begin-close state)
+        (let ((completed-p nil)
+              (driver-closed-p nil)
+              (transport (%tls-stream-transport-stream stream)))
+          (unwind-protect
+               (progn
+                 (if abort
+                     (when (open-stream-p transport)
+                       (close transport :abort t))
+                   (progn
+                     (%tls-server-send-close-notify
+                      state :allow-closing t)
+                     (when (open-stream-p transport)
+                       (close transport :abort nil))))
+                 (%tls-server-call-with-direction-locks
+                  state
+                  (lambda ()
+                    (unwind-protect
+                         (when driver
+                           (cl-tls-kit:tls13-server-driver-close driver)
+                           (setf driver-closed-p t))
+                      (unless driver-closed-p
+                        (%tls-server-cleanup-driver-close driver))
+                      (%tls-server-clear-traffic-states-unlocked state)))
+                  :allow-closing t)
+                 (setf completed-p t))
+            (unwind-protect
+                 (unless completed-p
+                   (unwind-protect
+                        (when (open-stream-p transport)
+                          (http-kit::%with-http-cleanup
+                            (close transport :abort t)))
+                     (%tls-server-call-with-direction-locks
+                      state
+                      (lambda ()
+                        (unless driver-closed-p
+                          (%tls-server-cleanup-driver-close driver))
+                        (%tls-server-clear-traffic-states-unlocked state))
+                      :allow-closing t)))
+              (unwind-protect
+                   (setf (%tls-stream-closed-p stream) t)
+                (%tls-server-finish-close state))))))
+      t)
+
     (defmethod close ((stream http-tls-stream) &key abort)
       (unless (%tls-stream-closed-p stream)
-        (let* ((completed-p nil)
-               (transport (%tls-stream-transport-stream stream))
+        (let* ((transport (%tls-stream-transport-stream stream))
                (driver (%tls-stream-driver stream))
                (server-state (and (typep driver 'http-tls-server-state)
                                   driver))
                (server-driver
                  (and server-state
-                      (http-tls-server-state-driver server-state)))
-               (driver-closed-p nil))
-          (unwind-protect
-               (progn
-                 (unless abort
-                   (if server-state
-                       (%tls-server-send-close-notify server-state)
-                       (cl-tls-kit:tls13-client-driver-close driver)))
-                 (when server-driver
-                   (cl-tls-kit:tls13-server-driver-close server-driver)
-                   (setf driver-closed-p t))
-                 (setf completed-p t))
-            (unwind-protect
-                 (unwind-protect
+                      (http-tls-server-state-driver server-state))))
+          (if server-state
+              (%tls-server-close-adapter stream server-state server-driver abort)
+            (let ((completed-p nil))
+              (unwind-protect
+                   (progn
+                     (unless abort
+                       (cl-tls-kit:tls13-client-driver-close driver))
+                     (setf completed-p t))
+                (unwind-protect
                      (when (open-stream-p transport)
                        (if completed-p
                            (close transport :abort abort)
-                           (http-kit::%with-http-cleanup
-                             (close transport :abort t))))
-                   (when (and server-driver (not driver-closed-p))
-                     (%tls-server-cleanup-driver-close server-driver)))
-              (setf (%tls-stream-closed-p stream) t)))))
+                         (http-kit::%with-http-cleanup
+                           (close transport :abort t))))
+                  (setf (%tls-stream-closed-p stream) t)))))))
       t))
 
   (defun make-http-tls-server-wrapper
