@@ -1979,7 +1979,7 @@
            :driver nil :provider nil :transport-stream nil))
         (levels nil))
     (%network-tls-contract-with-spy
-     'http-kit/tls::%tls-server-send-plaintext
+     'http-kit/tls::%tls-server-send-plaintext-unlocked
      (lambda (original)
        (declare (ignore original))
        (lambda (&rest arguments)
