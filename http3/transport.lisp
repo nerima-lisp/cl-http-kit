@@ -1379,64 +1379,40 @@ callback completion contract in the HTTP/3 API reference."
          (error condition)))))
 
   (defun %h3-promote-qpack-decompression-error (condition &key normalize-size-limit-p)
-  (labels ((error-message (condition)
-           (if (typep condition 'http-message-kit:http-error)
-               (http-message-kit:http-error-message condition)
-             (http-kit:http-error-message condition)))
-         (http-kit-size-error (condition)
-           (if (typep condition 'http-size-limit-exceeded)
-               condition
+  (labels ((wrapped-qpack-size-error (outer cause size-error)
              (make-condition
-              'http-size-limit-exceeded
-              :message (error-message condition)
+              'http-kit:http-connection-error
+              :message (http-kit:http-error-message outer)
               :operation :http3-transport
-              :detail (http-message-kit:http-protocol-error-detail condition)
-              :kind (http-message-kit:http-size-limit-exceeded-kind condition)
-              :limit (http-message-kit:http-size-limit-exceeded-limit condition)
-              :observed
-              (http-message-kit:http-size-limit-exceeded-observed condition))))
-         (wrapped-qpack-size-error (outer cause size-error)
-           (make-condition
-            'http-kit:http-connection-error
-            :message (error-message outer)
-            :operation :http3-transport
-            :cause
-            (make-condition
-             'http-protocol-error
-             :message (error-message cause)
-             :operation :http3-transport
-             :detail (list :qpack-decompression-failed size-error)))))
-    (let* ((cause (if (typep condition
-                             'http-message-kit:http-connection-error)
-                      (http-message-kit:http-connection-error-cause condition)
-                    condition))
-           (detail
-             (cond
-               ((typep cause 'http-protocol-error)
-                (http-kit:http-protocol-error-detail cause))
-               ((typep cause 'http-message-kit:http-protocol-error)
-                (http-message-kit:http-protocol-error-detail cause))))
+              :cause
+              (make-condition
+               'http-kit:http-protocol-error
+               :message (http-kit:http-error-message cause)
+               :operation :http3-transport
+               :detail (list :qpack-decompression-failed size-error)))))
+    (let* ((cause (if (typep condition 'http-kit:http-connection-error)
+                      (http-kit:http-connection-error-cause condition)
+                      condition))
+           (detail (when (typep cause 'http-kit:http-protocol-error)
+                     (http-kit:http-protocol-error-detail cause)))
            (size-error
              (and (consp detail)
                   (eq (first detail) :qpack-decompression-failed)
                   (second detail))))
       (cond
-        ((typep condition 'http-message-kit:http-size-limit-exceeded)
-         (error (http-kit-size-error condition)))
+        ((typep condition 'http-kit:http-size-limit-exceeded)
+         (error condition))
         ((and (consp detail)
               (eq (first detail) :qpack-decompression-failed)
-              (or (typep size-error 'http-size-limit-exceeded)
-                  (typep size-error 'http-message-kit:http-size-limit-exceeded)))
-         (let ((normalized-size-error (http-kit-size-error size-error)))
-           (if normalize-size-limit-p
-               (error normalized-size-error)
+              (typep size-error 'http-kit:http-size-limit-exceeded))
+         (if normalize-size-limit-p
+             (error size-error)
              (error
-              (wrapped-qpack-size-error
-               condition cause normalized-size-error)))))
+              (wrapped-qpack-size-error condition cause size-error))))
         ((and (consp detail)
               (eq (first detail) :qpack-decompression-failed))
          (%h3-connection-transport-error
-          (error-message condition)
+          (http-kit:http-error-message condition)
           detail
           #x200))
         (t
@@ -2341,9 +2317,7 @@ HTTP/3 API reference."
       (http-message-kit:http-connection-error (condition)
                                               (%h3-promote-qpack-decompression-error condition))
       (http-message-kit:http-protocol-error (condition)
-                                            (%h3-promote-qpack-decompression-error condition))
-      (http-protocol-error (condition)
-                           (%h3-promote-qpack-decompression-error condition)))))
+                                            (%h3-promote-qpack-decompression-error condition)))))
 
 (defun %h3-read-response
     (client stream &key on-response-headers on-body-chunk on-information collect-body-p
@@ -5137,9 +5111,7 @@ reference."
                                     (http-message-kit:http-connection-error (condition)
                                                                             (%h3-promote-qpack-decompression-error condition :normalize-size-limit-p t))
                                     (http-message-kit:http-protocol-error (condition)
-                                                                          (%h3-promote-qpack-decompression-error condition :normalize-size-limit-p t))
-                                    (http-protocol-error (condition)
-                                                         (%h3-promote-qpack-decompression-error condition :normalize-size-limit-p t)))))
+                                                                          (%h3-promote-qpack-decompression-error condition :normalize-size-limit-p t)))))
                              (if (not request-headers-seen-p)
                                  (progn
                                    (multiple-value-bind
