@@ -3113,7 +3113,7 @@
          (progn
            (sb-ext:without-package-locks
              (setf (fdefinition 'http-kit/tls::%tls-server-send-close-notify)
-                   (lambda (state)
+                   (lambda (state &key allow-closing)
                      (sb-thread:signal-semaphore close-notify-entered)
                      (setf close-notify-write-state-p
                            (http-kit/tls::http-tls-server-state-write-state
@@ -3123,7 +3123,8 @@
                        (error "Timed out waiting to release close_notify."))
                      (unwind-protect
                           (handler-case
-                              (funcall original-close-notify state)
+                              (funcall original-close-notify
+                                       state :allow-closing allow-closing)
                             (error (condition)
                               (setf close-notify-error condition)
                               (error condition)))
