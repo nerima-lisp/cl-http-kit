@@ -1859,6 +1859,7 @@
            (cancel-count 0)
            (report-count 0)
            (close-count 0)
+           (close-stream-count 0)
            (wait-count 0)
            (callback-condition
              (http-kit::%http-server-callback-condition :handler :request)))
@@ -1911,6 +1912,14 @@
                 (declare (ignore arguments))
                 (incf close-count)
                 (setf closed-p t)))
+        (cons 'cl-quic-kit:quic-connection-close-stream
+              (lambda (target target-stream)
+                (ensure-equal
+                 (http-kit/http3::%http3-server-connection-quic-connection
+                  connection)
+                 target)
+                (ensure-equal :stream target-stream)
+                (incf close-stream-count)))
         (cons 'http-kit::%http-server-broadcast
               (lambda (&rest arguments)
                 (declare (ignore arguments))
@@ -1955,7 +1964,8 @@
           server connection :stream 0 nil)
          (ensure-equal 3 report-count)
          (ensure-equal 1 close-count)
-         (ensure-true (plusp wait-count))))))
+         (ensure-true (plusp wait-count))
+         (ensure-equal 5 close-stream-count)))))
 
   (deftest http3-listener-coverage-worker-start-and-request-start-errors
     (let* ((server (%http3-listener-test-unit-server))
