@@ -497,8 +497,8 @@ driver's transport callbacks."
     "Lock order is connection, READ-LOCK, WRITE-LOCK, then LIFECYCLE-LOCK.
 Server lifecycle code releases the connection lock before waiting on TLS locks.
 Operations take LIFECYCLE-LOCK only while holding a direction lock. Close releases
-LIFECYCLE-LOCK before waiting on direction locks; deferred cleanup releases the
-direction locks before publishing CLOSED under LIFECYCLE-LOCK."
+LIFECYCLE-LOCK before waiting on direction locks; deferred cleanup publishes CLOSED
+under LIFECYCLE-LOCK while holding READ-LOCK and WRITE-LOCK."
     driver provider transport-stream deadline
     (clock-function (function %tls-monotonic-time))
     (phase :initial)
@@ -512,7 +512,6 @@ direction locks before publishing CLOSED under LIFECYCLE-LOCK."
     (closed-p nil)
     close-deadline
     (close-cleanup-pending-p nil)
-    (close-cleanup-running-p nil)
     (selected-alpn nil)
     (handshake-buffer
      (make-array 0
@@ -550,7 +549,9 @@ direction locks before publishing CLOSED under LIFECYCLE-LOCK."
       (%tls-protocol-error "TLS server stream is closing." :closed))
     nil)
 
-  (declaim (ftype function %tls-server-try-finish-deferred-close))
+  (declaim (ftype function
+             %tls-server-try-finish-deferred-close
+             %tls-server-finish-deferred-close))
 
   #+sbcl
   (defun %tls-server-grab-direction-lock (lock lock-deadline)
@@ -589,7 +590,7 @@ direction locks before publishing CLOSED under LIFECYCLE-LOCK."
                        (http-tls-server-state-read-lock state))
                      (sb-thread:holding-mutex-p
                       (http-tls-server-state-write-lock state)))
-            (%tls-server-try-finish-deferred-close state)))))
+            (%tls-server-finish-deferred-close state)))))
     #-sbcl
     (funcall thunk))
 
@@ -614,7 +615,7 @@ direction locks before publishing CLOSED under LIFECYCLE-LOCK."
           (sb-thread:release-mutex write-lock))
         (when read-locked-p
           (sb-thread:release-mutex read-lock))
-        (%tls-server-try-finish-deferred-close state)))
+        (%tls-server-finish-deferred-close state)))
     #-sbcl
     (funcall thunk))
 
@@ -652,8 +653,7 @@ direction locks before publishing CLOSED under LIFECYCLE-LOCK."
     #+sbcl
     (sb-thread:with-mutex ((http-tls-server-state-lifecycle-lock state))
       (setf (http-tls-server-state-closed-p state) t
-            (http-tls-server-state-close-cleanup-pending-p state) nil
-            (http-tls-server-state-close-cleanup-running-p state) nil)
+            (http-tls-server-state-close-cleanup-pending-p state) nil)
       (sb-thread:condition-broadcast
        (http-tls-server-state-lifecycle-waitqueue state)))
     #-sbcl
@@ -1383,44 +1383,40 @@ direction locks before publishing CLOSED under LIFECYCLE-LOCK."
     (defun %tls-server-try-finish-deferred-close (state)
       (declare (ignorable state))
       #+sbcl
-      (let ((claimed-p
-              (sb-thread:with-mutex
-                  ((http-tls-server-state-lifecycle-lock state))
-                (when (and (http-tls-server-state-close-cleanup-pending-p state)
-                           (not (http-tls-server-state-closed-p state))
-                           (not (http-tls-server-state-close-cleanup-running-p state)))
-                  (setf (http-tls-server-state-close-cleanup-running-p state) t)
-                  t))))
-        (when claimed-p
-          (let ((read-lock (http-tls-server-state-read-lock state))
-                (write-lock (http-tls-server-state-write-lock state))
-                (read-locked-p nil)
-                (write-locked-p nil)
-                (finished-p nil))
-            (unwind-protect
-                 (when (%tls-server-try-grab-direction-lock read-lock)
-                   (setf read-locked-p t)
-                   (when (%tls-server-try-grab-direction-lock write-lock)
-                     (setf write-locked-p t)
+      (when (sb-thread:with-mutex
+                ((http-tls-server-state-lifecycle-lock state))
+              (and (http-tls-server-state-close-cleanup-pending-p state)
+                   (not (http-tls-server-state-closed-p state))))
+        (let ((read-lock (http-tls-server-state-read-lock state))
+              (write-lock (http-tls-server-state-write-lock state))
+              (read-locked-p nil)
+              (write-locked-p nil)
+              (finished-p nil))
+          ;; Direction locks serialize cleanup attempts; a separate running flag
+          ;; can lose the last lock release while a nonblocking attempt is active.
+          (unwind-protect
+               (when (%tls-server-try-grab-direction-lock read-lock)
+                 (setf read-locked-p t)
+                 (when (%tls-server-try-grab-direction-lock write-lock)
+                   (setf write-locked-p t)
+                   (when (sb-thread:with-mutex
+                             ((http-tls-server-state-lifecycle-lock state))
+                           (and (http-tls-server-state-close-cleanup-pending-p state)
+                                (not (http-tls-server-state-closed-p state))))
                      (let ((driver-error
                              (%tls-server-close-state-unlocked
                               state (http-tls-server-state-driver state))))
                        (when driver-error
                          (handler-case
-                             (warn 'tls-server-cleanup-warning :cause driver-error)
+                             (warn (quote tls-server-cleanup-warning) :cause driver-error)
                            (error () nil))))
-                     (setf finished-p t)))
-              (when write-locked-p
-                (sb-thread:release-mutex write-lock))
-              (when read-locked-p
-                (sb-thread:release-mutex read-lock))
-              (unless finished-p
-                (sb-thread:with-mutex
-                    ((http-tls-server-state-lifecycle-lock state))
-                  (setf (http-tls-server-state-close-cleanup-running-p state) nil))))
-            (when finished-p
-              (%tls-server-finish-close state))
-            finished-p)))
+                     (%tls-server-finish-close state)
+                     (setf finished-p t))))
+            (when write-locked-p
+              (sb-thread:release-mutex write-lock))
+            (when read-locked-p
+              (sb-thread:release-mutex read-lock)))
+          finished-p))
       #-sbcl nil)
 
     (defun %tls-server-close-adapter (stream state driver abort)
@@ -1495,6 +1491,43 @@ direction locks before publishing CLOSED under LIFECYCLE-LOCK."
                            (close transport :abort t))))
                   (setf (%tls-stream-closed-p stream) t)))))))
       t))
+  (defun %tls-server-finish-deferred-close (state)
+  #+sbcl
+  (when (sb-thread:with-mutex
+            ((http-tls-server-state-lifecycle-lock state))
+          (and (http-tls-server-state-close-cleanup-pending-p state)
+               (not (http-tls-server-state-closed-p state))))
+    (let ((read-lock (http-tls-server-state-read-lock state))
+          (write-lock (http-tls-server-state-write-lock state))
+          (read-locked-p nil)
+          (write-locked-p nil)
+          (finished-p nil))
+      (unwind-protect
+           (progn
+             (%tls-server-grab-direction-lock read-lock nil)
+             (setf read-locked-p t)
+             (%tls-server-grab-direction-lock write-lock nil)
+             (setf write-locked-p t)
+             (when (sb-thread:with-mutex
+                       ((http-tls-server-state-lifecycle-lock state))
+                     (and (http-tls-server-state-close-cleanup-pending-p state)
+                          (not (http-tls-server-state-closed-p state))))
+               (let ((driver-error
+                       (%tls-server-close-state-unlocked
+                        state (http-tls-server-state-driver state))))
+                 (when driver-error
+                   (handler-case
+                       (warn (quote tls-server-cleanup-warning)
+                             :cause driver-error)
+                     (error () nil))))
+               (%tls-server-finish-close state)
+               (setf finished-p t)))
+        (when write-locked-p
+          (sb-thread:release-mutex write-lock))
+        (when read-locked-p
+          (sb-thread:release-mutex read-lock)))
+      finished-p))
+  #-sbcl nil)
 
   (defun make-http-tls-server-wrapper
       (&key certificate-chain private-key ticket-key-store alpn-protocols
