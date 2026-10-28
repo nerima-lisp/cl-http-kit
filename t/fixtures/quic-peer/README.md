@@ -1,10 +1,10 @@
 # QUIC peer fixture
 
-This fixture is a test-only raw QUIC peer for the HTTP/3 listener tests. The Nix package builds it with the stable Go 1.26 toolchain.
+This fixture is a test-only raw QUIC peer for the HTTP/3 listener tests. The pinned Nix package builds it with Go 1.26.5 through `pkgs.go_1_26`.
 
 ## Known standard-library vulnerabilities
 
-The fixture's Go 1.27rc2 scan reported these nine call-reachable Go standard-library vulnerabilities. The table lists the first fixed version on each release line. The Go Vulnerability Database reports that GO-2026-6090 and GO-2026-5972 were first fixed in Go 1.27.0-rc.3; both fixes are included in stable Go 1.27.0.
+The `govulncheck` 1.9.0 scan of this fixture with Go 1.27rc2 reported nine Go standard-library vulnerabilities reachable from the fixture's code. The pinned Go 1.26.5 toolchain predates the fixes listed below. The Go Vulnerability Database reports that GO-2026-6090 and GO-2026-5972 were first fixed in Go 1.27.0-rc.3; both fixes are included in stable Go 1.27.0.
 
 | Go vulnerability | First fixed in Go 1.26 | First fixed in Go 1.27 |
 | --- | --- | --- |
