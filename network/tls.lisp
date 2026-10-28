@@ -722,6 +722,33 @@ driver's transport callbacks."
                                    :invalid-driver-state))))
       plaintext)))
 
+  (defun %tls-server-zeroize-octets (octets)
+    (when (typep octets (quote (vector (unsigned-byte 8))))
+      (fill octets 0))
+    nil)
+
+  (defun %tls-server-clear-traffic-state (traffic-state)
+    (when traffic-state
+      (dolist (bytes
+               (list (cl-tls-kit:tls13-traffic-state-secret traffic-state)
+                     (cl-tls-kit:tls13-traffic-state-key traffic-state)
+                     (cl-tls-kit:tls13-traffic-state-iv traffic-state)))
+        (%tls-server-zeroize-octets bytes))
+      (setf (cl-tls-kit:tls13-traffic-state-secret traffic-state) nil
+            (cl-tls-kit:tls13-traffic-state-key traffic-state) nil
+            (cl-tls-kit:tls13-traffic-state-iv traffic-state) nil))
+    nil)
+
+  (defun %tls-server-clear-traffic-states (state)
+    (when state
+      (%tls-server-clear-traffic-state
+       (http-tls-server-state-read-state state))
+      (%tls-server-clear-traffic-state
+       (http-tls-server-state-write-state state))
+      (setf (http-tls-server-state-read-state state) nil
+            (http-tls-server-state-write-state state) nil))
+    nil)
+
   (defun %tls-server-handle-events (state events)
     (let ((alert-p nil))
       (dolist (event events)
@@ -729,19 +756,40 @@ driver's transport callbacks."
           (:cipher-suite
            (setf (http-tls-server-state-suite state) (getf event :suite)))
           (:secret
-           (let ((traffic-state
-                  (%tls-server-traffic-state state (getf event :secret))))
-             (case (getf event :direction)
-               (:read
-                (setf (http-tls-server-state-read-state state) traffic-state))
-               (:write
-                (setf (http-tls-server-state-write-state state) traffic-state))
-               (otherwise
-                (%tls-server-fail
-                 "TLS driver returned an invalid secret direction."
-                 :invalid-driver-state)))
-             (when (eq (getf event :level) :handshake)
-               (setf (http-tls-server-state-phase state) :handshake))))
+           (let* ((direction (getf event :direction))
+                  (secret (getf event :secret)))
+             (unless (member direction (quote (:read :write)))
+               (%tls-server-zeroize-octets secret)
+               (%tls-server-fail
+                "TLS driver returned an invalid secret direction."
+                :invalid-driver-state))
+             (let ((traffic-state nil)
+                   (installed-p nil))
+               (unwind-protect
+                    (progn
+                      (setf traffic-state
+                            (%tls-server-traffic-state state secret))
+                      (case direction
+                        (:read
+                         (let ((old-state
+                                 (http-tls-server-state-read-state state)))
+                           (setf (http-tls-server-state-read-state state)
+                                 traffic-state
+                                 installed-p t)
+                           (unless (eq old-state traffic-state)
+                             (%tls-server-clear-traffic-state old-state))))
+                        (:write
+                         (let ((old-state
+                                 (http-tls-server-state-write-state state)))
+                           (setf (http-tls-server-state-write-state state)
+                                 traffic-state
+                                 installed-p t)
+                           (unless (eq old-state traffic-state)
+                             (%tls-server-clear-traffic-state old-state)))))
+                      (when (eq (getf event :level) :handshake)
+                        (setf (http-tls-server-state-phase state) :handshake)))
+                 (unless installed-p
+                   (%tls-server-zeroize-octets secret))))))
           (:alpn
            (setf (http-tls-server-state-selected-alpn state)
                  (getf event :protocol)))
@@ -1108,7 +1156,8 @@ driver's transport callbacks."
         (unless (streamp stream)
           (%tls-protocol-error "TLS server wrapper requires a Lisp stream."
                                :invalid-stream))
-        (let ((driver nil))
+        (let ((driver nil)
+              (state nil))
           (handler-case
               (let ((effective-deadline
                       (http-deadline timeout
@@ -1131,29 +1180,30 @@ driver's transport callbacks."
                                    :ticket-key-store server-ticket-key-store
                                    :session-tickets session-tickets-p
                                    :alpn-protocols server-alpn))
-                            (let ((state
-                                    (%make-http-tls-server-state
-                                     :driver driver
-                                     :provider provider
-                                     :transport-stream stream
-                                     :deadline effective-deadline
-                                     :clock-function clock-function)))
-                              (http-kit/network::%network-call-with-accepted-stream-socket-non-blocking-mode
-                               stream
-                               (lambda ()
-                                 (%tls-server-handshake state)))
-                              (let ((tls-stream
-                                      (make-instance 'http-tls-stream
-                                                     :driver state
-                                                     :transport-stream stream)))
-                                (setf (http-tls-server-state-handshake-deadline-active-p state)
-                                      nil)
-                                tls-stream))))
+                            (setf state
+                                  (%make-http-tls-server-state
+                                   :driver driver
+                                   :provider provider
+                                   :transport-stream stream
+                                   :deadline effective-deadline
+                                   :clock-function clock-function))
+                            (http-kit/network::%network-call-with-accepted-stream-socket-non-blocking-mode
+                             stream
+                             (lambda ()
+                               (%tls-server-handshake state)))
+                            (let ((tls-stream
+                                    (make-instance 'http-tls-stream
+                                                   :driver state
+                                                   :transport-stream stream)))
+                              (setf (http-tls-server-state-handshake-deadline-active-p state)
+                                    nil)
+                              tls-stream)))
                         effective-deadline
                         clock-function)
                        (setf completed-p t))
                   (unless completed-p
                     (%tls-server-cleanup-driver-close driver)
+                    (%tls-server-clear-traffic-states state)
                     (http-kit::%with-http-cleanup
                       (when (open-stream-p stream)
                         (close stream :abort t))))))
@@ -1164,4 +1214,12 @@ driver's transport callbacks."
             (error ()
               (%tls-server-fail "TLS server handshake failed." :handshake-failed))))))
     #-sbcl
-    (%tls-unsupported :tls-native-server)))
+    (%tls-unsupported :tls-native-server))
+  #+sbcl
+  (defmethod close :around ((stream http-tls-stream) &key abort)
+    (declare (ignore abort))
+    (unwind-protect
+         (call-next-method)
+      (let ((driver (%tls-stream-driver stream)))
+        (when (typep driver 'http-tls-server-state)
+          (%tls-server-clear-traffic-states driver))))))

@@ -2432,3 +2432,197 @@
       (ensure-true (<= growth-count 20))
       (ensure-true
        (<= estimated-copied-bytes (* 2 (fill-pointer buffer)))))))
+#+sbcl
+(progn
+  (defun %tls-server-test-traffic-state (provider seed)
+    (let* ((secret
+             (make-array 32
+                         :element-type (quote (unsigned-byte 8))
+                         :initial-element seed))
+           (traffic-state
+             (cl-tls-kit:make-tls13-traffic-state
+              provider :sha256 :aes-128-gcm secret 16 12)))
+      (values traffic-state
+              (list (cl-tls-kit:tls13-traffic-state-secret traffic-state)
+                    (cl-tls-kit:tls13-traffic-state-key traffic-state)
+                    (cl-tls-kit:tls13-traffic-state-iv traffic-state)))))
+
+  (defun %tls-server-test-zeroed-octets-p (sequences)
+    (every (lambda (sequence)
+             (and sequence
+                  (every (lambda (octet) (zerop octet)) sequence)))
+           sequences))
+
+  (deftest tls-server-wrapper-zeroizes-adapter-traffic-states-on-timeout
+    (let* ((material (%tls-server-test-material))
+           (raw (make-instance (quote %tls-server-test-stream) :input (octets)))
+           (wrapper
+             (make-http-tls-server-wrapper
+              :certificate-chain (getf material :certificate-chain)
+              :private-key (getf material :private-key)
+              :alpn-protocols (list "h2")))
+           (timeout
+             (make-condition (quote http-timeout)
+                             :message "Injected handshake timeout."
+                             :operation :tls
+                             :kind :tls))
+           (state nil)
+           (secrets nil)
+           (observed nil))
+      (unwind-protect
+           (%tls-server-test-with-spy
+            (quote http-kit/tls::%tls-server-handshake)
+            (lambda (candidate)
+              (let* ((provider
+                       (http-kit/tls::http-tls-server-state-provider candidate))
+                     (read-state nil)
+                     (read-secrets nil)
+                     (write-state nil)
+                     (write-secrets nil))
+                (multiple-value-setq (read-state read-secrets)
+                  (%tls-server-test-traffic-state provider 7))
+                (multiple-value-setq (write-state write-secrets)
+                  (%tls-server-test-traffic-state provider 11))
+                (setf state candidate
+                      (http-kit/tls::http-tls-server-state-read-state candidate)
+                      read-state
+                      (http-kit/tls::http-tls-server-state-write-state candidate)
+                      write-state
+                      secrets (append read-secrets write-secrets))
+                (error timeout)))
+            (lambda ()
+              (setf observed
+                    (handler-case
+                        (progn (funcall wrapper raw :timeout 2) nil)
+                      (http-timeout (condition) condition)))
+              (ensure-true (eq timeout observed))
+              (ensure-true state)
+              (ensure-true (%tls-server-test-zeroed-octets-p secrets))
+              (ensure-false (http-kit/tls::http-tls-server-state-read-state state))
+              (ensure-false (http-kit/tls::http-tls-server-state-write-state state))
+              (ensure-false (open-stream-p raw))))
+        (when (open-stream-p raw)
+          (close raw :abort t))
+        (%tls-server-test-remove-material material)))))
+#+sbcl
+(deftest tls-server-wrapper-zeroizes-adapter-traffic-states-on-close
+  (let* ((material (%tls-server-test-material))
+         (transport (make-instance (quote %tls-server-test-stream)
+                                   :input (octets)))
+         (wrapper
+           (make-http-tls-server-wrapper
+            :certificate-chain (getf material :certificate-chain)
+            :private-key (getf material :private-key)
+            :alpn-protocols (list "h2")))
+         (secure nil)
+         (state nil)
+         (secrets nil))
+    (unwind-protect
+         (%tls-server-test-with-spy
+          (quote http-kit/tls::%tls-server-handshake)
+          (lambda (candidate)
+            (let* ((provider
+                     (http-kit/tls::http-tls-server-state-provider candidate))
+                   (read-state nil)
+                   (read-secrets nil)
+                   (write-state nil)
+                   (write-secrets nil))
+              (multiple-value-setq (read-state read-secrets)
+                (%tls-server-test-traffic-state provider 13))
+              (multiple-value-setq (write-state write-secrets)
+                (%tls-server-test-traffic-state provider 17))
+              (setf state candidate
+                    (http-kit/tls::http-tls-server-state-read-state candidate)
+                    read-state
+                    (http-kit/tls::http-tls-server-state-write-state candidate)
+                    write-state
+                    (http-kit/tls::http-tls-server-state-handshake-complete-p
+                     candidate)
+                    t
+                    (http-kit/tls::http-tls-server-state-selected-alpn candidate)
+                    "h2"
+                    secrets (append read-secrets write-secrets))
+              candidate))
+          (lambda ()
+            (setf secure (funcall wrapper transport :timeout 2))
+            (ensure-equal
+             "h2" (http-kit/tls:http-tls-selected-alpn-protocol secure))
+            (close secure)
+            (ensure-false (open-stream-p secure))
+            (ensure-true (%tls-server-test-zeroed-octets-p secrets))
+            (ensure-false (http-kit/tls::http-tls-server-state-read-state state))
+            (ensure-false (http-kit/tls::http-tls-server-state-write-state state))
+            (ensure-true (plusp (length (binary-test-output transport))))
+            (ensure-false (open-stream-p transport))))
+      (when (and secure (open-stream-p secure))
+        (close secure :abort t))
+      (when (open-stream-p transport)
+        (close transport :abort t))
+      (%tls-server-test-remove-material material))))
+#+sbcl
+(deftest tls-server-replaces-adapter-traffic-state-before-releasing-old-secrets
+  (let* ((provider (cl-tls-kit:make-cl-crypto-kit-provider))
+         (state
+           (http-kit/tls::%make-http-tls-server-state
+            :driver nil :provider provider :suite #x1301))
+         (old-state nil)
+         (old-secrets nil)
+         (new-state nil)
+         (new-secrets nil))
+    (multiple-value-setq (old-state old-secrets)
+      (%tls-server-test-traffic-state provider 19))
+    (multiple-value-setq (new-state new-secrets)
+      (%tls-server-test-traffic-state provider 23))
+    (setf (http-kit/tls::http-tls-server-state-read-state state) old-state)
+    (%tls-server-test-with-spy
+     (quote http-kit/tls::%tls-server-traffic-state)
+     (lambda (&rest arguments)
+       (declare (ignore arguments))
+       new-state)
+     (lambda ()
+       (http-kit/tls::%tls-server-handle-events
+        state
+        (list
+         (list :type :secret
+               :direction :read
+               :level :application
+               :secret
+               (cl-tls-kit:tls13-traffic-state-secret new-state))))))
+    (ensure-true
+     (eq new-state (http-kit/tls::http-tls-server-state-read-state state)))
+    (ensure-true (%tls-server-test-zeroed-octets-p old-secrets))
+    (ensure-false (%tls-server-test-zeroed-octets-p new-secrets))
+    (let* ((invalid-secret
+             (make-array 32
+                         :element-type (quote (unsigned-byte 8))
+                         :initial-element 29))
+           (calls 0)
+           (condition nil))
+      (%tls-server-test-with-spy
+       (quote http-kit/tls::%tls-server-traffic-state)
+       (lambda (&rest arguments)
+         (declare (ignore arguments))
+         (incf calls)
+         new-state)
+       (lambda ()
+         (setf condition
+               (%tls-server-test-condition
+                (lambda ()
+                  (http-kit/tls::%tls-server-handle-events
+                   state
+                   (list
+                    (list :type :secret
+                          :direction :invalid
+                          :level :application
+                          :secret invalid-secret))))))))
+      (ensure-equal 0 calls)
+      (ensure-equal :invalid-driver-state
+                    (http-protocol-error-detail condition))
+      (ensure-true (%tls-server-test-zeroed-octets-p (list invalid-secret)))
+      (ensure-true
+       (eq new-state (http-kit/tls::http-tls-server-state-read-state state))))
+    (dolist (bytes new-secrets)
+      (fill bytes 0))))
+
+
+
