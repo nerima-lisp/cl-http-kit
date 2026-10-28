@@ -1053,8 +1053,13 @@ references retained after a handler returns. Limits are finite and cannot be
 disabled with NIL.
 The handshake timeout is an absolute deadline measured from when TCP accept
 returns an accepted stream. Connection reservation and worker dispatch count
-toward it, and TLS negotiation must complete before the deadline. The request
-timeout covers request reads, handler execution, and response writes; the idle
+toward it, and TLS negotiation must complete before the deadline. After it
+expires, the server does not advance to another handshake phase or start a new
+TLS record; it abort-closes the connection. The deadline check and a nonblocking
+write cannot be atomic, so one nonblocking write that starts immediately after
+a successful check may finish after the deadline and cannot be canceled. The
+next check abort-closes the connection. The request timeout covers request
+reads, handler execution, and response writes; the idle
 timeout bounds the initial request wait and each wait between requests,
 including the HTTP/2 preface and first SETTINGS frame. A handler that finishes
 after its request deadline does not send a response. The graceful timeout bounds
