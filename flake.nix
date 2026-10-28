@@ -127,7 +127,8 @@
           pname = "cl-http-kit-quic-peer";
           version = "0.1.0";
           src = ./t/fixtures/quic-peer;
-          vendorHash = "sha256-lqos9WjFCedcUHa1Y6lWVxaggTrS4fwlbn352OqLTfw=";
+          go = pkgs.go_1_26;
+          vendorHash = "sha256-e02WaIUINy9tc+wJiaWsXFHsue6VW8iZm/nvA4dT+44=";
         };
       patchedParedit =
         system:
