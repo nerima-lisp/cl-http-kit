@@ -183,8 +183,12 @@
       (http-kit::%with-http-server-lock (server)
         (unless (%http3-server-connection-closed-p server connection)
           ;; The public close API maps integer codes to QUIC transport errors.
-          (cl-quic-kit::connection-close
-           quic-connection error-code reason :kind :application)
+          (let* ((engine (cl-quic-kit::%quic-connection-stream-engine quic-connection))
+                 (frame (cl-quic-kit::%connection-prepare-close
+                         quic-connection error-code reason :application)))
+            (when frame
+              (setf (cl-quic-kit::quic-client-closed-p engine) t)
+              (cl-quic-kit::%client-queue-frame engine frame :1-rtt)))
           (cl-quic-kit:quic-connection-flush quic-connection)))
       (http-kit::%http-server-broadcast server))
     nil)
