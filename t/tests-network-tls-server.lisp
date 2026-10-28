@@ -2621,8 +2621,53 @@
       (ensure-true (%tls-server-test-zeroed-octets-p (list invalid-secret)))
       (ensure-true
        (eq new-state (http-kit/tls::http-tls-server-state-read-state state))))
-    (dolist (bytes new-secrets)
-      (fill bytes 0))))
+    (setf (http-kit/tls::http-tls-server-state-write-state state) new-state)
+    (%tls-server-test-with-spy
+     (quote http-kit/tls::%tls-server-traffic-state)
+     (lambda (&rest arguments)
+       (declare (ignore arguments))
+       new-state)
+     (lambda ()
+       (http-kit/tls::%tls-server-handle-events
+        state
+        (list (list :type :secret
+                    :direction :read
+                    :level :application
+                    :secret
+                    (cl-tls-kit:tls13-traffic-state-secret new-state))
+              (list :type :secret
+                    :direction :write
+                    :level :application
+                    :secret
+                    (cl-tls-kit:tls13-traffic-state-secret new-state))))))
+    (ensure-false (%tls-server-test-zeroed-octets-p new-secrets))
+    (http-kit/tls::%tls-server-clear-traffic-state old-state)
+    (http-kit/tls::%tls-server-clear-traffic-states state)
+    (ensure-true (%tls-server-test-zeroed-octets-p new-secrets))
+    (ensure-false (http-kit/tls::http-tls-server-state-read-state state))
+    (ensure-false (http-kit/tls::http-tls-server-state-write-state state))
+    (let ((failure-secret
+            (make-array 32
+                        :element-type (quote (unsigned-byte 8))
+                        :initial-element 31))
+          (failure-signaled-p nil))
+      (%tls-server-test-with-spy
+       (quote http-kit/tls::%tls-server-traffic-state)
+       (lambda (&rest arguments)
+         (declare (ignore arguments))
+         (error "Injected TLS traffic-state setup failure."))
+       (lambda ()
+         (handler-case
+             (http-kit/tls::%tls-server-handle-events
+              state
+              (list (list :type :secret
+                          :direction :read
+                          :level :application
+                          :secret failure-secret)))
+           (error ()
+             (setf failure-signaled-p t)))))
+      (ensure-true failure-signaled-p)
+      (ensure-true (%tls-server-test-zeroed-octets-p (list failure-secret))))))
 
 
 
