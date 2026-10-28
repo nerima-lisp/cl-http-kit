@@ -2457,7 +2457,7 @@
         (close transport :abort t)))))
   (deftest tls-server-close-returns-before-held-operation-and-defers-zeroization
     (let* ((transport
-             (make-instance (quote %tls-server-test-stream) :input (octets)))
+             (make-instance '%tls-server-test-stream :input (octets)))
            (provider (cl-tls-kit:make-cl-crypto-kit-provider))
            (secret (make-array 32 :element-type '(unsigned-byte 8)
                                :initial-element 61))
@@ -2481,7 +2481,7 @@
            (operation-error nil)
            (close-result nil)
            (close-error nil))
-      (setf (http-kit/tls::http-tls-server-state-read-state state)
+      (setf (http-kit/tls::http-tls-server-state-write-state state)
             traffic-state)
       (unwind-protect
            (progn
@@ -2491,20 +2491,17 @@
                       (unwind-protect
                            (handler-case
                                (http-kit/tls::%tls-server-call-with-direction-lock
-                                state :read
+                                state :write
                                 (lambda ()
-                                  (http-kit/tls::%tls-server-call-with-direction-lock
-                                   state :write
-                                   (lambda ()
-                                     (sb-thread:signal-semaphore operation-entered)
-                                     (unless (sb-thread:wait-on-semaphore
-                                              release-operation :timeout 5)
-                                       (error "The TLS close test did not release the operation."))))))
+                                  (sb-thread:signal-semaphore operation-entered)
+                                  (unless (sb-thread:wait-on-semaphore
+                                           release-operation :timeout 5)
+                                    (error "The TLS close test did not release the operation."))))
                              (error (condition)
                                (setf operation-error condition)))
                         (sb-thread:signal-semaphore operation-done)))))
              (unless (sb-thread:wait-on-semaphore operation-entered :timeout 2)
-               (error "The TLS operation did not acquire the read lock."))
+               (error "The TLS operation did not acquire the write lock."))
              (setf close-thread
                    (sb-thread:make-thread
                     (lambda ()
@@ -2541,196 +2538,76 @@
           (close secure :abort t))
         (when (open-stream-p transport)
           (close transport :abort t)))))
-  (deftest tls-server-second-close-reuses-expired-deadline
-    (let* ((transport
-             (make-instance (quote %tls-server-test-stream) :input (octets)))
-           (state
-             (http-kit/tls::%make-http-tls-server-state
-              :driver nil :provider nil :transport-stream transport))
-           (secure (http-kit/tls::%make-http-tls-stream state transport))
-           (operation-entered (sb-thread:make-semaphore :count 0))
-           (release-operation (sb-thread:make-semaphore :count 0))
-           (operation-done (sb-thread:make-semaphore :count 0))
-           (second-close-started (sb-thread:make-semaphore :count 0))
-           (second-close-done (sb-thread:make-semaphore :count 0))
-           (operation-thread nil)
-           (second-close-thread nil)
-           (second-close-result nil)
-           (second-close-error nil))
-      (unwind-protect
-           (progn
-             (setf operation-thread
-                   (sb-thread:make-thread
-                    (lambda ()
-                      (unwind-protect
-                           (http-kit/tls::%tls-server-call-with-direction-lock
-                            state :read
-                            (lambda ()
-                              (sb-thread:signal-semaphore operation-entered)
-                              (unless (sb-thread:wait-on-semaphore
-                                       release-operation :timeout 5)
-                                (error "The TLS close test did not release the operation."))))
-                        (sb-thread:signal-semaphore operation-done)))))
-             (unless (sb-thread:wait-on-semaphore operation-entered :timeout 2)
-               (error "The TLS operation did not acquire the read lock."))
-             (ensure-true (http-kit/tls::%tls-server-begin-close state))
-             (ensure-false
-              (sb-thread:wait-on-semaphore
-               release-operation
-               :timeout (+ http-kit/tls::+tls-server-close-notify-timeout+ 0.1d0)))
-             (setf second-close-thread
-                   (sb-thread:make-thread
-                    (lambda ()
-                      (unwind-protect
-                           (progn
-                             (sb-thread:signal-semaphore second-close-started)
-                             (handler-case
-                                 (progn
-                                   (close secure :abort t)
-                                   (setf second-close-result :returned))
-                               (error (condition)
-                                 (setf second-close-error condition))))
-                        (sb-thread:signal-semaphore second-close-done)))))
-             (unless (sb-thread:wait-on-semaphore second-close-started :timeout 2)
-               (error "The TLS second close did not start."))
-             (ensure-true
-              (sb-thread:wait-on-semaphore second-close-done :timeout 0.5d0))
-             (ensure-equal :returned second-close-result)
-             (ensure-false second-close-error)
-             (ensure-false
-              (http-kit/tls::http-tls-server-state-closed-p state))
-             (sb-thread:signal-semaphore release-operation)
-             (ensure-true
-              (sb-thread:wait-on-semaphore operation-done :timeout 2))
-             (sb-thread:join-thread operation-thread :timeout 2 :default nil)
-             (ensure-true
-              (http-kit/tls::http-tls-server-state-closing-p state)))
-        (sb-thread:signal-semaphore release-operation)
-        (http-kit/tls::%tls-server-finish-close state)
-        (when operation-thread
-          (sb-thread:join-thread operation-thread :timeout 3 :default nil))
-        (when second-close-thread
-          (sb-thread:join-thread second-close-thread :timeout 3 :default nil))
-        (when (open-stream-p secure)
-          (close secure :abort t))
-        (when (open-stream-p transport)
-          (close transport :abort t)))))
-  (deftest tls-server-close-last-lock-release-retries-cleanup
-    (let* ((transport
-             (make-instance (quote %tls-server-test-stream) :input (octets)))
-           (provider (cl-tls-kit:make-cl-crypto-kit-provider))
-           (secret (make-array 32 :element-type (quote (unsigned-byte 8))
-                               :initial-element 61))
-           (traffic-state
-             (cl-tls-kit:make-tls13-traffic-state
-              provider :sha256 :aes-128-gcm secret 16 12))
-           (state
-             (http-kit/tls::%make-http-tls-server-state
-              :driver nil :provider provider :transport-stream transport))
-           (secure (http-kit/tls::%make-http-tls-stream state transport))
-           (read-lock (http-kit/tls::http-tls-server-state-read-lock state))
-           (key-material
-             (list (cl-tls-kit:tls13-traffic-state-secret traffic-state)
-                   (cl-tls-kit:tls13-traffic-state-key traffic-state)
-                   (cl-tls-kit:tls13-traffic-state-iv traffic-state)))
-           (operation-entered (sb-thread:make-semaphore :count 0))
-           (release-operation (sb-thread:make-semaphore :count 0))
-           (operation-done (sb-thread:make-semaphore :count 0))
-           (start-close (sb-thread:make-semaphore :count 0))
-           (cleanup-paused (sb-thread:make-semaphore :count 0))
-           (resume-cleanup (sb-thread:make-semaphore :count 0))
-           (close-done (sb-thread:make-semaphore :count 0))
-           (operation-thread nil)
-           (close-thread nil)
-           (close-read-attempts 0)
-           (operation-error nil)
-           (close-result nil)
-           (close-error nil))
-      (setf (http-kit/tls::http-tls-server-state-read-state state)
-            traffic-state)
-      (unwind-protect
-           (%tls-server-test-with-spy
-            (quote http-kit/tls::%tls-server-try-grab-direction-lock)
-            (let ((original
-                    (symbol-function
-                     (quote http-kit/tls::%tls-server-try-grab-direction-lock))))
-              (lambda (lock)
-                (let ((grabbed-p (funcall original lock)))
-                  (when (and (eq sb-thread:*current-thread* close-thread)
-                             (eq lock read-lock)
-                             (not grabbed-p))
-                    (incf close-read-attempts)
-                    (when (= close-read-attempts 2)
-                      (sb-thread:signal-semaphore cleanup-paused)
-                      (unless (sb-thread:wait-on-semaphore
-                               resume-cleanup :timeout 3)
-                        (error "The TLS close test did not resume cleanup."))))
-                  grabbed-p)))
-            (lambda ()
-              (setf operation-thread
-                    (sb-thread:make-thread
-                     (lambda ()
-                       (unwind-protect
-                            (handler-case
-                                (http-kit/tls::%tls-server-call-with-direction-lock
-                                 state :read
-                                 (lambda ()
-                                   (http-kit/tls::%tls-server-call-with-direction-lock
-                                    state :write
-                                    (lambda ()
-                                      (sb-thread:signal-semaphore operation-entered)
-                                      (unless (sb-thread:wait-on-semaphore
-                                               release-operation :timeout 5)
-                                        (error "The TLS close test did not release the operation."))))))
-                              (error (condition)
-                                (setf operation-error condition)))
-                         (sb-thread:signal-semaphore operation-done)))))
-              (unless (sb-thread:wait-on-semaphore operation-entered :timeout 2)
-                (error "The TLS operation did not acquire the direction locks."))
-              (setf close-thread
-                    (sb-thread:make-thread
-                     (lambda ()
-                       (unwind-protect
-                            (progn
-                              (unless (sb-thread:wait-on-semaphore start-close :timeout 2)
-                                (error "The TLS close test did not start the closer."))
-                              (handler-case
-                                  (progn
-                                    (close secure :abort t)
-                                    (setf close-result :returned))
-                                (error (condition)
-                                  (setf close-error condition))))
-                         (sb-thread:signal-semaphore close-done)))))
-              (sb-thread:signal-semaphore start-close)
-              (ensure-true
-               (sb-thread:wait-on-semaphore cleanup-paused :timeout 2.5d0))
-              (sb-thread:signal-semaphore release-operation)
-              (ensure-true
-               (sb-thread:wait-on-semaphore operation-done :timeout 2))
-              (sb-thread:join-thread operation-thread :timeout 2 :default nil)
-              (ensure-false operation-error)
-              (ensure-true
-               (every (lambda (octets) (every (function zerop) octets))
-                      key-material))
-              (ensure-true
-               (http-kit/tls::http-tls-server-state-closed-p state))
-              (sb-thread:signal-semaphore resume-cleanup)
-              (ensure-true (sb-thread:wait-on-semaphore close-done :timeout 2))
-              (sb-thread:join-thread close-thread :timeout 2 :default nil)
-              (ensure-equal :returned close-result)
-              (ensure-false close-error)))
-        (sb-thread:signal-semaphore release-operation)
-        (sb-thread:signal-semaphore resume-cleanup)
-        (sb-thread:signal-semaphore start-close)
-        (when operation-thread
-          (sb-thread:join-thread operation-thread :timeout 3 :default nil))
-        (when close-thread
-          (sb-thread:join-thread close-thread :timeout 3 :default nil))
-        (when (open-stream-p secure)
-          (close secure :abort t))
-        (when (open-stream-p transport)
-          (close transport :abort t)))))
-  (deftest tls-server-concurrent-deferred-finalizers-share-lock-order
+  (deftest tls-server-second-close-bounds-timed-wait-with-contended-lifecycle-lock
+  (let* ((transport
+           (make-instance '%tls-server-test-stream :input (octets)))
+         (state
+           (http-kit/tls::%make-http-tls-server-state
+            :driver nil :provider nil :transport-stream transport))
+         (secure (http-kit/tls::%make-http-tls-stream state transport))
+         (lifecycle-lock
+           (http-kit/tls::http-tls-server-state-lifecycle-lock state))
+         (second-close-started (sb-thread:make-semaphore :count 0))
+         (start-holder (sb-thread:make-semaphore :count 0))
+         (holder-holds-lock (sb-thread:make-semaphore :count 0))
+         (release-holder (sb-thread:make-semaphore :count 0))
+         (second-close-done (sb-thread:make-semaphore :count 0))
+         (holder-thread nil)
+         (second-close-thread nil)
+         (second-close-result nil)
+         (second-close-error nil))
+    (ensure-true (http-kit/tls::%tls-server-begin-close state))
+    (unwind-protect
+         (progn
+           (setf holder-thread
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (unless (sb-thread:wait-on-semaphore start-holder :timeout 5)
+                      (error "The TLS lifecycle-lock holder was not released."))
+                    (sleep 0.1d0)
+                    (sb-thread:grab-mutex lifecycle-lock)
+                    (unwind-protect
+                         (progn
+                           (sb-thread:signal-semaphore holder-holds-lock)
+                           (unless (sb-thread:wait-on-semaphore
+                                    release-holder :timeout 5)
+                             (error "The TLS lifecycle lock was not released.")))
+                      (sb-thread:release-mutex lifecycle-lock)))))
+           (setf second-close-thread
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (unwind-protect
+                         (handler-case
+                             (progn
+                               (sb-thread:signal-semaphore second-close-started)
+                               (close secure :abort t)
+                               (setf second-close-result :returned))
+                           (error (condition)
+                             (setf second-close-error condition)))
+                      (sb-thread:signal-semaphore second-close-done)))))
+           (unless (sb-thread:wait-on-semaphore second-close-started :timeout 2)
+             (error "The TLS second close did not start."))
+           (sb-thread:signal-semaphore start-holder)
+           (ensure-true
+            (sb-thread:wait-on-semaphore holder-holds-lock :timeout 2))
+           (ensure-false
+            (sb-thread:wait-on-semaphore second-close-done :timeout 0.01d0))
+           (ensure-true
+            (sb-thread:wait-on-semaphore second-close-done :timeout 2.5d0))
+           (ensure-equal :returned second-close-result)
+           (ensure-false second-close-error)
+           (ensure-false (http-kit/tls::http-tls-server-state-closed-p state)))
+      (sb-thread:signal-semaphore start-holder)
+      (sb-thread:signal-semaphore release-holder)
+      (when holder-thread
+        (sb-thread:join-thread holder-thread :timeout 3 :default nil))
+      (http-kit/tls::%tls-server-finish-close state)
+      (when second-close-thread
+        (sb-thread:join-thread second-close-thread :timeout 3 :default nil))
+      (setf (http-kit/tls::%tls-stream-closed-p secure) t)
+      (when (open-stream-p transport)
+        (close transport :abort t)))))
+  (deftest tls-server-final-operation-release-finishes-deferred-close-once
     (let* ((transport
              (make-instance '%tls-server-test-stream :input (octets)))
            (provider (cl-tls-kit:make-cl-crypto-kit-provider))
@@ -2738,127 +2615,144 @@
                                     :initial-element 61))
            (write-secret (make-array 32 :element-type '(unsigned-byte 8)
                                      :initial-element 62))
-           (read-traffic-state
+           (read-state
              (cl-tls-kit:make-tls13-traffic-state
               provider :sha256 :aes-128-gcm read-secret 16 12))
-           (write-traffic-state
+           (write-state
              (cl-tls-kit:make-tls13-traffic-state
               provider :sha256 :aes-128-gcm write-secret 16 12))
            (state
              (http-kit/tls::%make-http-tls-server-state
               :driver nil :provider provider :transport-stream transport))
            (secure (http-kit/tls::%make-http-tls-stream state transport))
-           (read-lock (http-kit/tls::http-tls-server-state-read-lock state))
-           (write-lock (http-kit/tls::http-tls-server-state-write-lock state))
            (key-material
              (append
-              (list (cl-tls-kit:tls13-traffic-state-secret read-traffic-state)
-                    (cl-tls-kit:tls13-traffic-state-key read-traffic-state)
-                    (cl-tls-kit:tls13-traffic-state-iv read-traffic-state))
-              (list (cl-tls-kit:tls13-traffic-state-secret write-traffic-state)
-                    (cl-tls-kit:tls13-traffic-state-key write-traffic-state)
-                    (cl-tls-kit:tls13-traffic-state-iv write-traffic-state))))
-           (operation-entered (sb-thread:make-semaphore :count 0))
-           (release-operation (sb-thread:make-semaphore :count 0))
-           (operation-done (sb-thread:make-semaphore :count 0))
-           (callback-entered (sb-thread:make-semaphore :count 0))
-           (close-finalizer-paused (sb-thread:make-semaphore :count 0))
-           (resume-close-finalizer (sb-thread:make-semaphore :count 0))
-           (close-finalizer-done (sb-thread:make-semaphore :count 0))
-           (operation-thread nil)
+              (list (cl-tls-kit:tls13-traffic-state-secret read-state)
+                    (cl-tls-kit:tls13-traffic-state-key read-state)
+                    (cl-tls-kit:tls13-traffic-state-iv read-state))
+              (list (cl-tls-kit:tls13-traffic-state-secret write-state)
+                    (cl-tls-kit:tls13-traffic-state-key write-state)
+                    (cl-tls-kit:tls13-traffic-state-iv write-state))))
+           (read-entered (sb-thread:make-semaphore :count 0))
+           (write-entered (sb-thread:make-semaphore :count 0))
+           (release-read (sb-thread:make-semaphore :count 0))
+           (release-write (sb-thread:make-semaphore :count 0))
+           (read-done (sb-thread:make-semaphore :count 0))
+           (write-done (sb-thread:make-semaphore :count 0))
+           (close-done (sb-thread:make-semaphore :count 0))
+           (finalizer-entered (sb-thread:make-semaphore :count 0))
+           (resume-finalizer (sb-thread:make-semaphore :count 0))
+           (read-thread nil)
+           (write-thread nil)
            (close-thread nil)
-           (operation-error nil)
+           (read-error nil)
+           (write-error nil)
            (close-error nil)
-           (close-pending-result nil))
-      (setf (http-kit/tls::http-tls-server-state-read-state state)
-            read-traffic-state
-            (http-kit/tls::http-tls-server-state-write-state state)
-            write-traffic-state)
+           (close-result nil)
+           (close-state-calls 0)
+           (original-close-state
+             (fdefinition 'http-kit/tls::%tls-server-close-state-unlocked)))
+      (setf (http-kit/tls::http-tls-server-state-read-state state) read-state
+            (http-kit/tls::http-tls-server-state-write-state state) write-state)
       (unwind-protect
            (%tls-server-test-with-spy
-            'http-kit/tls::%tls-server-grab-direction-lock
-            (let ((original
-                    (symbol-function
-                     'http-kit/tls::%tls-server-grab-direction-lock)))
-              (lambda (lock lock-deadline)
-                (when (and (eq sb-thread:*current-thread* operation-thread)
-                           (eq lock read-lock))
-                  (sb-thread:signal-semaphore callback-entered))
-                (funcall original lock lock-deadline)))
+            'http-kit/tls::%tls-server-close-state-unlocked
+            (lambda (candidate-state driver)
+              (incf close-state-calls)
+              (sb-thread:signal-semaphore finalizer-entered)
+              (unless (sb-thread:wait-on-semaphore resume-finalizer :timeout 5)
+                (error "The TLS deferred finalizer did not resume."))
+              (funcall original-close-state candidate-state driver))
             (lambda ()
-              (%tls-server-test-with-spy
-               'http-kit/tls::%tls-server-try-grab-direction-lock
-               (let ((original
-                       (symbol-function
-                        'http-kit/tls::%tls-server-try-grab-direction-lock)))
-                 (lambda (lock)
-                   (let ((grabbed-p (funcall original lock)))
-                     (when (and (eq lock write-lock)
-                                (not grabbed-p))
-                       (sb-thread:signal-semaphore close-finalizer-paused)
-                       (unless (sb-thread:wait-on-semaphore
-                                resume-close-finalizer :timeout 3)
-                         (error "The TLS close test did not resume its finalizer.")))
-                     (when (and (eq sb-thread:*current-thread* operation-thread)
-                                (eq lock read-lock)
-                                (not grabbed-p))
-                       (sb-thread:signal-semaphore callback-entered))
-                     grabbed-p)))
-               (lambda ()
-                 (setf operation-thread
-                       (sb-thread:make-thread
-                        (lambda ()
-                          (unwind-protect
-                               (handler-case
-                                   (http-kit/tls::%tls-server-call-with-direction-lock
-                                    state :write
-                                    (lambda ()
-                                      (sb-thread:signal-semaphore operation-entered)
-                                      (unless (sb-thread:wait-on-semaphore
-                                               release-operation :timeout 5)
-                                        (error "The TLS close test did not release the operation."))))
-                                 (error (condition)
-                                   (setf operation-error condition)))
-                            (sb-thread:signal-semaphore operation-done)))))
-                 (unless (sb-thread:wait-on-semaphore operation-entered :timeout 2)
-                   (error "The TLS operation did not acquire the write lock."))
-                 (ensure-true (nth-value 0 (http-kit/tls::%tls-server-begin-close state)))
-                 (setf close-thread
-                       (sb-thread:make-thread
-                        (lambda ()
-                          (unwind-protect
-                               (handler-case
-                                   (setf close-pending-result
-                                         (http-kit/tls::%tls-server-mark-close-cleanup-pending
-                                          state))
-                                 (error (condition)
-                                   (setf close-error condition)))
-                            (sb-thread:signal-semaphore close-finalizer-done)))))
-                 (ensure-true
-                  (sb-thread:wait-on-semaphore close-finalizer-paused :timeout 2))
-                 (ensure-false
-                  (every (lambda (octets) (every #'zerop octets)) key-material))
-                 (sb-thread:signal-semaphore release-operation)
-                 (ensure-true
-                  (sb-thread:wait-on-semaphore callback-entered :timeout 2))
-                 (sb-thread:signal-semaphore resume-close-finalizer)
-                 (ensure-true
-                  (sb-thread:wait-on-semaphore close-finalizer-done :timeout 2))
-                 (ensure-true
-                  (sb-thread:wait-on-semaphore operation-done :timeout 2))
-                 (sb-thread:join-thread close-thread :timeout 2 :default nil)
-                 (sb-thread:join-thread operation-thread :timeout 2 :default nil)
-                 (ensure-false close-error)
-                 (ensure-false operation-error)
-                 (ensure-false close-pending-result)
-                 (ensure-true
-                  (every (lambda (octets) (every #'zerop octets)) key-material))
-                 (ensure-true
-                  (http-kit/tls::http-tls-server-state-closed-p state))))))
-        (sb-thread:signal-semaphore release-operation)
-        (sb-thread:signal-semaphore resume-close-finalizer)
-        (when operation-thread
-          (sb-thread:join-thread operation-thread :timeout 3 :default nil))
+              (setf read-thread
+                    (sb-thread:make-thread
+                     (lambda ()
+                       (unwind-protect
+                            (handler-case
+                                (http-kit/tls::%tls-server-call-with-direction-lock
+                                 state :read
+                                 (lambda ()
+                                   (sb-thread:signal-semaphore read-entered)
+                                   (unless (sb-thread:wait-on-semaphore
+                                            release-read :timeout 8)
+                                     (error "The TLS read operation was not released."))))
+                              (error (condition)
+                                (setf read-error condition)))
+                         (sb-thread:signal-semaphore read-done)))))
+              (setf write-thread
+                    (sb-thread:make-thread
+                     (lambda ()
+                       (unwind-protect
+                            (handler-case
+                                (http-kit/tls::%tls-server-call-with-direction-lock
+                                 state :write
+                                 (lambda ()
+                                   (sb-thread:signal-semaphore write-entered)
+                                   (unless (sb-thread:wait-on-semaphore
+                                            release-write :timeout 8)
+                                     (error "The TLS write operation was not released."))))
+                              (error (condition)
+                                (setf write-error condition)))
+                         (sb-thread:signal-semaphore write-done)))))
+              (unless (sb-thread:wait-on-semaphore read-entered :timeout 2)
+                (error "The TLS read operation did not enter."))
+              (unless (sb-thread:wait-on-semaphore write-entered :timeout 2)
+                (error "The TLS write operation did not enter."))
+              (setf close-thread
+                    (sb-thread:make-thread
+                     (lambda ()
+                       (unwind-protect
+                            (handler-case
+                                (progn
+                                  (close secure :abort t)
+                                  (setf close-result :returned))
+                              (error (condition)
+                                (setf close-error condition)))
+                         (sb-thread:signal-semaphore close-done)))))
+              (ensure-true
+               (sb-thread:wait-on-semaphore close-done :timeout 2.5d0))
+              (ensure-equal :returned close-result)
+              (ensure-false close-error)
+              (ensure-true
+               (http-kit/tls::http-tls-server-state-close-cleanup-pending-p state))
+              (ensure-equal 0 close-state-calls)
+              (ensure-true
+               (some (lambda (octets)
+                       (some (lambda (byte) (not (zerop byte))) octets))
+                     key-material))
+              (sb-thread:signal-semaphore release-read)
+              (ensure-true (sb-thread:wait-on-semaphore read-done :timeout 2))
+              (ensure-false read-error)
+              (ensure-true
+               (some (lambda (octets)
+                       (some (lambda (byte) (not (zerop byte))) octets))
+                     key-material))
+              (sb-thread:signal-semaphore release-write)
+              (ensure-true (sb-thread:wait-on-semaphore finalizer-entered :timeout 2))
+              (ensure-false
+               (http-kit/tls::%tls-server-finish-deferred-close state))
+              (ensure-equal 1 close-state-calls)
+              (ensure-true
+               (some (lambda (octets)
+                       (some (lambda (byte) (not (zerop byte))) octets))
+                     key-material))
+              (sb-thread:signal-semaphore resume-finalizer)
+              (ensure-true (sb-thread:wait-on-semaphore write-done :timeout 2))
+              (ensure-false write-error)
+              (sb-thread:join-thread read-thread :timeout 2 :default nil)
+              (sb-thread:join-thread write-thread :timeout 2 :default nil)
+              (sb-thread:join-thread close-thread :timeout 2 :default nil)
+              (ensure-true
+               (every (lambda (octets) (every #'zerop octets)) key-material))
+              (ensure-true (http-kit/tls::http-tls-server-state-closed-p state))
+              (ensure-equal 1 close-state-calls)))
+        (sb-thread:signal-semaphore release-read)
+        (sb-thread:signal-semaphore release-write)
+        (sb-thread:signal-semaphore resume-finalizer)
+        (when read-thread
+          (sb-thread:join-thread read-thread :timeout 3 :default nil))
+        (when write-thread
+          (sb-thread:join-thread write-thread :timeout 3 :default nil))
         (when close-thread
           (sb-thread:join-thread close-thread :timeout 3 :default nil))
         (when (open-stream-p secure)
@@ -3630,6 +3524,174 @@
           (close raw :abort t))
         (http-kit/tls::%tls-server-clear-traffic-states state)))))
 
-
-
-
+#+sbcl
+(progn
+  (deftest tls-server-deferred-close-try-helper-covers-finalizer-branches
+    (let* ((state
+             (http-kit/tls::%make-http-tls-server-state
+              :driver nil :provider nil :transport-stream nil))
+           (read-lock (http-kit/tls::http-tls-server-state-read-lock state))
+           (write-lock (http-kit/tls::http-tls-server-state-write-lock state)))
+      (ensure-false (http-kit/tls::%tls-server-try-finish-deferred-close state))
+      (setf (http-kit/tls::http-tls-server-state-close-cleanup-pending-p state) t
+            (http-kit/tls::http-tls-server-state-closed-p state) t)
+      (ensure-false (http-kit/tls::%tls-server-try-finish-deferred-close state))
+      (setf (http-kit/tls::http-tls-server-state-closed-p state) nil)
+      (let ((lock-held (sb-thread:make-semaphore :count 0))
+            (release-lock (sb-thread:make-semaphore :count 0))
+            (holder nil))
+        (unwind-protect
+             (progn
+               (setf holder
+                     (sb-thread:make-thread
+                      (lambda ()
+                        (sb-thread:grab-mutex read-lock)
+                        (unwind-protect
+                             (progn
+                               (sb-thread:signal-semaphore lock-held)
+                               (unless
+                                   (sb-thread:wait-on-semaphore
+                                    release-lock :timeout 5)
+                                 (error "The deferred-close test did not release its lock.")))
+                          (sb-thread:release-mutex read-lock)))))
+               (unless (sb-thread:wait-on-semaphore lock-held :timeout 2)
+                 (error "The deferred-close read-lock holder did not start."))
+               (ensure-false
+                (http-kit/tls::%tls-server-try-finish-deferred-close state)))
+          (sb-thread:signal-semaphore release-lock)
+          (when holder
+            (sb-thread:join-thread holder :timeout 2 :default nil))))
+      (let ((lock-held (sb-thread:make-semaphore :count 0))
+            (release-lock (sb-thread:make-semaphore :count 0))
+            (holder nil))
+        (unwind-protect
+             (progn
+               (setf holder
+                     (sb-thread:make-thread
+                      (lambda ()
+                        (sb-thread:grab-mutex write-lock)
+                        (unwind-protect
+                             (progn
+                               (sb-thread:signal-semaphore lock-held)
+                               (unless
+                                   (sb-thread:wait-on-semaphore
+                                    release-lock :timeout 5)
+                                 (error "The deferred-close test did not release its lock.")))
+                          (sb-thread:release-mutex write-lock)))))
+               (unless (sb-thread:wait-on-semaphore lock-held :timeout 2)
+                 (error "The deferred-close write-lock holder did not start."))
+               (ensure-false
+                (http-kit/tls::%tls-server-try-finish-deferred-close state)))
+          (sb-thread:signal-semaphore release-lock)
+          (when holder
+            (sb-thread:join-thread holder :timeout 2 :default nil))))
+      (%tls-server-test-with-spy
+       'http-kit/tls::%tls-server-try-grab-direction-lock
+       (let ((original
+               (symbol-function
+                'http-kit/tls::%tls-server-try-grab-direction-lock)))
+         (lambda (lock)
+           (let ((grabbed-p (funcall original lock)))
+             (when (and grabbed-p (eq lock write-lock))
+               (http-kit/tls::%tls-server-finish-close state))
+             grabbed-p)))
+       (lambda ()
+         (ensure-false
+          (http-kit/tls::%tls-server-try-finish-deferred-close state))))
+      (ensure-true (http-kit/tls::http-tls-server-state-closed-p state)))
+    (let* ((provider (cl-tls-kit:make-cl-crypto-kit-provider))
+           (secret (make-array 32 :element-type '(unsigned-byte 8)
+                               :initial-element 63))
+           (traffic-state
+             (cl-tls-kit:make-tls13-traffic-state
+              provider :sha256 :aes-128-gcm secret 16 12))
+           (state
+             (http-kit/tls::%make-http-tls-server-state
+              :driver nil :provider provider :transport-stream nil))
+           (key-material
+             (list (cl-tls-kit:tls13-traffic-state-secret traffic-state)
+                   (cl-tls-kit:tls13-traffic-state-key traffic-state)
+                   (cl-tls-kit:tls13-traffic-state-iv traffic-state))))
+      (setf (http-kit/tls::http-tls-server-state-write-state state) traffic-state
+            (http-kit/tls::http-tls-server-state-close-cleanup-pending-p state) t)
+      (ensure-true (http-kit/tls::%tls-server-try-finish-deferred-close state))
+      (ensure-true
+       (every (lambda (octets) (every #'zerop octets)) key-material))
+      (ensure-true (http-kit/tls::http-tls-server-state-closed-p state)))
+    (let ((state
+            (http-kit/tls::%make-http-tls-server-state
+             :driver :fake :provider nil :transport-stream nil)))
+      (setf (http-kit/tls::http-tls-server-state-close-cleanup-pending-p state) t)
+      (handler-bind
+          ((http-kit/tls::tls-server-cleanup-warning
+             (lambda (warning)
+               (declare (ignore warning))
+               (invoke-restart 'muffle-warning))))
+        (%tls-server-test-with-spy
+         'cl-tls-kit:tls13-server-driver-close
+         (lambda (driver)
+           (declare (ignore driver))
+           (error "Injected TLS driver close failure."))
+         (lambda ()
+           (ensure-true
+            (http-kit/tls::%tls-server-try-finish-deferred-close state)))))
+      (ensure-true (http-kit/tls::http-tls-server-state-closed-p state)))
+    (let ((state
+            (http-kit/tls::%make-http-tls-server-state
+             :driver nil :provider nil :transport-stream nil)))
+      (ensure-false (http-kit/tls::%tls-server-finish-deferred-close state))
+      (setf (http-kit/tls::http-tls-server-state-close-cleanup-pending-p state) t
+            (http-kit/tls::http-tls-server-state-closed-p state) t)
+      (ensure-false (http-kit/tls::%tls-server-finish-deferred-close state)))
+    (let ((state
+            (http-kit/tls::%make-http-tls-server-state
+             :driver :fake :provider nil :transport-stream nil)))
+      (setf (http-kit/tls::http-tls-server-state-close-cleanup-pending-p state) t)
+      (handler-bind
+          ((http-kit/tls::tls-server-cleanup-warning
+             (lambda (warning)
+               (declare (ignore warning))
+               (invoke-restart 'muffle-warning))))
+        (%tls-server-test-with-spy
+         'cl-tls-kit:tls13-server-driver-close
+         (lambda (driver)
+           (declare (ignore driver))
+           (error "Injected TLS driver close failure."))
+         (lambda ()
+           (ensure-true
+            (http-kit/tls::%tls-server-finish-deferred-close state)))))
+      (ensure-true (http-kit/tls::http-tls-server-state-closed-p state)))
+    (let ((state
+            (http-kit/tls::%make-http-tls-server-state
+             :driver nil :provider nil :transport-stream nil)))
+      (setf (http-kit/tls::http-tls-server-state-closing-p state) t)
+      (multiple-value-bind (close-owner-p deadline)
+          (http-kit/tls::%tls-server-begin-close state)
+        (ensure-false close-owner-p)
+        (ensure-true deadline)))
+    (let* ((transport
+             (make-instance '%tls-server-test-stream :input (octets)))
+           (state
+             (http-kit/tls::%make-http-tls-server-state
+              :driver nil :provider nil :transport-stream transport))
+           (secure (http-kit/tls::%make-http-tls-stream state transport))
+           (close-state-calls 0))
+      (%tls-server-test-with-spy
+       'http-kit/tls::%tls-server-close-state-unlocked
+       (lambda (candidate-state driver)
+         (declare (ignore candidate-state driver))
+         (incf close-state-calls)
+         (when (= close-state-calls 1)
+           (error "Injected TLS driver close failure.")))
+       (lambda ()
+         (let ((condition
+                 (handler-case
+                     (progn (close secure :abort t) nil)
+                   (simple-error (condition) condition))))
+           (ensure-true (typep condition 'simple-error))
+           (ensure-equal 2 close-state-calls)
+           (ensure-true
+            (http-kit/tls::http-tls-server-state-closed-p state))
+           (ensure-false (open-stream-p secure)))))
+      (when (open-stream-p transport)
+        (close transport :abort t)))))
