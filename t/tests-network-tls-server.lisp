@@ -2393,7 +2393,123 @@
                     nil)
                 (http-timeout (condition) condition))))
         (ensure-true (typep condition 'http-timeout))
-        (ensure-false (open-stream-p raw))))))
+        (ensure-false (open-stream-p raw)))))
+  (deftest tls-server-concurrent-close-rejects-stream-operations
+    (let* ((raw (make-instance (quote %tls-server-test-stream) :input (octets)))
+           (state
+             (http-kit/tls::%make-http-tls-server-state
+              :driver nil :provider nil :transport-stream raw))
+           (secure (http-kit/tls::%make-http-tls-stream state raw))
+           (notify-entered (sb-thread:make-semaphore :count 0))
+           (release-notify (sb-thread:make-semaphore :count 0))
+           (second-close-entered (sb-thread:make-semaphore :count 0))
+           (first-close-done (sb-thread:make-semaphore :count 0))
+           (second-close-done (sb-thread:make-semaphore :count 0))
+           (original-notify
+             (fdefinition (quote http-kit/tls::%tls-server-send-close-notify)))
+           (original-begin-close
+             (fdefinition (quote http-kit/tls::%tls-server-begin-close)))
+           (first-close-result nil)
+           (first-close-error nil)
+           (second-close-result nil)
+           (second-close-error nil)
+           (first-thread nil)
+           (second-thread nil))
+      (unwind-protect
+           (progn
+             (setf (fdefinition (quote http-kit/tls::%tls-server-send-close-notify))
+                   (lambda (candidate &rest arguments)
+                     (sb-thread:signal-semaphore notify-entered)
+                     (unless (sb-thread:wait-on-semaphore release-notify :timeout 5)
+                       (error "The TLS close test did not release close_notify."))
+                     (apply original-notify candidate arguments))
+                   (fdefinition (quote http-kit/tls::%tls-server-begin-close))
+                   (lambda (candidate)
+                     (when (http-kit/tls::http-tls-server-state-closing-p candidate)
+                       (sb-thread:signal-semaphore second-close-entered))
+                     (funcall original-begin-close candidate)))
+             (setf first-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (unwind-protect
+                           (handler-case
+                               (progn
+                                 (close secure)
+                                 (setf first-close-result :returned))
+                             (error (condition)
+                               (setf first-close-error condition)))
+                        (sb-thread:signal-semaphore first-close-done)))))
+             (unless (sb-thread:wait-on-semaphore notify-entered :timeout 2)
+               (error "The first TLS close did not reach close_notify."))
+             (let ((condition
+                     (%tls-server-test-condition
+                      (lambda () (write-sequence (octets 9) secure)))))
+               (ensure-equal :closed (http-protocol-error-detail condition)))
+             (setf second-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (unwind-protect
+                           (handler-case
+                               (progn
+                                 (close secure)
+                                 (setf second-close-result :returned))
+                             (error (condition)
+                               (setf second-close-error condition)))
+                        (sb-thread:signal-semaphore second-close-done)))))
+             (unless (sb-thread:wait-on-semaphore second-close-entered :timeout 2)
+               (error "The second TLS close did not observe the closing state."))
+             (ensure-false (sb-thread:wait-on-semaphore second-close-done :timeout 0.1))
+             (sb-thread:signal-semaphore release-notify)
+             (unless (sb-thread:wait-on-semaphore first-close-done :timeout 3)
+               (error "The first TLS close did not finish."))
+             (unless (sb-thread:wait-on-semaphore second-close-done :timeout 3)
+               (error "The second TLS close did not finish."))
+             (sb-thread:join-thread first-thread :timeout 2 :default nil)
+             (sb-thread:join-thread second-thread :timeout 2 :default nil)
+             (ensure-equal :returned first-close-result)
+             (ensure-false first-close-error)
+             (ensure-equal :returned second-close-result)
+             (ensure-false second-close-error)
+             (ensure-false (open-stream-p secure))
+             (ensure-false (funcall original-begin-close state))
+             (ensure-true (http-kit/tls::%tls-server-close-adapter secure state nil t))
+             (let ((condition
+                     (%tls-server-test-condition
+                      (lambda () (read-byte secure)))))
+               (ensure-equal :closed (http-protocol-error-detail condition))))
+        (sb-thread:signal-semaphore release-notify)
+        (when first-thread
+          (sb-thread:join-thread first-thread :timeout 3 :default nil))
+        (when second-thread
+          (sb-thread:join-thread second-thread :timeout 3 :default nil))
+        (setf (fdefinition (quote http-kit/tls::%tls-server-send-close-notify))
+              original-notify
+              (fdefinition (quote http-kit/tls::%tls-server-begin-close))
+              original-begin-close)
+        (when (open-stream-p raw)
+          (close raw :abort t)))))
+
+  (deftest tls-server-fill-returns-eof-after-close-notify
+    (let* ((raw (make-instance (quote %tls-server-test-stream) :input (octets)))
+           (state
+             (http-kit/tls::%make-http-tls-server-state
+              :driver nil :provider nil :transport-stream raw)))
+      (setf (http-kit/tls::http-tls-server-state-close-notify-p state) t)
+      (ensure-false (http-kit/tls::%tls-server-fill state))
+      (ensure-equal :eof (http-kit/tls::%tls-server-read-byte state))
+      (close raw :abort t)))
+
+  (deftest tls-server-graceful-close-skips-already-closed-transport
+    (let* ((raw (make-instance (quote %tls-server-test-stream) :input (octets)))
+           (state
+             (http-kit/tls::%make-http-tls-server-state
+              :driver nil :provider nil :transport-stream raw))
+           (secure (http-kit/tls::%make-http-tls-stream state raw)))
+      (close raw :abort t)
+      (close secure)
+      (ensure-false (open-stream-p raw))
+      (ensure-false (open-stream-p secure))
+      (ensure-true (http-kit/tls::http-tls-server-state-closed-p state)))))
 )
 
 #+sbcl
