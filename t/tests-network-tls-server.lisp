@@ -2261,8 +2261,7 @@
                     :input nil
                     :output t
                     :element-type (quote (unsigned-byte 8))
-                    :buffering :full)
-                   server-socket nil)
+                    :buffering :full))
              (sb-bsd-sockets:socket-close listener)
              (setf listener nil
                    (sb-bsd-sockets:non-blocking-mode client-socket) t)
@@ -2297,7 +2296,7 @@
                (ensure-true (typep condition (quote http-timeout)))))
         (when (and transport (open-stream-p transport))
           (close transport :abort t))
-        (when server-socket
+        (when (and server-socket (null transport))
           (sb-bsd-sockets:socket-close server-socket))
         (when client-socket
           (sb-bsd-sockets:socket-close client-socket))
