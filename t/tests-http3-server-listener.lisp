@@ -2153,10 +2153,33 @@
                                      (/ (- (get-internal-real-time)
                                            setup-start)
                                         internal-time-units-per-second))))
-                                (error
-                                 "The raw HTTP/3 server connection was not registered; listener errors ~S; events ~S."
-                                 (%http3-listener-error-summary observations)
-                                 (%http3-listener-events observations)))
+                                (let* ((status
+                                         (handler-case
+                                             (%http3-listener-peer-wait peer)
+                                           (sb-ext:timeout ()
+                                             (%http3-listener-peer-cleanup peer)
+                                             :peer-wait-timeout)))
+                                       (output
+                                         (with-output-to-string (peer-output)
+                                           (loop for line =
+                                                   (read-line
+                                                    (uiop:process-info-output peer)
+                                                    nil nil)
+                                                 while line
+                                                 do (write-line line peer-output))))
+                                       (errors
+                                         (with-output-to-string (error-output)
+                                           (loop for line =
+                                                   (read-line
+                                                    (uiop:process-info-error-output peer)
+                                                    nil nil)
+                                                 while line
+                                                 do (write-line line error-output)))))
+                                  (error
+                                   "The raw HTTP/3 server connection was not registered; peer exit ~S; stdout ~S; stderr ~S; listener errors ~S; events ~S."
+                                   status output errors
+                                   (%http3-listener-error-summary observations)
+                                   (%http3-listener-events observations))))
                               (handler-case
                                   (progn
                                     (http-kit/http3::%http3-server-await-peer-settings
