@@ -2612,6 +2612,32 @@
       (ensure-true (sb-thread:grab-mutex lifecycle-lock :timeout 0))
       (sb-thread:release-mutex lifecycle-lock)
       (ensure-false (http-kit/tls::http-tls-server-state-closed-p state))))
+  (deftest tls-server-second-close-timeout-without-reacquiring-lifecycle-mutex
+    (let* ((state
+             (http-kit/tls::%make-http-tls-server-state
+              :driver nil :provider nil :transport-stream nil))
+           (lifecycle-lock
+             (http-kit/tls::http-tls-server-state-lifecycle-lock state))
+           (deadline (+ (http-kit/tls::%tls-monotonic-time) 60.0d0))
+           (wait-calls 0))
+      (setf (http-kit/tls::http-tls-server-state-closing-p state) t
+            (http-kit/tls::http-tls-server-state-close-deadline state) deadline)
+      (%tls-server-test-with-spy
+       'http-kit/tls::%tls-server-lifecycle-condition-wait
+       (lambda (candidate-state mutex timeout)
+         (declare (ignore candidate-state timeout))
+         (incf wait-calls)
+         (sb-thread:release-mutex mutex)
+         nil)
+       (lambda ()
+         (multiple-value-bind (close-owner-p actual-deadline)
+             (http-kit/tls::%tls-server-begin-close state)
+           (ensure-false close-owner-p)
+           (ensure-equal deadline actual-deadline)
+           (ensure-equal 1 wait-calls)
+           (ensure-false (sb-thread:holding-mutex-p lifecycle-lock)))))
+      (ensure-true (sb-thread:grab-mutex lifecycle-lock :timeout 0))
+      (sb-thread:release-mutex lifecycle-lock)))
   (progn
     (deftest tls-server-mark-close-cleanup-pending-covers-closed-and-default-deadline
       (let ((state

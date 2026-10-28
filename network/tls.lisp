@@ -494,7 +494,7 @@ driver's transport callbacks."
 (progn
   (defstruct (http-tls-server-state
               (:constructor %make-http-tls-server-state))
-    "Lock order is READ-LOCK, WRITE-LOCK, LIFECYCLE-LOCK. Close releases LIFECYCLE-LOCK before waiting on direction locks; deferred cleanup runs only after active operations drain and never waits for direction locks while holding LIFECYCLE-LOCK."
+    "Lock order is READ-LOCK, WRITE-LOCK, LIFECYCLE-LOCK. The lifecycle lock protects flag and count reads and writes only; do not perform blocking work while holding it. Close releases LIFECYCLE-LOCK before waiting on direction locks; deferred cleanup runs only after active operations drain and never waits for direction locks while holding LIFECYCLE-LOCK."
     driver provider transport-stream deadline
     (clock-function (function %tls-monotonic-time))
     (phase :initial)
@@ -532,26 +532,31 @@ driver's transport callbacks."
 
   (defun %tls-server-check-open-state
       (state allow-closing allow-closed &optional register-operation-p)
-    #+sbcl
-    (sb-thread:with-mutex
-        ((http-tls-server-state-lifecycle-lock state))
-      (when (or (and (http-tls-server-state-closed-p state)
-                     (not allow-closed))
-                (and (http-tls-server-state-closing-p state)
-                     (not allow-closing)))
+    (let ((rejected-p nil))
+      #+sbcl
+      (sb-thread:with-mutex
+          ((http-tls-server-state-lifecycle-lock state))
+        (setf rejected-p
+              (or (and (http-tls-server-state-closed-p state)
+                       (not allow-closed))
+                  (and (http-tls-server-state-closing-p state)
+                       (not allow-closing))))
+        (unless rejected-p
+          (when register-operation-p
+            (incf (http-tls-server-state-active-operation-count state)))))
+      #-sbcl
+      (progn
+        (setf rejected-p
+              (or (and (http-tls-server-state-closed-p state)
+                       (not allow-closed))
+                  (and (http-tls-server-state-closing-p state)
+                       (not allow-closing))))
+        (unless rejected-p
+          (when register-operation-p
+            (incf (http-tls-server-state-active-operation-count state)))))
+      (when rejected-p
         (%tls-protocol-error "TLS server stream is closing." :closed))
-      (when register-operation-p
-        (incf (http-tls-server-state-active-operation-count state))))
-    #-sbcl
-    (progn
-      (when (or (and (http-tls-server-state-closed-p state)
-                     (not allow-closed))
-                (and (http-tls-server-state-closing-p state)
-                     (not allow-closing)))
-        (%tls-protocol-error "TLS server stream is closing." :closed))
-      (when register-operation-p
-        (incf (http-tls-server-state-active-operation-count state))))
-    nil)
+      nil))
 
   (defun %tls-server-leave-operation (state)
     #+sbcl
@@ -561,6 +566,11 @@ driver's transport callbacks."
     #-sbcl
     (decf (http-tls-server-state-active-operation-count state))
     nil)
+  (defun %tls-server-lifecycle-condition-wait (state lock timeout)
+    (sb-thread:condition-wait
+     (http-tls-server-state-lifecycle-waitqueue state)
+     lock
+     :timeout timeout))
 
   (declaim (ftype function
              %tls-server-try-finish-deferred-close
@@ -673,12 +683,10 @@ driver's transport callbacks."
                           (when (<= remaining 0)
                             (return))
                           (unless
-                              (sb-thread:condition-wait
-                               (http-tls-server-state-lifecycle-waitqueue state)
-                               lock
-                               :timeout remaining)
+                              (%tls-server-lifecycle-condition-wait
+                               state lock remaining)
                             (return)))))
-          (when lock-held-p
+          (when (and lock-held-p (sb-thread:holding-mutex-p lock))
             (sb-thread:release-mutex lock))))
       (values close-owner-p deadline))
     #-sbcl
@@ -699,21 +707,14 @@ driver's transport callbacks."
 
   (defun %tls-server-finish-close (state)
     #+sbcl
-    (let* ((lock (http-tls-server-state-lifecycle-lock state))
-           (deadline (or (http-tls-server-state-close-deadline state)
-                         (%tls-monotonic-time)))
-           (lock-held-p
-             (%tls-server-grab-direction-lock lock deadline)))
-      (unwind-protect
-           (progn
-             (setf (http-tls-server-state-closed-p state) t
-                   (http-tls-server-state-close-cleanup-pending-p state) nil
-                   (http-tls-server-state-close-cleanup-running-p state) nil)
-             (when lock-held-p
-               (sb-thread:condition-broadcast
-                (http-tls-server-state-lifecycle-waitqueue state))))
-        (when (and lock-held-p (sb-thread:holding-mutex-p lock))
-          (sb-thread:release-mutex lock))))
+    (progn
+      (sb-thread:with-mutex
+          ((http-tls-server-state-lifecycle-lock state))
+        (setf (http-tls-server-state-closed-p state) t
+              (http-tls-server-state-close-cleanup-pending-p state) nil
+              (http-tls-server-state-close-cleanup-running-p state) nil))
+      (sb-thread:condition-broadcast
+       (http-tls-server-state-lifecycle-waitqueue state)))
     #-sbcl
     (setf (http-tls-server-state-closed-p state) t)
     nil)
