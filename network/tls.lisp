@@ -585,7 +585,11 @@ direction locks before publishing CLOSED under LIFECYCLE-LOCK."
                (unwind-protect
                     (call-locked)
                  (sb-thread:release-mutex lock)))
-          (%tls-server-try-finish-deferred-close state))))
+          (unless (or (sb-thread:holding-mutex-p
+                       (http-tls-server-state-read-lock state))
+                     (sb-thread:holding-mutex-p
+                      (http-tls-server-state-write-lock state)))
+            (%tls-server-try-finish-deferred-close state)))))
     #-sbcl
     (funcall thunk))
 
