@@ -1458,6 +1458,64 @@
       (ensure-true accounting-error)
       (ensure-equal :body-buffer-accounting
                     (http-server-error-reason-code accounting-error)))))
+#+sbcl
+(deftest https-listener-rejects-late-tls-stream-after-connection-close
+  (%with-https-listener-test-stubs (context)
+    (let* ((server (%https-listener-make-server))
+           (listener (gensym "LISTENER"))
+           (session-called-p nil))
+      (setf (http-kit::http-server-state server) :running
+            (http-kit::http-server-listener server) listener
+            (%https-listener-test-context-session-action context)
+            (lambda (protocol stream handler options)
+              (declare (ignore protocol stream handler options))
+              (setf session-called-p t)))
+      (dolist (close-stage (list :closing :closed))
+        (let* ((raw-stream (make-string-input-stream "raw"))
+               (tls-stream (make-string-input-stream "tls"))
+               (connection nil))
+          (unwind-protect
+               (progn
+                 (multiple-value-bind (reserved rejection)
+                     (http-kit::%http-server-reserve-connection
+                      server listener raw-stream "127.0.0.1" 4444)
+                   (ensure-false rejection)
+                   (setf connection reserved))
+                 (setf
+                  (%https-listener-test-context-handshake-action context)
+                  (lambda (stream timeout deadline)
+                    (declare (ignore stream timeout deadline))
+                    (ecase close-stage
+                      (:closing
+                       (http-kit::%with-http-server-lock (server)
+                         (setf
+                          (http-kit::%http-server-connection-closing-p
+                           connection)
+                          t)))
+                      (:closed
+                       (http-kit::%http-server-close-connection-stream
+                        server connection :abort t)))
+                    tls-stream))
+                 (http-kit::%http-server-run-connection server connection)
+                 (ensure-false
+                  (http-kit::%http-server-connection-tls-stream connection))
+                 (ensure-false (open-stream-p tls-stream))
+                 (ensure-false (open-stream-p raw-stream))
+                 (ensure-equal 0 (http-kit::http-server-handshake-count server))
+                 (ensure-equal 0 (http-kit::http-server-connection-count server)))
+            (when connection
+              (http-kit::%http-server-close-connection-stream
+               server connection :abort t)
+              (http-kit::%http-server-release-connection server connection))
+            (when (open-stream-p tls-stream)
+              (close tls-stream :abort t))
+            (when (open-stream-p raw-stream)
+              (close raw-stream :abort t)))))
+      (ensure-false session-called-p)
+      (ensure-equal 2 (%https-listener-test-context-wrapper-calls context))
+      (ensure-equal
+       0 (length (%https-listener-test-context-session-calls context))))))
+
 
 #+sbcl
 (deftest https-listener-covers-startup-and-worker-failures
