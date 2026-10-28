@@ -2586,6 +2586,168 @@
         (setf (http-kit/tls::%tls-stream-closed-p secure) t)
         (when (open-stream-p transport)
           (close transport :abort t)))))
+  (deftest tls-server-second-close-expired-deadline-after-lock-acquire
+    (let* ((state
+             (http-kit/tls::%make-http-tls-server-state
+              :driver nil :provider nil :transport-stream nil))
+           (lifecycle-lock
+             (http-kit/tls::http-tls-server-state-lifecycle-lock state))
+           (clock-calls 0))
+      (setf (http-kit/tls::http-tls-server-state-closing-p state) t
+          (http-kit/tls::http-tls-server-state-close-deadline state) 100.0)
+      (%tls-server-test-with-spy
+       'http-kit/tls::%tls-monotonic-time
+       (lambda ()
+         (incf clock-calls)
+         (case clock-calls
+           (1 99.0)
+           (2 99.0)
+           (otherwise 101.0)))
+       (lambda ()
+         (multiple-value-bind (close-owner-p deadline)
+             (http-kit/tls::%tls-server-begin-close state)
+           (ensure-false close-owner-p)
+           (ensure-equal 100.0 deadline)
+           (ensure-equal 3 clock-calls))))
+      (ensure-true (sb-thread:grab-mutex lifecycle-lock :timeout 0))
+      (sb-thread:release-mutex lifecycle-lock)
+      (ensure-false (http-kit/tls::http-tls-server-state-closed-p state))))
+  (progn
+    (deftest tls-server-mark-close-cleanup-pending-covers-closed-and-default-deadline
+      (let ((state
+              (http-kit/tls::%make-http-tls-server-state
+               :driver nil :provider nil :transport-stream nil)))
+        (setf (http-kit/tls::http-tls-server-state-closed-p state) t)
+        (ensure-true (http-kit/tls::%tls-server-mark-close-cleanup-pending state))
+        (ensure-false
+         (http-kit/tls::http-tls-server-state-close-cleanup-pending-p state))
+        (ensure-true (http-kit/tls::http-tls-server-state-closed-p state)))
+      (let* ((provider (cl-tls-kit:make-cl-crypto-kit-provider))
+             (secret (make-array 32 :element-type '(unsigned-byte 8)
+                                 :initial-element 64))
+             (traffic-state
+               (cl-tls-kit:make-tls13-traffic-state
+                provider :sha256 :aes-128-gcm secret 16 12))
+             (state
+               (http-kit/tls::%make-http-tls-server-state
+                :driver nil :provider provider :transport-stream nil))
+             (key-material
+               (list (cl-tls-kit:tls13-traffic-state-secret traffic-state)
+                     (cl-tls-kit:tls13-traffic-state-key traffic-state)
+                     (cl-tls-kit:tls13-traffic-state-iv traffic-state))))
+        (setf (http-kit/tls::http-tls-server-state-write-state state)
+              traffic-state)
+        (ensure-true (http-kit/tls::%tls-server-mark-close-cleanup-pending state))
+        (ensure-true (http-kit/tls::http-tls-server-state-closed-p state))
+        (ensure-false
+         (http-kit/tls::http-tls-server-state-close-cleanup-pending-p state))
+        (ensure-true
+         (every (lambda (octets) (every #'zerop octets)) key-material))))
+    (deftest tls-server-deferred-close-skips-after-close-wins-lock-race
+      (let* ((state
+               (http-kit/tls::%make-http-tls-server-state
+                :driver nil :provider nil :transport-stream nil))
+             (read-lock (http-kit/tls::http-tls-server-state-read-lock state))
+             (write-lock (http-kit/tls::http-tls-server-state-write-lock state)))
+        (setf (http-kit/tls::http-tls-server-state-close-cleanup-pending-p state)
+              t)
+        (%tls-server-test-with-spy
+         'http-kit/tls::%tls-server-try-grab-direction-lock
+         (let ((original
+                 (symbol-function
+                  'http-kit/tls::%tls-server-try-grab-direction-lock)))
+           (lambda (lock)
+             (let ((grabbed-p (funcall original lock)))
+               (when (and grabbed-p (eq lock write-lock))
+                 (setf (http-kit/tls::http-tls-server-state-closed-p state) t
+                       (http-kit/tls::http-tls-server-state-close-cleanup-pending-p
+                        state)
+                       nil))
+               grabbed-p)))
+         (lambda ()
+           (ensure-false
+            (http-kit/tls::%tls-server-try-finish-deferred-close state))))
+        (ensure-true (http-kit/tls::http-tls-server-state-closed-p state))
+        (ensure-false
+         (http-kit/tls::http-tls-server-state-close-cleanup-pending-p state))
+        (setf (http-kit/tls::http-tls-server-state-closed-p state) nil
+              (http-kit/tls::http-tls-server-state-close-cleanup-pending-p state)
+              t)
+        (%tls-server-test-with-spy
+         'http-kit/tls::%tls-server-try-grab-direction-lock
+         (let ((original
+                 (symbol-function
+                  'http-kit/tls::%tls-server-try-grab-direction-lock)))
+           (lambda (lock)
+             (let ((grabbed-p (funcall original lock)))
+               (when (and grabbed-p (eq lock write-lock))
+                 (setf (http-kit/tls::http-tls-server-state-closed-p state) t
+                       (http-kit/tls::http-tls-server-state-close-cleanup-pending-p
+                        state)
+                       nil))
+               grabbed-p)))
+         (lambda ()
+           (ensure-false
+            (http-kit/tls::%tls-server-finish-deferred-close state))))
+        (ensure-true (http-kit/tls::http-tls-server-state-closed-p state))
+        (ensure-false
+         (http-kit/tls::http-tls-server-state-close-cleanup-pending-p state))
+        (setf (http-kit/tls::http-tls-server-state-closed-p state) nil
+              (http-kit/tls::http-tls-server-state-close-cleanup-pending-p state)
+              t)
+        (%tls-server-test-with-spy
+         'http-kit/tls::%tls-server-try-grab-direction-lock
+         (let ((original
+                 (symbol-function
+                  'http-kit/tls::%tls-server-try-grab-direction-lock)))
+           (lambda (lock)
+             (let ((grabbed-p (funcall original lock)))
+               (when (and grabbed-p (eq lock write-lock))
+                 (setf (http-kit/tls::http-tls-server-state-closed-p state) t))
+               grabbed-p)))
+         (lambda ()
+           (ensure-false
+            (http-kit/tls::%tls-server-finish-deferred-close state))))
+        (ensure-true (http-kit/tls::http-tls-server-state-closed-p state))
+        (ensure-true
+         (http-kit/tls::http-tls-server-state-close-cleanup-pending-p state))))
+    (deftest tls-server-deferred-close-retries-after-interrupted-finalizer
+      (let* ((provider (cl-tls-kit:make-cl-crypto-kit-provider))
+             (secret (make-array 32 :element-type '(unsigned-byte 8)
+                                 :initial-element 66))
+             (traffic-state
+               (cl-tls-kit:make-tls13-traffic-state
+                provider :sha256 :aes-128-gcm secret 16 12))
+             (state
+               (http-kit/tls::%make-http-tls-server-state
+                :driver nil :provider provider :transport-stream nil))
+             (key-material
+               (list (cl-tls-kit:tls13-traffic-state-secret traffic-state)
+                     (cl-tls-kit:tls13-traffic-state-key traffic-state)
+                     (cl-tls-kit:tls13-traffic-state-iv traffic-state))))
+        (setf (http-kit/tls::http-tls-server-state-write-state state)
+              traffic-state
+              (http-kit/tls::http-tls-server-state-close-cleanup-pending-p state)
+              t)
+        (ensure-equal
+         :interrupted
+         (catch 'tls-server-deferred-close-interrupted
+           (%tls-server-test-with-spy
+            'http-kit/tls::%tls-server-close-state-unlocked
+            (lambda (candidate-state driver)
+              (declare (ignore candidate-state driver))
+              (throw 'tls-server-deferred-close-interrupted :interrupted))
+            (lambda ()
+              (http-kit/tls::%tls-server-finish-deferred-close state)))))
+        (ensure-false
+         (http-kit/tls::http-tls-server-state-close-cleanup-running-p state))
+        (ensure-true
+         (http-kit/tls::http-tls-server-state-close-cleanup-pending-p state))
+        (ensure-true (http-kit/tls::%tls-server-finish-deferred-close state))
+        (ensure-true
+         (every (lambda (octets) (every #'zerop octets)) key-material))
+        (ensure-true (http-kit/tls::http-tls-server-state-closed-p state))))
+  )
   (deftest tls-server-final-operation-release-finishes-deferred-close-once
     (let* ((transport
              (make-instance '%tls-server-test-stream :input (octets)))
@@ -3787,12 +3949,16 @@
          (lambda (lock)
            (let ((grabbed-p (funcall original lock)))
              (when (and grabbed-p (eq lock write-lock))
-               (http-kit/tls::%tls-server-finish-close state))
+                 (setf (http-kit/tls::http-tls-server-state-closed-p state) t))
              grabbed-p)))
        (lambda ()
          (ensure-false
           (http-kit/tls::%tls-server-try-finish-deferred-close state))))
-      (ensure-true (http-kit/tls::http-tls-server-state-closed-p state)))
+      (ensure-true (http-kit/tls::http-tls-server-state-closed-p state))
+      (ensure-true
+       (http-kit/tls::http-tls-server-state-close-cleanup-pending-p state))
+      (setf (http-kit/tls::http-tls-server-state-close-cleanup-pending-p state)
+            nil))
     (let* ((provider (cl-tls-kit:make-cl-crypto-kit-provider))
            (secret (make-array 32 :element-type '(unsigned-byte 8)
                                :initial-element 63))
@@ -3816,19 +3982,17 @@
             (http-kit/tls::%make-http-tls-server-state
              :driver :fake :provider nil :transport-stream nil)))
       (setf (http-kit/tls::http-tls-server-state-close-cleanup-pending-p state) t)
-      (handler-bind
-          ((http-kit/tls::tls-server-cleanup-warning
-             (lambda (warning)
-               (declare (ignore warning))
-               (invoke-restart 'muffle-warning))))
-        (%tls-server-test-with-spy
-         'cl-tls-kit:tls13-server-driver-close
-         (lambda (driver)
-           (declare (ignore driver))
-           (error "Injected TLS driver close failure."))
-         (lambda ()
-           (ensure-true
-            (http-kit/tls::%tls-server-try-finish-deferred-close state)))))
+      (let ((warning-output (make-string-output-stream)))
+        (close warning-output)
+        (let ((*error-output* warning-output))
+          (%tls-server-test-with-spy
+           'cl-tls-kit:tls13-server-driver-close
+           (lambda (driver)
+             (declare (ignore driver))
+             (error "Injected TLS driver close failure."))
+           (lambda ()
+             (ensure-true
+              (http-kit/tls::%tls-server-try-finish-deferred-close state))))))
       (ensure-true (http-kit/tls::http-tls-server-state-closed-p state)))
     (let ((state
             (http-kit/tls::%make-http-tls-server-state
@@ -3841,19 +4005,17 @@
             (http-kit/tls::%make-http-tls-server-state
              :driver :fake :provider nil :transport-stream nil)))
       (setf (http-kit/tls::http-tls-server-state-close-cleanup-pending-p state) t)
-      (handler-bind
-          ((http-kit/tls::tls-server-cleanup-warning
-             (lambda (warning)
-               (declare (ignore warning))
-               (invoke-restart 'muffle-warning))))
-        (%tls-server-test-with-spy
-         'cl-tls-kit:tls13-server-driver-close
-         (lambda (driver)
-           (declare (ignore driver))
-           (error "Injected TLS driver close failure."))
-         (lambda ()
-           (ensure-true
-            (http-kit/tls::%tls-server-finish-deferred-close state)))))
+      (let ((warning-output (make-string-output-stream)))
+        (close warning-output)
+        (let ((*error-output* warning-output))
+          (%tls-server-test-with-spy
+           'cl-tls-kit:tls13-server-driver-close
+           (lambda (driver)
+             (declare (ignore driver))
+             (error "Injected TLS driver close failure."))
+           (lambda ()
+             (ensure-true
+              (http-kit/tls::%tls-server-finish-deferred-close state))))))
       (ensure-true (http-kit/tls::http-tls-server-state-closed-p state)))
     (let ((state
             (http-kit/tls::%make-http-tls-server-state
@@ -3876,7 +4038,9 @@
          (declare (ignore candidate-state driver))
          (incf close-state-calls)
          (when (= close-state-calls 1)
-           (error "Injected TLS driver close failure.")))
+           (make-condition 'simple-error
+                           :format-control "Injected TLS driver close failure."
+                           :format-arguments nil)))
        (lambda ()
          (let ((condition
                  (handler-case
