@@ -42,6 +42,9 @@ func (values *stringList) Set(value string) error {
 func run() error {
 	mode := flag.String("mode", "", "peer mode")
 	rawAction := flag.String("raw-action", "", "raw HTTP/3 peer action")
+	expectGracefulDrainClose := flag.Bool(
+		"expect-graceful-drain-close", false,
+		"expect a graceful listener drain after the error callback fails")
 	cert := flag.String("cert", "", "certificate PEM")
 	key := flag.String("key", "", "private key PEM")
 	checkPort := flag.Int("check-port", 0, "verify UDP port release")
@@ -88,7 +91,8 @@ func run() error {
 		return runPendingHandshake(*targetPort, *ca, *timeout)
 	}
 	if *mode == "http3-raw" {
-		return runRawHTTP3Client(*targetPort, *ca, *timeout, *rawAction)
+		return runRawHTTP3Client(
+			*targetPort, *ca, *timeout, *rawAction, *expectGracefulDrainClose)
 	}
 	if *mode != "control-none" && *mode != "control-prefix-no-settings" && *mode != "normal-delayed-settings" && *mode != "normal-delayed-stream-batch" {
 		return fmt.Errorf("invalid peer mode")
@@ -601,7 +605,9 @@ func runALPNMismatch(port int, caPath string, timeout time.Duration) error {
 	return nil
 }
 
-func runRawHTTP3Client(port int, caPath string, timeout time.Duration, action string) error {
+func runRawHTTP3Client(
+	port int, caPath string, timeout time.Duration, action string, expectGracefulDrainClose bool,
+) error {
 	if timeout <= 0 {
 		return fmt.Errorf("timeout must be positive")
 	}
@@ -657,6 +663,18 @@ func runRawHTTP3Client(port int, caPath string, timeout time.Duration, action st
 			cause := context.Cause(conn.Context())
 			var closeError *quic.ApplicationError
 			if !errors.As(cause, &closeError) {
+				var transportError *quic.TransportError
+				if expectGracefulDrainClose &&
+					label == "malformed-control" &&
+					errors.As(cause, &transportError) &&
+					transportError.Remote &&
+					transportError.ErrorCode == quic.NoError &&
+					transportError.ErrorMessage == "HTTP/3 request drain complete" {
+					fmt.Printf(
+						"RAW CONNECTION CLOSED action=%s remote=true code=%#x reason=%q\n",
+						label, uint64(transportError.ErrorCode), transportError.ErrorMessage)
+					return nil
+				}
 				fmt.Printf("RAW CONNECTION CLOSED action=%s cause-type=%T cause=%q\n", label, cause, cause)
 				return fmt.Errorf("raw %s connection closed with unexpected QUIC cause %T: %v", label, cause, cause)
 			}
@@ -905,7 +923,8 @@ func runRawHTTP3Client(port int, caPath string, timeout time.Duration, action st
 		if err != nil {
 			return err
 		}
-		if _, err := stream.Write([]byte{1, 5, 0, 0, 0x21, 0x58, 0}); err != nil {
+		// Reference dynamic-table entry 0 with a Required Insert Count of zero.
+		if _, err := stream.Write([]byte{1, 3, 0, 0, 0x80}); err != nil {
 			return err
 		}
 		if err := stream.Close(); err != nil {

@@ -1,12 +1,13 @@
 (in-package #:http-kit/http3)
 (progn
-  (define-condition http3-server-connection-closed (http-kit:http-error)
-    ((close-kind :initarg :close-kind :initform nil
-                 :reader http3-server-connection-close-kind)
-     (close-error-code :initarg :close-error-code :initform nil
-                       :reader http3-server-connection-close-error-code)
-     (close-reason :initarg :close-reason :initform nil
-                   :reader http3-server-connection-close-reason)))
+  (define-condition http3-server-connection-closed
+    (http-kit:http-error http-kit:http-server-error)
+  ((close-kind :initarg :close-kind :initform nil
+               :reader http3-server-connection-close-kind)
+   (close-error-code :initarg :close-error-code :initform nil
+                     :reader http3-server-connection-close-error-code)
+   (close-reason :initarg :close-reason :initform nil
+                 :reader http3-server-connection-close-reason)))
   (define-condition http3-server-stopped (http-kit:http-error) ()))
 
 #+sbcl
@@ -41,6 +42,20 @@
            :message "The HTTP/3 server operation exceeded its deadline."
            :operation :http3-server
            :kind kind))
+
+  (defun %http3-server-sanitize-close-reason (reason)
+    (when (stringp reason)
+      (with-output-to-string (output)
+        (loop for index below (min 256 (length reason))
+              for character = (char reason index)
+              for code = (char-code character)
+              do (write-char
+                  (if (or (< code #x20)
+                          (<= #x7f code #x9f)
+                          (member code '(#x2028 #x2029)))
+                      #\Space
+                      character)
+                  output)))))
 
   (defun %http3-server-transport-parameters (server)
     (list :initial-max-data 1048576
@@ -266,8 +281,13 @@
       (loop
         (when (or (zerop (length octets))
                   (http-kit::%with-http-server-lock (server)
-                    (>= (cl-quic-kit:stream-send-offset stream)
-                        expected-offset)))
+                    (and (>= (cl-quic-kit:stream-send-offset stream)
+                             expected-offset)
+                         (not
+                          (cl-quic-kit:client-stream-write-pending-p
+                           (cl-quic-kit::%quic-connection-stream-engine
+                            quic-connection)
+                           stream)))))
           (return t))
         (when (and deadline (>= (%http3-server-now) deadline))
           (%http3-server-timeout :write))
@@ -366,7 +386,11 @@
       (server connection condition phase)
     (http-kit::%http-server-report-error
      server condition phase :protocol :http3
-     :peer-address nil :peer-port nil)
+     :peer-address nil :peer-port nil
+     :callback-condition
+     (and (eq phase :session)
+          (typep condition 'http3-server-connection-closed)
+          condition))
     (when connection
       (http-kit::%http-server-emit-event
        server
@@ -402,26 +426,31 @@
       (server listener connection stream)
     (declare (ignore listener))
     (let ((client (%http3-server-connection-http3-client connection)))
-      (http-kit/http3:serve-http3-control-stream
-       stream
-       :read-stream
-       (lambda (input &key timeout deadline)
-         (%h3-read-client-stream
-          client input timeout deadline))
-       :peer-role :client
-       :on-settings
-       (lambda (settings state)
-         (declare (ignore settings state))
-         (http-kit::%with-http-server-lock (server)
-           (setf (%http3-server-connection-peer-settings-received-p connection)
-                 t)
-           (http-kit::%http-server-broadcast server)))
-       :on-goaway
-       (lambda (identifier state)
-         (declare (ignore state))
-         (http-kit::%with-http-server-lock (server)
-           (setf (%http3-server-connection-peer-goaway-id connection)
-                 identifier))))))
+      (handler-case
+          (http-kit/http3:serve-http3-control-stream
+           stream
+           :read-stream
+           (lambda (input &key timeout deadline)
+             (%h3-read-client-stream
+              client input timeout deadline))
+           :peer-role :client
+           :on-settings
+           (lambda (settings state)
+             (declare (ignore settings state))
+             (http-kit::%with-http-server-lock (server)
+               (setf (%http3-server-connection-peer-settings-received-p connection)
+                     t)
+               (http-kit::%http-server-broadcast server)))
+           :on-goaway
+           (lambda (identifier state)
+             (declare (ignore state))
+             (http-kit::%with-http-server-lock (server)
+               (setf (%http3-server-connection-peer-goaway-id connection)
+                     identifier))))
+        (http3-connection-protocol-error (condition)
+          (error condition))
+        (http-protocol-error (condition)
+          (%h3-promote-http3-control-error condition)))))
 
   ;; Blocking QUIC reads must not hold the shared client-state serializer.
   (defun %http3-server-qpack-encoder-worker (connection stream)
@@ -443,11 +472,31 @@
           (when ended-p (return))))))
 
   (defun %http3-server-discard-stream (server connection stream)
-    (loop
-      (multiple-value-bind (chunk fin-p)
-          (%http3-server-stream-read server connection stream)
-        (declare (ignore chunk))
-        (when fin-p (return)))))
+    (let ((client (%http3-server-connection-http3-client connection)))
+      (labels ((finished-p ()
+                 (%h3-with-scheduler-lock (client)
+                   (let ((entry
+                           (assoc
+                            stream
+                            (http3-client-discard-peer-unidirectional-streams client)
+                            :test #'eq)))
+                     (and entry
+                          (member (cdr entry) '(:finished :cancelled) :test #'eq)))))
+               (forget-stream ()
+                 (%h3-with-scheduler-lock (client)
+                   (setf (http3-client-discard-peer-unidirectional-streams client)
+                         (remove stream
+                                 (http3-client-discard-peer-unidirectional-streams
+                                  client)
+                                 :key #'car :test #'eq)))))
+        (unwind-protect
+             (unless (finished-p)
+               (loop
+                 (multiple-value-bind (chunk fin-p)
+                     (%http3-server-stream-read server connection stream)
+                   (declare (ignore chunk))
+                   (when fin-p (return)))))
+          (forget-stream)))))
 
   (defun %http3-server-unidirectional-worker
       (server listener connection stream)
@@ -479,6 +528,15 @@
               :reason "HTTP/3 client push stream is invalid"))))
       (http-kit::http-server-callback-error (condition)
         (error condition))
+      (http3-connection-protocol-error (condition)
+        (unless (or (%http3-server-connection-closed-p server connection)
+                    (not (http-kit::%http-server-running-p server)))
+          (%http3-server-report-error
+           server connection condition :control-stream)
+          (%http3-server-close-application-error
+           server connection
+           (http3-connection-protocol-error-quic-error-code condition)
+           (http-kit:http-error-message condition))))
       (error (condition)
         (unless (or (%http3-server-connection-closed-p server connection)
                     (not (http-kit::%http-server-running-p server)))
@@ -511,9 +569,12 @@
           (error (quote http3-server-connection-closed)
                  :message "The HTTP/3 connection closed before peer SETTINGS arrived."
                  :operation :http3-server
+                 :reason-code :connection-error
+                 :phase :session
                  :close-kind close-kind
                  :close-error-code close-error-code
-                 :close-reason close-reason)))
+                 :close-reason
+                 (%http3-server-sanitize-close-reason close-reason))))
       (unless (http-kit::%http-server-running-p server)
         (error (quote http3-server-stopped)
                :message "The HTTP/3 server stopped before peer SETTINGS arrived."

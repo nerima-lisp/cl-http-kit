@@ -347,11 +347,16 @@ are ignored and return :EXTENSION, as required by HTTP/3 extensibility rules."
     (%http3-control-error "HTTP/3 control-frame processing requires a frame."
                           (type-of frame)))
   (let ((type (http3-frame-type frame)))
-    (when (and (not (http3-control-state-settings-received-p state))
-               (/= type +http3-settings-type+))
-      (%http3-control-error
-       "The first HTTP/3 control-stream frame must be SETTINGS."
-       :h3-missing-settings))
+    (progn
+      (when (member type (quote (#x02 #x06 #x08 #x09)))
+        (%http3-control-error
+         "HTTP/2 reserved frame types are invalid on an HTTP/3 control stream."
+         :h3-frame-unexpected))
+      (when (and (not (http3-control-state-settings-received-p state))
+                 (/= type +http3-settings-type+))
+        (%http3-control-error
+         "The first HTTP/3 control-stream frame must be SETTINGS."
+         :h3-missing-settings)))
     (when (and (null (http3-control-state-peer-role state))
                (member type (list +http3-goaway-type+
                                   +http3-max-push-id-type+

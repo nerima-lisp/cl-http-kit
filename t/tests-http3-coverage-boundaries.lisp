@@ -744,7 +744,10 @@
                  (:max-body-bytes -1 "HTTP/3 server max-body-bytes must be NIL or a non-negative integer." :value)
                  (:collect-body-p 17 "HTTP/3 server collect-body-p must be boolean." :value)
                  (:on-body-chunk 17 "HTTP/3 server on-body-chunk must be a function or NIL." :type)
-                 (:on-error 17 "HTTP/3 server on-error must be a function or NIL." :type)))
+                 (:on-error 17 "HTTP/3 server on-error must be a function or NIL." :type)
+                 (:reserve-body-bytes 17
+                  "HTTP/3 request body-buffer callbacks must be paired."
+                  (17 nil))))
     (destructuring-bind (key value message detail-kind) row
       (let ((reads 0) (writes 0) (handlers 0) (closes 0))
         (let ((failure
@@ -770,7 +773,11 @@
                                           (declare (ignore stream condition))
                                           (incf closes)))))))))
           (http3-public-error-check failure message
-                                   (if (eq detail-kind :type) (type-of value) value))
+                                   (cond ((eq detail-kind :type)
+                                          (type-of value))
+                                         ((eq detail-kind :value)
+                                          value)
+                                         (t detail-kind)))
           (ensure-equal 0 reads)
           (ensure-equal 0 writes)
           (ensure-equal 0 handlers)

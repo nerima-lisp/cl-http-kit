@@ -529,23 +529,31 @@
         :peer-port peer-port))
 
 (defun %http-server-report-error
-    (server condition phase &key protocol peer-address peer-port fatal-p)
-  (let* ((safe-condition (%http-server-safe-error condition phase))
+    (server condition phase &key protocol peer-address peer-port
+            callback-condition fatal-p)
+  (let* ((reported-condition
+           (if (and (eq condition callback-condition)
+                    (typep callback-condition 'http-server-error)
+                    (eq :connection-error
+                        (http-server-error-reason-code callback-condition))
+                    (eq phase (http-server-error-phase callback-condition)))
+               callback-condition
+               (%http-server-safe-error condition phase)))
          (callback (http-server-on-error server)))
     (when callback
       (handler-case
           (funcall callback
-                   safe-condition
+                   reported-condition
                    (%http-server-error-context
                     phase protocol peer-address peer-port))
         (error ()
-          (let ((callback-condition
+          (let ((callback-failure
                   (%http-server-callback-condition :on-error phase)))
-            (%http-server-mark-failed server callback-condition)
-            (error callback-condition)))))
+            (%http-server-mark-failed server callback-failure)
+            (error callback-failure)))))
     (when fatal-p
-      (%http-server-mark-failed server safe-condition))
-    safe-condition))
+      (%http-server-mark-failed server reported-condition))
+    reported-condition))
 
 (defun %http-server-report-callback-error (server condition)
   (let ((callback (http-server-on-error server)))

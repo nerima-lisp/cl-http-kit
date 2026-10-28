@@ -904,7 +904,7 @@
   (deftest http3-listener-coverage-startup-and-close-cleanup
     (let ((mode :quic-server-fails)
           (udp-close-count 0)
-          (quic-close-count 0)
+          (quic-server nil)
           (original-listener-constructor
             (symbol-function
              'http-kit/http3::%make-http3-server-listener)))
@@ -923,7 +923,12 @@
                     (error 'http-server-error
                            :reason-code :listener-open-failed
                            :phase :session)
-                    :quic-server)))
+                    (setf quic-server
+                          (cl-quic-kit::%make-quic-server
+                           :udp-socket :udp-socket
+                           :connections (make-hash-table :test #'equalp)
+                           :retry-tokens (make-hash-table :test #'equalp)
+                           :paths (make-hash-table :test #'equalp))))))
         (cons 'http-kit/http3::%make-http3-server-listener
               (lambda (&rest arguments)
                 (if (eq mode :listener-constructor-fails)
@@ -933,10 +938,6 @@
               (lambda (socket)
                 (ensure-equal :udp-socket socket)
                 (incf udp-close-count)))
-        (cons 'cl-quic-kit:quic-server-close
-              (lambda (quic-server)
-                (ensure-equal :quic-server quic-server)
-                (incf quic-close-count)))
         (cons 'http-kit::%http-server-configuration-error
               (lambda (reason)
                 (error 'http-server-error
@@ -957,7 +958,8 @@
                   (http-kit/http3::%http3-server-start server nil)
                   nil)
               (error () t)))
-           (ensure-equal 1 quic-close-count)
+           (ensure-true
+            (cl-quic-kit::quic-server-closed-p quic-server))
            (setf mode :success)
            (let* ((listener
                     (http-kit/http3::%make-http3-server-listener
@@ -981,6 +983,7 @@
            (connection (%http3-listener-test-unit-connection))
            (stream (cl-quic-kit:make-stream 1))
            (offset 0)
+           (pending-write-p nil)
            (advance-write-p t)
            (reset-event-mode :event)
            (stop-event-mode nil)
@@ -988,6 +991,7 @@
            (release-offset-on-wait-p nil)
            (wait-count 0)
            (cancel-count 0)
+           (close-stream-count 0)
            (expected-error-code #x10c))
       (%http3-listener-test-call-with-function-stubs
        (list
@@ -995,6 +999,15 @@
               (lambda (target)
                 (ensure-equal stream target)
                 offset))
+        (cons 'cl-quic-kit::%quic-connection-stream-engine
+              (lambda (target)
+                (declare (ignore target))
+                :test-engine))
+        (cons 'cl-quic-kit:client-stream-write-pending-p
+              (lambda (engine target)
+                (ensure-equal :test-engine engine)
+                (ensure-equal stream target)
+                pending-write-p))
         (cons 'cl-quic-kit:quic-connection-write-stream
               (lambda (quic-connection target octets &key fin-p)
                 (declare (ignore quic-connection fin-p))
@@ -1018,7 +1031,8 @@
                 ;; Keep this loop test independent of thread scheduling.
                 (when release-offset-on-wait-p
                   (setf offset 2
-                        (cl-quic-kit:stream-send-offset stream) 2))))
+                        (cl-quic-kit:stream-send-offset stream) 2
+                        pending-write-p nil))))
         (cons 'cl-quic-kit:stream-reset-send
               (lambda (target error-code)
                 (declare (ignore target))
@@ -1043,6 +1057,14 @@
               (lambda (&rest arguments)
                 (declare (ignore arguments))
                 (incf cancel-count)))
+        (cons 'cl-quic-kit:quic-connection-close-stream
+              (lambda (target target-stream)
+                (ensure-equal
+                 (http-kit/http3::%http3-server-connection-quic-connection
+                  connection)
+                 target)
+                (ensure-equal stream target-stream)
+                (incf close-stream-count)))
         )
        (lambda ()
          (ensure-true
@@ -1056,6 +1078,17 @@
            server connection stream #(1 2) :fin-p t))
          (ensure-equal 2 offset)
          (setf offset 0
+               pending-write-p t
+               release-offset-on-wait-p t
+               wait-count 0
+               now-values '(1.0d0 1.0d0)
+               (cl-quic-kit:stream-send-offset stream) 0)
+         (ensure-true
+          (http-kit/http3::%http3-server-stream-write
+           server connection stream #(1 2) :fin-p t))
+         (ensure-equal 1 wait-count)
+         (ensure-false pending-write-p)
+         (setf offset 0
                (cl-quic-kit:stream-send-offset stream) 0
                advance-write-p nil release-offset-on-wait-p t
                now-values '(1.0d0 1.0d0))
@@ -1063,7 +1096,7 @@
           (http-kit/http3::%http3-server-stream-write
            server connection stream #(1 2) :fin-p t))
          (ensure-equal 2 offset)
-         (ensure-equal 1 wait-count)
+         (ensure-equal 2 wait-count)
          (ensure-true
           (handler-case
               (progn
@@ -1107,7 +1140,8 @@
            (ensure-equal 5 cancel-count)
            (setf expected-error-code #x123)
            (funcall cancel stream :error-code expected-error-code)
-           (ensure-equal 7 cancel-count))))))
+           (ensure-equal 7 cancel-count)
+           (ensure-equal 6 close-stream-count))))))
 
   (deftest http3-listener-coverage-connection-cleanup-and-registration
     (let* ((server (%http3-listener-test-unit-server))
@@ -1214,6 +1248,55 @@
                    (http-server-error (condition) condition))))
            (ensure-equal :body-buffer-accounting
                          (http-server-error-reason-code condition)))))))
+
+  (deftest http3-listener-reports-typed-connection-close
+    (let* ((callback-condition nil)
+           (callback-context nil)
+           (condition
+             (make-condition
+              'http-kit/http3:http3-server-connection-closed
+              :message "The HTTP/3 connection closed before peer SETTINGS arrived."
+              :operation :http3-server
+              :reason-code :connection-error
+              :phase :session
+              :close-kind :remote
+              :close-error-code #x200
+              :close-reason
+              (http-kit/http3::%http3-server-sanitize-close-reason
+               (format nil "peer~%close reason"))))
+           (server
+             (%http3-listener-test-unit-server
+              :on-error
+              (lambda (reported-condition context)
+                (setf callback-condition reported-condition
+                      callback-context context)))))
+      (http-kit/http3::%http3-server-report-error
+       server nil condition :session)
+      (ensure-true (eq condition callback-condition))
+      (ensure-true
+       (typep callback-condition 'http-kit/http3:http3-server-connection-closed))
+      (ensure-true (typep callback-condition 'http-kit:http-server-error))
+      (ensure-equal :connection-error
+                    (http-kit:http-server-error-reason-code callback-condition))
+      (ensure-equal :session
+                    (http-kit:http-server-error-phase callback-condition))
+      (ensure-equal :remote
+                    (http-kit/http3:http3-server-connection-close-kind
+                     callback-condition))
+      (ensure-equal #x200
+                    (http-kit/http3:http3-server-connection-close-error-code
+                     callback-condition))
+      (ensure-equal "peer close reason"
+                    (http-kit/http3:http3-server-connection-close-reason
+                     callback-condition))
+      (ensure-equal
+       '(:phase :session :protocol :http3 :peer-address nil :peer-port nil)
+       callback-context)
+      (ensure-equal
+       256
+       (length
+        (http-kit/http3::%http3-server-sanitize-close-reason
+         (make-string 300 :initial-element #\x))))))
 
   (deftest http3-listener-coverage-poll-drain-idle-and-close
     (let* ((server (%http3-listener-test-unit-server :idle-timeout 1))
@@ -1772,15 +1855,23 @@
                         :active-request-streams 1))
            (mode :pre-serving)
            (running-p t)
+           (closed-p nil)
            (cancel-count 0)
            (report-count 0)
-           (failed-count 0)
            (close-count 0)
            (wait-count 0)
            (callback-condition
              (http-kit::%http-server-callback-condition :handler :request)))
       (%http3-listener-test-call-with-function-stubs
        (list
+        (cons 'http-kit/http3::%http3-server-stream-open
+              (lambda (&rest arguments)
+                (declare (ignore arguments))
+                (gensym "HTTP3-TEST-STREAM-")))
+        (cons 'http-kit/http3::%http3-server-stream-write
+              (lambda (&rest arguments)
+                (declare (ignore arguments))
+                t))
         (cons 'http-kit/http3::%http3-server-await-peer-settings
               (lambda (&rest arguments)
                 (declare (ignore arguments))
@@ -1789,7 +1880,8 @@
         (cons 'http-kit/http3:serve-http3-request-stream
               (lambda (&rest arguments)
                 (case mode
-                  (:callback-error (error callback-condition))
+                  (:callback-error
+                   (error callback-condition))
                   (:reported-error
                    (funcall (getf arguments :on-error)
                             (make-condition 'simple-error
@@ -1806,10 +1898,6 @@
               (lambda (&rest arguments)
                 (declare (ignore arguments))
                 (incf report-count)))
-        (cons 'http-kit::%http-server-mark-failed
-              (lambda (&rest arguments)
-                (declare (ignore arguments))
-                (incf failed-count)))
         (cons 'http-kit::%http-server-running-p
               (lambda (&rest arguments)
                 (declare (ignore arguments))
@@ -1817,16 +1905,18 @@
         (cons 'http-kit/http3::%http3-server-connection-closed-p
               (lambda (&rest arguments)
                 (declare (ignore arguments))
-                nil))
+                (if closed-p '(:closed) nil)))
         (cons 'cl-quic-kit:quic-connection-close
               (lambda (&rest arguments)
                 (declare (ignore arguments))
-                (incf close-count)))
+                (incf close-count)
+                (setf closed-p t)))
         (cons 'http-kit::%http-server-broadcast
               (lambda (&rest arguments)
                 (declare (ignore arguments))
                 (incf wait-count))))
        (lambda ()
+         (http-kit/http3::%http3-server-make-client server connection)
          (http-kit/http3::%http3-server-request-worker
           server connection :stream 0 nil)
          (ensure-equal 1 cancel-count)
@@ -1854,7 +1944,7 @@
                1)
          (http-kit/http3::%http3-server-request-worker
           server connection :stream 0 nil)
-         (ensure-equal 1 failed-count)
+         (ensure-equal :failed (http-kit::http-server-state server))
          (setf mode :generic-error
                running-p nil
                (http-kit::http-server-state server) :stopping
@@ -2297,7 +2387,7 @@
                                                       client)))))
                                        (and (getf streams-state :encoder)
                                             (getf streams-state :decoder)
-                                            (getf streams-state :discard)))
+                                            (= 4 (getf streams-state :stream-count))))
                                      2))
                               (http-kit/http3::%http3-server-close-connection
                                server connection :error-code :application-error
@@ -2417,11 +2507,19 @@
          (multiple-value-bind (output errors status)
              (%http3-listener-run-peer
               material "http3-raw" (http-server-port server)
-              "--raw-action" "malformed-control" "--timeout" "3s")
+              "--raw-action" "malformed-control" "--timeout" "3s"
+              "--expect-graceful-drain-close")
            (unless (zerop status)
              (error "Raw HTTP/3 callback-failure peer failed: ~A; ~A"
                     output errors))
-           (ensure-true (search "RAW CONNECTION CLOSED" output)))
+           (unless
+    (search
+     (concatenate
+      'string
+      "RAW CONNECTION CLOSED action=malformed-control "
+      "remote=true code=0x0 reason=\"HTTP/3 request drain complete\"")
+     output)
+  (error "Unexpected raw callback-failure output: ~A" output)))
          (ensure-true
           (%http3-listener-wait-until
            (lambda ()
@@ -2655,32 +2753,6 @@
        (when (eq (getf event :type) :connection-opened)
          (sb-thread:signal-semaphore peer-opened)))
      :options '(:request-timeout 2))))
-
-#+sbcl
-  (setf (fdefinition '%http3-listener-test-call-with-function-stubs)
-        (lambda (bindings thunk)
-          (let* ((bindings
-                   (if (assoc 'cl-quic-kit:quic-connection-close-stream bindings)
-                       bindings
-                       (append bindings
-                               (list
-                                (cons 'cl-quic-kit:quic-connection-close-stream
-                                      (lambda (&rest arguments)
-                                        (declare (ignore arguments))
-                                        t))))))
-                 (originals
-                   (mapcar (lambda (binding)
-                             (cons (car binding) (fdefinition (car binding))))
-                           bindings)))
-            (unwind-protect
-                 (progn
-                   (sb-ext:without-package-locks
-                     (dolist (binding bindings)
-                       (setf (fdefinition (car binding)) (cdr binding))))
-                   (funcall thunk))
-              (sb-ext:without-package-locks
-                (dolist (binding originals)
-                  (setf (fdefinition (car binding)) (cdr binding))))))))
 
 #+sbcl
   (deftest http3-listener-cancel-removes-engine-streams
