@@ -547,15 +547,31 @@ it before waiting on direction locks."
     nil)
 
   (defun %tls-server-call-with-direction-lock
-      (state direction thunk &key allow-closing)
+      (state direction thunk &key allow-closing lock-deadline)
+    (declare (ignorable lock-deadline))
     #+sbcl
     (let ((lock
             (ecase direction
               (:read (http-tls-server-state-read-lock state))
               (:write (http-tls-server-state-write-lock state)))))
-      (sb-thread:with-mutex (lock)
-        (%tls-server-check-open-state state allow-closing nil)
-        (funcall thunk)))
+      (flet ((call-locked ()
+               (%tls-server-check-open-state state allow-closing nil)
+               (funcall thunk)))
+        (if lock-deadline
+            (let* ((remaining
+                     (- lock-deadline (%tls-monotonic-time)))
+                   (acquired-p
+                     (sb-sys:without-interrupts
+                       (sb-sys:allow-with-interrupts
+                         (sb-thread:grab-mutex
+                          lock :timeout (max 0 remaining))))))
+              (unless acquired-p
+                (%tls-timeout))
+              (unwind-protect
+                   (call-locked)
+                (sb-thread:release-mutex lock)))
+            (sb-thread:with-mutex (lock)
+              (call-locked)))))
     #-sbcl
     (funcall thunk))
 
@@ -1194,11 +1210,15 @@ it before waiting on direction locks."
         (setf (http-tls-server-state-close-sent-p state) t)))
     t)
 
-  (defun %tls-server-send-close-notify (state &key allow-closing)
+  (defun %tls-server-send-close-notify
+    (state &key allow-closing
+              (lock-deadline (+ (%tls-monotonic-time)
+                                +tls-server-close-notify-timeout+)))
     (%tls-server-call-with-direction-lock
      state :write
      (lambda () (%tls-server-send-close-notify-unlocked state))
-     :allow-closing allow-closing))
+     :allow-closing allow-closing
+     :lock-deadline lock-deadline))
 
   (defun %tls-server-reject-missing-alpn (state)
     (%tls-server-send-plaintext

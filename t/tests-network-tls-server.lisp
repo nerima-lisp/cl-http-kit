@@ -2299,7 +2299,6 @@
                        previous-mode)))
              (sb-bsd-sockets:socket-close listener)
              (setf listener nil
-                   (sb-bsd-sockets:non-blocking-mode server-socket) t
                    server-stream
                    (sb-bsd-sockets:socket-make-stream
                     server-socket
@@ -2389,18 +2388,35 @@
           (sb-thread:join-thread writer-thread :timeout 3 :default nil))
         (when closer-thread
           (sb-thread:join-thread closer-thread :timeout 3 :default nil))
-        (when (and transport (open-stream-p transport))
-          (close transport :abort t))
-        (when (and server-stream (open-stream-p server-stream))
-          (close server-stream :abort t))
+        (when (and
+       (not (or (and writer-thread
+                     (sb-thread:thread-alive-p writer-thread))
+                (and closer-thread
+                     (sb-thread:thread-alive-p closer-thread))))
+       transport
+       (open-stream-p transport))
+  (close transport :abort t))
+        (when (and
+       (not (or (and writer-thread
+                     (sb-thread:thread-alive-p writer-thread))
+                (and closer-thread
+                     (sb-thread:thread-alive-p closer-thread))))
+       server-stream
+       (open-stream-p server-stream))
+  (close server-stream :abort t))
         (when (and server-socket (null server-stream))
           (sb-bsd-sockets:socket-close server-socket))
         (when client-socket
           (sb-bsd-sockets:socket-close client-socket))
         (when listener
           (sb-bsd-sockets:socket-close listener))
-        (when state
-          (http-kit/tls::%tls-server-clear-traffic-states state)))))
+        (when (and
+       state
+       (not (or (and writer-thread
+                     (sb-thread:thread-alive-p writer-thread))
+                (and closer-thread
+                     (sb-thread:thread-alive-p closer-thread)))))
+  (http-kit/tls::%tls-server-clear-traffic-states state)))))
 
   (deftest tls-server-check-handshake-deadline-follows-handoff
     (let ((state
