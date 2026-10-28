@@ -15,10 +15,12 @@
              (write-string "An HTTPS server callback failed." stream))))
 
 (defvar *http-server-clock-function* #'http-kit::%monotonic-time)
+(defvar *http-server-http3-hooks* nil)
 
 (defstruct (http-server (:constructor %make-http-server))
   host
   port
+  transport
   handler
   certificate-chain
   private-key
@@ -99,6 +101,11 @@
 
 (defun %http-server-configuration-error (reason-code)
   (error 'http-server-error :reason-code reason-code :phase :configuration))
+
+(defun %http-server-http3-hook (name)
+  (or (getf *http-server-http3-hooks* name)
+      (%http-server-configuration-error :unsupported-transport)))
+
 
 (defun %http-server-positive-real-p (value)
   #+sbcl
@@ -338,7 +345,7 @@
        (max (* 64 1024 1024)
             (* 2 (if (integerp max-body-bytes) max-body-bytes 0))))
       on-event on-error)
-  (unless (eq transport :https)
+  (unless (member transport '(:https :http3))
     (%http-server-configuration-error :unsupported-transport))
   (unless (and (stringp host) (plusp (length host)))
     (%http-server-configuration-error :invalid-host))
@@ -371,27 +378,33 @@
              (not (cl-tls-kit:tls13-server-ticket-key-store-p
                    ticket-key-store)))
     (%http-server-configuration-error :invalid-ticket-key-store))
-  (let* ((owned-p (null ticket-key-store))
-         (store (or ticket-key-store (%http-server-new-ticket-key-store)))
+  (when (and (eq transport :http3) ticket-key-store)
+    (%http-server-configuration-error :invalid-ticket-key-store))
+  (let* ((owned-p (and (eq transport :https) (null ticket-key-store)))
+         (store (and (eq transport :https)
+                     (or ticket-key-store (%http-server-new-ticket-key-store))))
          (wrapper nil)
          (server nil))
     (unwind-protect
          (progn
-           (setf wrapper
-                 (%http-server-make-tls-wrapper
-                  certificate-chain private-key store))
+           (when (eq transport :https)
+             (setf wrapper
+                   (%http-server-make-tls-wrapper
+                    certificate-chain private-key store)))
            (setf server
                  (%make-http-server
                   :host host
                   :port port
+                  :transport transport
                   :handler handler
                   :certificate-chain certificate-chain
                   :private-key private-key
                   :ticket-key-store store
                   :ticket-key-store-owned-p owned-p
                   :ticket-key-rotation-deadline
-                  (+ (%http-server-now)
-                     +http-server-ticket-key-rotation-interval+)
+                  (and (eq transport :https)
+                       (+ (%http-server-now)
+                          +http-server-ticket-key-rotation-interval+))
                   :tls-wrapper wrapper
                   :max-connections max-connections
                   :max-handshakes max-handshakes
@@ -452,7 +465,10 @@
 (defun %http-server-close-listener-object (listener)
   (when listener
     (%with-http-cleanup
-      (http-kit/network:close-http-tcp-listener listener))))
+      (if (and *http-server-http3-hooks*
+               (funcall (getf *http-server-http3-hooks* :listener-p) listener))
+          (funcall (%http-server-http3-hook :close-listener) listener)
+          (http-kit/network:close-http-tcp-listener listener)))))
 
 (declaim (ftype function %http-server-ensure-shutdown-coordinator
                           %http-server-shutdown-coordinator
@@ -970,7 +986,9 @@
                   (http-server-listener-wake-in-progress-p server) t))))
       (when listener
         (handler-case
-            (http-kit/network:wake-http-tcp-listener listener)
+            (if (eq (http-server-transport server) :http3)
+                (funcall (%http-server-http3-hook :wake) listener)
+                (http-kit/network:wake-http-tcp-listener listener))
           (error (condition)
             (%with-http-server-lock (server)
               (when (eq listener (http-server-listener server))
@@ -1063,8 +1081,10 @@
           collect connection)))
 
 (defun %http-server-force-close-connections (server)
-  (dolist (connection (%http-server-connection-snapshot server))
-    (%http-server-close-connection-stream server connection))
+  (if (eq (http-server-transport server) :http3)
+      (funcall (%http-server-http3-hook :force-close) server)
+      (dolist (connection (%http-server-connection-snapshot server))
+        (%http-server-close-connection-stream server connection)))
   nil)
 
 (progn
@@ -1222,16 +1242,18 @@
                       :phase :startup
                       :host (http-server-host server)
                       :port (http-server-port server))))
-             (loop while (%http-server-running-p server)
-                   do (handler-case
-                          (%http-server-accept-one server listener)
-                        (http-server-callback-error (condition)
-                          (error condition))
-                        (error (condition)
-                          (when (%http-server-running-p server)
-                            (%http-server-report-error
-                             server condition :accept :fatal-p t))
-                          (return)))))
+             (if (eq (http-server-transport server) :http3)
+                 (funcall (%http-server-http3-hook :supervisor) server listener)
+                 (loop while (%http-server-running-p server)
+                       do (handler-case
+                              (%http-server-accept-one server listener)
+                            (http-server-callback-error (condition)
+                              (error condition))
+                            (error (condition)
+                              (when (%http-server-running-p server)
+                                (%http-server-report-error
+                                 server condition :accept :fatal-p t))
+                              (return))))))
          (http-server-callback-error (condition)
            (%http-server-mark-failed server condition))
          (error (condition)
@@ -1243,14 +1265,17 @@
     (%http-server-supervisor-exited server)))
 
 (defun %http-server-start-listener (server start-token)
-  (unless (%http-server-ensure-owned-ticket-key-store server start-token)
-    (return-from %http-server-start-listener))
-  (handler-case
-      (http-kit/network:open-http-tcp-listener
-       :host (http-server-host server)
-       :port (http-server-port server))
-    (error ()
-      (%http-server-configuration-error :listener-open-failed))))
+  (if (eq (http-server-transport server) :http3)
+      (funcall (%http-server-http3-hook :start) server start-token)
+      (progn
+        (unless (%http-server-ensure-owned-ticket-key-store server start-token)
+          (return-from %http-server-start-listener))
+        (handler-case
+            (http-kit/network:open-http-tcp-listener
+             :host (http-server-host server)
+             :port (http-server-port server))
+          (error ()
+            (%http-server-configuration-error :listener-open-failed))))))
 
 #+sbcl
 (defun start-http-server (server)
@@ -1304,7 +1329,9 @@
                      (eq (http-server-start-token server) start-token))
             (setf (http-server-listener server) listener
                   (http-server-port server)
-                  (http-kit/network:http-network-listener-port listener)
+                  (if (eq (http-server-transport server) :http3)
+                      (funcall (%http-server-http3-hook :port) listener)
+                      (http-kit/network:http-network-listener-port listener))
                   (http-server-state server) :running)
             (handler-case
                 (setf (http-server-supervisor server)
