@@ -2205,6 +2205,8 @@
           (sb-thread:join-thread writer-thread :timeout 2 :default nil))
         (when (and transport (open-stream-p transport))
           (close transport :abort t))
+        (when writer-thread
+          (sb-thread:join-thread writer-thread :timeout 3 :default nil))
         (when (and server-stream (open-stream-p server-stream))
           (close server-stream :abort t))
         (when server-socket
@@ -2213,6 +2215,193 @@
           (sb-bsd-sockets:socket-close client-socket))
         (when listener
           (sb-bsd-sockets:socket-close listener)))))
+  (deftest tls-server-graceful-close-unblocks-backpressured-write
+    (let* ((listener
+             (make-instance 'sb-bsd-sockets:inet-socket
+                            :type :stream
+                            :protocol :tcp))
+           (client-socket
+             (make-instance 'sb-bsd-sockets:inet-socket
+                            :type :stream
+                            :protocol :tcp))
+           (server-socket nil)
+           (server-stream nil)
+           (transport nil)
+           (state nil)
+           (secure nil)
+           (provider (cl-tls-kit:make-cl-crypto-kit-provider))
+           (write-state nil)
+           (secret (make-array 32 :element-type '(unsigned-byte 8)
+                               :initial-element 53))
+           (key-material nil)
+           (finish-entered (sb-thread:make-semaphore :count 0))
+           (writer-done (sb-thread:make-semaphore :count 0))
+           (closer-started (sb-thread:make-semaphore :count 0))
+           (closer-done (sb-thread:make-semaphore :count 0))
+           (writer-result nil)
+           (writer-error nil)
+           (close-result nil)
+           (close-error nil)
+           (writer-thread nil)
+           (closer-thread nil)
+           (buffer-full-p nil)
+           (filled-bytes 0))
+      (unwind-protect
+           (progn
+             (sb-bsd-sockets:socket-bind listener #(127 0 0 1) 0)
+             (sb-bsd-sockets:socket-listen listener 1)
+             (multiple-value-bind (address port)
+                 (sb-bsd-sockets:socket-name listener)
+               (sb-bsd-sockets:socket-connect client-socket address port))
+             (setf server-socket (sb-bsd-sockets:socket-accept listener)
+                   (sb-bsd-sockets:sockopt-receive-buffer client-socket) 4096
+                   (sb-bsd-sockets:sockopt-send-buffer server-socket) 4096)
+             (let ((previous-mode
+                     (sb-bsd-sockets:non-blocking-mode server-socket))
+                   (payload (make-array 4096 :element-type '(unsigned-byte 8)
+                                        :initial-element 0))
+                   (server-fd
+                     (sb-bsd-sockets:socket-file-descriptor server-socket)))
+               (unwind-protect
+                    (progn
+                      (setf (sb-bsd-sockets:non-blocking-mode server-socket) t)
+                      (loop repeat 16384
+                            for sent =
+                              (sb-bsd-sockets:socket-send
+                               server-socket payload (length payload))
+                            do (if (and sent (plusp sent))
+                                   (incf filled-bytes sent)
+                                   (unless
+                                         (sb-sys:wait-until-fd-usable
+                                          server-fd :output 0.05d0)
+                                       (when
+                                           (loop repeat 20
+                                                 always
+                                                 (and
+                                                  (not
+                                                   (sb-sys:wait-until-fd-usable
+                                                    server-fd :output 0.05d0))
+                                                  (let ((probe-sent
+                                                         (sb-bsd-sockets:socket-send
+                                                          server-socket payload 1)))
+                                                    (if (and probe-sent
+                                                             (plusp probe-sent))
+                                                        (progn
+                                                          (incf filled-bytes
+                                                                probe-sent)
+                                                          nil)
+                                                        t))))
+                                         (setf buffer-full-p t)
+                                         (return)))))
+                      (ensure-true buffer-full-p)
+                      (ensure-true (plusp filled-bytes)))
+                 (setf (sb-bsd-sockets:non-blocking-mode server-socket)
+                       previous-mode)))
+             (sb-bsd-sockets:socket-close listener)
+             (setf listener nil
+                   (sb-bsd-sockets:non-blocking-mode server-socket) t
+                   server-stream
+                   (sb-bsd-sockets:socket-make-stream
+                    server-socket
+                    :input nil
+                    :output t
+                    :element-type '(unsigned-byte 8)
+                    :buffering :full)
+                   transport
+                   (make-instance '%tls-server-backpressure-stream
+                                  :stream
+                                  (make-instance '%tls-server-backpressure-observer-stream
+                                                 :stream server-stream
+                                                 :flush-entered finish-entered)))
+             (http-kit/network::%network-record-stream-socket
+              transport server-socket)
+             (setf state
+                   (http-kit/tls::%make-http-tls-server-state
+                    :driver nil
+                    :provider provider
+                    :transport-stream transport)
+                   secure (http-kit/tls::%make-http-tls-stream state transport))
+             (setf write-state
+                   (cl-tls-kit:make-tls13-traffic-state
+                    provider :sha256 :aes-128-gcm secret 16 12)
+                   key-material
+                   (list (cl-tls-kit:tls13-traffic-state-secret write-state)
+                         (cl-tls-kit:tls13-traffic-state-key write-state)
+                         (cl-tls-kit:tls13-traffic-state-iv write-state)))
+             (setf (http-kit/tls::http-tls-server-state-write-state state)
+                   write-state
+                   (http-kit/tls::http-tls-server-state-handshake-complete-p state)
+                   t
+                   (http-kit/tls::http-tls-server-state-selected-alpn state) "h2")
+             (setf writer-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (unwind-protect
+                           (handler-case
+                               (progn
+                                 (write-sequence (octets 65) secure)
+                                 (setf writer-result :returned))
+                             (error (condition)
+                               (setf writer-error condition
+                                     writer-result :error)))
+                        (sb-thread:signal-semaphore writer-done)))))
+             (unless (sb-thread:wait-on-semaphore finish-entered :timeout 3)
+               (error "The TLS application write did not reach the blocked flush."))
+             (ensure-false (sb-thread:wait-on-semaphore writer-done :timeout 0.1d0))
+             (setf closer-thread
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (unwind-protect
+                           (handler-case
+                               (progn
+                                 (sb-thread:signal-semaphore closer-started)
+                                 (close secure)
+                                 (setf close-result :returned))
+                             (error (condition)
+                               (setf close-error condition)))
+                        (sb-thread:signal-semaphore closer-done)))))
+             (unless (sb-thread:wait-on-semaphore closer-started :timeout 2)
+               (error "The TLS graceful close did not start."))
+             (unless (sb-thread:wait-on-semaphore closer-done :timeout 3)
+               (error "The TLS graceful close did not abort the blocked write."))
+             (unless (sb-thread:wait-on-semaphore writer-done :timeout 3)
+               (error "The TLS application writer did not leave the socket after shutdown."))
+             (sb-thread:join-thread writer-thread :timeout 2 :default nil)
+             (sb-thread:join-thread closer-thread :timeout 2 :default nil)
+             (ensure-equal :returned close-result)
+             (ensure-false close-error)
+             (ensure-equal :error writer-result)
+             (ensure-true (typep writer-error 'http-protocol-error))
+             (ensure-equal :transport-error
+                           (http-protocol-error-detail writer-error))
+             (ensure-equal 1
+                           (cl-tls-kit:tls13-traffic-state-sequence-number
+                            write-state))
+             (ensure-true
+              (every (lambda (sequence)
+                       (every (lambda (octet) (zerop octet)) sequence))
+                     key-material))
+             (ensure-false (open-stream-p secure))
+             (ensure-true (%tls-server-backpressure-stream-aborted-p transport)))
+        (when server-socket
+          (http-kit/network::%network-shutdown-socket server-socket))
+        (when writer-thread
+          (sb-thread:join-thread writer-thread :timeout 3 :default nil))
+        (when closer-thread
+          (sb-thread:join-thread closer-thread :timeout 3 :default nil))
+        (when (and transport (open-stream-p transport))
+          (close transport :abort t))
+        (when (and server-stream (open-stream-p server-stream))
+          (close server-stream :abort t))
+        (when (and server-socket (null server-stream))
+          (sb-bsd-sockets:socket-close server-socket))
+        (when client-socket
+          (sb-bsd-sockets:socket-close client-socket))
+        (when listener
+          (sb-bsd-sockets:socket-close listener))
+        (when state
+          (http-kit/tls::%tls-server-clear-traffic-states state)))))
+
   (deftest tls-server-check-handshake-deadline-follows-handoff
     (let ((state
             (http-kit/tls::%make-http-tls-server-state
@@ -2833,12 +3022,11 @@
            (monitor-lock (sb-thread:make-mutex :name "TLS race test monitor"))
            (encrypt-entered (sb-thread:make-semaphore :count 0))
            (second-encrypt-entered (sb-thread:make-semaphore :count 0))
-           (close-notify-entered (sb-thread:make-semaphore :count 0))
+           (closer-started (sb-thread:make-semaphore :count 0))
            (release-first-encrypt (sb-thread:make-semaphore :count 0))
            (writer-done (sb-thread:make-semaphore :count 0))
            (closer-done (sb-thread:make-semaphore :count 0))
            (original-encrypt (fdefinition 'cl-tls-kit:encrypt-tls13-traffic-record))
-           (original-close-notify (fdefinition 'http-kit/tls::%tls-server-send-close-notify))
            (encrypt-count 0)
            (observed-sequences nil)
            (zeroized-key-used-p nil)
@@ -2880,10 +3068,6 @@
                        (when (= call-index 2)
                          (sb-thread:signal-semaphore second-encrypt-entered))
                        (funcall original-encrypt plaintext candidate))))
-             (setf (fdefinition 'http-kit/tls::%tls-server-send-close-notify)
-                   (lambda (candidate &rest arguments)
-                     (sb-thread:signal-semaphore close-notify-entered)
-                     (apply original-close-notify candidate arguments)))
              (setf writer-thread
                    (sb-thread:make-thread
                     (lambda ()
@@ -2905,25 +3089,26 @@
                       (unwind-protect
                            (handler-case
                                (progn
+                                 (sb-thread:signal-semaphore closer-started)
                                  (close tls-stream)
                                  (setf close-result :returned))
                              (error (condition)
                                (setf close-error condition)))
                         (sb-thread:signal-semaphore closer-done))
                     :name "TLS concurrent closer")))
-             (unless (sb-thread:wait-on-semaphore close-notify-entered :timeout 2)
-               (error "The TLS race test closer did not reach close_notify."))
+             (unless (sb-thread:wait-on-semaphore closer-started :timeout 2)
+               (error "The TLS race test closer did not start."))
              (setf overlapped-p
                    (sb-thread:wait-on-semaphore
-                    second-encrypt-entered :timeout 1d0))
-             (when overlapped-p
-               (unless (sb-thread:wait-on-semaphore closer-done :timeout 3)
-                 (error "The TLS race test closer did not finish after concurrent encryption.")))
+                    second-encrypt-entered :timeout 0.05d0))
              (sb-thread:signal-semaphore release-first-encrypt)
              (unless (sb-thread:wait-on-semaphore writer-done :timeout 3)
                (error "The TLS race test writer did not finish."))
              (unless (or overlapped-p
-                         (sb-thread:wait-on-semaphore closer-done :timeout 3))
+                         (sb-thread:wait-on-semaphore
+                          second-encrypt-entered :timeout 3))
+               (error "The TLS race test closer did not send close_notify."))
+             (unless (sb-thread:wait-on-semaphore closer-done :timeout 3)
                (error "The TLS race test closer did not finish."))
              (sb-thread:join-thread writer-thread :timeout 2 :default nil)
              (sb-thread:join-thread closer-thread :timeout 2 :default nil)
@@ -2942,9 +3127,7 @@
         (when closer-thread
           (sb-thread:join-thread closer-thread :timeout 3 :default nil))
         (setf (fdefinition 'cl-tls-kit:encrypt-tls13-traffic-record)
-              original-encrypt
-              (fdefinition 'http-kit/tls::%tls-server-send-close-notify)
-              original-close-notify)
+              original-encrypt)
         (when (open-stream-p raw)
           (close raw :abort t))
         (http-kit/tls::%tls-server-clear-traffic-states state)))))

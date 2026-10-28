@@ -172,6 +172,9 @@
             t)
         (error () nil))))
 
+  (defun %network-shutdown-accepted-stream (stream)
+    (%network-shutdown-socket (%network-stream-socket stream)))
+
   (defun %network-listener-error (operation &optional detail)
     (error 'http-protocol-error
            :message (format nil "The native TCP listener ~A operation is invalid."

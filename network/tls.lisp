@@ -21,6 +21,8 @@
          :operation :tls
          :kind :tls))
 
+(defconstant +tls-server-close-notify-timeout+ 1.0d0)
+
 #+sbcl
 (defun %tls-call-with-timeout (thunk remaining)
   (if remaining
@@ -1268,21 +1270,36 @@ it before waiting on direction locks."
               (error () nil)))))
       nil)
 
+    (defun %tls-server-shutdown-transport (transport)
+      (unless (http-kit/network::%network-shutdown-accepted-stream transport)
+        (when (open-stream-p transport)
+          (http-kit::%with-http-cleanup
+            (close transport :abort t))))
+      nil)
+
     (defun %tls-server-close-adapter (stream state driver abort)
       (when (%tls-server-begin-close state)
         (let ((completed-p nil)
               (driver-closed-p nil)
+              (abort-transport-p abort)
               (transport (%tls-stream-transport-stream stream)))
           (unwind-protect
                (progn
-                 (if abort
-                     (when (open-stream-p transport)
-                       (close transport :abort t))
-                   (progn
-                     (%tls-server-send-close-notify
-                      state :allow-closing t)
-                     (when (open-stream-p transport)
-                       (close transport :abort nil))))
+                 (if abort-transport-p
+                     (%tls-server-shutdown-transport transport)
+                   (handler-case
+                       (%call-with-tls-io-deadline
+                        (lambda ()
+                          (%tls-server-send-close-notify
+                           state :allow-closing t))
+                        (+ (%tls-monotonic-time)
+                           +tls-server-close-notify-timeout+)
+                        #'%tls-monotonic-time)
+                     (http-timeout ()
+                       (setf abort-transport-p t)
+                       (%tls-server-shutdown-transport transport))))
+                 (when (open-stream-p transport)
+                   (close transport :abort abort-transport-p))
                  (%tls-server-call-with-direction-locks
                   state
                   (lambda ()
@@ -1297,17 +1314,18 @@ it before waiting on direction locks."
                  (setf completed-p t))
             (unwind-protect
                  (unless completed-p
-                   (unwind-protect
-                        (when (open-stream-p transport)
-                          (http-kit::%with-http-cleanup
-                            (close transport :abort t)))
-                     (%tls-server-call-with-direction-locks
-                      state
-                      (lambda ()
-                        (unless driver-closed-p
-                          (%tls-server-cleanup-driver-close driver))
-                        (%tls-server-clear-traffic-states-unlocked state))
-                      :allow-closing t)))
+                   (%tls-server-shutdown-transport transport)
+                   (%tls-server-call-with-direction-locks
+                    state
+                    (lambda ()
+                      (when (open-stream-p transport)
+                        (http-kit::%with-http-cleanup
+                          (close transport :abort t)))
+                      (unwind-protect
+                           (unless driver-closed-p
+                             (%tls-server-cleanup-driver-close driver))
+                        (%tls-server-clear-traffic-states-unlocked state)))
+                    :allow-closing t))
               (unwind-protect
                    (setf (%tls-stream-closed-p stream) t)
                 (%tls-server-finish-close state))))))
