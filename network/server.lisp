@@ -706,9 +706,15 @@
     nil))
 
 (defun %http-server-set-tls-stream (server connection stream)
-  (%with-http-server-lock (server)
-    (setf (%http-server-connection-tls-stream connection) stream))
-  stream)
+  (let ((installed-p nil))
+    (%with-http-server-lock (server)
+      (unless (or (%http-server-connection-closing-p connection)
+                  (%http-server-connection-closed-p connection))
+        (setf (%http-server-connection-tls-stream connection) stream
+              installed-p t)))
+    (unless installed-p
+      (http-kit/network::%network-close-accepted-stream stream :abort t))
+    (when installed-p stream)))
 (defun %http-server-open-tls-stream (server connection raw-stream)
   (let ((wrapper
           (%http-server-rotate-ticket-key-store-if-due server connection)))
@@ -795,7 +801,8 @@
              (progn
                (setf tls-stream
                      (%http-server-open-tls-stream server connection raw-stream))
-               (%http-server-set-tls-stream server connection tls-stream)
+               (unless (%http-server-set-tls-stream server connection tls-stream)
+                 (return-from %http-server-run-connection nil))
                (%http-server-release-handshake server connection)
                (setf phase :alpn)
                (let ((alpn
