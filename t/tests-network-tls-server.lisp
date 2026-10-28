@@ -2291,8 +2291,7 @@
                 (sb-sys:wait-until-fd-usable
                  (sb-bsd-sockets:socket-file-descriptor client-socket)
                  :input 1d0))
-               (http-kit/tls::%tls-server-backpressure-drain
-                client-socket received)
+               (%tls-server-backpressure-drain client-socket received)
                (ensure-equal 0 (length received))
                (ensure-true (typep condition (quote http-timeout)))))
         (when (and transport (open-stream-p transport))
