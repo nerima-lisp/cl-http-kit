@@ -1,4 +1,13 @@
 (in-package #:http-kit/http3)
+(progn
+  (define-condition http3-server-connection-closed (http-kit:http-error)
+    ((close-kind :initarg :close-kind :initform nil
+                 :reader http3-server-connection-close-kind)
+     (close-error-code :initarg :close-error-code :initform nil
+                       :reader http3-server-connection-close-error-code)
+     (close-reason :initarg :close-reason :initform nil
+                   :reader http3-server-connection-close-reason)))
+  (define-condition http3-server-stopped (http-kit:http-error) ()))
 
 #+sbcl
 (progn

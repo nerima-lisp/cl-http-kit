@@ -136,4 +136,4 @@
    #:http3-quic-adapter-http3-client
    #:http3-quic-adapter-start
    #:http3-quic-adapter-poll
-   #:close-http3-quic-adapter))
+   #:close-http3-quic-adapter #:http3-server-connection-closed #:http3-server-connection-close-kind #:http3-server-connection-close-error-code #:http3-server-connection-close-reason #:http3-server-stopped))

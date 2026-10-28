@@ -814,6 +814,18 @@ encoding only references entries already present, so callers must synchronize
 the peer table before sending a section that has a non-zero required insert
 count.
 
+### HTTP/3 server conditions
+
+Listener-side waits that require peer SETTINGS distinguish three outcomes.
+`http3-server-connection-closed` reports that the QUIC connection closed; its
+`http3-server-connection-close-kind`,
+`http3-server-connection-close-error-code`, and
+`http3-server-connection-close-reason` readers return the close kind, QUIC error
+code, and close reason when available. `http3-server-stopped` reports that the
+server stopped before SETTINGS arrived. `http-kit:http-timeout` is reserved for
+an operation deadline that actually expired; `http-kit:http-timeout-kind`
+returns the operation kind.
+
 ### HTTP/3 client
 
 #### Callback completion contract
