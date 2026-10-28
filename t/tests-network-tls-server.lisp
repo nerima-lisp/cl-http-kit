@@ -2538,7 +2538,7 @@
           (close secure :abort t))
         (when (open-stream-p transport)
           (close transport :abort t)))))
-    (deftest tls-server-second-close-bounds-condition-wait
+  (deftest tls-server-second-close-bounds-condition-wait
     (let* ((transport
              (make-instance '%tls-server-test-stream :input (octets)))
            (state
@@ -2576,9 +2576,13 @@
              (ensure-false second-close-error)
              (ensure-false
               (http-kit/tls::http-tls-server-state-closed-p state)))
+        (sb-thread:with-mutex
+            ((http-kit/tls::http-tls-server-state-lifecycle-lock state))
+          (setf (http-kit/tls::http-tls-server-state-closed-p state) t)
+          (sb-thread:condition-broadcast
+           (http-kit/tls::http-tls-server-state-lifecycle-waitqueue state)))
         (when second-close-thread
           (sb-thread:join-thread second-close-thread :timeout 3 :default nil))
-        (http-kit/tls::%tls-server-finish-close state)
         (setf (http-kit/tls::%tls-stream-closed-p secure) t)
         (when (open-stream-p transport)
           (close transport :abort t)))))
