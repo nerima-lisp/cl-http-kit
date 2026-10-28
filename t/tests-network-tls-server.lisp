@@ -441,8 +441,8 @@
             (ensure-true (cl-tls-kit:tls13-server-ticket-key-store-p driver-store))
             (%tls-server-test-with-spy
              'http-kit/tls::%tls-server-send-close-notify
-             (lambda (state)
-               (declare (ignore state))
+             (lambda (state &rest arguments)
+               (declare (ignore state arguments))
                (error "Injected TLS close_notify failure."))
              (lambda ()
                (handler-case
@@ -1907,8 +1907,8 @@
                                 (muffle-warning warning))))
                           (%tls-server-test-with-spy
                            'http-kit/tls::%tls-server-send-close-notify
-                           (lambda (state &key allow-closing)
-                             (declare (ignore state allow-closing))
+                           (lambda (state &key allow-closing deadline)
+                             (declare (ignore state allow-closing deadline))
                              (error close-condition))
                            (lambda ()
                              (handler-case
@@ -2417,6 +2417,78 @@
                 (and closer-thread
                      (sb-thread:thread-alive-p closer-thread)))))
   (http-kit/tls::%tls-server-clear-traffic-states state)))))
+  (deftest tls-server-close-notify-times-out-waiting-for-write-lock
+  (let* ((transport
+           (make-instance (quote %tls-server-test-stream) :input (octets)))
+         (state
+           (http-kit/tls::%make-http-tls-server-state
+            :driver nil :provider nil :transport-stream transport))
+         (lock (http-kit/tls::http-tls-server-state-write-lock state))
+         (lock-held (sb-thread:make-semaphore :count 0))
+         (release-lock (sb-thread:make-semaphore :count 0))
+         (holder nil))
+    (unwind-protect
+         (progn
+           (setf holder
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (sb-thread:grab-mutex lock)
+                    (unwind-protect
+                         (progn
+                           (sb-thread:signal-semaphore lock-held)
+                           (sb-thread:wait-on-semaphore release-lock :timeout 5))
+                      (sb-thread:release-mutex lock)))))
+           (unless (sb-thread:wait-on-semaphore lock-held :timeout 2)
+             (error "The TLS writer lock was not acquired."))
+           (let ((condition
+                   (handler-case
+                       (progn
+                         (http-kit/tls::%tls-server-send-close-notify
+                          state :allow-closing t
+                          :deadline (+ (http-kit/tls::%tls-monotonic-time)
+                                       0.02d0))
+                         nil)
+                     (http-timeout (condition) condition))))
+             (ensure-true (typep condition (quote http-timeout)))))
+      (sb-thread:signal-semaphore release-lock)
+      (when holder
+        (sb-thread:join-thread holder :timeout 2 :default nil))
+      (when (open-stream-p transport)
+        (close transport :abort t)))))
+  (deftest tls-server-close-cleanup-closes-open-transport-after-notify-error
+  (dolist (close-during-shutdown-p (list nil t))
+    (let* ((transport
+             (make-instance (quote %tls-server-test-stream) :input (octets)))
+           (state
+             (http-kit/tls::%make-http-tls-server-state
+              :driver nil :provider nil :transport-stream transport))
+           (secure (http-kit/tls::%make-http-tls-stream state transport)))
+      (unwind-protect
+           (%tls-server-test-with-spy
+            (quote http-kit/tls::%tls-server-shutdown-transport)
+            (lambda (candidate)
+              (ensure-true (eq candidate transport))
+              (when close-during-shutdown-p
+                (close candidate :abort t))
+              t)
+            (lambda ()
+              (%tls-server-test-with-spy
+               (quote http-kit/tls::%tls-server-send-close-notify)
+               (lambda (candidate &rest arguments)
+                 (declare (ignore candidate arguments))
+                 (error "Injected TLS close_notify failure."))
+               (lambda ()
+                 (let ((condition
+                         (handler-case
+                             (progn (close secure) nil)
+                           (error (condition) condition))))
+                   (ensure-true (typep condition (quote simple-error)))
+                   (ensure-false (open-stream-p secure))
+                   (ensure-false (open-stream-p transport)))))))
+        (when (open-stream-p secure)
+          (close secure :abort t))
+        (when (open-stream-p transport)
+          (close transport :abort t))))))
 
   (deftest tls-server-check-handshake-deadline-follows-handoff
     (let ((state

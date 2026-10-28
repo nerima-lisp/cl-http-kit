@@ -1211,14 +1211,18 @@ it before waiting on direction locks."
     t)
 
   (defun %tls-server-send-close-notify
-    (state &key allow-closing
-              (lock-deadline (+ (%tls-monotonic-time)
-                                +tls-server-close-notify-timeout+)))
+      (state &key allow-closing
+             (deadline (+ (%tls-monotonic-time)
+                          +tls-server-close-notify-timeout+)))
     (%tls-server-call-with-direction-lock
      state :write
-     (lambda () (%tls-server-send-close-notify-unlocked state))
+     (lambda ()
+       (%call-with-tls-io-deadline
+        (lambda () (%tls-server-send-close-notify-unlocked state))
+        deadline
+        #'%tls-monotonic-time))
      :allow-closing allow-closing
-     :lock-deadline lock-deadline))
+     :lock-deadline deadline))
 
   (defun %tls-server-reject-missing-alpn (state)
     (%tls-server-send-plaintext
@@ -1302,19 +1306,18 @@ it before waiting on direction locks."
         (let ((completed-p nil)
               (driver-closed-p nil)
               (abort-transport-p abort)
-              (transport (%tls-stream-transport-stream stream)))
+              (transport (%tls-stream-transport-stream stream))
+              (close-notify-deadline
+                (+ (%tls-monotonic-time)
+                   +tls-server-close-notify-timeout+)))
           (unwind-protect
                (progn
                  (if abort-transport-p
                      (%tls-server-shutdown-transport transport)
                    (handler-case
-                       (%call-with-tls-io-deadline
-                        (lambda ()
-                          (%tls-server-send-close-notify
-                           state :allow-closing t))
-                        (+ (%tls-monotonic-time)
-                           +tls-server-close-notify-timeout+)
-                        #'%tls-monotonic-time)
+                       (%tls-server-send-close-notify
+                        state :allow-closing t
+                        :deadline close-notify-deadline)
                      (http-timeout ()
                        (setf abort-transport-p t)
                        (%tls-server-shutdown-transport transport))))
