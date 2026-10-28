@@ -2478,6 +2478,7 @@
            (close-done (sb-thread:make-semaphore :count 0))
            (operation-thread nil)
            (close-thread nil)
+           (operation-error nil)
            (close-result nil)
            (close-error nil))
       (setf (http-kit/tls::http-tls-server-state-read-state state)
@@ -2488,13 +2489,19 @@
                    (sb-thread:make-thread
                     (lambda ()
                       (unwind-protect
-                           (http-kit/tls::%tls-server-call-with-direction-lock
-                            state :read
-                            (lambda ()
-                              (sb-thread:signal-semaphore operation-entered)
-                              (unless (sb-thread:wait-on-semaphore
-                                       release-operation :timeout 5)
-                                (error "The TLS close test did not release the operation."))))
+                           (handler-case
+                               (http-kit/tls::%tls-server-call-with-direction-lock
+                                state :read
+                                (lambda ()
+                                  (http-kit/tls::%tls-server-call-with-direction-lock
+                                   state :write
+                                   (lambda ()
+                                     (sb-thread:signal-semaphore operation-entered)
+                                     (unless (sb-thread:wait-on-semaphore
+                                              release-operation :timeout 5)
+                                       (error "The TLS close test did not release the operation."))))))
+                             (error (condition)
+                               (setf operation-error condition)))
                         (sb-thread:signal-semaphore operation-done)))))
              (unless (sb-thread:wait-on-semaphore operation-entered :timeout 2)
                (error "The TLS operation did not acquire the read lock."))
@@ -2521,6 +2528,7 @@
              (ensure-true
               (sb-thread:wait-on-semaphore operation-done :timeout 2))
              (sb-thread:join-thread operation-thread :timeout 2 :default nil)
+             (ensure-false operation-error)
              (ensure-true
               (every (lambda (octets) (every #'zerop octets)) key-material))
              (ensure-true (http-kit/tls::http-tls-server-state-closed-p state)))
@@ -2533,7 +2541,7 @@
           (close secure :abort t))
         (when (open-stream-p transport)
           (close transport :abort t)))))
-  (deftest tls-server-second-close-wait-uses-close-deadline
+  (deftest tls-server-second-close-reuses-expired-deadline
     (let* ((transport
              (make-instance (quote %tls-server-test-stream) :input (octets)))
            (state
@@ -2543,16 +2551,10 @@
            (operation-entered (sb-thread:make-semaphore :count 0))
            (release-operation (sb-thread:make-semaphore :count 0))
            (operation-done (sb-thread:make-semaphore :count 0))
-           (close-start (sb-thread:make-semaphore :count 0))
-           (close-ready (sb-thread:make-semaphore :count 0))
-           (first-close-done (sb-thread:make-semaphore :count 0))
+           (second-close-started (sb-thread:make-semaphore :count 0))
            (second-close-done (sb-thread:make-semaphore :count 0))
            (operation-thread nil)
-           (first-close-thread nil)
            (second-close-thread nil)
-           (lifecycle-locked-p nil)
-           (first-close-result nil)
-           (first-close-error nil)
            (second-close-result nil)
            (second-close-error nil))
       (unwind-protect
@@ -2571,34 +2573,17 @@
                         (sb-thread:signal-semaphore operation-done)))))
              (unless (sb-thread:wait-on-semaphore operation-entered :timeout 2)
                (error "The TLS operation did not acquire the read lock."))
-             (sb-thread:grab-mutex
-              (http-kit/tls::http-tls-server-state-lifecycle-lock state))
-             (setf lifecycle-locked-p t)
-             (setf first-close-thread
-                   (sb-thread:make-thread
-                    (lambda ()
-                      (unwind-protect
-                           (progn
-                             (sb-thread:signal-semaphore close-ready)
-                             (unless (sb-thread:wait-on-semaphore
-                                      close-start :timeout 5)
-                               (error "The TLS close test did not start the close."))
-                             (handler-case
-                                 (progn
-                                   (close secure :abort t)
-                                   (setf first-close-result :returned))
-                               (error (condition)
-                                 (setf first-close-error condition))))
-                        (sb-thread:signal-semaphore first-close-done)))))
+             (ensure-true (http-kit/tls::%tls-server-begin-close state))
+             (ensure-false
+              (sb-thread:wait-on-semaphore
+               release-operation
+               :timeout (+ http-kit/tls::+tls-server-close-notify-timeout+ 0.1d0)))
              (setf second-close-thread
                    (sb-thread:make-thread
                     (lambda ()
                       (unwind-protect
                            (progn
-                             (sb-thread:signal-semaphore close-ready)
-                             (unless (sb-thread:wait-on-semaphore
-                                      close-start :timeout 5)
-                               (error "The TLS close test did not start the close."))
+                             (sb-thread:signal-semaphore second-close-started)
                              (handler-case
                                  (progn
                                    (close secure :abort t)
@@ -2606,20 +2591,10 @@
                                (error (condition)
                                  (setf second-close-error condition))))
                         (sb-thread:signal-semaphore second-close-done)))))
-             (unless (and (sb-thread:wait-on-semaphore close-ready :timeout 2)
-                          (sb-thread:wait-on-semaphore close-ready :timeout 2))
-               (error "The TLS close threads did not reach their start barrier."))
-             (sb-thread:signal-semaphore close-start)
-             (sb-thread:signal-semaphore close-start)
-             (sb-thread:release-mutex
-              (http-kit/tls::http-tls-server-state-lifecycle-lock state))
-             (setf lifecycle-locked-p nil)
+             (unless (sb-thread:wait-on-semaphore second-close-started :timeout 2)
+               (error "The TLS second close did not start."))
              (ensure-true
-              (sb-thread:wait-on-semaphore second-close-done :timeout 2.5d0))
-             (ensure-true
-              (sb-thread:wait-on-semaphore first-close-done :timeout 2.5d0))
-             (ensure-equal :returned first-close-result)
-             (ensure-false first-close-error)
+              (sb-thread:wait-on-semaphore second-close-done :timeout 0.5d0))
              (ensure-equal :returned second-close-result)
              (ensure-false second-close-error)
              (ensure-false
@@ -2628,17 +2603,12 @@
              (ensure-true
               (sb-thread:wait-on-semaphore operation-done :timeout 2))
              (sb-thread:join-thread operation-thread :timeout 2 :default nil)
-             (ensure-true (http-kit/tls::http-tls-server-state-closed-p state)))
-        (when lifecycle-locked-p
-          (sb-thread:release-mutex
-           (http-kit/tls::http-tls-server-state-lifecycle-lock state)))
-        (sb-thread:signal-semaphore close-start)
-        (sb-thread:signal-semaphore close-start)
+             (ensure-true
+              (http-kit/tls::http-tls-server-state-closing-p state)))
         (sb-thread:signal-semaphore release-operation)
+        (http-kit/tls::%tls-server-finish-close state)
         (when operation-thread
           (sb-thread:join-thread operation-thread :timeout 3 :default nil))
-        (when first-close-thread
-          (sb-thread:join-thread first-close-thread :timeout 3 :default nil))
         (when second-close-thread
           (sb-thread:join-thread second-close-thread :timeout 3 :default nil))
         (when (open-stream-p secure)
