@@ -505,6 +505,7 @@ driver's transport callbacks."
     (input-buffer (make-array 0 :element-type '(unsigned-byte 8)))
     (input-position 0)
     (handshake-complete-p nil)
+    (handshake-deadline-active-p t)
     (client-hello-received-p nil)
     (early-data-offered-p nil)
     (hello-retry-request-sent-p nil)
@@ -548,14 +549,66 @@ driver's transport callbacks."
               (%tls-timeout)
               (%tls-server-fail "TLS transport read failed." :transport-error))))))
 
+  (defun %tls-server-check-handshake-deadline (state)
+    (when (http-tls-server-state-handshake-deadline-active-p state)
+      (let ((deadline (http-tls-server-state-deadline state)))
+        (when (and deadline
+                   (>= (funcall
+                        (http-tls-server-state-clock-function state))
+                       deadline))
+          (%tls-timeout))))
+    nil)
+  (progn
+    #+sbcl
+    (defun %tls-call-with-io-deadline (thunk remaining)
+      (if remaining
+          (handler-case
+              (sb-sys:with-deadline (:seconds remaining)
+                (funcall thunk))
+            (sb-sys:deadline-timeout ()
+              (%tls-timeout)))
+          (funcall thunk)))
+    #-sbcl
+    (defun %tls-call-with-io-deadline (thunk remaining)
+      (declare (ignore remaining))
+      (funcall thunk))
+    (defun %call-with-tls-io-deadline (thunk deadline clock-function)
+      (let ((remaining (and deadline (- deadline (funcall clock-function)))))
+        (when (and remaining (<= remaining 0))
+          (%tls-timeout))
+        (let ((result (%tls-call-with-io-deadline thunk remaining)))
+          (when (and deadline
+                     (>= (funcall clock-function) deadline))
+            (%tls-timeout))
+          result))))
   (defun %tls-server-write-record (state bytes)
-    (handler-case
-        (let ((stream (http-tls-server-state-transport-stream state)))
-          (write-sequence bytes stream)
-          (finish-output stream))
-      (http-timeout (condition) (error condition))
-      (error ()
-        (%tls-server-fail "TLS transport write failed." :transport-error))))
+    (let ((stream (http-tls-server-state-transport-stream state)))
+      (flet ((write-with-deadline (thunk)
+               (if (http-tls-server-state-handshake-deadline-active-p state)
+                   (%call-with-tls-io-deadline
+                    thunk
+                    (http-tls-server-state-deadline state)
+                    (http-tls-server-state-clock-function state))
+                   (funcall thunk)))
+             (abort-transport ()
+               (http-kit::%with-http-cleanup
+                 (when (open-stream-p stream)
+                   (close stream :abort t)))))
+        (handler-case
+            (progn
+              (write-with-deadline (lambda () (write-sequence bytes stream)))
+              (write-with-deadline (lambda () (finish-output stream))))
+          (http-timeout (condition)
+            (abort-transport)
+            (error condition))
+          #+sbcl (sb-bsd-sockets:operation-timeout-error ()
+                   (abort-transport)
+                   (if (http-tls-server-state-handshake-deadline-active-p state)
+                       (%tls-timeout)
+                       (%tls-server-fail "TLS transport write failed." :transport-error)))
+          (error ()
+            (%tls-server-fail "TLS transport write failed." :transport-error))))))
+
 
   (defun %tls-server-content-type (name)
     (cond ((eq name :handshake) cl-tls-kit:+tls-content-type-handshake+)
@@ -693,6 +746,7 @@ driver's transport callbacks."
            (setf (http-tls-server-state-selected-alpn state)
                  (getf event :protocol)))
           (:send
+           (%tls-server-check-handshake-deadline state)
            (let* ((level (getf event :level))
                   (content-type
                    (%tls-server-content-type (getf event :content-type)))
@@ -1084,10 +1138,17 @@ driver's transport callbacks."
                                      :transport-stream stream
                                      :deadline effective-deadline
                                      :clock-function clock-function)))
-                              (%tls-server-handshake state)
-                              (make-instance 'http-tls-stream
-                                             :driver state
-                                             :transport-stream stream))))
+                              (http-kit/network::%network-call-with-accepted-stream-socket-non-blocking-mode
+                               stream
+                               (lambda ()
+                                 (%tls-server-handshake state)))
+                              (let ((tls-stream
+                                      (make-instance 'http-tls-stream
+                                                     :driver state
+                                                     :transport-stream stream)))
+                                (setf (http-tls-server-state-handshake-deadline-active-p state)
+                                      nil)
+                                tls-stream))))
                         effective-deadline
                         clock-function)
                        (setf completed-p t))

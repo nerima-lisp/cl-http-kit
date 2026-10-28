@@ -126,6 +126,44 @@
     (sb-thread:with-mutex (*network-stream-sockets-lock*)
       (gethash stream *network-stream-sockets*)))
 
+  (defun %network-set-accepted-stream-socket-non-blocking-mode
+      (stream mode)
+    (sb-thread:with-mutex (*network-stream-sockets-lock*)
+      (let ((socket (gethash stream *network-stream-sockets*)))
+        (when (and socket (open-stream-p stream))
+          (setf (sb-bsd-sockets:non-blocking-mode socket) mode)
+          t))))
+
+  (defun %network-close-accepted-stream (stream &key (abort t))
+    (if abort
+        (let ((closed-under-lock-p nil))
+          (sb-thread:with-mutex (*network-stream-sockets-lock*)
+            (when (gethash stream *network-stream-sockets*)
+              (setf closed-under-lock-p t)
+              (close stream :abort t)))
+          (unless closed-under-lock-p
+            (close stream :abort t)))
+        (close stream :abort nil))
+    nil)
+
+  (defun %network-call-with-accepted-stream-socket-non-blocking-mode
+      (stream thunk)
+    (let ((mode-enabled-p nil)
+          (previous-mode nil))
+      (sb-thread:with-mutex (*network-stream-sockets-lock*)
+        (let ((socket (gethash stream *network-stream-sockets*)))
+          (when (and socket (open-stream-p stream))
+            (setf previous-mode
+                  (sb-bsd-sockets:non-blocking-mode socket))
+            (setf (sb-bsd-sockets:non-blocking-mode socket) t)
+            (setf mode-enabled-p t))))
+      (if mode-enabled-p
+          (unwind-protect
+               (funcall thunk)
+            (%network-set-accepted-stream-socket-non-blocking-mode
+             stream previous-mode))
+          (funcall thunk))))
+
   (defun %network-shutdown-socket (socket)
     (when socket
       (handler-case
@@ -504,6 +542,10 @@ perform TLS or proxy negotiation."
 (defun close-http-tcp-stream (stream)
   "Close a stream returned by OPEN-HTTP-TCP-STREAM."
   (when stream
+    #+sbcl
+    (http-kit::%with-http-cleanup
+      (%network-close-accepted-stream stream :abort t))
+    #-sbcl
     (http-kit::%with-http-cleanup
       (close stream :abort t)))
   nil)
