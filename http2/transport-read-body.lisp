@@ -132,7 +132,8 @@ Content-Length without rescanning a non-collecting response body."
 
 (defun %h2-append-data-frame*
     (frame status body body-length request-method max-body-bytes
-     on-body-chunk collect-body-p expected-stream-id)
+     on-body-chunk collect-body-p expected-stream-id
+     &optional on-response-complete)
   (%h2-validate-response-stream-id (%h2-frame-stream-id frame)
                                    (%h2-frame-type frame)
                                    expected-stream-id)
@@ -148,18 +149,22 @@ Content-Length without rescanning a non-collecting response body."
            :detail (list request-method status)))
   (let* ((flow-controlled-length (length (%h2-frame-payload frame)))
          (payload (%h2-data-payload frame))
-         (new-body-length (+ body-length (length payload))))
+         (new-body-length (+ body-length (length payload)))
+         (end-stream-p
+           (/= 0 (logand (%h2-frame-flags frame)
+                         +http2-end-stream-flag+))))
     (http-kit::%check-limit :body
                             new-body-length
                             max-body-bytes)
     (when collect-body-p
       (loop for octet across payload
             do (vector-push-extend octet body)))
+    (when (and end-stream-p on-response-complete)
+      ;; Record completion before user code can cancel the request.
+      (funcall on-response-complete))
     (when (and on-body-chunk (plusp (array-total-size payload)))
       (funcall on-body-chunk payload))
-    (values (/= 0 (logand (%h2-frame-flags frame) +http2-end-stream-flag+))
-            new-body-length
-            flow-controlled-length)))
+    (values end-stream-p new-body-length flow-controlled-length)))
 
 (defun %h2-append-data-frame (frame status body &rest arguments)
   "Append a DATA frame, accepting both the legacy and streaming call forms.
@@ -183,6 +188,14 @@ same framing checks while the response reader tracks flow-control bytes."
             frame status body
             (first arguments) (second arguments) (third arguments)
             (fourth arguments) (fifth arguments) (list (sixth arguments))))
+    ((and (= (length arguments) 7)
+          (or (null (seventh arguments))
+              (functionp (seventh arguments))))
+     (apply #'%h2-append-data-frame*
+            frame status body
+            (first arguments) (second arguments) (third arguments)
+            (fourth arguments) (fifth arguments)
+            (list (sixth arguments) (seventh arguments))))
     (t
      (error 'http-kit:http-protocol-error
             :message "Invalid HTTP/2 DATA append arguments."

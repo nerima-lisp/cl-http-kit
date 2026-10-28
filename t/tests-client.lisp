@@ -292,6 +292,20 @@
                       (lambda (&rest arguments)
                         (declare (ignore arguments))))))
 
+
+(deftest client-configures-max-http2-concurrent-streams
+  (ensure-equal
+   100
+   (http-client-max-http2-concurrent-streams (make-http-client)))
+  (ensure-equal
+   12
+   (http-client-max-http2-concurrent-streams
+    (make-http-client :max-http2-concurrent-streams 12)))
+  (signals http-protocol-error
+    (make-http-client :max-http2-concurrent-streams 0))
+  (signals http-protocol-error
+    (make-http-client :max-http2-concurrent-streams "invalid")))
+
 (deftest client-challenge-authentication-requires-replayable-body
   (let ((calls 0)
         (provider-calls 0))
@@ -638,6 +652,40 @@
                     (http-header-value
                      (http-request-headers effective-request)
                      "Accept-Encoding")))))
+(deftest client-send-rejects-invalid-cancellation-token
+  (let* ((transport-calls 0)
+         (client
+           (make-http-client
+            :cache nil
+            :transport-function
+            (lambda (request &key &allow-other-keys)
+              (declare (ignore request))
+              (incf transport-calls)
+              (client-test-response 200))))
+         (caught
+           (handler-case
+               (progn
+                 (http-client-send
+                  client "GET" "http://example.test/invalid-cancel-token"
+                  :cancel-token :invalid)
+                 nil)
+             (http-protocol-error (condition) condition))))
+    (ensure-true caught)
+    (ensure-equal :client (http-error-operation caught))
+    (ensure-equal :invalid (http-protocol-error-detail caught))
+    (ensure-equal 0 transport-calls)))
+
+(deftest client-cancel-request-rejects-invalid-token
+  (let ((caught
+          (handler-case
+              (progn
+                (http-client-cancel-request :invalid)
+                nil)
+            (http-protocol-error (condition)
+              condition))))
+    (ensure-true caught)
+    (ensure-equal :client (http-error-operation caught))
+    (ensure-equal :invalid (http-protocol-error-detail caught))))
 
 (deftest client-multipart-parser-round-trip
   (multiple-value-bind (body content-type)
@@ -1709,6 +1757,173 @@
       (ensure-equal 1 http3-calls)
       (ensure-equal 1 producer-calls)
       (ensure-equal (if (eq body-kind :factory) 1 0) factory-calls))))
+(deftest client-alt-svc-active-cancellation-token-allows-pre-send-fallback
+  (let* ((http3-calls 0)
+         (tcp-calls 0)
+         (token (make-http-cancellation-token))
+         (client
+           (make-http-client
+            :cache nil
+            :transport-function
+            (lambda (request &key &allow-other-keys)
+              (declare (ignore request))
+              (incf tcp-calls)
+              (client-test-response 200))
+            :http3-transport-function
+            (lambda (request &key &allow-other-keys)
+              (declare (ignore request))
+              (incf http3-calls)
+              (error 'http-connection-error
+                     :message "synthetic pre-send failure"
+                     :request-sent-p nil)))))
+    (http-alternative-service-store-note-response
+     (http-client-alternative-service-store client)
+     "https://example.test/"
+     (client-test-response
+      200 :headers (list (make-http-header "Alt-Svc" "h3=\":443\"; ma=60"))))
+    (ensure-equal
+     200
+     (http-response-status
+      (http-client-send client "GET" "https://example.test/"
+                        :cancel-token token)))
+    (ensure-equal 1 http3-calls)
+    (ensure-equal 1 tcp-calls)))
+
+(deftest client-transport-rejects-invalid-cancel-handler
+  (let* ((token (make-http-cancellation-token))
+         (transport-returned-p nil)
+         (client
+           (make-http-client
+            :cache nil
+            :transport-function
+            (lambda (request &key on-cancel &allow-other-keys)
+              (declare (ignore request))
+              (funcall on-cancel :invalid)
+              (setf transport-returned-p t)
+              (client-test-response 200))))
+         (caught
+           (handler-case
+               (progn
+                 (http-client-send
+                  client "GET" "http://example.test/invalid-cancel-handler"
+                  :cancel-token token)
+                 nil)
+             (http-protocol-error (condition)
+               condition))))
+    (ensure-true caught)
+    (ensure-equal :client (http-error-operation caught))
+    (ensure-equal :invalid (http-protocol-error-detail caught))
+    (ensure-false transport-returned-p)))
+
+(deftest client-alt-svc-cancelled-token-suppresses-pre-send-fallback
+  (let* ((http3-calls 0)
+         (tcp-calls 0)
+         (token (make-http-cancellation-token))
+         (client
+           (make-http-client
+            :cache nil
+            :transport-function
+            (lambda (request &key &allow-other-keys)
+              (declare (ignore request))
+              (incf tcp-calls)
+              (client-test-response 200))
+            :http3-transport-function
+            (lambda (request &key on-cancel &allow-other-keys)
+              (declare (ignore request))
+              (incf http3-calls)
+              (funcall on-cancel (lambda () nil))
+              (ensure-true (http-client-cancel-request token))
+              (error
+               (make-condition
+                (quote http-connection-error)
+                :message "synthetic pre-send failure"
+                :request-sent-p nil))))))
+    (http-alternative-service-store-note-response
+     (http-client-alternative-service-store client)
+     "https://example.test/"
+     (client-test-response
+      200 :headers (list (make-http-header "Alt-Svc" "h3=\":443\"; ma=60"))))
+    (let ((condition
+            (handler-case
+                (progn
+                  (http-client-send client "GET" "https://example.test/"
+                                    :cancel-token token)
+                  nil)
+              (http-client-request-cancelled (condition)
+                condition))))
+      (ensure-true condition))
+    (ensure-equal 1 http3-calls)
+    (ensure-equal 0 tcp-calls)))
+
+(deftest client-cancellation-registration-after-cancel-runs-handler
+  (let* ((token (make-http-cancellation-token))
+         (cancel-handler-calls 0)
+         (client
+           (make-http-client
+            :cache nil
+            :transport-function
+            (lambda (request &key on-cancel &allow-other-keys)
+              (declare (ignore request))
+              (ensure-true (http-client-cancel-request token))
+              (funcall on-cancel
+                       (lambda ()
+                         (incf cancel-handler-calls)))
+              (client-test-response 200))))
+         (caught
+           (handler-case
+               (progn
+                 (http-client-send
+                  client "GET" "http://example.test/late-cancel-handler"
+                  :cancel-token token)
+                 nil)
+             (http-client-request-cancelled (condition)
+               condition))))
+    (ensure-true caught)
+    (ensure-equal 1 cancel-handler-calls)
+    (ensure-false (http-client-cancel-request token))))
+
+(deftest client-cancel-request-runs-all-handlers-after-failure
+  (let* ((token (make-http-cancellation-token))
+         (failing-handler-calls 0)
+         (active-handler-calls 0)
+         (unregistered-handler-calls 0)
+         (client
+           (make-http-client
+            :cache nil
+            :transport-function
+            (lambda (request &key on-cancel &allow-other-keys)
+              (declare (ignore request))
+              (let ((unregister
+                      (funcall
+                       on-cancel
+                       (lambda ()
+                         (incf unregistered-handler-calls)))))
+                (funcall
+                 on-cancel
+                 (lambda ()
+                   (incf active-handler-calls)))
+                (funcall
+                 on-cancel
+                 (lambda ()
+                   (incf failing-handler-calls)
+                   (funcall unregister)
+                   (error "cancel handler failed")))
+                (http-client-cancel-request token)
+                (client-test-response 200)))))
+         (caught
+           (handler-case
+               (progn
+                 (http-client-send
+                  client "GET" "http://example.test/cancel-handler-failure"
+                  :cancel-token token)
+                 nil)
+             (simple-error (condition)
+               condition))))
+    (ensure-true caught)
+    (ensure-equal 1 failing-handler-calls)
+    (ensure-equal 1 active-handler-calls)
+    (ensure-equal 0 unregistered-handler-calls)
+    (ensure-false (http-client-cancel-request token))))
 
 (deftest client-alt-svc-connect-timeout-preserves-producer-and-deadline
   (dolist (body-kind '(:producer :factory))
@@ -2953,6 +3168,28 @@
                       (http-uri-string
                        (http-request-uri effective-request))))
       (ensure-equal 0 calls))))
+(deftest client-only-if-cached-without-cache-preserves-effective-request
+  (let* ((calls 0)
+        (client
+          (make-http-client
+           :cache nil
+           :transport-function
+           (lambda (request &key &allow-other-keys)
+             (declare (ignore request))
+             (incf calls)
+             (client-test-response 200))))
+        (request
+          (http-client-request
+           client "GET" "http://example.test/missing-without-cache"
+           :headers (list (make-http-header
+                           "Cache-Control" "only-if-cached")))))
+    (multiple-value-bind (response effective-request)
+        (http-client-send client request)
+      (ensure-equal 504 (http-response-status response))
+      (ensure-equal "http://example.test/missing-without-cache"
+                    (http-uri-string
+                     (http-request-uri effective-request))))
+    (ensure-equal 0 calls)))
 
 (deftest client-cache-forwards-existing-request-preconditions
   (dolist (precondition
@@ -3080,6 +3317,67 @@
     (ensure-equal 1 calls)
     (ensure-equal :fresh
                   (nth-value 1 (http-cache-lookup cache request :now now)))))
+(deftest client-cache-304-callback-sees-only-merged-response
+  (let* ((now 1000)
+         (transport-calls 0)
+         (callback-count 0)
+         (callback-status nil)
+         (callback-etag nil)
+         (cache (make-http-cache :clock-function (lambda () now)))
+         (client
+           (make-http-client
+            :cache cache
+            :automatic-decompression-p nil
+            :transport-function
+            (lambda (request &key on-response-headers &allow-other-keys)
+              (incf transport-calls)
+              (ensure-equal
+               "\"v1\""
+               (http-header-value (http-request-headers request)
+                                  "If-None-Match"))
+              (let ((response
+                      (client-test-response
+                       304 :headers
+                       (list (make-http-header
+                              "Cache-Control" "max-age=60")
+                             (make-http-header "ETag" "\"v1\"")))))
+                (funcall on-response-headers
+                         304 (http-response-headers response))
+                response))))
+         (request
+           (http-client-request client "GET"
+                                "http://example.test/304-callback"))
+         (stale-entry nil))
+    (http-cache-store
+     cache request
+     (client-test-response
+      200
+      :headers (list (make-http-header "Cache-Control" "max-age=0")
+                     (make-http-header "ETag" "\"v1\"")
+                     (make-http-header "Content-Type" "text/plain"))
+      :body (ascii "cached"))
+     :now now)
+    (setf now 1001)
+    (multiple-value-bind (cached-response state entry)
+        (http-cache-lookup cache request :now now)
+      (declare (ignore cached-response))
+      (ensure-equal :stale state)
+      (setf stale-entry entry))
+    (let ((response
+            (http-client-send
+             client request
+             :cache-revalidation-entry stale-entry
+             :on-response-headers
+             (lambda (status headers)
+               (incf callback-count)
+               (setf callback-status status
+                     callback-etag (http-header-value headers "ETag"))))))
+      (ensure-equal 200 (http-response-status response))
+      (ensure-equal "cached" (octets-as-string (http-response-body response))))
+    (ensure-equal 1 transport-calls)
+    (ensure-equal 1 callback-count)
+    (ensure-equal 200 callback-status)
+    (ensure-equal "\"v1\"" callback-etag)))
 
 (deftest client-cache-request-no-cache-suppresses-stale-while-revalidate
   (let* ((now 2000)
@@ -3206,6 +3504,54 @@
      "cached-after-connection-error"
      (octets-as-string
       (http-response-body (http-client-send client request))))))
+(deftest client-cache-stale-if-error-delivers-headers-before-response
+  (let* ((now 4000)
+         (events nil)
+         (uri "http://example.test/stale-headers-on-error")
+         (cache (make-http-cache :clock-function (lambda () now)))
+         (client
+           (make-http-client
+            :cache cache
+            :retry-policy
+            (make-http-retry-policy :retry-on-connection-error-p nil)
+            :on-response
+            (lambda (response request attempt)
+              (declare (ignore request attempt))
+              (push (list :response
+                          (http-response-status response)
+                          (octets-as-string (http-response-body response)))
+                    events))
+            :transport-function
+            (lambda (request &key &allow-other-keys)
+              (declare (ignore request))
+              (error 'http-connection-error :message "unavailable"))))
+         (request (http-client-request client "GET" uri)))
+    (http-cache-store
+     cache request
+     (client-test-response
+      200
+      :headers (list (make-http-header
+                      "Cache-Control" "max-age=1, stale-if-error=10")
+                     (make-http-header "Content-Type" "text/plain"))
+      :body (ascii "cached"))
+     :now now)
+    (setf now 4002)
+    (multiple-value-bind (response effective-request)
+        (http-client-send
+         client request
+         :on-response-headers
+         (lambda (status headers)
+           (push (list :headers
+                       status
+                       (http-header-value headers "Content-Type"))
+                 events)))
+      (declare (ignore effective-request))
+      (ensure-equal 200 (http-response-status response))
+      (ensure-equal "cached"
+                    (octets-as-string (http-response-body response))))
+    (ensure-equal '((:headers 200 "text/plain")
+                    (:response 200 "cached"))
+                  (reverse events))))
 
 (deftest client-redirects-and-hooks
   (let ((calls 0)
@@ -4539,6 +4885,198 @@
     (ensure-true closed)))
 
 #+sbcl
+(deftest client-response-headers-precede-body-chunks
+  (let* ((stream
+           (make-instance
+            'binary-test-stream
+            :input
+            (ascii "HTTP/1.1 200 OK|CRLF|Content-Length: 3|CRLF||CRLF|abc")))
+         (events nil)
+         (client
+           (make-http-client
+            :cache nil
+            :open-stream
+            (lambda (request &key timeout deadline &allow-other-keys)
+              (declare (ignore request timeout deadline))
+              stream)
+            :close-stream (lambda (closed-stream)
+                            (ensure-equal stream closed-stream)))))
+    (multiple-value-bind (response effective)
+        (http-client-send
+         client "GET" "http://example.test/stream"
+         :on-response-headers
+         (lambda (status headers)
+           (push (list :headers status
+                       (http-header-value headers "Content-Length"))
+                 events))
+         :on-body-chunk
+         (lambda (chunk)
+           (push (list :body (octets-as-string chunk)) events))
+         :collect-body-p nil)
+      (declare (ignore effective))
+      (ensure-equal 200 (http-response-status response))
+      (ensure-equal '((:headers 200 "3") (:body "abc"))
+                    (reverse events)))))
+
+#+sbcl
+(deftest client-cancel-from-response-headers-skips-body
+  (let* ((body-start-position
+           (length
+            (ascii "HTTP/1.1 401 Unauthorized|CRLF|Content-Length: 3|CRLF||CRLF|")))
+         (stream
+           (make-instance
+            'binary-test-stream
+            :input
+            (ascii "HTTP/1.1 401 Unauthorized|CRLF|Content-Length: 3|CRLF||CRLF|bad")))
+         (token (make-http-cancellation-token))
+         (header-status nil)
+         (body-callback-called-p nil)
+         (close-count 0)
+         (client
+           (make-http-client
+            :cache nil
+            :open-stream
+            (lambda (request &key timeout deadline &allow-other-keys)
+              (declare (ignore request timeout deadline))
+              stream)
+            :close-stream
+            (lambda (closed-stream)
+              (ensure-equal stream closed-stream)
+              (incf close-count))))
+         (condition
+           (handler-case
+               (progn
+                 (http-client-send
+                  client "GET" "http://example.test/unauthorized"
+                  :cancel-token token
+                  :on-response-headers
+                  (lambda (status headers)
+                    (declare (ignore headers))
+                    (setf header-status status)
+                    (ensure-true (http-client-cancel-request token)))
+                  :on-body-chunk
+                  (lambda (chunk)
+                    (declare (ignore chunk))
+                    (setf body-callback-called-p t)))
+                 nil)
+             (http-client-request-cancelled (cancelled)
+               cancelled))))
+    (ensure-equal 401 header-status)
+    (ensure-true (typep condition 'http-client-request-cancelled))
+    (ensure-false body-callback-called-p)
+    (ensure-equal body-start-position
+                  (http-kit/test-core::binary-test-input-position stream))
+    (ensure-equal 1 close-count)
+    (ensure-false (http-client-cancel-request token))))
+
+#+sbcl
+(progn
+  (defclass blocking-client-cancellation-stream (binary-test-stream)
+    ((read-started
+       :initarg :read-started
+       :reader blocking-client-cancellation-stream-read-started)
+     (release-read
+       :initarg :release-read
+       :reader blocking-client-cancellation-stream-release-read)
+     (closed-p
+       :initform nil
+       :accessor blocking-client-cancellation-stream-closed-p)))
+
+  (defun %blocking-client-cancellation-stream-wait (stream)
+    (unless (blocking-client-cancellation-stream-closed-p stream)
+      (sb-thread:signal-semaphore
+       (blocking-client-cancellation-stream-read-started stream))
+      (sb-thread:wait-on-semaphore
+       (blocking-client-cancellation-stream-release-read stream)))
+    stream)
+
+  (defmethod sb-gray:stream-read-byte
+      ((stream blocking-client-cancellation-stream))
+    (let ((position
+            (http-kit/test-core::binary-test-input-position stream))
+          (input (http-kit/test-core::binary-test-input stream)))
+      (if (< position (length input))
+          (call-next-method)
+          (progn
+            (%blocking-client-cancellation-stream-wait stream)
+            :eof))))
+
+  (defmethod sb-gray:stream-read-sequence
+      ((stream blocking-client-cancellation-stream) sequence
+       &optional (start 0) end)
+    (let* ((end (or end (length sequence)))
+           (position
+             (http-kit/test-core::binary-test-input-position stream))
+           (input (http-kit/test-core::binary-test-input stream)))
+      (cond ((or (= start end) (< position (length input)))
+               (call-next-method))
+            (t
+             (%blocking-client-cancellation-stream-wait stream)
+             start))))
+
+  (deftest client-cancel-closes-blocked-stream-and-exits-worker
+    (let* ((read-started (sb-thread:make-semaphore :count 0))
+           (release-read (sb-thread:make-semaphore :count 0))
+           (stream
+             (make-instance
+              'blocking-client-cancellation-stream
+              :read-started read-started
+              :release-read release-read
+              :input
+              (ascii "HTTP/1.1 200 OK|CRLF|Content-Length: 1|CRLF||CRLF|")))
+           (token (make-http-cancellation-token))
+           (worker-done (sb-thread:make-semaphore :count 0))
+           (close-count 0)
+           (body-callback-called-p nil)
+           (cancel-condition nil)
+           (worker
+             (sb-thread:make-thread
+              (lambda ()
+                (unwind-protect
+                     (handler-case
+                         (http-client-send
+                          (make-http-client
+                           :cache nil
+                           :open-stream
+                           (lambda (request &key timeout deadline &allow-other-keys)
+                             (declare (ignore request timeout deadline))
+                             stream)
+                           :close-stream
+                           (lambda (closed-stream)
+                             (ensure-equal stream closed-stream)
+                             (incf close-count)
+                             (setf (blocking-client-cancellation-stream-closed-p
+                                    stream)
+                                   t)
+                             (sb-thread:signal-semaphore release-read)))
+                          "GET" "http://example.test/blocked"
+                          :cancel-token token
+                          :on-body-chunk
+                          (lambda (chunk)
+                            (declare (ignore chunk))
+                            (setf body-callback-called-p t)))
+                       (http-client-request-cancelled (condition)
+                         (setf cancel-condition condition)))
+                  (sb-thread:signal-semaphore worker-done))))))
+      (unwind-protect
+           (progn
+             (let ((read-started-p
+                     (sb-thread:wait-on-semaphore read-started :timeout 5)))
+               (ensure-true read-started-p)
+               (ensure-true (http-client-cancel-request token))
+               (ensure-false (http-client-cancel-request token)))
+             (ensure-true
+              (sb-thread:wait-on-semaphore worker-done :timeout 5))
+             (sb-thread:join-thread worker :timeout 5)
+             (ensure-true
+              (typep cancel-condition 'http-client-request-cancelled))
+             (ensure-equal 1 close-count)
+             (ensure-false body-callback-called-p))
+        (setf (blocking-client-cancellation-stream-closed-p stream) t)
+        (sb-thread:signal-semaphore release-read)
+        (sb-thread:join-thread worker :timeout 5)))))
+
+#+sbcl
 (deftest client-informational-response-over-direct-stream
   (let* ((stream
            (make-instance
@@ -4547,6 +5085,7 @@
             (ascii
              "HTTP/1.1 100 Continue|CRLF||CRLF|HTTP/1.1 200 OK|CRLF|Content-Length: 2|CRLF||CRLF|ok")))
          (statuses nil)
+         (response-header-statuses nil)
          (closed nil)
          (client
            (make-http-client
@@ -4571,11 +5110,16 @@
           :body "abc")
          :on-information
          (lambda (information)
-           (push (http-response-status information) statuses)))
+           (push (http-response-status information) statuses))
+         :on-response-headers
+         (lambda (status headers)
+           (declare (ignore headers))
+           (push status response-header-statuses)))
       (declare (ignore effective))
       (ensure-equal 200 (http-response-status response))
       (ensure-equal "ok" (octets-as-string (http-response-body response))))
     (ensure-equal '(100) (reverse statuses))
+    (ensure-equal '(200) (reverse response-header-statuses))
     (ensure-true closed)
     (ensure-equal
      (ascii
@@ -5110,6 +5654,9 @@
   (let ((calls 0)
         (seen-if-none-match nil)
         (seen-bodies nil)
+        (revalidation-events nil)
+        (revalidation-status nil)
+        (revalidation-headers nil)
         (now 1000))
     (with-test-client (client
                        (lambda (request &key proxy-plan &allow-other-keys)
@@ -5142,10 +5689,37 @@
           (ensure-equal request effective))
         (setf now 1001)
         (multiple-value-bind (response effective)
-            (http-client-send client request)
+            (http-client-send
+             client request
+             :on-response-headers
+             (lambda (status headers)
+               (setf revalidation-status status
+                     revalidation-headers headers)
+               (push (list :headers status) revalidation-events))
+             :on-body-chunk
+             (lambda (chunk)
+               (push (list :body (octets-as-string chunk))
+                     revalidation-events)))
           (ensure-equal 200 (http-response-status response))
           (ensure-equal request effective)
-          (ensure-equal "cached" (octets-as-string (http-response-body response))))
+          (ensure-equal "cached" (octets-as-string (http-response-body response)))
+          (ensure-equal (http-response-status response) revalidation-status)
+          (ensure-equal
+           (mapcar (lambda (header)
+                     (cons (http-header-name header)
+                           (http-header-content header)))
+                   (http-response-headers response))
+           (mapcar (lambda (header)
+                     (cons (http-header-name header)
+                           (http-header-content header)))
+                   revalidation-headers))
+          (ensure-equal "\"v1\""
+                        (http-header-value revalidation-headers "ETag"))
+          (ensure-equal "\"v1\""
+                        (http-header-value (http-response-headers response)
+                                           "ETag"))
+          (ensure-equal '((:headers 200) (:body "cached"))
+                        (reverse revalidation-events)))
         (ensure-equal "\"v1\"" seen-if-none-match)
         (setf now 1002)
         (multiple-value-bind (response effective)
@@ -7363,3 +7937,195 @@
       (ensure-equal left-origin (http-uri-origin left))
       (ensure-equal right-origin (http-uri-origin right))
       (ensure-equal same-p (not (null (http-same-origin-p left right)))))))
+#+sbcl
+(deftest client-cancellation-unregister-waits-for-running-handler
+  (let* ((transport-entered (sb-thread:make-semaphore :count 0))
+         (release-transport (sb-thread:make-semaphore :count 0))
+         (handler-started (sb-thread:make-semaphore :count 0))
+         (release-handler (sb-thread:make-semaphore :count 0))
+         (cleanup-started (sb-thread:make-semaphore :count 0))
+         (cleanup-finished (sb-thread:make-semaphore :count 0))
+         (worker-finished (sb-thread:make-semaphore :count 0))
+         (cancel-finished (sb-thread:make-semaphore :count 0))
+         (token (make-http-cancellation-token))
+         (cleanup-returned-p nil)
+         (worker-condition nil)
+         (cancel-result nil)
+         (cancel-error nil)
+         (worker
+           (sb-thread:make-thread
+            (lambda ()
+              (unwind-protect
+                   (handler-case
+                       (http-client-send
+                        (make-http-client
+                         :cache nil
+                         :transport-function
+                         (lambda (request &key on-cancel &allow-other-keys)
+                           (declare (ignore request))
+                           (let ((unregister
+                                   (funcall
+                                    on-cancel
+                                    (lambda ()
+                                      (sb-thread:signal-semaphore handler-started)
+                                      (sb-thread:wait-on-semaphore
+                                       release-handler)))))
+                             (unwind-protect
+                                  (progn
+                                    (sb-thread:signal-semaphore transport-entered)
+                                    (sb-thread:wait-on-semaphore release-transport)
+                                    (client-test-response 200))
+                               (sb-thread:signal-semaphore cleanup-started)
+                               (funcall unregister)
+                               (setf cleanup-returned-p t)
+                               (sb-thread:signal-semaphore cleanup-finished)))))
+                        "GET" "http://example.test/cancel-cleanup"
+                        :cancel-token token)
+                     (http-client-request-cancelled (condition)
+                       (setf worker-condition condition))
+                     (error (condition)
+                       (setf worker-condition condition)))
+                (sb-thread:signal-semaphore worker-finished)))))
+         (cancel-thread nil))
+    (unwind-protect
+         (progn
+           (ensure-true
+            (sb-thread:wait-on-semaphore transport-entered :timeout 5))
+           (setf cancel-thread
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (unwind-protect
+                         (handler-case
+                             (setf cancel-result
+                                   (http-client-cancel-request token))
+                           (error (condition)
+                             (setf cancel-error condition)))
+                      (sb-thread:signal-semaphore cancel-finished)))))
+           (ensure-true
+            (sb-thread:wait-on-semaphore handler-started :timeout 5))
+           (sb-thread:signal-semaphore release-transport)
+           (ensure-true
+            (sb-thread:wait-on-semaphore cleanup-started :timeout 5))
+           (ensure-false
+            (sb-thread:wait-on-semaphore cleanup-finished :timeout 0.05))
+           (sb-thread:signal-semaphore release-handler)
+           (ensure-true
+            (sb-thread:wait-on-semaphore cleanup-finished :timeout 5))
+           (ensure-true
+            (sb-thread:wait-on-semaphore cancel-finished :timeout 5))
+           (ensure-true
+            (sb-thread:wait-on-semaphore worker-finished :timeout 5))
+           (sb-thread:join-thread cancel-thread :timeout 5)
+           (sb-thread:join-thread worker :timeout 5)
+           (ensure-true (typep worker-condition
+                               'http-client-request-cancelled))
+           (ensure-true cancel-result)
+           (ensure-false cancel-error)
+           (ensure-true cleanup-returned-p))
+      (sb-thread:signal-semaphore release-transport)
+      (sb-thread:signal-semaphore release-handler)
+      (when cancel-thread
+        (sb-thread:join-thread cancel-thread :timeout 5))
+      (sb-thread:join-thread worker :timeout 5))))
+
+#+sbcl
+(progn
+  (defclass blocking-client-upload-stream (binary-test-stream)
+    ((write-started
+       :initarg :write-started
+       :reader blocking-client-upload-stream-write-started)
+     (release-write
+       :initarg :release-write
+       :reader blocking-client-upload-stream-release-write)
+     (upload-started-p
+       :initform nil
+       :accessor blocking-client-upload-stream-upload-started-p)
+     (closed-p
+       :initform nil
+       :accessor blocking-client-upload-stream-closed-p)))
+
+  (defmethod sb-gray:stream-write-sequence
+      ((stream blocking-client-upload-stream) sequence
+       &optional (start 0) end)
+    (if (blocking-client-upload-stream-upload-started-p stream)
+        (progn
+          (sb-thread:signal-semaphore
+           (blocking-client-upload-stream-write-started stream))
+          (unless (sb-thread:wait-on-semaphore
+                   (blocking-client-upload-stream-release-write stream)
+                   :timeout 5)
+            (error "Timed out waiting for upload cancellation."))
+          (when (blocking-client-upload-stream-closed-p stream)
+            (error "The HTTP test stream was closed during upload."))
+          (call-next-method))
+        (call-next-method)))
+
+  (deftest client-cancel-interrupts-streaming-upload
+    (let* ((write-started (sb-thread:make-semaphore :count 0))
+           (release-write (sb-thread:make-semaphore :count 0))
+           (stream
+             (make-instance
+              'blocking-client-upload-stream
+              :write-started write-started
+              :release-write release-write
+              :input
+              (ascii "HTTP/1.1 200 OK|CRLF|Content-Length: 0|CRLF||CRLF|")))
+           (token (make-http-cancellation-token))
+           (worker-done (sb-thread:make-semaphore :count 0))
+           (produced-chunks 0)
+           (close-count 0)
+           (request-condition nil)
+           (client
+             (make-http-client
+              :cache nil
+              :open-stream
+              (lambda (request &key timeout deadline &allow-other-keys)
+                (declare (ignore request timeout deadline))
+                stream)
+              :close-stream
+              (lambda (closed-stream)
+                (ensure-equal stream closed-stream)
+                (incf close-count)
+                (setf (blocking-client-upload-stream-closed-p stream) t)
+                (sb-thread:signal-semaphore release-write))))
+           (worker
+             (sb-thread:make-thread
+              (lambda ()
+                (unwind-protect
+                     (handler-case
+                         (http-client-send
+                          client "POST" "http://example.test/upload"
+                          :cancel-token token
+                          :request-body-length 8
+                          :request-body-function
+                          (lambda (limit)
+                            (ensure-equal 65536 limit)
+                            (incf produced-chunks)
+                            (setf
+                             (blocking-client-upload-stream-upload-started-p
+                              stream)
+                             t)
+                            (if (<= produced-chunks 2)
+                                (octets 1 2 3 4)
+                                nil)))
+                       (http-client-request-cancelled (condition)
+                         (setf request-condition condition))
+                       (error (condition)
+                         (setf request-condition condition)))
+                  (sb-thread:signal-semaphore worker-done))))))
+      (unwind-protect
+           (progn
+             (ensure-true
+              (sb-thread:wait-on-semaphore write-started :timeout 5))
+             (ensure-true (http-client-cancel-request token))
+             (ensure-false (http-client-cancel-request token))
+             (ensure-true
+              (sb-thread:wait-on-semaphore worker-done :timeout 5))
+             (sb-thread:join-thread worker :timeout 5)
+             (ensure-true
+              (typep request-condition 'http-client-request-cancelled))
+             (ensure-equal 1 produced-chunks)
+             (ensure-equal 1 close-count))
+        (setf (blocking-client-upload-stream-closed-p stream) t)
+        (sb-thread:signal-semaphore release-write)
+        (sb-thread:join-thread worker :timeout 5)))))

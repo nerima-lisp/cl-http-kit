@@ -562,13 +562,13 @@ huffman-p)`.
 ### Reusable HTTP/2 connections
 
 `make-http2-connection (&key stream close-stream max-frame-size
-max-header-bytes max-fields max-body-bytes max-control-frames
-max-control-window clock-function)` creates a connection over an already
-negotiated binary stream.
+max-header-bytes max-fields max-concurrent-streams max-body-bytes
+max-control-frames max-control-window max-pending-information-callbacks
+clock-function)` creates a connection over an already negotiated binary stream.
 `send-http2-request-over-connection (connection request &key timeout deadline
 max-header-bytes max-fields max-body-bytes clock-function
 request-body-function request-body-length on-body-chunk on-information
-on-stream-open collect-body-p huffman-p)` sends one request.
+on-response-headers on-stream-open collect-body-p huffman-p)` sends one request.
 `send-http2-requests-over-connection (connection requests &key timeout deadline
 max-header-bytes max-fields max-body-bytes clock-function
 request-body-functions request-body-lengths on-body-chunk collect-body-p
@@ -576,7 +576,7 @@ huffman-p)` multiplexes a non-empty batch. The CPS signatures are
 `send-http2-request-over-connection/cps (connection request on-success &key
 on-error timeout deadline max-header-bytes max-fields max-body-bytes
 clock-function request-body-function request-body-length on-body-chunk
-on-stream-open collect-body-p huffman-p)` and
+on-response-headers on-stream-open collect-body-p huffman-p)` and
 `send-http2-requests-over-connection/cps (connection requests on-success &key
 on-error timeout deadline max-header-bytes max-fields max-body-bytes
 clock-function request-body-functions request-body-lengths on-body-chunk
@@ -587,6 +587,31 @@ connection to the high-level client transport protocol.
 `http2-client-connection (client)` returns the reusable connection owned by a
 stream-backed client, when present. These functions accept `max-fields`; the
 default per decoded header or trailer section is 256.
+
+`max-concurrent-streams` must be a positive integer and defaults to 100. It
+caps active client request streams on this connection. The cap applies when the
+peer has not advertised
+`SETTINGS_MAX_CONCURRENT_STREAMS`; a lower peer limit also constrains stream
+admission. A batch larger than the effective limit runs in successive waves
+under the same deadline. A single request waits for an active stream slot when
+the effective limit is full; its deadline and cancellation token remain active
+while it waits.
+
+On SBCL, when `collect-body-p` is NIL and `on-body-chunk` is supplied, the
+scheduler returns connection-level flow-control credit after it receives and
+queues each callback payload, without waiting for delivery. For nonterminal
+payloads, it holds that stream's credit until the callback completes, so a slow
+callback applies backpressure to its stream while other scheduled streams can
+continue. When body collection is enabled, callback events refer to ranges in
+the collected body vector; collected response storage remains bounded by
+`max-body-bytes`. On other implementations, the serial reader invokes the
+callback while processing DATA, then returns connection-level credit and, for
+nonterminal DATA, stream-level credit.
+
+`max-pending-information-callbacks` sets the per-stream limit for unfinished
+informational response callbacks, including queued and running callbacks. It
+defaults to 16. If another informational response would exceed the limit, that
+stream fails with a stream error.
 
 `cancel-http2-stream` emits `RST_STREAM` for an opened client stream.
 `ping-http2-connection` sends a PING and waits for the matching acknowledgement.
@@ -652,12 +677,13 @@ toward that limit, so the total number of open connections can exceed it. On
 SBCL, the manager synchronizes its entry state for concurrent callers. Ordinary
 single-request calls with the same key can share one retained connection; its
 scheduler assigns distinct stream IDs and observes the peer's concurrent-stream
-and flow-control limits. A batch call holds an exclusive lease on its selected
-connection. A concurrent call that cannot share an active entry uses a
-request-scoped connection.
-There is no separate cap on total open connections. Enforcing one would require
-the manager to define how concurrent calls wait or fail when all sockets are in
-use, so `max-connections` remains a retained-cache limit.
+and flow-control limits together with that connection's local
+`max-concurrent-streams` cap. A batch call holds an exclusive lease on its
+selected connection and runs in waves if it exceeds the effective stream limit.
+A concurrent call that cannot share an active entry uses a request-scoped
+connection. The manager does not set a stream limit itself: `open-connection`
+must construct each returned connection with its desired
+`max-concurrent-streams` value.
 By default, the cache key includes the request scheme, host, port, proxy plan,
 and proxy.
 Supplying `connection-key` to a send function replaces that default; keys are
@@ -1200,6 +1226,11 @@ The base condition type for failures raised by the client policy layer.
 ### `http-client-error-detail`
 
 Return the detail value carried by an HTTP-CLIENT-ERROR.
+
+### `http-client-request-cancelled`
+
+The condition signaled when a request is cancelled through its cancellation
+token.
 
 ### `http-redirect-limit-exceeded`
 
@@ -1944,7 +1975,8 @@ alternative-service-store redirect-policy
 retry-policy proxy tls-upgrade resolve-host resolve-host-style auth-provider
 challenge-auth-provider proxy-challenge-auth-provider
 stale-while-revalidate-scheduler clock-function
-wall-clock-function sleep-function random-function default-timeout max-header-bytes max-fields max-body-bytes
+wall-clock-function sleep-function random-function default-timeout
+max-header-bytes max-fields max-http2-concurrent-streams max-body-bytes
 automatic-decompression-p content-decoders on-request on-response). At most one
 of transport-function, open-stream, or connection-pool may be supplied;
 omitting all three and close-stream selects the native TCP/TLS connection pool.
@@ -1953,6 +1985,37 @@ optional for the direct stream transport boundary. Omitting
 strict-transport-store creates a new RFC 6797 store; explicitly passing nil
 disables HSTS. Omitting alternative-service-store creates a new RFC 7838 store;
 explicitly passing nil disables alternative-service discovery.
+
+`max-http2-concurrent-streams` must be a positive integer and defaults to 100.
+It sets the local stream cap for each HTTP/2 connection opened by the native
+negotiated client. The cap is per connection: requests sharing one
+manager-selected connection share this limit, while the manager's
+`max-connections` controls retained connections, not streams. Injected
+transports set their own HTTP/2 stream limits.
+
+### `make-http-cancellation-token`
+
+Create a one-shot token for cancelling one or more active requests. A token
+already cancelled before a request begins causes that send to signal
+`HTTP-CLIENT-REQUEST-CANCELLED`.
+
+### `http-client-cancel-request`
+
+Mark TOKEN cancelled and invoke the cancellation functions registered by active
+requests. Return true only when this call changes the token to cancelled. A
+token can be shared between concurrent requests; cancellation functions are
+removed when their transport operations complete. Each transport owns how it
+interrupts I/O. The direct HTTP/1.1 stream transport closes its stream. HTTP/2
+sends `RST_STREAM` when a stream has been allocated. Cancellation while waiting
+for a stream slot sends no `RST_STREAM`. If the request caller currently owns a
+blocked synchronous frame read, it observes cancellation after that read
+completes or its deadline expires. An HTTP/3 transport must supply a
+`cancel-stream` callback to `make-http3-client`; the built-in cl-quic-kit adapter
+does not currently supply one. With that adapter,
+`http-client-cancel-request` marks the token cancelled
+and signals `http-protocol-error` with operation `:http3-transport` and detail
+`:unsupported`. It sends no stream reset or stop-sending signal, so active I/O
+can continue until it completes or its deadline expires.
 
 ### `http-client-clear-connections`
 
@@ -1990,14 +2053,18 @@ contract for any request features the application uses:
 ```lisp
 (request &key timeout deadline max-header-bytes max-fields max-body-bytes
   proxy proxy-plan request-body-function request-body-length
-  on-body-chunk on-information (collect-body-p t))
+  on-body-chunk on-information on-response-headers on-cancel
+  (collect-body-p t))
 ```
 
 The first seven keywords, through `proxy-plan`, are always passed. The body
 producer and length keywords are passed together when either is supplied;
 response callbacks are passed only when supplied; `collect-body-p` is passed
-only when false. A legacy transport supporting only the always-passed keywords
-can serve requests that do not use these features.
+only when false. `on-cancel` is passed when the caller supplies a cancellation
+token. A transport calls it with a function that cancels the active request and
+retains the returned cleanup function until the request completes. A legacy
+transport supporting only the always-passed keywords can serve requests that do
+not use these features.
 
 `http3-transport-function` has the same contract plus `alternative-service`.
 That keyword is always passed: a selected `http-alternative-service` for
@@ -2130,6 +2197,11 @@ Return the client's maximum response header size.
 
 Return the client's maximum response field count per field section.
 
+### `http-client-max-http2-concurrent-streams`
+
+Return the client's maximum concurrent HTTP/2 request streams per native
+connection.
+
 ### `http-client-max-body-bytes`
 
 Return the client's maximum response body size.
@@ -2174,7 +2246,8 @@ request after redirects or retries.
 
 Send keywords are TIMEOUT, DEADLINE, REDIRECT-POLICY, RETRY-POLICY,
 REQUEST-BODY-FUNCTION, REQUEST-BODY-FACTORY, REQUEST-BODY-LENGTH,
-ON-BODY-CHUNK, ON-INFORMATION, COLLECT-BODY-P, COOKIE-SAME-SITE-P,
+ON-BODY-CHUNK, ON-INFORMATION, ON-RESPONSE-HEADERS, CANCEL-TOKEN,
+COLLECT-BODY-P, COOKIE-SAME-SITE-P,
 COOKIE-TOP-LEVEL-NAVIGATION-P, and COOKIE-PARTITION-KEY.
 
 REQUEST-BODY-FUNCTION is called with a chunk-size argument and returns an
@@ -2185,8 +2258,20 @@ cannot accompany a nonempty in-memory body. REQUEST-BODY-LENGTH requires a
 producer or factory. A non-replayable producer is sent once.
 
 ON-BODY-CHUNK is called with one body chunk; ON-INFORMATION is called with one
-informational response. COLLECT-BODY-P defaults to true and controls whether
-the response body is retained.
+informational response. ON-RESPONSE-HEADERS is called with the final response
+status and header list before body chunks; informational responses use
+ON-INFORMATION instead. Once response headers are delivered, client retries,
+authentication replay, and redirects are suppressed for that response.
+COLLECT-BODY-P defaults to true and controls whether the response body is
+retained.
+
+`MAKE-HTTP-CANCELLATION-TOKEN` creates a one-shot token. Pass it as
+`:CANCEL-TOKEN`; `HTTP-CLIENT-CANCEL-REQUEST` marks the token cancelled and
+invokes cancellation handlers for its active requests. It returns true only on
+the first call. A send using a cancelled token signals
+`HTTP-CLIENT-REQUEST-CANCELLED`. The token may be shared by concurrent requests.
+Custom transports receive `:on-cancel` and must use it to register a function
+that interrupts the active operation.
 COOKIE-SAME-SITE-P and COOKIE-TOP-LEVEL-NAVIGATION-P supply the request context
 for SameSite cookie selection. COOKIE-PARTITION-KEY supplies the canonical
 top-level-site identifier for Partitioned cookie acceptance and selection.

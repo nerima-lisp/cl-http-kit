@@ -613,10 +613,15 @@
                          probe-connection)
                         (http-kit/http2::%http2-connection-max-body-bytes
                          probe-connection)
-                        0 clock nil nil nil t nil
+                        0 clock nil nil nil nil t nil
                         (lambda (wire)
                           (declare (ignore wire))
-                          (http-kit::%check-deadline 0 clock :write)))
+                          (http-kit::%check-deadline 0 clock :write))
+                        (lambda () nil)
+                        (lambda ()
+                          (error "Unexpected request cancellation."))
+                        (lambda (opened-entry)
+                          (declare (ignore opened-entry))))
                      (http-kit:http-timeout ()
                        (setf timeout-seen-p t)))
                    (ensure-true timeout-seen-p)
@@ -957,7 +962,7 @@
                                  (setf server-error condition)))
                           (when server-error
                             (%network-test-close-stream server-stream)
-                            (%network-test-close-socket server-socket)))))))
+                            (%network-test-close-socket server-socket))))))
                (setf client-stream
                      (open-http-tcp-stream
                       (make-http-request
@@ -1036,7 +1041,7 @@
                 (http-response-body (aref responses 1)))
                (ensure-octets-equal
                 (ascii "nested-response")
-                (http-response-body nested-response)))
+                (http-response-body nested-response))))
           (when connection
             (ignore-errors (close-http2-connection connection)))
           (%network-test-close-stream client-stream)

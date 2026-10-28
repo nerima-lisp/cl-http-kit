@@ -46,6 +46,470 @@
                   (nreverse chunks)
                   "HTTP/2 DATA callbacks preserve frame boundaries")))
 
+(deftest http2-response-headers-callback-precedes-body-and-skips-information
+    (let* ((events nil)
+           (response
+             (http-kit/http2:send-http2-request
+              (http-kit/http2:make-http2-client
+               :exchange
+               (lambda (request wire &key timeout deadline)
+                 (declare (ignore request wire timeout deadline))
+                 (concatenate-octets
+                  (h2-frame 4 0 0 (octets))
+                  (h2-frame 1 4 1 (h2-header-block (cons ":status" "103")))
+                  (h2-frame 1 4 1
+                            (h2-header-block (cons ":status" "200")
+                                             (cons "content-type"
+                                                   "text/event-stream")
+                                             (cons "content-length" "2")))
+                  (h2-frame 0 1 1 (octets 65 66)))))
+              (make-http-request :method "GET" :uri "https://example.test/")
+              :on-response-headers
+              (lambda (status headers)
+                (push (list :headers status
+                            (http-header-value headers "content-type"))
+                      events))
+              :on-body-chunk
+              (lambda (chunk)
+                (push (list :body (copy-seq chunk)) events)))))
+      (ensure-equal 200 (http-response-status response))
+      (ensure-equal
+       (list (list :headers 200 "text/event-stream")
+             (list :body (octets 65 66)))
+       (nreverse events))))
+  (deftest http2-response-header-http-error-is-preserved
+  (let* ((input
+           (concatenate-octets
+            (h2-frame 4 0 0 (octets))
+            (h2-frame 1 5 1
+                      (h2-header-block (cons ":status" "200")))))
+         (stream (make-instance 'binary-session-stream :input input))
+         (connection (http-kit/http2:make-http2-connection :stream stream))
+         (request (make-http-request :method "GET"
+                                     :uri "https://example.test/reject"))
+         (callback-error
+           (make-condition 'http-protocol-error
+                           :message "response rejected"
+                           :operation :test-callback
+                           :detail :rejected))
+         (observed-error nil))
+    (unwind-protect
+         (progn
+           (handler-case
+               (http-kit/http2::%h2-send-http2-request-over-connection-serial
+                connection request
+                :on-response-headers
+                (lambda (status headers)
+                  (declare (ignore status headers))
+                  (error callback-error)))
+             (error (condition)
+               (setf observed-error condition)))
+           (ensure-true (eq callback-error observed-error))
+           (ensure-true (http-kit/http2:http2-connection-open-p connection)))
+      (http-kit/http2:close-http2-connection connection))))
+  (deftest http2-generic-on-stream-open-errors-are-translated
+  (dolist (sender
+           (list #'http-kit/http2::%h2-send-http2-request-over-connection-serial
+                 #'http-kit/http2:send-http2-request-over-connection))
+    (let* ((stream
+             (make-instance 'binary-session-stream
+                            :input (h2-frame 4 0 0 (octets))))
+           (connection
+             (http-kit/http2:make-http2-connection :stream stream))
+           (request
+             (make-http-request :method "GET"
+                                :uri "https://example.test/error-hook"))
+           (failure
+             (make-condition 'simple-error
+                             :format-control "stream-open hook failed"
+                             :format-arguments nil))
+           (observed-error nil))
+      (unwind-protect
+           (progn
+             (handler-case
+                 (funcall sender
+                          connection request
+                          :on-stream-open
+                          (lambda (stream-id cancel-function)
+                            (declare (ignore stream-id cancel-function))
+                            (error failure)))
+               (error (condition)
+                 (setf observed-error condition)))
+             (ensure-true
+              (typep observed-error 'http-kit:http-connection-error))
+             (ensure-true
+              (eq failure
+                  (http-kit:http-connection-error-cause observed-error))))
+        (http-kit/http2:close-http2-connection connection)))))
+  (deftest http2-response-cancel-callbacks-use-default-and-custom-codes
+  (dolist (sender
+           (list #'http-kit/http2::%h2-send-http2-request-over-connection-serial
+                 #'http-kit/http2:send-http2-request-over-connection))
+    (dolist (cancel-case '((nil 8) ((:error-code 7) 7)))
+      (destructuring-bind (cancel-arguments expected-error-code) cancel-case
+        (let* ((expected-stream-id
+                 (if (eq sender
+                         #'http-kit/http2::%h2-send-http2-request-over-connection-serial)
+                     1
+                     nil))
+               (stream
+                 (make-instance 'binary-session-stream
+                                :input (h2-frame 4 0 0 (octets))))
+               (connection
+                 (http-kit/http2:make-http2-connection :stream stream))
+               (request
+                 (make-http-request :method "GET"
+                                    :uri "https://example.test/cancel"))
+               (failure nil))
+          (unwind-protect
+               (progn
+                 (handler-case
+                     (funcall sender
+                              connection request
+                              :on-cancel
+                              (lambda (cancel-function)
+                                (apply cancel-function cancel-arguments)
+                                nil))
+                   (error (condition)
+                     (setf failure condition)))
+                 (ensure-true (typep failure 'http-connection-error))
+                 (ensure-equal
+                  (list :local-cancel expected-stream-id expected-error-code)
+                               (http-connection-error-cause failure))
+                 (if expected-stream-id
+                     (let ((reset-frame
+                             (find-if
+                              (lambda (frame)
+                                (and (= 3 (http-kit/http2::%h2-frame-type frame))
+                                     (= 1
+                                        (http-kit/http2::%h2-frame-stream-id
+                                         frame))))
+                              (h2-output-frames stream))))
+                       (ensure-true reset-frame)
+                       (ensure-equal (octets 0 0 0 expected-error-code)
+                                     (http-kit/http2::%h2-frame-payload
+                                      reset-frame)))
+                     (ensure-equal 0
+                                   (length (binary-session-output stream)))))
+            (http-kit/http2:close-http2-connection connection)))))))
+  (deftest http2-serial-cancel-after-bodyless-response-does-not-send-rst
+    (let* ((input
+             (concatenate-octets
+              (h2-frame 4 0 0 (octets))
+              (h2-frame 1 5 1
+                        (h2-header-block (cons ":status" "200")))))
+           (stream (make-instance 'binary-session-stream :input input))
+           (connection (http-kit/http2:make-http2-connection :stream stream))
+           (request
+             (make-http-request :method "GET"
+                                :uri "https://example.test/cancel-after-response"))
+           (cancel-function nil)
+           (response nil))
+      (unwind-protect
+           (progn
+             (setf response
+                   (http-kit/http2::%h2-send-http2-request-over-connection-serial
+                    connection request
+                    :on-cancel
+                    (lambda (callback)
+                      (setf cancel-function callback)
+                      nil)
+                    :on-response-headers
+                    (lambda (status headers)
+                      (declare (ignore headers))
+                      (ensure-equal 200 status)
+                      (ensure-true (functionp cancel-function))
+                      (funcall cancel-function))))
+             (ensure-equal 200 (http-response-status response))
+             (ensure-false
+              (find-if
+               (lambda (frame)
+                 (and (= 3 (http-kit/http2::%h2-frame-type frame))
+                      (= 1 (http-kit/http2::%h2-frame-stream-id frame))))
+               (h2-output-frames stream))))
+        (http-kit/http2:close-http2-connection connection))))
+  (deftest http2-serial-final-data-callback-cancel-preserves-response
+  #+sbcl
+  (let* ((input
+           (concatenate-octets
+            (h2-frame 4 0 0 (octets))
+            (h2-frame 1 4 1
+                      (h2-header-block (cons ":status" "200")
+                                       (cons "content-length" "1")))
+            (h2-frame 0 1 1 (octets 82))))
+         (stream (make-instance 'binary-session-stream :input input))
+         (connection (http-kit/http2:make-http2-connection :stream stream))
+         (request (make-http-request :method "GET"
+                                     :uri "https://example.test/final-data"))
+         (cancel-function nil)
+         (cancel-result nil)
+         (response nil))
+    (unwind-protect
+         (progn
+           (setf response
+                 (http-kit/http2::%h2-send-http2-request-over-connection-serial
+                  connection request
+                  :on-cancel
+                  (lambda (function)
+                    (setf cancel-function function)
+                    nil)
+                  :on-body-chunk
+                  (lambda (chunk)
+                    (ensure-octets-equal (octets 82) chunk)
+                    (ensure-true (functionp cancel-function))
+                    (setf cancel-result (funcall cancel-function)))))
+           (ensure-equal 200 (http-response-status response))
+           (ensure-octets-equal (octets 82) (http-response-body response))
+           (ensure-equal :response-complete cancel-result)
+           (ensure-false
+            (find-if
+             (lambda (frame)
+               (and (= 3 (http-kit/http2::%h2-frame-type frame))
+                    (= 1 (http-kit/http2::%h2-frame-stream-id frame))))
+             (h2-output-frames stream)))
+      (http-kit/http2:close-http2-connection connection)))
+  #-sbcl
+  (uiop:with-temporary-file (:pathname input-path)
+    (uiop:with-temporary-file (:pathname output-path)
+      (let ((input
+              (concatenate-octets
+               (h2-frame 4 0 0 (octets))
+               (h2-frame 1 4 1
+                         (h2-header-block (cons ":status" "200")
+                                          (cons "content-length" "1")))
+               (h2-frame 0 1 1 (octets 82)))))
+        (with-open-file (input-writer input-path
+                         :direction :output
+                         :if-exists :supersede
+                         :element-type '(unsigned-byte 8))
+          (write-sequence input input-writer)))
+      (let* ((input-stream
+               (open input-path :direction :input
+                     :element-type '(unsigned-byte 8)))
+             (output-stream
+               (open output-path :direction :output
+                     :if-exists :supersede
+                     :element-type '(unsigned-byte 8)))
+             (stream (make-two-way-stream input-stream output-stream))
+             (connection
+               (http-kit/http2:make-http2-connection :stream stream))
+             (request
+               (make-http-request :method "GET"
+                                  :uri "https://example.test/final-data"))
+             (cancel-function nil)
+             (cancel-result nil)
+             (response nil))
+        (unwind-protect
+             (progn
+               (setf response
+                     (http-kit/http2:send-http2-request-over-connection
+                      connection request
+                      :on-cancel
+                      (lambda (function)
+                        (setf cancel-function function)
+                        nil)
+                      :on-body-chunk
+                      (lambda (chunk)
+                        (ensure-octets-equal (octets 82) chunk)
+                        (ensure-true (functionp cancel-function))
+                        (setf cancel-result (funcall cancel-function)))))
+               (ensure-equal 200 (http-response-status response))
+               (ensure-octets-equal (octets 82) (http-response-body response))
+               (ensure-equal :response-complete cancel-result)
+               (http-kit/http2:close-http2-connection connection)
+               (setf connection nil)
+               (with-open-file (written-output output-path
+                                :direction :input
+                                :element-type '(unsigned-byte 8))
+                 (let* ((output
+                          (make-array (file-length written-output)
+                                      :element-type '(unsigned-byte 8)))
+                        (preface (h2-preface))
+                        (frame-offset (length preface))
+                        (reset-frame-p nil))
+                   (read-sequence output written-output)
+                   (ensure-true (>= (length output) frame-offset))
+                   (ensure-octets-equal preface
+                                        (subseq output 0 frame-offset))
+                   (loop while (< frame-offset (length output))
+                         do (ensure-true (<= (+ frame-offset 9)
+                                             (length output)))
+                            (let* ((payload-length
+                                     (+ (ash (aref output frame-offset) 16)
+                                        (ash (aref output (1+ frame-offset)) 8)
+                                        (aref output (+ frame-offset 2))))
+                                   (frame-end (+ frame-offset 9 payload-length)))
+                              (ensure-true (<= frame-end (length output)))
+                              (when (= (aref output (+ frame-offset 3)) 3)
+                                (setf reset-frame-p t))
+                              (setf frame-offset frame-end)))
+                   (ensure-true (> (length output) (length preface)))
+                   (ensure-false reset-frame-p))))
+          (when connection
+            (http-kit/http2:close-http2-connection connection)))))))
+)
+
+  (deftest http2-response-callbacks-cover-serial-and-scheduled-transport
+    (let* ((input
+             (concatenate-octets
+              (h2-frame 4 0 0 (octets))
+              (h2-frame 1 4 1
+                        (h2-header-block (cons ":status" "200")
+                                         (cons "content-length" "2")))
+              (h2-frame 0 1 1 (octets 65 66))))
+           (stream (make-instance 'binary-session-stream :input input))
+           (connection (http-kit/http2:make-http2-connection :stream stream))
+           (request (make-http-request :method "GET"
+                                      :uri "https://example.test/serial"))
+           (events nil)
+           (response nil))
+      (unwind-protect
+           (progn
+             (setf response
+                   (http-kit/http2::%h2-send-http2-request-over-connection-serial
+                    connection request
+                    :on-response-headers
+                    (lambda (status headers)
+                      (ensure-equal 200 status)
+                      (ensure-equal "2" (http-header-value headers "content-length"))
+                      (push :headers events))
+                    :on-body-chunk
+                    (lambda (chunk)
+                      (declare (ignore chunk))
+                      (push :body events))
+                    :on-cancel
+                    (lambda (cancel-function)
+                      (ensure-true (functionp cancel-function))
+                      (push :registered events)
+                      (lambda () (push :cleanup events)))))
+             (ensure-equal 200 (http-response-status response))
+             (ensure-equal (octets 65 66) (http-response-body response))
+             (ensure-equal '(:registered :headers :body :cleanup)
+                           (nreverse events)))
+        (http-kit/http2:close-http2-connection connection)))
+    (let* ((input
+             (concatenate-octets
+              (h2-frame 4 0 0 (octets))
+              (h2-frame 1 5 1
+                        (h2-header-block (cons ":status" "200")))))
+           (stream (make-instance 'binary-session-stream :input input))
+           (connection (http-kit/http2:make-http2-connection :stream stream))
+           (request (make-http-request :method "GET"
+                                      :uri "https://example.test/reject"))
+           (callback-error
+             (make-condition 'simple-error
+                             :format-control "response rejected"
+                             :format-arguments nil))
+           (observed-error nil))
+      (unwind-protect
+           (progn
+             (handler-case
+                 (http-kit/http2::%h2-send-http2-request-over-connection-serial
+                  connection request
+                  :on-response-headers
+                  (lambda (status headers)
+                    (declare (ignore status headers))
+                    (error callback-error)))
+               (error (condition)
+                 (setf observed-error condition)))
+             (ensure-true (eq callback-error observed-error))
+             (ensure-true (http-kit/http2:http2-connection-open-p connection))
+             (let ((reset-frame
+                     (find-if
+                      (lambda (frame)
+                        (and (= 3 (http-kit/http2::%h2-frame-type frame))
+                             (= 1 (http-kit/http2::%h2-frame-stream-id frame))))
+                      (h2-output-frames stream))))
+               (ensure-true reset-frame)
+               (ensure-equal (octets 0 0 0 8)
+                             (http-kit/http2::%h2-frame-payload reset-frame))))
+        (http-kit/http2:close-http2-connection connection)))
+    (let* ((stream (make-instance 'binary-session-stream :input (octets)))
+           (connection (http-kit/http2:make-http2-connection :stream stream))
+           (request (make-http-request :method "GET"
+                                      :uri "https://example.test/invalid")))
+      (unwind-protect
+           (progn
+             (signals http-protocol-error
+               (http-kit/http2::%h2-send-http2-request-over-connection-serial
+                connection request :on-response-headers :invalid))
+             (signals http-protocol-error
+               (http-kit/http2::%h2-send-http2-request-over-connection-serial
+                connection request :on-cancel :invalid))
+             (signals http-protocol-error
+               (http-kit/http2:send-http2-request-over-connection
+                connection request :on-response-headers :invalid))
+             (signals http-protocol-error
+               (http-kit/http2:send-http2-request-over-connection
+                connection request :on-cancel :invalid))
+             (ensure-equal 0 (length (binary-session-output stream))))
+        (http-kit/http2:close-http2-connection connection)))
+    (let* ((stream
+             (make-instance 'binary-session-stream
+                            :input (h2-frame 4 0 0 (octets))))
+           (connection (http-kit/http2:make-http2-connection :stream stream))
+           (request (make-http-request :method "GET"
+                                      :uri "https://example.test/invalid-cleanup"))
+           (failure nil))
+      (unwind-protect
+           (progn
+             (handler-case
+                 (http-kit/http2::%h2-send-http2-request-over-connection-serial
+                  connection request
+                  :on-cancel
+                  (lambda (cancel-function)
+                    (declare (ignore cancel-function))
+                    :invalid))
+               (http-protocol-error (condition)
+                 (setf failure condition)))
+             (ensure-true (typep failure 'http-protocol-error))
+             (ensure-equal :invalid (http-protocol-error-detail failure)))
+        (http-kit/http2:close-http2-connection connection)))
+    (let* ((stream
+             (make-instance 'binary-session-stream
+                            :input (h2-frame 4 0 0 (octets))))
+           (connection (http-kit/http2:make-http2-connection :stream stream))
+           (request (make-http-request :method "GET"
+                                      :uri "https://example.test/cancel"))
+           (failure nil))
+      (unwind-protect
+           (progn
+             (handler-case
+                 (http-kit/http2:send-http2-request-over-connection
+                  connection request
+                  :on-cancel
+                  (lambda (cancel-function)
+                    (funcall cancel-function)
+                    nil))
+               (error (condition)
+                 (setf failure condition)))
+             (ensure-true (typep failure 'http-connection-error))
+             (ensure-equal '(:local-cancel nil 8)
+                           (http-connection-error-cause failure))
+             (ensure-true (http-kit/http2:http2-connection-open-p connection)))
+        (http-kit/http2:close-http2-connection connection)))
+    (let* ((stream
+             (make-instance 'binary-session-stream
+                            :input (h2-frame 4 0 0 (octets))))
+           (connection (http-kit/http2:make-http2-connection :stream stream))
+           (request (make-http-request :method "GET"
+                                      :uri "https://example.test/invalid-cleanup"))
+           (failure nil))
+      (unwind-protect
+           (progn
+             (handler-case
+                 (http-kit/http2:send-http2-request-over-connection
+                  connection request
+                  :on-cancel
+                  (lambda (cancel-function)
+                    (declare (ignore cancel-function))
+                    :invalid))
+               (http-protocol-error (condition)
+                 (setf failure condition)))
+             (ensure-true (typep failure 'http-protocol-error))
+             (ensure-equal :invalid (http-protocol-error-detail failure)))
+        (http-kit/http2:close-http2-connection connection))))
+
 (deftest http2-accepts-padded-response-frames
   (let* ((header-block (h2-header-block
                         (cons ":status" "200")
@@ -360,7 +824,7 @@
               (ensure-equal (h2-preface) (subseq wire 0 (length (h2-preface))))
               (incf exchanges)
               (h2-response-wire (octets 0 255))))))
-    (dolist (options '((:on-body-chunk :invalid) (:collect-body-p :invalid)))
+    (dolist (options '((:on-body-chunk :invalid) (:on-response-headers :invalid) (:collect-body-p :invalid)))
       (let ((failure
               (handler-case
                   (apply #'http-kit/http2:send-http2-request client request options)
@@ -738,9 +1202,9 @@
                       (http-size-limit-exceeded-kind result))
         (ensure-equal (if (eq kind :headers) header-limit body-limit)
                       (http-size-limit-exceeded-limit result))
-        (ensure-equal 1 closed)
-        (ensure-false
-         (http-kit/http2:http2-connection-open-p connection))
+        (ensure-equal (if (or (eq kind :headers) batch-p) 1 0) closed)
+        (ensure-equal (and (eq kind :body) (not batch-p))
+                      (http-kit/http2:http2-connection-open-p connection))
         (http-kit/http2:close-http2-connection connection)
         (ensure-equal 1 closed)))))
 #+sbcl
@@ -750,13 +1214,12 @@
             (h2-frame 4 0 0 (octets))
             (h2-frame 1 4 1 (h2-header-block (cons ":status" "200")))
             (h2-frame 1 4 3 (h2-header-block (cons ":status" "200")))
-            (h2-frame 0 1 1 (octets 1 2))))
+            (h2-frame 0 1 5 (octets 1 2))))
          (stream (make-instance 'binary-session-stream :input input))
          (closed 0)
          (connection
            (http-kit/http2:make-http2-connection
             :stream stream
-            :max-body-bytes 1
             :close-stream (lambda (actual)
                             (ensure-true (eq stream actual))
                             (incf closed)
@@ -806,8 +1269,8 @@
              (setf first-thread nil)
              (sb-thread:join-thread second-thread)
              (setf second-thread nil)
-             (ensure-true (typep first-error 'http-size-limit-exceeded))
-             (ensure-true (typep second-error 'http-size-limit-exceeded))
+             (ensure-true (typep first-error 'http-protocol-error))
+             (ensure-true (typep second-error 'http-protocol-error))
              (ensure-false
               (http-kit/http2:http2-connection-open-p connection))
              (ensure-equal 1 closed))
@@ -868,7 +1331,7 @@
       (let ((frames (h2-output-frames stream)))
         (ensure-equal '(4 1 4 8 8) (mapcar #'http-kit/http2::%h2-frame-type frames))
         (ensure-equal '(0 5 1 0 0) (mapcar #'http-kit/http2::%h2-frame-flags frames))
-        (ensure-equal '(0 1 0 1 0) (mapcar #'http-kit/http2::%h2-frame-stream-id frames))
+        (ensure-equal '(0 1 0 0 1) (mapcar #'http-kit/http2::%h2-frame-stream-id frames))
         (ensure-equal (octets) (http-kit/http2::%h2-frame-payload (third frames)))
         (dolist (frame (last frames 2))
           (ensure-equal (octets 0 0 0 5) (http-kit/http2::%h2-frame-payload frame)))))))

@@ -1,12 +1,41 @@
 (in-package #:http-kit)
 
+(defun %register-http1-cancellation-handler (on-cancel cancel-stream-function)
+  (when (and on-cancel (not (functionp on-cancel)))
+    (error 'http-protocol-error
+           :message "ON-CANCEL must be a function or NIL."
+           :operation :response-parse
+           :detail on-cancel))
+  (when (and cancel-stream-function
+             (not (functionp cancel-stream-function)))
+    (error 'http-protocol-error
+           :message "CANCEL-STREAM-FUNCTION must be a function or NIL."
+           :operation :response-parse
+           :detail cancel-stream-function))
+  (when (and on-cancel (not cancel-stream-function))
+    (error 'http-protocol-error
+           :message "ON-CANCEL requires a cancellation function."
+           :operation :response-parse
+           :detail on-cancel))
+  (let ((unregister-cancel
+          (when on-cancel
+            (funcall on-cancel cancel-stream-function))))
+    (when (and unregister-cancel (not (functionp unregister-cancel)))
+      (error 'http-protocol-error
+             :message "ON-CANCEL must return a function or NIL."
+             :operation :response-parse
+             :detail unregister-cancel))
+    unregister-cancel))
+
 (defun parse-http-response (input &key timeout deadline
-                                      max-header-bytes max-fields max-body-bytes
-                                      request-method
-                                      on-body-chunk
-                                      on-information
-                                      (collect-body-p t)
-                                      (clock-function #'%monotonic-time))
+                                  max-header-bytes max-fields max-body-bytes
+                                  request-method
+                                  on-body-chunk
+                                  on-information
+                                  on-response-headers
+                                  on-cancel cancel-stream-function
+                                  (collect-body-p t)
+                                  (clock-function #'%monotonic-time))
   "Parse one binary HTTP/1.x response from INPUT.
 
 INPUT may be an octet vector or a binary stream.  A response with
@@ -49,88 +78,76 @@ REQUEST-METHOD as \"HEAD\" for the bodyless response semantics of HEAD."
              :message "ON-INFORMATION must be a function or NIL."
              :operation :response-parse
              :detail on-information))
-    (unless (member collect-body-p '(nil t))
-      (error 'http-protocol-error
-             :message "COLLECT-BODY-P must be NIL or T."
-             :operation :response-parse
-             :detail collect-body-p))
-    (loop
-      (multiple-value-bind (status-line updated-bytes)
-          (%read-crlf-line source absolute-deadline clock-function header-limit header-used)
-        (setf header-used updated-bytes)
-        (multiple-value-bind (protocol-version status reason)
-            (%parse-status-line status-line)
-          (multiple-value-bind (headers final-header-bytes)
-              (%read-response-headers source absolute-deadline clock-function
-                                      header-limit field-limit header-used)
-            (setf header-used final-header-bytes)
-            (let ((transfer-encoding (%response-transfer-encoding headers))
-                  ;; HEAD and 304 lengths describe representation metadata,
-                  ;; not octets that this response parser will consume.
-                  (content-length (%response-content-length
-                                   headers (unless (or head-response-p (= status 304))
-                                             body-limit))))
-              (%validate-http-response-framing
-               protocol-version status transfer-encoding content-length)
-              (when (= status 101)
-                (when content-length
-                  (error 'http-invalid-header
-                         :message "A 101 Switching Protocols response cannot declare Content-Length."
-                         :operation :response-parse
-                         :name "content-length"
-                         :reason :forbidden))
-                (return
-                  (%make-header-only-http-response
-                   protocol-version status reason headers)))
-              ;; Informational responses do not carry a response body;
-              ;; notify the caller and continue until the final response.
-              ;; The 101 case above is a protocol switch rather than an
-              ;; interim response.
-              (if (< status 200)
-                  (progn
-                    (when content-length
-                      (error 'http-invalid-header
-                             :message "An informational response cannot declare Content-Length."
-                             :operation :response-parse
-                             :name "content-length"
-                             :reason :forbidden))
-                    (when transfer-encoding
-                      (error 'http-invalid-header
-                             :message "An informational response cannot declare Transfer-Encoding."
-                             :operation :response-parse
-                             :name "transfer-encoding"
-                             :reason :forbidden))
-                    (when on-information
-                      (funcall on-information
-                               (make-http-response
-                                :protocol-version protocol-version
-                                :status status :reason reason
-                                :headers headers :trailers '()
-                                :body (%empty-octets)))))
-                  (let ((body (%empty-octets))
-                        (trailers '()))
-                    (cond
-                      ((and (not head-response-p) (= status 205) transfer-encoding)
-                       (multiple-value-bind (decoded-body decoded-trailers decoded-length)
-                           (%read-chunked-body source absolute-deadline clock-function
-                                               header-limit field-limit body-limit header-used
-                                               :on-body-chunk on-body-chunk
-                                               :collect-body-p collect-body-p)
-                         (unless (zerop decoded-length)
-                           (error 'http-protocol-error
-                                  :message "A 205 response cannot carry response content."
+    (progn
+      (when (and on-response-headers (not (functionp on-response-headers)))
+        (error 'http-protocol-error
+               :message "ON-RESPONSE-HEADERS must be a function or NIL."
+               :operation :response-parse
+               :detail on-response-headers))
+      (unless (member collect-body-p '(nil t))
+        (error 'http-protocol-error
+               :message "COLLECT-BODY-P must be NIL or T."
+               :operation :response-parse
+               :detail collect-body-p)))
+    (let ((unregister-cancel
+           (%register-http1-cancellation-handler
+            on-cancel cancel-stream-function)))
+      (unwind-protect
+          (loop
+           (multiple-value-bind (status-line updated-bytes)
+               (%read-crlf-line source absolute-deadline clock-function header-limit header-used)
+             (setf header-used updated-bytes)
+             (multiple-value-bind (protocol-version status reason)
+                 (%parse-status-line status-line)
+               (multiple-value-bind (headers final-header-bytes)
+                   (%read-response-headers source absolute-deadline clock-function
+                                           header-limit field-limit header-used)
+                 (setf header-used final-header-bytes)
+                 (let ((transfer-encoding (%response-transfer-encoding headers))
+                       ;; HEAD and 304 lengths describe representation metadata,
+                       ;; not octets that this response parser will consume.
+                       (content-length (%response-content-length
+                                        headers (unless (or head-response-p (= status 304))
+                                                  body-limit))))
+                   (%validate-http-response-framing
+                    protocol-version status transfer-encoding content-length)
+                   (when (= status 101)
+                     (when content-length
+                       (error 'http-invalid-header
+                              :message "A 101 Switching Protocols response cannot declare Content-Length."
+                              :operation :response-parse
+                              :name "content-length"
+                              :reason :forbidden))
+                     (return
+                      (%make-header-only-http-response
+                       protocol-version status reason headers)))
+                   ;; Informational responses do not carry a response body;
+                   ;; notify the caller and continue until the final response.
+                   ;; A 101 switches protocols. Preserve its headers for the upgrade
+                   ;; while keeping it out of the final-response callback.
+                   (if (< status 200)
+                       (progn
+                         (when content-length
+                           (error 'http-invalid-header
+                                  :message "An informational response cannot declare Content-Length."
                                   :operation :response-parse
-                                  :detail decoded-length))
-                         (setf body decoded-body
-                               trailers decoded-trailers)))
-                      ((or head-response-p
-                           (and connect-response-p
-                                (<= 200 status 299))
-                           (= status 204)
-                           (= status 205)
-                           (= status 304))
-                       (when (and (or (= status 204)
-                                      (= status 205))
+                                  :name "content-length"
+                                  :reason :forbidden))
+                         (when transfer-encoding
+                           (error 'http-invalid-header
+                                  :message "An informational response cannot declare Transfer-Encoding."
+                                  :operation :response-parse
+                                  :name "transfer-encoding"
+                                  :reason :forbidden))
+                         (when on-information
+                           (funcall on-information
+                                    (make-http-response
+                                     :protocol-version protocol-version
+                                     :status status :reason reason
+                                     :headers headers :trailers '()
+                                     :body (%empty-octets)))))
+                     (progn
+                       (when (and (or (= status 204) (= status 205))
                                   content-length
                                   (plusp content-length))
                          (error 'http-invalid-header
@@ -138,8 +155,7 @@ REQUEST-METHOD as \"HEAD\" for the bodyless response semantics of HEAD."
                                 :operation :response-parse
                                 :name "content-length"
                                 :reason :forbidden))
-                       (when (and (or (and connect-response-p
-                                           (<= 200 status 299))
+                       (when (and (or (and connect-response-p (<= 200 status 299))
                                       (= status 204))
                                   transfer-encoding)
                          (error 'http-invalid-header
@@ -147,36 +163,63 @@ REQUEST-METHOD as \"HEAD\" for the bodyless response semantics of HEAD."
                                 :operation :response-parse
                                 :name "transfer-encoding"
                                 :reason :forbidden))
-                       (when (and connect-response-p
-                                  (<= 200 status 299)
-                                  content-length)
+                       (when (and connect-response-p (<= 200 status 299) content-length)
                          (error 'http-invalid-header
                                 :message "A successful CONNECT response cannot declare Content-Length."
                                 :operation :response-parse
                                 :name "content-length"
                                 :reason :forbidden))
-                       (setf body (%empty-octets)))
-                      (transfer-encoding
-                       (multiple-value-setq (body trailers)
-                         (%read-chunked-body source absolute-deadline clock-function
-                                             header-limit field-limit body-limit header-used
-                                             :on-body-chunk on-body-chunk
-                                             :collect-body-p collect-body-p)))
-                      (content-length
-                       (setf body (%read-exact-body source content-length absolute-deadline
-                                                    clock-function body-limit
-                                                    :on-body-chunk on-body-chunk
-                                                    :collect-body-p collect-body-p)))
-                      (t
-                       ;; HTTP/1.1 close-delimited responses are valid framing.
-                       ;; The transport owns closing the stream, so this parser
-                       ;; consumes until EOF even when Connection: close is omitted.
-                       (setf body (%read-close-body source absolute-deadline clock-function
-                                                    body-limit
-                                                    :on-body-chunk on-body-chunk
-                                                    :collect-body-p collect-body-p))))
-                    (return
-                      (make-http-response :protocol-version protocol-version
-                                          :status status :reason reason
-                                          :headers headers :trailers trailers
-                                          :body body)))))))))))
+                       (when on-response-headers
+                         (funcall on-response-headers status headers))
+                       (let ((body (%empty-octets))
+                             (trailers '()))
+                         (cond
+                          ((and (not head-response-p) (= status 205) transfer-encoding)
+                           (multiple-value-bind (decoded-body decoded-trailers decoded-length)
+                               (%read-chunked-body source absolute-deadline clock-function
+                                                   header-limit field-limit body-limit header-used
+                                                   :on-body-chunk on-body-chunk
+                                                   :collect-body-p collect-body-p)
+                             (unless (zerop decoded-length)
+                               (error 'http-protocol-error
+                                      :message "A 205 response cannot carry response content."
+                                      :operation :response-parse
+                                      :detail decoded-length))
+                             (setf body decoded-body
+                                   trailers decoded-trailers)))
+                          ((or head-response-p
+                               (and connect-response-p
+                                    (<= 200 status 299))
+                               (= status 204)
+                               (= status 205)
+                               (= status 304))
+
+
+
+                           (setf body (%empty-octets)))
+                          (transfer-encoding
+                           (multiple-value-setq (body trailers)
+                                                (%read-chunked-body source absolute-deadline clock-function
+                                                                    header-limit field-limit body-limit header-used
+                                                                    :on-body-chunk on-body-chunk
+                                                                    :collect-body-p collect-body-p)))
+                          (content-length
+                           (setf body (%read-exact-body source content-length absolute-deadline
+                                                        clock-function body-limit
+                                                        :on-body-chunk on-body-chunk
+                                                        :collect-body-p collect-body-p)))
+                          (t
+                           ;; HTTP/1.1 close-delimited responses are valid framing.
+                           ;; The transport owns closing the stream, so this parser
+                           ;; consumes until EOF even when Connection: close is omitted.
+                           (setf body (%read-close-body source absolute-deadline clock-function
+                                                        body-limit
+                                                        :on-body-chunk on-body-chunk
+                                                        :collect-body-p collect-body-p))))
+                         (return
+                          (make-http-response :protocol-version protocol-version
+                                              :status status :reason reason
+                                              :headers headers :trailers trailers
+                                              :body body))))))))))
+        (when unregister-cancel
+          (funcall unregister-cancel))))))

@@ -27,19 +27,21 @@
              (:conc-name %http2-connection-)
              (:constructor %make-http2-connection
                  (&key stream close-stream max-frame-size max-header-bytes max-fields
-                       max-body-bytes clock-function hpack-context
+                       max-concurrent-streams max-body-bytes clock-function hpack-context
                        next-stream-id peer-max-frame-size peer-max-table-size
                        peer-max-concurrent-streams peer-max-header-list-size
                        peer-initial-window-size peer-enable-connect-protocol-p
                        peer-connection-window-size
-                       peer-stream-windows session-started-p
+                       peer-stream-windows session-started-p scheduler-reader
                        goaway-last-stream-id closed-p max-control-frames
-                       max-control-window control-frame-times)))
+                       max-control-window max-pending-information-callbacks
+                       control-frame-times)))
   stream
   (close-stream #'close)
   max-frame-size
   max-header-bytes
   (max-fields 256)
+  (max-concurrent-streams 100)
   max-body-bytes
   clock-function
   (hpack-context nil)
@@ -53,17 +55,25 @@
   (peer-connection-window-size +http2-default-window-size+)
   (peer-stream-windows nil)
   (session-started-p nil)
+  (session-start-state :not-started)
+  (scheduler-reader nil)
+  (scheduler-header-block-state nil)
+  (scheduler-write-queue nil)
+  (scheduler-write-queue-tail nil)
   (goaway-last-stream-id nil)
   (local-goaway-last-stream-id nil)
   (draining-p nil)
   (closed-p nil)
   (max-control-frames 100)
   (max-control-window 1.0d0)
+  (max-pending-information-callbacks 16)
   (control-frame-times nil)
   #+sbcl (scheduler-lock (sb-thread:make-mutex :name "HTTP/2 scheduler"))
   #-sbcl (scheduler-lock nil)
   #+sbcl (writer-lock (sb-thread:make-mutex :name "HTTP/2 writer"))
   #-sbcl (writer-lock nil)
+  #+sbcl (close-lock (sb-thread:make-mutex :name "HTTP/2 close"))
+  #-sbcl (close-lock nil)
   #+sbcl (scheduler-condition (sb-thread:make-waitqueue))
   #-sbcl (scheduler-condition nil)
   (scheduler-reader-active-p nil)

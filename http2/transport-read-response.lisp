@@ -8,19 +8,7 @@
   ;; &OPTIONAL and &KEY in the lambda list (which some implementations warn
   ;; about).  A keyword immediately after the callback means that collection
   ;; keeps its default value.
-  (let ((on-body-chunk nil) (on-information nil)
-        (collect-body-p t)
-        (expected-stream-id 1)
-        (hpack-context nil)
-        (read-initial-settings-p t)
-        (peer-max-frame-size nil)
-        (initial-frames nil)
-        (on-peer-settings nil)
-        (control-handler nil)
-        (budget-owner nil)
-        (max-fields nil)
-        (keyword-options options)
-        (missing-value (gensym "MISSING-VALUE-")))
+  (let ((on-body-chunk nil) (on-information nil) (on-response-headers nil) (on-response-complete nil) (response-headers-fired-p nil) (collect-body-p t) (expected-stream-id 1) (hpack-context nil) (read-initial-settings-p t) (peer-max-frame-size nil) (initial-frames nil) (on-peer-settings nil) (control-handler nil) (budget-owner nil) (max-fields nil) (keyword-options options) (missing-value (gensym "MISSING-VALUE-")))
     (declare (ignorable peer-max-frame-size))
     (unless (or (null keyword-options)
                 (keywordp (car keyword-options)))
@@ -38,23 +26,7 @@
                       :message "An HTTP/2 response option is missing its value."
                       :operation :http2-read
                       :detail key))
-             (case key
-               (:expected-stream-id (setf expected-stream-id value))
-               (:hpack-context (setf hpack-context value))
-               (:max-fields (setf max-fields value))
-               (:read-initial-settings-p
-                (setf read-initial-settings-p value))
-               (:peer-max-frame-size (setf peer-max-frame-size value))
-               (:initial-frames (setf initial-frames value))
-               (:on-information (setf on-information value))
-               (:on-peer-settings (setf on-peer-settings value))
-               (:control-handler (setf control-handler value))
-               (:budget-owner (setf budget-owner value))
-               (otherwise
-                (error 'http-kit:http-protocol-error
-                       :message "An unknown HTTP/2 response option was supplied."
-                       :operation :http2-read
-                       :detail key))))
+             (case key (:expected-stream-id (setf expected-stream-id value)) (:hpack-context (setf hpack-context value)) (:max-fields (setf max-fields value)) (:read-initial-settings-p (setf read-initial-settings-p value)) (:peer-max-frame-size (setf peer-max-frame-size value)) (:initial-frames (setf initial-frames value)) (:on-information (setf on-information value)) (:on-response-headers (setf on-response-headers value)) (:on-response-complete (setf on-response-complete value)) (:on-peer-settings (setf on-peer-settings value)) (:control-handler (setf control-handler value)) (:budget-owner (setf budget-owner value)) (otherwise (error 'http-kit:http-protocol-error :message "An unknown HTTP/2 response option was supplied." :operation :http2-read :detail key))))
     (let ((context (or hpack-context
                        (%h2-make-hpack-context :max-table-size +hpack-default-table-size+)))
         (status nil)
@@ -122,6 +94,15 @@
                    frame reader max-frame-size deadline clock-function
                    max-header-bytes context status headers body body-length
                    request-method expected-stream-id max-fields)
+                (when (and response on-response-complete)
+                  (funcall on-response-complete))
+                (when (and on-response-headers
+                           (not response-headers-fired-p)
+                           new-status
+                           (>= new-status 200))
+                  (funcall on-response-headers new-status new-headers))
+                (when (and new-status (>= new-status 200))
+                  (setf response-headers-fired-p t))
                 (setf status new-status
                       headers new-headers)
                 (when (and information-status on-information)
@@ -136,7 +117,8 @@
               (multiple-value-bind (end-stream new-body-length data-length)
                   (%h2-append-data-frame
                    frame status body body-length request-method max-body-bytes
-                   on-body-chunk collect-body-p expected-stream-id)
+                   on-body-chunk collect-body-p expected-stream-id
+                   on-response-complete)
                 (setf body-length new-body-length)
                 ;; Restore stream credit only while more response DATA can arrive.
                 (unless end-stream
@@ -147,20 +129,13 @@
                     (%h2-finish-request-response
                      status headers nil body request-method
                      :body-length body-length)))))
-             ((= type +http2-continuation-type+)
-              (error 'http-kit:http-protocol-error
-                     :message "An unexpected HTTP/2 CONTINUATION frame was received."
-                     :operation :http2-read
-                     :detail stream-id))
+             ((= type +http2-continuation-type+) (error 'http-kit:http-protocol-error :message "An unexpected HTTP/2 CONTINUATION frame was received." :operation :http2-read :detail stream-id))
              (t
               ;; Unknown extension frames are ignored as required by HTTP/2.
               nil)))))))
 
 (defun send-http2-request
-    (client request
-     &key timeout deadline max-header-bytes max-fields max-body-bytes clock-function
-       request-body-function request-body-length
-       on-body-chunk (collect-body-p t) (huffman-p nil))
+    (client request &key timeout deadline max-header-bytes max-fields max-body-bytes clock-function request-body-function request-body-length on-body-chunk on-response-headers (collect-body-p t) (huffman-p nil))
   (unless (http2-client-p client)
     (error 'http-kit:http-protocol-error
            :message "An HTTP/2 request requires an HTTP2-CLIENT."
@@ -169,11 +144,7 @@
   (http-kit::%check-http-request request)
   (%h2-validate-request-body-options
    request request-body-function request-body-length)
-  (when (and on-body-chunk (not (functionp on-body-chunk)))
-    (error 'http-kit:http-protocol-error
-           :message "ON-BODY-CHUNK must be a function or NIL."
-           :operation :http2-client
-           :detail on-body-chunk))
+  (progn (when (and on-body-chunk (not (functionp on-body-chunk))) (error 'http-kit:http-protocol-error :message "ON-BODY-CHUNK must be a function or NIL." :operation :http2-client :detail on-body-chunk)) (when (and on-response-headers (not (functionp on-response-headers))) (error 'http-kit:http-protocol-error :message "ON-RESPONSE-HEADERS must be a function or NIL." :operation :http2-client :detail on-response-headers)))
   (unless (member collect-body-p '(nil t))
     (error 'http-kit:http-protocol-error
            :message "COLLECT-BODY-P must be NIL or T."
@@ -210,6 +181,7 @@
                  :request-body-length request-body-length
                  :huffman-p huffman-p
                  :on-body-chunk on-body-chunk
+                 :on-response-headers on-response-headers
                  :collect-body-p collect-body-p))
                ((%http2-exchange client)
                 (when request-body-function
@@ -233,6 +205,7 @@
                                      (http-kit:http-request-method request)
                                      on-body-chunk collect-body-p
                                      :max-fields field-limit
+                                     :on-response-headers on-response-headers
                                      :budget-owner client
                                      :control-handler
                                      (lambda (frame response-writer expected-id)
@@ -279,6 +252,7 @@
                  :request-body-length request-body-length
                  :huffman-p huffman-p
                  :on-body-chunk on-body-chunk
+                 :on-response-headers on-response-headers
                  :collect-body-p collect-body-p)))
           (when temporary-connection
             (close-http2-connection temporary-connection))
@@ -286,10 +260,7 @@
             (funcall (%http2-close-stream client) stream)))))))
 
 (defun send-http2-request/cps
-    (client request on-success
-     &key on-error timeout deadline max-header-bytes max-fields max-body-bytes
-       clock-function request-body-function request-body-length
-       on-body-chunk (collect-body-p t) (huffman-p nil))
+    (client request on-success &key on-error timeout deadline max-header-bytes max-fields max-body-bytes clock-function request-body-function request-body-length on-body-chunk on-response-headers (collect-body-p t) (huffman-p nil))
   "Send an HTTP/2 request and dispatch its result to CPS continuations."
   (http-kit::%call-http-operation/cps
    (lambda ()
@@ -305,6 +276,7 @@
       :request-body-length request-body-length
       :huffman-p huffman-p
       :on-body-chunk on-body-chunk
+      :on-response-headers on-response-headers
       :collect-body-p collect-body-p))
    on-success
    :on-error on-error))

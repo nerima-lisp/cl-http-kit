@@ -2186,12 +2186,16 @@
       (ensure-equal
        '(:read (:await nil) :resumed (:data #(1 2 3)))
        (nreverse events)))))
-(deftest http3-client-native-scheduler-delivers-response
-  (let* ((response-encoder-context
-           (http-message-kit:make-qpack-context
-            :max-table-capacity 0 :table-capacity 0 :huffman nil))
-         (response-wire
+(deftest http3-client-native-scheduler-delivers-response-and-cancel-callbacks
+  (let* ((response-wire
            (http3-test-concat-octets
+            (http-kit/http3:encode-http3-frame
+             (http-kit/http3:make-http3-frame
+              :type http-kit/http3:+http3-headers-type+
+              :payload
+              (http3-test-qpack-encode
+               (list (cons ":status" "103"))
+               :use-dynamic-p nil)))
             (http-kit/http3:encode-http3-frame
              (http-kit/http3:make-http3-frame
               :type http-kit/http3:+http3-headers-type+
@@ -2199,68 +2203,109 @@
               (http3-test-qpack-encode
                (list (cons ":status" "200")
                      (cons "content-length" "3"))
-               :context response-encoder-context
                :use-dynamic-p nil)))
             (http-kit/http3:encode-http3-frame
              (http-kit/http3:make-http3-frame
               :type http-kit/http3:+http3-data-type+
               :payload (octets 1 2 3)))))
          (request-stream nil)
-         (polls 0)
-         (try-reads 0)
-         (blocking-reads 0)
-         (request-writes 0)
+         (cancel-function nil)
+         (events nil)
          (response-sent-p nil)
          (client
-           (http-kit/http3:make-http3-client
-            :open-stream
-            (lambda (request &key stream-type timeout deadline)
-              (declare (ignore request timeout deadline))
-              (let ((stream (make-http3-test-stream :kind stream-type)))
-                (when (eq stream-type :request)
-                  (setf request-stream stream))
-                (if (eq stream-type :request)
-                    (values stream 0)
-                    stream)))
-            :write-stream
-            (lambda (stream octets &key fin-p timeout deadline)
-              (declare (ignore octets fin-p timeout deadline))
-              (when (eq (http3-test-stream-kind stream) :request)
-                (incf request-writes)))
+           (http3-test-make-native-client
             :read-stream
             (lambda (stream &key timeout deadline)
               (declare (ignore stream timeout deadline))
-              (incf blocking-reads)
-              (values response-wire t))
-            :poll-function
-            (lambda () (incf polls))
+              (error "The native scheduler used blocking reads."))
+            :close-stream
+            (lambda (stream &key condition)
+              (declare (ignore condition))
+              (setf (http3-test-stream-closed-p stream) t))
             :try-read-stream
             (lambda (stream &key timeout deadline)
               (declare (ignore timeout deadline))
               (ensure-true (eq request-stream stream))
-              (incf try-reads)
               (if response-sent-p
                   (values nil nil :would-block)
-                  (progn
-                    (setf response-sent-p t)
-                    (values response-wire t :data))))
-            :stream-write-pending-p
-            (lambda (stream)
-              (declare (ignore stream))
-              nil))))
+                (progn
+                  (setf response-sent-p t)
+                  (values response-wire t :data)))))))
     (unwind-protect
          (let ((response
                  (http-kit/http3:send-http3-request
                   client
                   (make-http-request
-                   :method "GET" :uri "https://example.test/"))))
+                   :method "GET" :uri "https://example.test/")
+                  :on-cancel
+                  (lambda (cancel)
+                    (setf cancel-function cancel)
+                    (push :cancel-register events)
+                    (lambda ()
+                      (ensure-false (http3-test-stream-closed-p request-stream))
+                      (push :cancel-cleanup events)))
+                  :on-stream-open
+                  (lambda (stream stream-id cancel)
+                    (setf request-stream stream)
+                    (ensure-equal 0 stream-id)
+                    (ensure-true (functionp cancel))
+                    (ensure-true (eq cancel-function cancel))
+                    (push :open events))
+                  :on-information
+                  (lambda (information)
+                    (ensure-equal 103 (http-response-status information))
+                    (push :information events))
+                  :on-response-headers
+                  (lambda (status headers)
+                    (ensure-equal 200 status)
+                    (ensure-equal "3" (http-header-value headers "content-length"))
+                    (push :response-headers events))
+                  :on-body-chunk
+                  (lambda (chunk)
+                    (ensure-equal (octets 1 2 3) chunk)
+                    (push :body events)))))
+           (ensure-equal
+            (list :cancel-register :open :information :response-headers
+                  :body :cancel-cleanup)
+            (reverse events))
            (ensure-equal 200 (http-response-status response))
            (ensure-equal (octets 1 2 3) (http-response-body response))
-           (ensure-true (plusp polls))
-           (ensure-true (plusp request-writes))
-           (ensure-true (plusp try-reads))
-           (ensure-equal 0 blocking-reads))
+           (ensure-true (http3-test-stream-closed-p request-stream)))
       (http-kit/http3:close-http3-client client))))
+(deftest http3-client-native-scheduler-rejects-invalid-cancel-cleanup
+  (let* ((cancel-count 0)
+         (client
+           (http3-test-make-native-client
+            :cancel-stream
+            (lambda (stream &key error-code timeout deadline)
+              (declare (ignore stream error-code timeout deadline))
+              (incf cancel-count))
+            :try-read-stream
+            (lambda (stream &key timeout deadline)
+              (declare (ignore stream timeout deadline))
+              (values nil nil :would-block)))))
+    (unwind-protect
+         (let ((failure
+                 (http3-boundary-error
+                  (lambda ()
+                    (http-kit/http3:send-http3-request
+                     client
+                     (make-http-request
+                      :method "GET"
+                      :uri "https://example.test/invalid-cancel-cleanup")
+                     :on-cancel
+                     (lambda (cancel)
+                       (declare (ignore cancel))
+                       :invalid-cleanup))))))
+           (ensure-equal :http3-transport (http-error-operation failure))
+           (ensure-equal
+            "ON-CANCEL must return a cleanup function or NIL."
+            (http-error-message failure))
+           (ensure-equal (type-of :invalid-cleanup) (http-protocol-error-detail failure))
+           (ensure-equal 1 cancel-count)
+           (ensure-true (http-kit/http3:http3-client-open-p client)))
+      (when (http-kit/http3:http3-client-open-p client)
+        (http-kit/http3:close-http3-client client)))))
 (deftest http3-client-native-scheduler-preserves-response-after-peer-stops-request
   (let* ((quic (make-http3-quic-adapter-test-client))
          (response-wire (http3-test-native-response-wire (octets 7 8)))
@@ -6864,7 +6909,7 @@
 (deftest http3-client-cancellation-callbacks-require-functions
   (labels ((open-stream (request &key stream-type timeout deadline)
              (declare (ignore request timeout deadline))
-             (make-http3-test-stream :kind stream-type))
+             (values (make-http3-test-stream :kind stream-type) 0))
            (write-stream (stream octets &key fin-p timeout deadline)
              (declare (ignore stream octets fin-p timeout deadline)))
            (read-stream (stream &key timeout deadline)
@@ -6884,17 +6929,29 @@
        :close-connection :not-a-function))
     (let ((client
             (http-kit/http3:make-http3-client
-             :open-stream (function open-stream)
-             :write-stream (function write-stream)
-             :read-stream (function read-stream)
-             :cancel-stream
-             (lambda (stream &key error-code timeout deadline)
-               (declare (ignore stream error-code timeout deadline))))))
-      (signals http-protocol-error
-        (http-kit/http3:send-http3-request
-         client
-         (make-http-request :method "GET" :uri "https://example.test/")
-         :on-stream-open :not-a-function)))))
+             :open-stream #'open-stream
+             :write-stream #'write-stream
+             :read-stream #'read-stream
+             :cancel-stream (lambda (stream &key error-code timeout deadline)
+                              (declare (ignore stream error-code timeout deadline))))))
+      (let ((request
+              (make-http-request :method "GET" :uri "https://example.test/")))
+        (signals http-protocol-error
+          (http-kit/http3:send-http3-request
+           client request :on-stream-open :not-a-function))
+        (signals http-protocol-error
+          (http-kit/http3:send-http3-request
+           client request :on-response-headers :not-a-function))
+        (signals http-protocol-error
+          (http-kit/http3:send-http3-request
+           client request :on-cancel :not-a-function))
+        (signals http-protocol-error
+          (http-kit/http3:send-http3-request
+           client request
+           :on-cancel
+           (lambda (cancel-function)
+             (declare (ignore cancel-function))
+             :not-a-cleanup)))))))
 
 (deftest http3-client-rejects-request-stream-excluded-by-goaway
   (let ((request-stream (make-http3-test-stream :kind :request))
@@ -6936,7 +6993,8 @@
 (deftest http3-request-cancel-function-forwards-default-code-and-timing
   (let ((request-stream (make-http3-test-stream :kind :request))
         (cancel-call nil)
-        (closed-condition :unset))
+        (closed-condition :unset)
+        (registered-cancel-function nil))
     (labels ((open-stream (request &key stream-type timeout deadline)
                (declare (ignore request timeout deadline))
                (if (eq stream-type :request)
@@ -6965,14 +7023,19 @@
            (make-http-request :method "GET" :uri "https://example.test/")
            :timeout 23
            :deadline 47
+           :on-cancel
+           (lambda (cancel-function)
+             (setf registered-cancel-function cancel-function)
+             (funcall cancel-function)
+             nil)
            :on-stream-open
            (lambda (stream stream-id cancel-function)
              (ensure-true (eq request-stream stream))
              (ensure-equal 17 stream-id)
              (ensure-true (functionp cancel-function))
-             (funcall cancel-function))))))
-    (ensure-equal (list request-stream #x10c 23 47) cancel-call)
-    (ensure-true (typep closed-condition 'error))))
+             (ensure-true (eq cancel-function registered-cancel-function))))))
+      (ensure-equal (list request-stream #x10c 23 47) cancel-call)
+      (ensure-true (typep closed-condition 'error)))))
 
 (deftest http3-request-cancel-failure-still-closes-request-stream
   (let ((request-stream (make-http3-test-stream :kind :request))
@@ -12042,30 +12105,49 @@
                                                   ("content-length" . "1"))) nil)
                   (list (http3-boundary-data "a") t))))
          (events nil)
+         (request-stream nil)
+         (cancel-function nil)
          (response
            (http-kit/http3:send-http3-request
             (http3-boundary-fixture-client fixture)
             (make-http-request :method "GET" :uri "https://example.test/")
             :collect-body-p nil
+            :on-cancel
+            (lambda (cancel)
+              (setf cancel-function cancel)
+              (push :cancel-register events)
+              (lambda ()
+                (ensure-false (http3-test-stream-closed-p request-stream))
+                (push :cancel-cleanup events)))
             :on-stream-open
             (lambda (stream stream-id cancel)
+              (setf request-stream stream)
               (ensure-true (eq stream (first (http3-boundary-fixture-streams fixture))))
               (ensure-equal 0 stream-id)
               (ensure-true (functionp cancel))
+              (ensure-true (eq cancel cancel-function))
               (ensure-equal nil (http3-test-stream-writes stream))
               (ensure-equal 0 (http3-boundary-fixture-reads fixture))
               (push :open events))
             :on-information
-            (lambda (response)
-              (ensure-equal 103 (http-response-status response))
+            (lambda (information)
+              (ensure-equal 103 (http-response-status information))
               (ensure-equal 1 (http3-boundary-fixture-reads fixture))
               (push :information events))
+            :on-response-headers
+            (lambda (status headers)
+              (ensure-equal 200 status)
+              (ensure-equal "1" (http-header-value headers "content-length"))
+              (ensure-equal 2 (http3-boundary-fixture-reads fixture))
+              (push :response-headers events))
             :on-body-chunk
             (lambda (chunk)
               (ensure-true (equalp (ascii "a") chunk))
               (ensure-equal 3 (http3-boundary-fixture-reads fixture))
               (push :body events)))))
-    (ensure-equal '(:open :information :body) (reverse events))
+    (ensure-equal '(:cancel-register :open :information :response-headers :body
+                    :cancel-cleanup)
+                  (reverse events))
     (ensure-equal 200 (http-response-status response))
     (ensure-equal 0 (length (http-response-body response)))
     (let* ((writes (reverse (http3-test-stream-writes
@@ -12080,7 +12162,8 @@
       (ensure-equal http-kit/http3:+http3-headers-type+
                     (http-kit/http3:http3-frame-type (first headers)))
       (ensure-true (member '(":method" . "GET")
-                           (http3-test-qpack-decode (http-kit/http3:http3-frame-payload (first headers)))
+                           (http3-test-qpack-decode
+                            (http-kit/http3:http3-frame-payload (first headers)))
                            :test #'equal))
       (ensure-equal http-kit/http3:+http3-data-type+
                     (http-kit/http3:http3-frame-type (first data)))
@@ -12090,7 +12173,7 @@
     (http-kit/http3:close-http3-client (http3-boundary-fixture-client fixture))))
 
 (deftest http3-public-response-callback-failure-releases-capacity
-  (dolist (phase '(:open :information :body))
+  (dolist (phase '(:open :information :headers :body))
     (let* ((fixture
              (http3-boundary-fixture
               (list (list (http3-boundary-headers '((":status" . "103"))) nil)
@@ -12116,17 +12199,29 @@
                    (ensure-equal 103 (http-response-status response))
                    (push :information calls)
                    (when (eq phase :information) (error primary)))
+                 :on-response-headers
+                 (lambda (status headers)
+                   (ensure-equal 200 status)
+                   (ensure-equal "1" (http-header-value headers "content-length"))
+                   (push :headers calls)
+                   (when (eq phase :headers) (error primary)))
                  :on-body-chunk
                  (lambda (chunk)
                    (ensure-true (equalp (ascii "a") chunk))
                    (push :body calls)
                    (when (eq phase :body) (error primary))))))))
       (ensure-true (eq primary failure))
-      (ensure-equal (ecase phase (:open '(:open))
-                                (:information '(:open :information))
-                                (:body '(:open :information :body)))
+      (ensure-equal (ecase phase
+                      (:open '(:open))
+                      (:information '(:open :information))
+                      (:headers '(:open :information :headers))
+                      (:body '(:open :information :headers :body)))
                     (reverse calls))
-      (ensure-equal (ecase phase (:open 0) (:information 1) (:body 3))
+      (ensure-equal (ecase phase
+                      (:open 0)
+                      (:information 1)
+                      (:headers 2)
+                      (:body 3))
                     (http3-boundary-fixture-reads fixture))
       (when (eq phase :open)
         (ensure-equal nil (http3-test-stream-writes
@@ -12905,7 +13000,17 @@
                (setf response
                      (funcall
                       (http-kit/http3:make-http3-connection-manager-transport manager)
-                      request :proxy nil :proxy-plan plan))
+                      request :proxy nil :proxy-plan plan
+                      :on-response-headers
+                      (lambda (status headers)
+                        (ensure-equal 204 status)
+                        (ensure-equal nil headers)
+                        (push :response-headers events))
+                      :on-cancel
+                      (lambda (cancel-function)
+                        (ensure-true (functionp cancel-function))
+                        (push :cancel-register events)
+                        (lambda () (push :cancel-unregister events)))))
              (http-protocol-error (error-condition)
                (setf condition error-condition)))
            (setf retained-count
@@ -12928,6 +13033,15 @@
           (ensure-equal '(:open-client t) (first request-events))
           (ensure-true (member :write-stream request-events))
           (ensure-true (member :read-stream request-events))
+          (ensure-true (member :response-headers request-events))
+          (ensure-true (member :cancel-register request-events))
+          (ensure-true (member :cancel-unregister request-events))
+          (ensure-true (< (position :open-stream request-events)
+                          (position :cancel-register request-events)))
+          (ensure-true (< (position :response-headers request-events)
+                          (position :cancel-unregister request-events)))
+          (ensure-true (< (position :cancel-unregister request-events)
+                          (position :close-stream request-events)))
           (ensure-equal 1 retained-count))
         (progn
           (ensure-true (typep condition 'http-protocol-error))

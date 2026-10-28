@@ -34,6 +34,88 @@
          :operation (or operation :client)
          :detail detail))
 
+(defstruct (http-cancellation-token
+             (:constructor %make-http-cancellation-token))
+  (cancelled-p nil)
+  (cancel-handlers nil)
+  lock
+  #+sbcl (waitqueue (sb-thread:make-waitqueue))
+  #-sbcl (waitqueue nil))
+
+(defun make-http-cancellation-token ()
+  "Create a one-shot token that can cancel active HTTP client requests."
+  (%make-http-cancellation-token
+   :lock (%make-client-lock "http-cancellation-token")))
+
+(defun %client-cancellation-token-cancelled-p (token)
+  (%with-client-lock ((http-cancellation-token-lock token))
+    (http-cancellation-token-cancelled-p token)))
+
+(defun %client-cancellation-token-register-handler (token handler)
+  (let* ((entry (vector nil t nil))
+         (invoke-handler
+           (lambda ()
+             (let ((invoke-p nil))
+               (%with-client-lock ((http-cancellation-token-lock token))
+                 (when (aref entry 1)
+                   (setf (aref entry 1) nil
+                         (aref entry 2) t
+                         invoke-p t)))
+               (when invoke-p
+                 (unwind-protect
+                      (funcall handler)
+                   (%with-client-lock ((http-cancellation-token-lock token))
+                     (setf (aref entry 2) nil)
+                     #+sbcl
+                     (sb-thread:condition-broadcast
+                      (http-cancellation-token-waitqueue token))))))))
+         (cancel-now-p nil))
+    (setf (aref entry 0) invoke-handler)
+    (%with-client-lock ((http-cancellation-token-lock token))
+      (if (http-cancellation-token-cancelled-p token)
+          (setf cancel-now-p t)
+          (push entry (http-cancellation-token-cancel-handlers token))))
+    (when cancel-now-p
+      (funcall invoke-handler))
+    (lambda ()
+      (%with-client-lock ((http-cancellation-token-lock token))
+        (setf (aref entry 1) nil)
+        #+sbcl
+        (loop while (aref entry 2)
+              do (sb-thread:condition-wait
+                  (http-cancellation-token-waitqueue token)
+                  (http-cancellation-token-lock token)))
+        (setf (http-cancellation-token-cancel-handlers token)
+              (delete entry
+                      (http-cancellation-token-cancel-handlers token)
+                      :test (function eq))))
+      nil)))
+
+(defun http-client-cancel-request (token)
+  "Cancel active requests using TOKEN.  Return T only on the first call."
+  (unless (http-cancellation-token-p token)
+    (%client-protocol-error
+     "The cancellation token must come from MAKE-HTTP-CANCELLATION-TOKEN."
+     token))
+  (let ((handlers nil)
+        (first-cancel-p nil)
+        (first-error nil))
+    (%with-client-lock ((http-cancellation-token-lock token))
+      (unless (http-cancellation-token-cancelled-p token)
+        (setf (http-cancellation-token-cancelled-p token) t
+              handlers (http-cancellation-token-cancel-handlers token)
+              (http-cancellation-token-cancel-handlers token) nil
+              first-cancel-p t)))
+    (dolist (entry handlers)
+      (handler-case
+          (funcall (aref entry 0))
+        (error (condition)
+          (unless first-error
+            (setf first-error condition)))))
+    (when first-error
+      (error first-error))
+    first-cancel-p))
+
 (defun %client-redirect-limit-error (uri redirects)
   (error 'http-redirect-limit-exceeded
          :message "The HTTP redirect policy exhausted its redirect limit."
@@ -353,6 +435,7 @@ character in that range is a decimal digit, apart from an optional sign when
   default-timeout
   max-header-bytes
   max-fields
+  (max-http2-concurrent-streams 100)
   max-body-bytes
   (automatic-decompression-p t)
   (content-decoders nil)

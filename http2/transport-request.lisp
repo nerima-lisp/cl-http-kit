@@ -208,6 +208,22 @@
             (t
              (error condition))))))))
 
+(define-condition %h2-local-request-header-size-error
+    (http-kit:http-size-limit-exceeded)
+  ())
+
+(defun %h2-check-request-header-limit (observed limit)
+  (handler-case
+      (http-kit::%check-limit :headers observed limit)
+    (http-kit:http-size-limit-exceeded (condition)
+      (error '%h2-local-request-header-size-error
+             :message (http-kit:http-error-message condition)
+             :operation (http-kit:http-error-operation condition)
+             :detail (http-kit:http-protocol-error-detail condition)
+             :limit (http-kit:http-size-limit-exceeded-limit condition)
+             :observed (http-kit:http-size-limit-exceeded-observed condition)
+             :kind (http-kit:http-size-limit-exceeded-kind condition)))))
+
 (defun %h2-request-header-wire (request max-frame-size max-header-bytes
                                 max-body-bytes
                                 &key (stream-id 1) (include-session-p t)
@@ -239,11 +255,11 @@
          (trailer-fields (%h2-request-trailer-fields request))
          (header-size (%h2-header-list-size fields))
          (trailer-size (%h2-header-list-size trailer-fields)))
-    (http-kit::%check-limit :headers header-size max-header-bytes)
-    (http-kit::%check-limit :headers trailer-size max-header-bytes)
+    (%h2-check-request-header-limit header-size max-header-bytes)
+    (%h2-check-request-header-limit trailer-size max-header-bytes)
     (when peer-max-header-list-size
-      (http-kit::%check-limit :headers header-size peer-max-header-list-size)
-      (http-kit::%check-limit :headers trailer-size peer-max-header-list-size))
+      (%h2-check-request-header-limit header-size peer-max-header-list-size)
+      (%h2-check-request-header-limit trailer-size peer-max-header-list-size))
     (http-kit::%check-limit :body (or expected-body-length (length body))
                             max-body-bytes)
     (let* ((block (%h2-encode-header-block fields :huffman-p huffman-p))

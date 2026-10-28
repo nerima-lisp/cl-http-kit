@@ -14,6 +14,8 @@
    (last-response :initarg :last-response :initform nil
                   :reader http-retry-exhausted-last-response)))
 
+(define-condition http-client-request-cancelled (http-client-error) ())
+
 (define-condition http-cookie-error (http-client-error) ())
 (define-condition http-cache-error (http-client-error) ())
 (define-condition http-proxy-error (http-client-error) ())
