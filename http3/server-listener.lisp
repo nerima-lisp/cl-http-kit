@@ -708,44 +708,47 @@
              :reason "HTTP/3 request drain complete"))))))
 
   (defun %http3-server-start-worker (server function name &optional connection)
-    (let ((worker nil))
+    (let ((worker nil) (registered-p nil))
       (handler-case
           (http-kit::%with-http-server-lock (server)
             (setf worker
                   (sb-thread:make-thread
                    (lambda ()
-                     (http-kit::%with-http-server-lock (server) nil)
-                     (unwind-protect
-                          (handler-case
-                              (funcall function)
-                            (http-kit::http-server-callback-error (condition)
-                              (http-kit::%http-server-mark-failed
-                               server condition))
-                            (error (condition)
-                              (when (and (http-kit::%http-server-running-p server)
-                                         (or (null connection)
-                                             (not (%http3-server-connection-closed-p
-                                                   server connection))))
-                                (http-kit::%http-server-report-error
-                                 server condition :stream :protocol :http3))))
-                       (progn
-                         (http-kit::%with-http-server-lock (server)
-                           (remhash sb-thread:*current-thread*
-                                    (http-kit::http-server-workers server))
-                           (http-kit::%http-server-broadcast server))
-                         (when (http-kit::%with-http-server-lock (server)
-                                 (and (http-kit::http-server-shutdown-p server)
-                                      (member (http-kit::http-server-state server)
-                                              '(:stopping :failed))
-                                      (let ((supervisor
-                                              (http-kit::http-server-supervisor server)))
-                                        (or (null supervisor)
-                                            (not (sb-thread:thread-alive-p
-                                                  supervisor))))))
-                           (http-kit::%http-server-ensure-shutdown-coordinator
-                            server)))))
+                     (when (http-kit::%with-http-server-lock (server)
+                             registered-p)
+                       (unwind-protect
+                           (handler-case
+                               (funcall function)
+                             (http-kit::http-server-callback-error (condition)
+                               (http-kit::%http-server-mark-failed
+                                server condition))
+                             (error (condition)
+                               (when (and (http-kit::%http-server-running-p server)
+                                          (or (null connection)
+                                              (not (%http3-server-connection-closed-p
+                                                    server connection))))
+                                 (http-kit::%http-server-report-error
+                                  server condition :stream :protocol :http3))))
+                         (progn
+                           (http-kit::%with-http-server-lock (server)
+                             (remhash sb-thread:*current-thread*
+                                      (http-kit::http-server-workers server))
+                             (http-kit::%http-server-broadcast server))
+                           (when (http-kit::%with-http-server-lock (server)
+                                   (and (http-kit::http-server-shutdown-p server)
+                                        (member (http-kit::http-server-state server)
+                                                (quote (:stopping :failed)))
+                                        (let ((supervisor
+                                                (http-kit::http-server-supervisor server)))
+                                          (or (null supervisor)
+                                              (not (sb-thread:thread-alive-p
+                                                    supervisor))))))
+                             (http-kit::%http-server-ensure-shutdown-coordinator
+                              server))))))
                    :name name))
-            (setf (gethash worker (http-kit::http-server-workers server)) t))
+            (progn
+              (setf (gethash worker (http-kit::http-server-workers server)) t)
+              (setf registered-p t)))
         (error ()
           (http-kit::%http-server-configuration-error :worker-start-failed)))
       worker))

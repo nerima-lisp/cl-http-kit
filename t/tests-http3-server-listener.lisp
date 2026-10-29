@@ -2293,11 +2293,50 @@
                   server (lambda () nil) "shutdown-dead-supervisor")))
            (sb-thread:join-thread worker))
          (ensure-equal 2 coordinator-count)
-         (setf (http-kit/http3::%http3-server-connection-active-request-streams
-               connection)
-              1
-              (http-kit::http-server-active-http3-request-workers server)
-              1)
+         (progn
+           (setf (http-kit/http3::%http3-server-connection-active-request-streams
+                  connection)
+                 1
+                 (http-kit::http-server-active-http3-request-workers server)
+                 1)
+           (let ((workers (http-kit::http-server-workers server))
+                 (original-make-thread
+                   (symbol-function (quote sb-thread:make-thread)))
+                 (worker nil)
+                 (thread-count 0)
+                 (worker-function-called-p nil))
+             (unwind-protect
+                  (progn
+                    (setf (http-kit::http-server-workers server) nil)
+                    (let ((condition
+                            (handler-case
+                                (%http3-listener-test-call-with-function-stubs
+                                 (list
+                                  (cons (quote sb-thread:make-thread)
+                                        (lambda (function &rest arguments)
+                                          (incf thread-count)
+                                          (setf worker
+                                                (apply original-make-thread
+                                                       function arguments)))))
+                                 (lambda ()
+                                   (http-kit/http3::%http3-server-start-worker
+                                    server
+                                    (lambda ()
+                                      (setf worker-function-called-p t))
+                                    "worker-registration-failure")))
+                              (http-kit::http-server-error (condition) condition))))
+                      (ensure-equal
+                       :worker-start-failed
+                       (http-kit::http-server-error-reason-code condition)))
+                    (ensure-equal 1 thread-count)
+                    (ensure-true worker)
+                    (handler-case
+                        (sb-thread:join-thread worker)
+                      (error () nil))
+                    (ensure-false worker-function-called-p))
+               (setf (http-kit::http-server-workers server) workers)
+               (when (and worker (sb-thread:thread-alive-p worker))
+                 (sb-thread:join-thread worker)))))
          (%http3-listener-test-call-with-function-stubs
           (list
            (cons 'http-kit/http3::%http3-server-start-worker

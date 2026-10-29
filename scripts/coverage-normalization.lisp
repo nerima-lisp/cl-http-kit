@@ -92,8 +92,11 @@
                                             (= (length (second (second lambda))) 2)
                                             (symbolp (first (second (second lambda))))
                                             (eql (second (second (second lambda))) 8))
-                                   (key-candidates (second lambda)
-                                                   (list* 1 3 slot path)))))))))
+                                   (key-candidates
+  (second lambda)
+  (list* 1 3 slot path)
+  nil
+  (source-body-anchors lambda (list* 3 slot path) 2)))))))))
         (descend form path
                  (list (list 'defun 3 nil) (list 'let* 2 nil)
                        (list deadline 2 nil) (list translation 2 nil)
@@ -126,7 +129,11 @@
                                         (= (length (second (second lambda))) 2)
                                         (symbolp (first (second (second lambda))))
                                         (eql (second (second (second lambda))) 268))
-                               (key-candidates (second lambda) (list* 1 4 slot path)))))))))
+                               (key-candidates
+  (second lambda)
+  (list* 1 4 slot path)
+  nil
+  (source-body-anchors lambda (list* 4 slot path) 2)))))))))
     (descend form path
              '((defun 3 nil) (let* 2 nil) (unwind-protect 1 2)
                (handler-case 1 2) (progn 1 nil)))))
@@ -136,8 +143,21 @@
   (if (equal initializer '(quote ("h3")))
       (values (list "h3") t)
       (proven-atomic-value initializer)))
+(defun source-body-anchors (form path first-slot)
+  (let ((forms (nthcdr first-slot form))
+        (slot first-slot))
+    (when (and forms (stringp (first forms)))
+      (pop forms)
+      (incf slot))
+    (loop while (and forms (consp (first forms))
+                     (eq (caar forms) (find-symbol "DECLARE" "CL")))
+          do (pop forms)
+             (incf slot))
+    (loop repeat (length forms)
+          collect (cons slot path)
+          do (incf slot))))
 
-(defun key-candidates (lambda-list path &optional allow-alpn)
+(defun key-candidates (lambda-list path &optional allow-alpn body-anchors)
   ;; Mixed argument lists can execute the native path for an atomic key default.
   (when (some (lambda (binding)
                 (member binding '(&optional &rest &body &aux &whole &environment)))
@@ -173,7 +193,8 @@
                                 (if (equal (second binding) '(quote nil))
                                     nil (second binding))
                                 (if (consp value) (copy-tree value)
-                                    (if (stringp value) (copy-seq value) value)))
+                                    (if (stringp value) (copy-seq value) value))
+                                (copy-tree body-anchors))
                           candidates))))))
     (nreverse candidates)))
 
@@ -181,13 +202,18 @@
   (when (and (consp form) (eq (first form) 'defun) (listp (third form)))
     (let* ((callback (callback-key-candidates form path))
            (macros (when callback (callback-macro-dependencies)))
-           (body-slot (1- (length form))) (body (car (last form))))
+           (body-slot (1- (length form)))
+           (body (car (last form))))
       (values
        (nconc callback (h3-callback-key-candidates form path)
-              (key-candidates (third form) (cons 2 path) t)
+              (key-candidates (third form) (cons 2 path) t
+                              (source-body-anchors form path 3))
               (when (and (>= body-slot 3) (consp body)
                          (eq (first body) 'lambda) (listp (second body)))
-                (key-candidates (second body) (list* 1 body-slot path))))
+                (key-candidates (second body) (list* 1 body-slot path) nil
+                                (source-body-anchors body
+                                                     (cons body-slot path)
+                                                     2))))
        macros))))
 
 (defun keyword-nil-slot-candidates (slots top)
@@ -196,7 +222,7 @@
   (loop for slot in slots for index from 2
         when (and (consp slot) (consp (cdr slot)) (symbolp (first slot))
                   (or (null (second slot)) (equal (second slot) '(quote nil))))
-          collect (list (list 1 index top) nil nil)))
+          collect (list (list 1 index top) nil nil nil)))
 
 (defun source-candidates (bytes)
   (let ((*package* (find-package '#:cl-user))
@@ -322,33 +348,41 @@
     (unless (and (= (length paths) (length bits))
                  (or (null locations) (>= (length locations) (length paths))))
       (error "Unsupported coverage record layout: ~A" pathname))
-    (when proof
-      (dolist (candidate (source-proof-candidates proof))
-        (let ((indices (loop for path across paths for index from 0
-                             when (equal path (first candidate)) collect index)))
-          (unless (= (length indices) 1)
-            (error "Unmatched declaration coverage path: ~A" pathname))
-          (when (zerop (sbit bits (first indices)))
-            (push (first indices) removed)))))
-    (dotimes (index (length paths))
-      (unless (member index removed) (push index retained)))
-    (setf retained (nreverse retained))
-    (let* ((new-paths (map 'vector (lambda (index) (copy-tree (aref paths index)))
-                          retained))
-           ;; Preserve the location suffix used by SB-COVER's source suppressions.
-           (new-locations
-             (when locations
-               (concatenate 'vector
-                            (map 'vector (lambda (index) (aref locations index)) retained)
-                            (subseq locations (length paths)))))
-           (new-file (sb-c::make-coverage-instrumented-file
-                      new-paths new-locations
-                      (when (sb-c::covered-file-lines file)
-                        (copy-seq (sb-c::covered-file-lines file))))))
-      (loop for old in retained for new from 0
-            do (setf (sbit (sb-c::covered-file-executed new-file) new)
-                     (sbit bits old)))
-      (values new-file (length removed)))))
+    (labels ((body-executed-p (anchors)
+               (and anchors
+                    (some (lambda (anchor)
+                            (loop for path across paths for index from 0
+                                  thereis (and (equal path anchor)
+                                               (= 1 (sbit bits index)))))
+                          anchors))))
+      (when proof
+        (dolist (candidate (source-proof-candidates proof))
+          (let ((indices (loop for path across paths for index from 0
+                               when (equal path (first candidate)) collect index)))
+            (unless (= (length indices) 1)
+              (error "Unmatched declaration coverage path: ~A" pathname))
+            (when (and (zerop (sbit bits (first indices)))
+                       (body-executed-p (fourth candidate)))
+              (push (first indices) removed)))))
+      (dotimes (index (length paths))
+        (unless (member index removed) (push index retained)))
+      (setf retained (nreverse retained))
+      (let* ((new-paths (map 'vector (lambda (index) (copy-tree (aref paths index)))
+                            retained))
+             ;; Preserve the location suffix used by SB-COVER's source suppressions.
+             (new-locations
+               (when locations
+                 (concatenate 'vector
+                              (map 'vector (lambda (index) (aref locations index)) retained)
+                              (subseq locations (length paths)))))
+             (new-file (sb-c::make-coverage-instrumented-file
+                        new-paths new-locations
+                        (when (sb-c::covered-file-lines file)
+                          (copy-seq (sb-c::covered-file-lines file))))))
+        (loop for old in retained for new from 0
+              do (setf (sbit (sb-c::covered-file-executed new-file) new)
+                       (sbit bits old)))
+        (values new-file (length removed))))))
 
 (defun project-table (table proofs)
   ;; No compiler invariant is assumed elsewhere; the raw gate remains intact.
