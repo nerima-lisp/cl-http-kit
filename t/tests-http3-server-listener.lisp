@@ -2108,14 +2108,14 @@
               (http-message-kit:qpack-make-http3-decoder-context
                decoder-context :max-blocked-streams 1))
              (server (%http3-listener-test-unit-server))
+             (quic-connection
+              (cl-quic-kit::%make-quic-connection
+               :state :established))
              (connection
               (%http3-listener-test-unit-connection
+               :quic-connection quic-connection
                :active-request-streams 1))
-             (quic-connection
-              (http-kit/http3::%http3-server-connection-quic-connection
-               connection))
-             (client (http-kit/http3::%http3-server-make-client
-                      server connection))
+             (client nil)
              (wire
               (http-kit/http3:encode-http3-frame
                (http-kit/http3:make-http3-frame
@@ -2127,20 +2127,12 @@
              (write-count 0)
              (close-stream-count 0)
              (report-count 0))
-        (setf (http-kit/http3::http3-client-qpack-decoder-context client)
-              decoder-context
-              (http-kit/http3::http3-client-qpack-http3-decoder-context client)
-              decoder-adapter
-              (http-kit::http-server-handler server)
-              (lambda (request)
-                (incf handler-count)
-                (ensure-equal "GET" (http-request-method request))
-                (ensure-equal
-                 "ready"
-                 (http-header-value (http-request-headers request) "x-blocked"))
-                (make-http-response :status 204)))
         (%http3-listener-test-call-with-function-stubs
          (list
+          (cons 'http-kit/http3::%http3-server-stream-open
+                (lambda (&rest arguments)
+                  (declare (ignore arguments))
+                  :opened-stream))
           (cons 'http-kit/http3::%http3-server-await-peer-settings
                 (lambda (&rest arguments)
                   (declare (ignore arguments))
@@ -2179,6 +2171,21 @@
                   (ensure-equal :request-stream stream)
                   (incf close-stream-count))))
          (lambda ()
+           (setf client
+                 (http-kit/http3::%http3-server-make-client
+                  server connection))
+           (setf (http-kit/http3::http3-client-qpack-decoder-context client)
+                 decoder-context
+                 (http-kit/http3::http3-client-qpack-http3-decoder-context client)
+                 decoder-adapter
+                 (http-kit::http-server-handler server)
+                 (lambda (request)
+                   (incf handler-count)
+                   (ensure-equal "GET" (http-request-method request))
+                   (ensure-equal
+                    "ready"
+                    (http-header-value (http-request-headers request) "x-blocked"))
+                   (make-http-response :status 204)))
            (http-kit/http3::%http3-server-request-worker
             server connection :request-stream 0 5.0d0)
            (ensure-equal 1 read-count)
