@@ -1049,7 +1049,7 @@ The optional `cl-http-kit/tls` system provides an HTTPS listener on SBCL.
 `http-server-port` are exported from `HTTP-KIT`. `make-http-server` has this
 signature: `(&key (transport :https) host port handler
 certificate-chain private-key ticket-key-store max-connections
-max-handshakes max-concurrent-streams handshake-timeout request-timeout
+max-active-request-workers max-handshakes max-concurrent-streams handshake-timeout request-timeout
 idle-timeout graceful-timeout max-header-bytes max-fields max-body-bytes
 max-buffered-body-bytes on-event on-error)`. HOST, PORT, HANDLER,
 CERTIFICATE-CHAIN, and PRIVATE-KEY
@@ -1070,6 +1070,10 @@ the response may be an HTTP response or response stream.
 Defaults are 128 concurrent connections, 32 concurrent handshakes, 100 HTTP/2
 streams per connection, a 10-second handshake timeout, a 30-second request
 timeout, a 60-second idle timeout, and a 30-second graceful-stop timeout.
+The server-wide HTTP/3 request-worker limit defaults to 128, matching the
+`max-connections` default. It also bounds request workers waiting for peer
+SETTINGS; excess request streams receive `H3_REQUEST_REJECTED` before a worker
+starts.
 Request headers are limited to 65,536 bytes and 100 fields; request bodies are
 limited to 16,777,216 bytes per request. The aggregate buffered-body limit
 defaults to the larger of 64 MiB and twice MAX-BODY-BYTES. It applies across

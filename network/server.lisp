@@ -31,6 +31,7 @@
   (ticket-key-store-users (make-hash-table :test (function eq)))
   tls-wrapper
   max-connections
+  (max-active-request-workers 128)
   max-handshakes
   max-concurrent-streams
   handshake-timeout
@@ -56,6 +57,7 @@
   (connection-count 0)
   (handshake-count 0)
   (buffered-body-bytes 0)
+  (active-http3-request-workers 0)
   (connections (make-hash-table :test (function eq)))
   (failure-value nil)
   (ticket-key-store-cleanup-error nil)
@@ -332,6 +334,7 @@
     (&key (transport :https)
       host port handler certificate-chain private-key ticket-key-store
       (max-connections 128)
+      (max-active-request-workers 128)
       (max-handshakes 32)
       (max-concurrent-streams 100)
       (handshake-timeout 10)
@@ -345,6 +348,7 @@
        (max (* 64 1024 1024)
             (* 2 (if (integerp max-body-bytes) max-body-bytes 0))))
       on-event on-error)
+  "Create an HTTPS or HTTP/3 server. The server-wide HTTP/3 request-worker limit defaults to 128, matching the `max-connections` default; it bounds workers because request streams may arrive before peer SETTINGS."
   (unless (member transport '(:https :http3))
     (%http-server-configuration-error :unsupported-transport))
   (unless (and (stringp host) (plusp (length host)))
@@ -359,7 +363,7 @@
     (%http-server-configuration-error :invalid-event-callback))
   (unless (or (null on-error) (functionp on-error))
     (%http-server-configuration-error :invalid-error-callback))
-  (unless (and (%http-server-positive-integer-p max-connections)
+  (unless (and (%http-server-positive-integer-p max-connections) (%http-server-positive-integer-p max-active-request-workers)
                (%http-server-positive-integer-p max-handshakes)
                (%http-server-positive-integer-p max-concurrent-streams)
                (%http-server-positive-integer-p max-header-bytes)
@@ -406,7 +410,7 @@
                        (+ (%http-server-now)
                           +http-server-ticket-key-rotation-interval+))
                   :tls-wrapper wrapper
-                  :max-connections max-connections
+                  :max-connections max-connections :max-active-request-workers max-active-request-workers
                   :max-handshakes max-handshakes
                   :max-concurrent-streams max-concurrent-streams
                   :handshake-timeout handshake-timeout

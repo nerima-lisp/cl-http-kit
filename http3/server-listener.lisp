@@ -364,10 +364,11 @@
                (%http3-server-stream-read
                 server connection stream :timeout timeout :deadline deadline))
              :cancel-stream
-             (lambda (stream &key (error-code #x10c) timeout deadline)
+             (lambda (stream &key (error-code nil error-code-supplied-p) timeout deadline)
                (declare (ignore timeout deadline))
                (%http3-server-stream-cancel
-                server connection stream error-code))
+                server connection stream
+                (if error-code-supplied-p error-code #x10c)))
              :max-header-bytes
              (http-kit::http-server-max-header-bytes server)
              :max-fields (http-kit::http-server-max-fields server)
@@ -613,7 +614,7 @@
     amount)
 
   (defun %http3-server-request-worker
-      (server connection stream stream-id deadline)
+      (server connection stream stream-id deadline &optional reservation)
     (let ((reported-p nil)
           (serving-p nil)
           (client (%http3-server-connection-http3-client connection))
@@ -689,8 +690,14 @@
                  (%http3-server-report-error
                   server connection condition :session))))
         (http-kit::%with-http-server-lock (server)
+          (if reservation
+              (when (car reservation)
+                (setf (car reservation) nil)
+                (decf (%http3-server-connection-active-request-streams connection))
+                (decf (http-kit::http-server-active-http3-request-workers server)))
+            (decf (%http3-server-connection-active-request-streams connection)))
+          (http-kit::%http-server-broadcast server)
           (cl-quic-kit:quic-connection-close-stream quic-connection stream)
-          (decf (%http3-server-connection-active-request-streams connection))
           (when (and (member (http-kit::http-server-state server)
                              '(:stopping :failed))
                      (zerop
@@ -698,8 +705,7 @@
                      (not (%http3-server-connection-closed-p server connection)))
             (cl-quic-kit:quic-connection-close
              quic-connection :error-code :no-error
-             :reason "HTTP/3 request drain complete"))
-          (http-kit::%http-server-broadcast server)))))
+             :reason "HTTP/3 request drain complete"))))))
 
   (defun %http3-server-start-worker (server function name &optional connection)
     (let ((worker nil))
@@ -745,18 +751,23 @@
       worker))
 
   (defun %http3-server-start-request-worker
-      (server connection stream stream-id deadline)
+      (server connection stream stream-id deadline &optional reservation)
     (handler-case
         (%http3-server-start-worker
          server
          (lambda ()
            (%http3-server-request-worker
-            server connection stream stream-id deadline))
+            server connection stream stream-id deadline reservation))
          "HTTP/3 request stream"
          connection)
       (http-kit::http-server-error (condition)
         (http-kit::%with-http-server-lock (server)
-          (decf (%http3-server-connection-active-request-streams connection))
+          (if reservation
+              (when (car reservation)
+                (setf (car reservation) nil)
+                (decf (%http3-server-connection-active-request-streams connection))
+                (decf (http-kit::http-server-active-http3-request-workers server)))
+            (decf (%http3-server-connection-active-request-streams connection)))
           (http-kit::%http-server-broadcast server))
         (error condition))))
 
@@ -914,7 +925,9 @@
           (failed-connections nil)
           (now (%http3-server-now))
           (closed-p nil))
-      (http-kit::%with-http-server-lock (server)
+      (unwind-protect
+        (progn
+          (http-kit::%with-http-server-lock (server)
         (let ((snapshot (%http3-server-stream-stop-snapshot listener)))
           (handler-case
               (setf closed-p (cl-quic-kit:quic-server-poll quic-server now))
@@ -955,13 +968,13 @@
                        for stream-id = (cl-quic-kit:stream-id stream)
                        for rejection-reason =
                          (cond
-                           ((%http3-server-listener-draining-p listener)
-                            :draining)
-                           ((>= (%http3-server-connection-active-request-streams
-                                 connection)
-                                (http-kit::http-server-max-concurrent-streams
-                                 server))
-                            :max-concurrent-streams))
+                             ((%http3-server-listener-draining-p listener) :draining)
+                             ((>= (%http3-server-connection-active-request-streams connection)
+                                  (http-kit::http-server-max-concurrent-streams server))
+                              :max-concurrent-streams)
+                             ((>= (http-kit::http-server-active-http3-request-workers server)
+                                  (http-kit::http-server-max-active-request-workers server))
+                              :max-active-request-workers))
                        do (setf (%http3-server-connection-last-activity connection)
                                 now)
                           (if rejection-reason
@@ -970,22 +983,16 @@
                                  connection stream #x10b)
                                 (push (list stream-id rejection-reason)
                                       rejected-streams))
-                            (progn
-                              (incf
-                               (%http3-server-connection-active-request-streams
-                                connection))
-                              (setf
-                               (%http3-server-connection-highest-request-stream-id
-                                connection)
-                               (max stream-id
-                                    (or
-                                     (%http3-server-connection-highest-request-stream-id
-                                      connection)
-                                     0)))
+                            (let ((reservation (list :pending)))
+                              (incf (http-kit::http-server-active-http3-request-workers server))
+                              (incf (%http3-server-connection-active-request-streams connection))
+                              (setf (%http3-server-connection-highest-request-stream-id connection)
+                                    (max stream-id
+                                         (or (%http3-server-connection-highest-request-stream-id connection)
+                                             0)))
                               (push (list connection stream stream-id
-                                          (+ now
-                                             (http-kit::http-server-request-timeout
-                                              server)))
+                                          (+ now (http-kit::http-server-request-timeout server))
+                                          reservation)
                                     request-streams))))
                  (when (and (zerop
                              (%http3-server-connection-active-request-streams
@@ -1012,35 +1019,52 @@
                    (push (cons connection condition) failed-connections))))))
          (%http3-server-listener-connections listener))
         (http-kit::%http-server-broadcast server))
-      (dolist (entry (nreverse failed-connections))
-        (%http3-server-isolate-peer-error
-         server listener (car entry) (cdr entry)))
-      (dolist (entry (nreverse rejected-streams))
-        (http-kit::%http-server-emit-event
-         server
-         (list :type :http3-request-stream-rejected
-               :phase :request
-               :protocol :http3
-               :stream-id (first entry)
-               :reason (second entry))))
-      (dolist (connection released-connections)
-        (%http3-server-release-connection server listener connection))
-      (dolist (quic-connection (nreverse accepted-connections))
-        (%http3-server-accept-quic-connection server listener quic-connection))
-      (dolist (entry (nreverse unidirectional-streams))
-        (%http3-server-start-unidirectional-worker
-         server listener (car entry) (cdr entry)))
-      (dolist (entry (nreverse request-streams))
-        (%http3-server-start-request-worker
-         server (first entry) (second entry) (third entry) (fourth entry)))
-      (when closed-p
-        (setf (%http3-server-listener-closed-p listener) t)
-        (dolist (connection
-                 (http-kit::%with-http-server-lock (server)
-                   (loop for connection being the hash-values of
-                         (%http3-server-listener-connections listener)
-                         collect connection)))
-          (%http3-server-release-connection server listener connection)))
+          (progn
+          (dolist (entry (nreverse failed-connections))
+            (%http3-server-isolate-peer-error
+             server listener (car entry) (cdr entry)))
+          (dolist (entry (nreverse rejected-streams))
+            (http-kit::%http-server-emit-event
+             server
+             (list :type :http3-request-stream-rejected
+                   :phase :request
+                   :protocol :http3
+                   :stream-id (first entry)
+                   :reason (second entry))))
+          (dolist (connection released-connections)
+            (%http3-server-release-connection server listener connection))
+          (dolist (quic-connection (nreverse accepted-connections))
+            (%http3-server-accept-quic-connection server listener quic-connection))
+          (dolist (entry (nreverse unidirectional-streams))
+            (%http3-server-start-unidirectional-worker
+             server listener (car entry) (cdr entry)))
+          (setf request-streams (nreverse request-streams))
+          (loop while request-streams
+                for entry = (first request-streams)
+                do (%http3-server-start-request-worker
+                    server (first entry) (second entry) (third entry)
+                    (fourth entry) (fifth entry))
+                   (http-kit::%with-http-server-lock (server)
+                     (when (eq :pending (car (fifth entry)))
+                       (setf (car (fifth entry)) :owned)))
+                   (pop request-streams))
+          (when closed-p
+            (setf (%http3-server-listener-closed-p listener) t)
+            (dolist (connection
+                     (http-kit::%with-http-server-lock (server)
+                       (loop for connection being the hash-values of
+                             (%http3-server-listener-connections listener)
+                             collect connection)))
+              (%http3-server-release-connection server listener connection)))))
+        (dolist (entry request-streams)
+        (let ((connection (first entry))
+              (reservation (fifth entry)))
+          (http-kit::%with-http-server-lock (server)
+            (when (eq :pending (car reservation))
+              (setf (car reservation) nil)
+              (decf (%http3-server-connection-active-request-streams connection))
+              (decf (http-kit::http-server-active-http3-request-workers server))
+              (http-kit::%http-server-broadcast server))))))
       closed-p))
 
   (defun %http3-server-supervisor (server listener)
