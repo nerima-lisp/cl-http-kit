@@ -3510,3 +3510,473 @@
         (dolist (worker workers)
           (sb-thread:join-thread worker)))))
 )
+
+#+sbcl
+(deftest http3-listener-coverage-unidirectional-close-and-start-failures
+  (let* ((server (%http3-listener-test-unit-server))
+         (quic-connection :quic-connection)
+         (connection
+           (%http3-listener-test-unit-connection
+            :quic-connection quic-connection))
+         (closed-streams nil)
+         (reported-conditions nil))
+    (setf (http-kit/http3::%http3-server-connection-active-unidirectional-workers
+           connection)
+          1)
+    (%http3-listener-test-call-with-function-stubs
+     (list
+      (cons 'cl-quic-kit:quic-connection-close-stream
+            (lambda (actual-quic-connection stream)
+              (ensure-true (eq quic-connection actual-quic-connection))
+              (push stream closed-streams)
+              (when (eq stream :close-fails)
+                (error "Unidirectional stream close failed."))))
+      (cons 'http-kit::%http-server-report-error
+            (lambda (actual-server condition phase &rest context)
+              (ensure-true (eq server actual-server))
+              (ensure-equal :close phase)
+              (ensure-true (typep condition 'simple-error))
+              (ensure-equal :http3 (getf context :protocol))
+              (push condition reported-conditions)))
+      (cons 'http-kit::%http-server-broadcast
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              nil))
+      (cons 'http-kit/http3::%http3-server-start-worker
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              (error 'http-server-error
+                     :reason-code :worker-start-failed
+                     :phase :session))))
+     (lambda ()
+       (http-kit/http3::%http3-server-close-unidirectional-streams
+        server connection '(:close-fails))
+       (ensure-equal '(:close-fails) closed-streams)
+       (ensure-equal 1 (length reported-conditions))
+       (ensure-true
+        (handler-case
+            (progn
+              (http-kit/http3::%http3-server-start-unidirectional-worker
+               server :listener connection :start-fails)
+              nil)
+          (http-server-error (condition)
+            (eq :worker-start-failed
+                (http-server-error-reason-code condition)))))
+       (ensure-equal '(:start-fails :close-fails) closed-streams)
+       (ensure-equal 1 (length reported-conditions))
+       (ensure-equal
+        0
+        (http-kit/http3::%http3-server-connection-active-unidirectional-workers
+         connection))))))
+
+#+sbcl
+(deftest http3-listener-coverage-request-worker-reservation-cleanup
+  (let* ((server (%http3-listener-test-unit-server))
+         (quic-connection
+           (cl-quic-kit:make-quic-connection :role :server))
+         (quic-client
+           (cl-quic-kit:make-quic-client
+            :connection quic-connection :disable-hostname-verification-p t))
+         (stream (cl-quic-kit:make-stream 0 :local-initiator :server))
+         (connection
+           (%http3-listener-test-unit-connection
+            :quic-connection quic-connection))
+         (report-count 0)
+         (cancel-count 0))
+    (%http3-listener-test-call-with-function-stubs
+     (list
+      (cons 'http-kit/http3::%http3-server-await-peer-settings
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              (error "Peer SETTINGS wait failed.")))
+      (cons 'http-kit/http3::%http3-server-stream-cancel-locked
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              (incf cancel-count)))
+      (cons 'http-kit/http3::%http3-server-report-error
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              (incf report-count)))
+      (cons 'http-kit::%http-server-running-p
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              t))
+      (cons 'http-kit/http3::%http3-server-connection-closed-p
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              nil))
+      (cons 'http-kit::%http-server-broadcast
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              nil))
+      (cons 'http-kit/http3::%http3-server-start-worker
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              (error 'http-server-error
+                     :reason-code :worker-start-failed
+                     :phase :session))))
+     (lambda ()
+       (setf (gethash (cl-quic-kit:stream-id stream)
+                      (cl-quic-kit::quic-client-streams quic-client))
+             stream)
+       (http-kit/http3::%http3-server-make-client server connection)
+       (setf (http-kit/http3::%http3-server-connection-active-request-streams
+              connection)
+             1
+             (http-kit::http-server-active-http3-request-workers server)
+             1)
+       (let ((reservation (list :owned)))
+         (http-kit/http3::%http3-server-request-worker
+          server connection stream 0 nil reservation)
+         (ensure-false
+          (gethash (cl-quic-kit:stream-id stream)
+                   (cl-quic-kit::quic-client-streams quic-client)))
+         (ensure-false (car reservation))
+         (ensure-equal
+          0
+          (http-kit/http3::%http3-server-connection-active-request-streams
+           connection))
+         (ensure-equal
+          0
+          (http-kit::http-server-active-http3-request-workers server)))
+       (let ((reservation (list nil)))
+         (http-kit/http3::%http3-server-request-worker
+          server connection stream 0 nil reservation)
+         (ensure-false (car reservation))
+         (ensure-equal
+          0
+          (http-kit/http3::%http3-server-connection-active-request-streams
+           connection))
+         (ensure-equal
+          0
+          (http-kit::http-server-active-http3-request-workers server)))
+       (setf (http-kit/http3::%http3-server-connection-active-request-streams
+              connection)
+             1)
+       (ensure-true
+        (handler-case
+            (progn
+              (http-kit/http3::%http3-server-start-request-worker
+               server connection stream 0 nil)
+              nil)
+          (http-server-error () t)))
+       (ensure-equal
+        0
+        (http-kit/http3::%http3-server-connection-active-request-streams
+         connection))
+       (ensure-equal
+        0
+        (http-kit::http-server-active-http3-request-workers server))
+       (let ((reservation (list nil)))
+         (ensure-true
+          (handler-case
+              (progn
+                (http-kit/http3::%http3-server-start-request-worker
+                 server connection stream 0 nil reservation)
+                nil)
+            (http-server-error () t)))
+         (ensure-false (car reservation))
+         (ensure-equal
+          0
+          (http-kit/http3::%http3-server-connection-active-request-streams
+           connection)))
+       (setf (http-kit/http3::%http3-server-connection-active-request-streams
+              connection)
+             1
+             (http-kit::http-server-active-http3-request-workers server)
+             1)
+       (let ((reservation (list :pending)))
+         (ensure-true
+          (handler-case
+              (progn
+                (http-kit/http3::%http3-server-start-request-worker
+                 server connection stream 0 nil reservation)
+                nil)
+            (http-server-error () t)))
+         (ensure-false (car reservation))
+         (ensure-equal
+          0
+          (http-kit/http3::%http3-server-connection-active-request-streams
+           connection))
+         (ensure-equal
+          0
+          (http-kit::http-server-active-http3-request-workers server)))
+       (ensure-true (plusp cancel-count))
+       (ensure-true (plusp report-count))))))
+
+#+sbcl
+(deftest http3-listener-coverage-poll-request-reservation-transfer
+  (let* ((server (%http3-listener-test-unit-server))
+         (quic-connection
+           (cl-quic-kit::%make-quic-connection :state :established))
+         (listener
+           (http-kit/http3::%make-http3-server-listener
+            :server server :quic-server :quic-server :socket :udp-socket))
+         (connection
+           (%http3-listener-test-unit-connection
+            :quic-connection quic-connection))
+         (request-streams
+           (list (cl-quic-kit:make-stream 0)
+                 (cl-quic-kit:make-stream 4)))
+         (reservations nil)
+         (start-count 0))
+    (setf (gethash quic-connection
+                   (http-kit/http3::%http3-server-listener-connections listener))
+          connection)
+    (%http3-listener-test-call-with-function-stubs
+     (list
+      (cons 'cl-quic-kit:quic-server-poll
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              nil))
+      (cons 'cl-quic-kit:quic-server-accept-connection
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              nil))
+      (cons 'http-kit/http3::%http3-server-now (lambda () 10))
+      (cons 'http-kit/http3::%http3-server-stream-stop-snapshot
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              (make-hash-table :test #'eq)))
+      (cons 'http-kit/http3::%http3-server-connection-closed-p
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              nil))
+      (cons 'cl-quic-kit:quic-connection-accept-stream
+            (lambda (actual-quic-connection &key type)
+              (ensure-true (eq quic-connection actual-quic-connection))
+              (if (eq type :bidirectional)
+                  (pop request-streams)
+                nil)))
+      (cons 'http-kit/http3::%http3-server-start-request-worker
+            (lambda (actual-server actual-connection stream stream-id deadline
+                     reservation)
+              (declare (ignore stream deadline))
+              (ensure-true (eq server actual-server))
+              (ensure-true (eq connection actual-connection))
+              (ensure-true (member stream-id '(0 4)))
+              (push reservation reservations)
+              (when (= (incf start-count) 2)
+                (setf (car reservation) :owned))))
+      (cons 'cl-quic-kit:quic-connection-flush
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              nil))
+      (cons 'cl-quic-kit:quic-connection-close
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              nil))
+      (cons 'http-kit::%http-server-broadcast
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              nil))
+      (cons 'http-kit::%http-server-emit-event
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              nil))
+      (cons 'http-kit/http3::%http3-server-release-connection
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              nil)))
+     (lambda ()
+       (http-kit/http3::%http3-server-poll-listener server listener)
+       (ensure-equal '(:owned :owned)
+                     (mapcar #'car (nreverse reservations)))
+       (ensure-equal
+        2
+        (http-kit/http3::%http3-server-connection-active-request-streams
+         connection))))))
+
+#+sbcl
+(deftest http3-listener-coverage-poll-unwind-releases-queued-streams
+  (let* ((server (%http3-listener-test-unit-server))
+         (quic-connection
+           (cl-quic-kit::%make-quic-connection :state :established))
+         (listener
+           (http-kit/http3::%make-http3-server-listener
+            :server server :quic-server :quic-server :socket :udp-socket))
+         (connection
+           (%http3-listener-test-unit-connection
+            :quic-connection quic-connection))
+         (unidirectional-stream (cl-quic-kit:make-stream 2))
+         (request-stream (cl-quic-kit:make-stream 0))
+         (unidirectional-streams (list unidirectional-stream))
+         (request-streams (list request-stream))
+         (closed-stream-ids nil)
+         (reported-conditions nil))
+    (setf (gethash quic-connection
+                   (http-kit/http3::%http3-server-listener-connections listener))
+          connection)
+    (%http3-listener-test-call-with-function-stubs
+     (list
+      (cons 'cl-quic-kit:quic-server-poll
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              nil))
+      (cons 'cl-quic-kit:quic-server-accept-connection
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              nil))
+      (cons 'http-kit/http3::%http3-server-now (lambda () 10))
+      (cons 'http-kit/http3::%http3-server-stream-stop-snapshot
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              (make-hash-table :test #'eq)))
+      (cons 'http-kit/http3::%http3-server-connection-closed-p
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              nil))
+      (cons 'cl-quic-kit:quic-connection-accept-stream
+            (lambda (actual-quic-connection &key type)
+              (ensure-true (eq quic-connection actual-quic-connection))
+              (case type
+                (:unidirectional (pop unidirectional-streams))
+                (:bidirectional (pop request-streams)))))
+      (cons 'cl-quic-kit:quic-connection-flush
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              (error "Poll flush failed.")))
+      (cons 'cl-quic-kit:quic-connection-close-stream
+            (lambda (actual-quic-connection stream)
+              (ensure-true (eq quic-connection actual-quic-connection))
+              (push (cl-quic-kit:stream-id stream) closed-stream-ids)
+              (error "Unidirectional stream close failed.")))
+      (cons 'http-kit::%http-server-report-error
+            (lambda (actual-server condition phase &rest context)
+              (ensure-true (eq server actual-server))
+              (ensure-equal :close phase)
+              (ensure-true (typep condition 'simple-error))
+              (ensure-equal :http3 (getf context :protocol))
+              (push condition reported-conditions)))
+      (cons 'http-kit::%http-server-broadcast
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              nil)))
+     (lambda ()
+       (let ((condition
+               (handler-case
+                   (progn
+                     (http-kit/http3::%http3-server-poll-listener
+                      server listener)
+                     nil)
+                 (simple-error (condition) condition))))
+         (ensure-true condition)
+         (ensure-equal "Poll flush failed."
+                       (simple-condition-format-control condition)))
+       (ensure-equal '(2) closed-stream-ids)
+       (ensure-equal 1 (length reported-conditions))
+       (ensure-equal
+        nil
+        (http-kit/http3::%http3-server-connection-pending-unidirectional-streams
+         connection))
+       (ensure-equal
+        0
+        (http-kit/http3::%http3-server-connection-active-unidirectional-workers
+         connection))
+       (ensure-equal
+        0
+        (http-kit/http3::%http3-server-connection-active-request-streams
+         connection))
+       (ensure-equal
+        0
+        (http-kit::http-server-active-http3-request-workers server))))))
+
+#+sbcl
+(deftest http3-listener-cancel-callback-preserves-error-code-presence
+  (let* ((server (%http3-listener-test-unit-server))
+         (quic-connection (cl-quic-kit:make-quic-connection :role :server))
+         (quic-client
+           (cl-quic-kit:make-quic-client
+            :connection quic-connection :disable-hostname-verification-p t))
+         (connection
+           (%http3-listener-test-unit-connection :quic-connection quic-connection))
+         (error-codes nil))
+    (ensure-true quic-client)
+    (%http3-listener-test-call-with-function-stubs
+     (list
+      (cons 'http-kit/http3::%http3-server-stream-cancel
+            (lambda (actual-server actual-connection stream error-code)
+              (ensure-true (eq server actual-server))
+              (ensure-true (eq connection actual-connection))
+              (ensure-equal :stream stream)
+              (push error-code error-codes))))
+     (lambda ()
+       (let* ((client (http-kit/http3::%http3-server-make-client server connection))
+              (cancel (http-kit/http3::http3-client-cancel-stream client)))
+         (funcall cancel :stream)
+         (funcall cancel :stream :error-code nil)
+         (funcall cancel :stream :error-code #x123 :timeout nil :deadline nil)
+         (ensure-equal '(#x123 nil #x10c) error-codes))))))
+#+sbcl
+(deftest http3-listener-coverage-poll-unwind-skips-released-request-reservation
+  (let* ((server (%http3-listener-test-unit-server))
+         (quic-connection
+           (cl-quic-kit::%make-quic-connection :state :established))
+         (listener
+           (http-kit/http3::%make-http3-server-listener
+            :server server :quic-server :quic-server :socket :udp-socket))
+         (connection
+           (%http3-listener-test-unit-connection
+            :quic-connection quic-connection))
+         (request-stream (cl-quic-kit:make-stream 0))
+         (request-streams (list request-stream)))
+    (setf (gethash quic-connection
+                   (http-kit/http3::%http3-server-listener-connections listener))
+          connection)
+    (%http3-listener-test-call-with-function-stubs
+     (list
+      (cons 'cl-quic-kit:quic-server-poll
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              nil))
+      (cons 'cl-quic-kit:quic-server-accept-connection
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              nil))
+      (cons 'http-kit/http3::%http3-server-now (lambda () 10))
+      (cons 'http-kit/http3::%http3-server-stream-stop-snapshot
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              (make-hash-table :test #'eq)))
+      (cons 'http-kit/http3::%http3-server-connection-closed-p
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              nil))
+      (cons 'cl-quic-kit:quic-connection-accept-stream
+            (lambda (actual-quic-connection &key type)
+              (ensure-true (eq quic-connection actual-quic-connection))
+              (if (eq type :bidirectional)
+                  (pop request-streams)
+                nil)))
+      (cons 'cl-quic-kit:quic-connection-flush
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              nil))
+      (cons 'http-kit/http3::%http3-server-start-worker
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              (error 'http-server-error
+                     :reason-code :worker-start-failed
+                     :phase :session)))
+      (cons 'http-kit::%http-server-broadcast
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              nil)))
+     (lambda ()
+       (let ((condition
+               (handler-case
+                   (progn
+                     (http-kit/http3::%http3-server-poll-listener
+                      server listener)
+                     nil)
+                 (http-server-error (condition) condition))))
+         (ensure-true condition)
+         (ensure-equal :worker-start-failed
+                       (http-server-error-reason-code condition)))
+       (ensure-equal
+        0
+        (http-kit/http3::%http3-server-connection-active-request-streams
+         connection))
+       (ensure-equal
+        0
+        (http-kit::http-server-active-http3-request-workers server))))))
