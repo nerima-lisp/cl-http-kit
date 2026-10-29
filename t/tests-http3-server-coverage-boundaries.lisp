@@ -268,7 +268,9 @@
                                   (http-kit/http3:http3-frame-payload (second frames))))))))))))
 
 (deftest http3-control-state-default-constructor-initializes-tracking-fields
-  (let ((state (http-kit/http3:make-http3-control-state)))
+  (let ((state (locally
+                  (declare (notinline http-kit/http3:make-http3-control-state))
+                (http-kit/http3:make-http3-control-state))))
     (ensure-false
      (http-kit/http3:http3-control-state-settings-received-p state))
     (ensure-equal
