@@ -423,8 +423,11 @@
 
 #+sbcl
 (deftest http2-coverage-server-stream-omitted-defaults
-  (let* ((first (http-kit/http2::%make-h2-server-stream 1))
-         (second (http-kit/http2::%make-h2-server-stream 3))
+  (let* ((constructor
+           (symbol-function
+            (quote http-kit/http2::%make-h2-server-stream)))
+         (first (funcall constructor 1))
+         (second (funcall constructor 3))
          (body (http-kit/http2::%h2-server-stream-body first)))
     (ensure-equal 1 (http-kit/http2::%h2-server-stream-id first))
     (ensure-equal 0 (http-kit/http2::%h2-server-stream-body-length-seen first))
@@ -445,7 +448,8 @@
                    (http-kit/http2::%h2-server-stream-send-window first) 1 :stream))
     (ensure-equal 65536
                   (http-kit/http2::%h2-server-window-add
-                   (http-kit/http2::%h2-server-stream-receive-window first) 1 :stream))))
+                   (http-kit/http2::%h2-server-stream-receive-window first)
+                   1 :stream))))
 
 #+sbcl
 (deftest http2-coverage-settings-peer-role-validation
