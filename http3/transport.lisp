@@ -736,7 +736,7 @@ RECEIVE-HTTP3-PUSH."
           (t
            (error cancel-condition)))))
     stream))
-(defun %accept-http3-peer-unidirectional-stream-serialized
+(defun %accept-http3-peer-unidirectional-stream
     (client stream &key timeout deadline)
   "Classify and attach one peer-created HTTP/3 unidirectional STREAM.
 
@@ -747,95 +747,160 @@ bytes are replayed to the corresponding reader. Returns :CONTROL,
   (unless stream
     (%h3-transport-error
      "ACCEPT-HTTP3-PEER-UNIDIRECTIONAL-STREAM requires a stream."))
-  (when (>= (http3-client-peer-unidirectional-stream-count client)
-            (http3-client-max-peer-unidirectional-streams client))
-    (%h3-transport-error
-     "The HTTP/3 peer unidirectional-stream limit was exceeded."
-     :h3-excessive-load))
-  (incf (http3-client-peer-unidirectional-stream-count client))
   (let* ((prefetched
-          (%call-http3-serialized
-           client
-           (lambda ()
-             (let ((entry
-                    (assoc stream
-                           (http3-client-prefetched-stream-inputs client))))
-               (when entry
-                 (setf (http3-client-prefetched-stream-inputs client)
-                       (remove stream
-                               (http3-client-prefetched-stream-inputs client)
-                               :key #'car :test #'eq :count 1))
-                 (cdr entry))))))
+           (%call-http3-serialized
+            client
+            (lambda ()
+              (when (>= (http3-client-peer-unidirectional-stream-count client)
+                        (http3-client-max-peer-unidirectional-streams client))
+                (%h3-transport-error
+                 "The HTTP/3 peer unidirectional-stream limit was exceeded."
+                 :h3-excessive-load))
+              (incf (http3-client-peer-unidirectional-stream-count client))
+              (let* ((prefix-entry
+                       (assoc stream
+                              (http3-client-peer-unidirectional-prefix-buffers
+                               client)
+                              :test #'eq))
+                     (prefetched-entry
+                       (assoc stream
+                              (http3-client-prefetched-stream-inputs client)
+                              :test #'eq))
+                     (input (or (cdr prefix-entry) (cdr prefetched-entry))))
+                (setf (http3-client-peer-unidirectional-prefix-buffers client)
+                      (remove stream
+                              (http3-client-peer-unidirectional-prefix-buffers
+                               client)
+                              :key #'car :test #'eq)
+                      (http3-client-prefetched-stream-inputs client)
+                      (remove stream
+                              (http3-client-prefetched-stream-inputs client)
+                              :key #'car :test #'eq))
+                (when input
+                  (setf (http3-client-peer-unidirectional-prefix-buffers client)
+                        (acons
+                         stream input
+                         (http3-client-peer-unidirectional-prefix-buffers
+                          client))))
+                (%h3-check-state-bytes client)
+                input))))
          (buffer (if prefetched
                      (first prefetched)
                    (make-array 0 :element-type '(unsigned-byte 8))))
          (prefetched-fin-p (and prefetched (second prefetched))))
-    (loop
-     (multiple-value-bind (stream-type type-end)
-         (http3-varint-decode buffer :allow-incomplete-p t)
-       (when stream-type
-         (let ((kind
-                (cond
-                 ((= stream-type +http3-control-stream-type+)
-                  (attach-http3-peer-control-stream client stream)
-                  :control)
-                 ((= stream-type +http3-push-stream-type+) :push)
-                 ((= stream-type +http3-qpack-encoder-stream-type+)
-                  (attach-http3-peer-qpack-encoder-stream client stream)
-                  :qpack-encoder)
-                 ((= stream-type +http3-qpack-decoder-stream-type+)
-                  (attach-http3-peer-qpack-decoder-stream client stream)
-                  :qpack-decoder)
-                 (t :unknown))))
-           (if (eq kind :push)
-               (multiple-value-bind (push-id push-end)
-                   (http3-varint-decode
-                    buffer :position type-end :allow-incomplete-p t)
-                 (declare (ignore push-end))
-                 (when push-id
-                   (%h3-register-peer-push-stream client stream push-id)
-                   (%h3-prefetch-stream-input
-                    client stream buffer prefetched-fin-p)
-                   (return :push))
-                 (when prefetched-fin-p
-                   (%h3-transport-error
-                    "An HTTP/3 push stream ended with a truncated push ID."
-                    :h3-stream-creation-error)))
-             (progn
-               (if (eq kind :unknown)
-                   (%h3-retain-unknown-peer-stream client stream prefetched-fin-p)
-                 (%h3-prefetch-stream-input client stream buffer prefetched-fin-p))
-               (return kind)))))
-       (multiple-value-bind (chunk fin-p)
-           (funcall (http3-client-read-stream client)
-                    stream :timeout timeout :deadline deadline)
-         (when chunk
-           (unless (%http3-octet-vector-p chunk)
-             (%h3-transport-error
-              "HTTP/3 read-stream must return an octet vector or NIL."
-              (type-of chunk)))
-           (progn
-             (%h3-check-state-bytes client (+ (length buffer) (length chunk)))
-             (setf buffer (%http3-concatenate-octets buffer chunk))))
-         (setf prefetched-fin-p (or fin-p (null chunk)))
-         (when prefetched-fin-p
-           (multiple-value-bind (stream-type position)
-               (http3-varint-decode buffer :allow-incomplete-p t)
-             (declare (ignore position))
-             (unless stream-type
-               (%h3-transport-error
-                "A peer HTTP/3 unidirectional stream ended before its type prefix."
-                :h3-stream-creation-error)))))))))
+    (labels (             (replay-prefix (before-replay)
+               (%call-http3-serialized
+                client
+                (lambda ()
+                  (funcall before-replay)
+                  (setf (http3-client-peer-unidirectional-prefix-buffers client)
+                        (remove stream
+                                (http3-client-peer-unidirectional-prefix-buffers
+                                 client)
+                                :key #'car :test #'eq)
+                        (http3-client-prefetched-stream-inputs client)
+                        (acons
+                         stream (list buffer prefetched-fin-p)
+                         (remove stream
+                                 (http3-client-prefetched-stream-inputs client)
+                                 :key #'car :test #'eq)))
+                  (%h3-check-state-bytes client))))
+             (clear-prefix ()
+               (%call-http3-serialized
+                client
+                (lambda ()
+                  (setf (http3-client-peer-unidirectional-prefix-buffers client)
+                        (remove stream
+                                (http3-client-peer-unidirectional-prefix-buffers
+                                 client)
+                                :key #'car :test #'eq))))))
+      (unwind-protect
+           (loop
+             (multiple-value-bind (stream-type type-end)
+                 (http3-varint-decode buffer :allow-incomplete-p t)
+               (when stream-type
+                 (let ((kind
+                         (cond
+                           ((= stream-type +http3-control-stream-type+)
+                            :control)
+                           ((= stream-type +http3-push-stream-type+) :push)
+                           ((= stream-type +http3-qpack-encoder-stream-type+)
+                            :qpack-encoder)
+                           ((= stream-type +http3-qpack-decoder-stream-type+)
+                            :qpack-decoder)
+                           (t :unknown))))
+                   (if (eq kind :push)
+                       (multiple-value-bind (push-id push-end)
+                           (http3-varint-decode
+                            buffer :position type-end :allow-incomplete-p t)
+                         (declare (ignore push-end))
+                         (when push-id
+                           (replay-prefix
+                            (lambda ()
+                              (%h3-register-peer-push-stream
+                               client stream push-id)))
+                           (return :push))
+                         (when prefetched-fin-p
+                           (%h3-transport-error
+                            "An HTTP/3 push stream ended with a truncated push ID."
+                            :h3-stream-creation-error)))
+                       (progn
+                         (unless (eq kind :unknown)
+                           (replay-prefix
+                            (lambda ()
+                              (ecase kind
+                                (:control
+                                 (attach-http3-peer-control-stream
+                                  client stream))
+                                (:qpack-encoder
+                                 (attach-http3-peer-qpack-encoder-stream
+                                  client stream))
+                                (:qpack-decoder
+                                 (attach-http3-peer-qpack-decoder-stream
+                                  client stream))))))
+                         (when (eq kind :unknown)
+                           (%h3-retain-unknown-peer-stream
+                            client stream prefetched-fin-p))
+                         (return kind)))))
+             (multiple-value-bind (chunk fin-p)
+                 (funcall (http3-client-read-stream client)
+                          stream :timeout timeout :deadline deadline)
+               (when (and chunk (not (%http3-octet-vector-p chunk)))
+                 (%h3-transport-error
+                  "HTTP/3 read-stream must return an octet vector or NIL."
+                  (type-of chunk)))
+               (setf prefetched-fin-p (or fin-p (null chunk)))
+               (%call-http3-serialized
+                client
+                (lambda ()
+                  (when chunk
+                    (%h3-check-state-bytes client (length chunk))
+                    (setf buffer (%http3-concatenate-octets buffer chunk)))
+                  (setf (http3-client-peer-unidirectional-prefix-buffers client)
+                        (acons
+                         stream (list buffer prefetched-fin-p)
+                         (remove stream
+                                 (http3-client-peer-unidirectional-prefix-buffers
+                                  client)
+                                 :key #'car :test #'eq)))
+                  (%h3-check-state-bytes client)))
+               (when prefetched-fin-p
+                 (multiple-value-bind (stream-type position)
+                     (http3-varint-decode buffer :allow-incomplete-p t)
+                   (declare (ignore position))
+                   (unless stream-type
+                     (%h3-transport-error
+                      "A peer HTTP/3 unidirectional stream ended before its type prefix."
+                      :h3-stream-creation-error))))))
+        (clear-prefix)))))
+)
 (defun accept-http3-peer-unidirectional-stream
     (client stream &key timeout deadline)
   "Classify and attach one peer-created HTTP/3 unidirectional STREAM."
   (unless (and (http3-client-p client) (http3-client-open-p client))
     (%h3-transport-error "A live HTTP/3 client is required."))
-  (%call-http3-serialized
-   client
-   (lambda ()
-     (%accept-http3-peer-unidirectional-stream-serialized
-      client stream :timeout timeout :deadline deadline))))
+  (%accept-http3-peer-unidirectional-stream
+   client stream :timeout timeout :deadline deadline))
 
 (defun %process-http3-peer-unidirectional-stream-serialized
     (client stream &key timeout deadline)
@@ -1313,21 +1378,45 @@ callback completion contract in the HTTP/3 API reference."
         (t
          (error condition)))))
 
-  (defun %h3-promote-qpack-decompression-error (condition)
-    (let* ((cause (if (typep condition
-                             'http-message-kit:http-connection-error)
-                      (http-message-kit:http-connection-error-cause condition)
+  (defun %h3-promote-qpack-decompression-error (condition &key normalize-size-limit-p)
+  (labels ((wrapped-qpack-size-error (outer cause size-error)
+             (make-condition
+              'http-kit:http-connection-error
+              :message (http-kit:http-error-message outer)
+              :operation :http3-transport
+              :cause
+              (make-condition
+               'http-kit:http-protocol-error
+               :message (http-kit:http-error-message cause)
+               :operation :http3-transport
+               :detail (list :qpack-decompression-failed size-error)))))
+    (let* ((cause (if (typep condition 'http-kit:http-connection-error)
+                      (http-kit:http-connection-error-cause condition)
                       condition))
-           (detail (and (typep cause 'http-protocol-error)
-                        (http-kit:http-protocol-error-detail cause))))
-      (when (and (consp detail)
-                 (eq (first detail) :qpack-decompression-failed)
-                 (not (typep (second detail) 'http-size-limit-exceeded)))
-        (%h3-connection-transport-error
-         (http-kit:http-error-message condition)
-         detail
-         #x200)))
-    (error condition))))
+           (detail (when (typep cause 'http-kit:http-protocol-error)
+                     (http-kit:http-protocol-error-detail cause)))
+           (size-error
+             (and (consp detail)
+                  (eq (first detail) :qpack-decompression-failed)
+                  (second detail))))
+      (cond
+        ((typep condition 'http-kit:http-size-limit-exceeded)
+         (error condition))
+        ((and (consp detail)
+              (eq (first detail) :qpack-decompression-failed)
+              (typep size-error 'http-kit:http-size-limit-exceeded))
+         (if normalize-size-limit-p
+             (error size-error)
+             (error
+              (wrapped-qpack-size-error condition cause size-error))))
+        ((and (consp detail)
+              (eq (first detail) :qpack-decompression-failed))
+         (%h3-connection-transport-error
+          (http-kit:http-error-message condition)
+          detail
+          #x200))
+        (t
+         (error condition))))))))
 
 (defun attach-http3-peer-control-stream (client stream)
   "Attach the incoming HTTP/3 control stream to CLIENT."
@@ -2226,9 +2315,9 @@ HTTP/3 API reference."
               "A live HTTP/3 client with its own QPACK decoder context is required.")))
          :return-blocked-p return-blocked-p)
       (http-message-kit:http-connection-error (condition)
-        (%h3-promote-qpack-decompression-error condition))
-      (http-protocol-error (condition)
-        (%h3-promote-qpack-decompression-error condition)))))
+                                              (%h3-promote-qpack-decompression-error condition))
+      (http-message-kit:http-protocol-error (condition)
+                                            (%h3-promote-qpack-decompression-error condition)))))
 
 (defun %h3-read-response
     (client stream &key on-response-headers on-body-chunk on-information collect-body-p
@@ -4846,7 +4935,8 @@ here follow the callback completion contract in the HTTP/3 API reference."
             qpack-http3-decoder-context on-qpack-section-acknowledgment
             stream-id await-qpack
             (qpack-serialize (lambda (thunk) (funcall thunk)))
-            qpack-encoder-context (huffman-p nil) (enable-connect-p nil)
+            qpack-encoder-context reserve-body-bytes release-body-bytes
+            (huffman-p nil) (enable-connect-p nil)
             timeout deadline on-error)
   "Serve one HTTP/3 request stream over caller-supplied QUIC callbacks.
 
@@ -4856,7 +4946,11 @@ vector and a FIN boolean. WRITE-STREAM is called as
 called as (STREAM &KEY CONDITION) exactly once. The callbacks own QUIC,
 TLS 1.3, ALPN, packet loss recovery, flow control, and socket behavior; this
 function owns HTTP/3 request framing, QPACK field validation, request-body
-limits, and response framing.
+limits, and response framing. RESERVE-BODY-BYTES and RELEASE-BODY-BYTES must be
+supplied together. When COLLECT-BODY-P is true, the reserve callback receives
+each nonempty DATA payload size before storage and the request-body size before
+a request copy is made. The release callback receives the total reserved size
+when request processing exits.
 
 QPACK-DECODER-CONTEXT is the message-kit context for incoming field sections;
 QPACK-HTTP3-DECODER-CONTEXT is its HTTP/3 adapter. When the adapter is supplied,
@@ -4920,31 +5014,37 @@ reference."
     (%h3-transport-error
      "HTTP/3 server on-error must be a function or NIL."
      (type-of on-error)))
+  (unless (or (and (null reserve-body-bytes) (null release-body-bytes))
+              (and (functionp reserve-body-bytes)
+                   (functionp release-body-bytes)))
+    (%h3-transport-error
+     "HTTP/3 request body-buffer callbacks must be paired."
+     (list reserve-body-bytes release-body-bytes)))
   (progn
-  (when qpack-http3-decoder-context
-    (unless (and (integerp stream-id) (>= stream-id 0))
-      (%h3-transport-error
-       "Dynamic QPACK request decoding requires a numeric stream ID."
-       stream-id))
-    (unless (functionp on-qpack-section-acknowledgment)
-      (%h3-transport-error
-       "QPACK HTTP/3 request decoding requires an acknowledgment callback."
-       on-qpack-section-acknowledgment))
-    (unless (functionp qpack-serialize)
-      (%h3-transport-error
-       "Dynamic QPACK request decoding requires a serializer."
-       qpack-serialize)))
-  (progn
-    (when (not (eq (null qpack-decoder-context)
-                   (null qpack-http3-decoder-context)))
-      (%h3-transport-error
-       "A QPACK decoder context and its HTTP/3 adapter must be supplied together."
-       (list qpack-decoder-context qpack-http3-decoder-context)))
     (when qpack-http3-decoder-context
-      (unless (functionp await-qpack)
+      (unless (and (integerp stream-id) (>= stream-id 0))
         (%h3-transport-error
-         "A blocked QPACK field section requires an await-qpack callback."
-         stream-id)))))
+         "Dynamic QPACK request decoding requires a numeric stream ID."
+         stream-id))
+      (unless (functionp on-qpack-section-acknowledgment)
+        (%h3-transport-error
+         "QPACK HTTP/3 request decoding requires an acknowledgment callback."
+         on-qpack-section-acknowledgment))
+      (unless (functionp qpack-serialize)
+        (%h3-transport-error
+         "Dynamic QPACK request decoding requires a serializer."
+         qpack-serialize)))
+    (progn
+      (when (not (eq (null qpack-decoder-context)
+                     (null qpack-http3-decoder-context)))
+        (%h3-transport-error
+         "A QPACK decoder context and its HTTP/3 adapter must be supplied together."
+         (list qpack-decoder-context qpack-http3-decoder-context)))
+      (when qpack-http3-decoder-context
+        (unless (functionp await-qpack)
+          (%h3-transport-error
+           "A blocked QPACK field section requires an await-qpack callback."
+           stream-id)))))
   (let ((closer (or close-stream
                     (lambda (ignored-stream &key condition)
                       (declare (ignore ignored-stream condition))
@@ -4958,31 +5058,33 @@ reference."
         (request-trailers nil)
         (request-trailers-seen-p nil)
         (request nil)
+        (reserved-body-bytes 0)
         (failure nil))
     (unwind-protect
-         (handler-case
-             (loop
-               (multiple-value-bind (chunk fin-p)
-                   (funcall read-stream stream
-                            :timeout timeout :deadline deadline)
-                 (when chunk
-                   (unless (%http3-octet-vector-p chunk)
-                     (%h3-transport-error
-                      "HTTP/3 read-stream must return an octet vector or NIL."
-                      (type-of chunk)))
-                   (when (plusp (length chunk))
-                     (setf buffer (%http3-concatenate-octets buffer chunk))
-                     (multiple-value-bind (frames remainder)
-                         (decode-http3-frames
-                          buffer :allow-incomplete-p t
-                          :max-frame-size max-frame-size)
-                       (setf buffer remainder)
-                       (dolist (frame frames)
-                         (let ((type (http3-frame-type frame))
-                               (payload (http3-frame-payload frame)))
-                           (cond
-                             ((= type +http3-headers-type+)
-                              (let ((fields
+        (handler-case
+            (loop
+             (multiple-value-bind (chunk fin-p)
+                 (funcall read-stream stream
+                          :timeout timeout :deadline deadline)
+               (when chunk
+                 (unless (%http3-octet-vector-p chunk)
+                   (%h3-transport-error
+                    "HTTP/3 read-stream must return an octet vector or NIL."
+                    (type-of chunk)))
+                 (when (plusp (length chunk))
+                   (setf buffer (%http3-concatenate-octets buffer chunk))
+                   (multiple-value-bind (frames remainder)
+                       (decode-http3-frames
+                        buffer :allow-incomplete-p t
+                        :max-frame-size max-frame-size)
+                     (setf buffer remainder)
+                     (dolist (frame frames)
+                       (let ((type (http3-frame-type frame))
+                             (payload (http3-frame-payload frame)))
+                         (cond
+                          ((= type +http3-headers-type+)
+                           (let ((fields
+                                  (handler-case
                                       (if qpack-http3-decoder-context
                                           (%h3-decode-dynamic-field-section
                                            payload qpack-http3-decoder-context
@@ -4996,101 +5098,122 @@ reference."
                                               on-qpack-section-acknowledgment
                                               acknowledged-stream-id))
                                            max-header-bytes max-fields)
-                                          (mapcar
-                                           (lambda (header)
-                                             (cons (http-message-kit:http-header-name header)
-                                                   (http-message-kit:http-header-content header)))
-                                           (http-message-kit:qpack-decode-header-block
-                                            payload
-                                            :context qpack-decoder-context
-                                            :stream-id stream-id
-                                            :max-header-bytes max-header-bytes
-                                            :max-fields max-fields)))))
-                                (if (not request-headers-seen-p)
-                                    (progn
-                                      (multiple-value-bind
-                                            (method protocol scheme authority target path query headers)
-                                          (%h3-server-parse-request-fields
-                                           fields :enable-connect-p enable-connect-p)
-                                        (setf request-info
-                                              (list method protocol scheme authority
-                                                    target path query headers)))
-                                      (setf request-headers-seen-p t))
-                                    (progn
-                                      (when request-trailers-seen-p
-                                        (%h3-transport-error
-                                         "An HTTP/3 request cannot contain multiple trailer blocks."))
-                                      (setf request-trailers
-                                            (%h3-server-parse-trailer-fields fields)
-                                            request-trailers-seen-p t)))))
-                             ((= type +http3-data-type+)
-                              (unless request-headers-seen-p
-                                (%h3-transport-error
-                                 "An HTTP/3 DATA frame arrived before request HEADERS."))
-                              (when request-trailers-seen-p
-                                (%h3-transport-error
-                                 "An HTTP/3 DATA frame arrived after request trailers."))
-                              (let ((new-length (+ body-length (length payload))))
-                                (when (and max-body-bytes
-                                           (> new-length max-body-bytes))
-                                  (%h3-size-error :body max-body-bytes new-length))
-                                (setf body-length new-length)
-                                (when collect-body-p
-                                  (loop for octet across payload
-                                        do (vector-push-extend octet body)))
-                                (when on-body-chunk
-                                  (funcall on-body-chunk
-                                           (%http3-copy-octets payload)))))
-                             ((member type (list +http3-settings-type+
-                                                 +http3-cancel-push-type+
-                                                 +http3-goaway-type+
-                                                 +http3-max-push-id-type+
-                                                 +http3-push-promise-type+
-                                                 +http3-priority-update-request-type+
-                                                 +http3-priority-update-push-type+)
-                                      :test #'=)
-                              (%h3-transport-error
-                               "HTTP/3 control or push frames are invalid on a request stream."
-                               type))
-                             (t
-                              ;; Extension frames are ignored, as required by
-                              ;; the HTTP/3 frame extensibility rules.
-                              nil)))))))
-                 (when (or fin-p (null chunk))
-                   (when (plusp (length buffer))
-                     (%h3-transport-error
-                      "The HTTP/3 request stream ended with a truncated frame."))
-                   (unless request-headers-seen-p
-                     (%h3-transport-error
-                      "The HTTP/3 request stream ended before request HEADERS."))
-                   (setf request
-                         (%h3-server-make-request
-                          request-info body body-length request-trailers
-                          collect-body-p))
-                   (return
-                     (multiple-value-bind (response information)
-                         (funcall handler request)
-                       (unless (listp information)
-                         (%h3-transport-error
-                          "HTTP/3 informational responses must be supplied as a list."
-                          (type-of information)))
-                       (dolist (informational-response information)
-                         (%h3-server-send-information
-                          stream write-stream informational-response
-                          max-frame-size max-header-bytes qpack-encoder-context
-                          huffman-p timeout deadline))
-                       (%h3-server-send-response
-                        stream write-stream response request
-                        max-frame-size max-header-bytes
-                        qpack-encoder-context huffman-p
-                        timeout deadline))))))
-           (error (condition)
-             (setf failure condition)
-             (when on-error
-               (http-kit::%with-http-cleanup
-                 (funcall on-error condition request)))
-             (error condition)))
-      (funcall closer stream :condition failure))))
+                                        (mapcar
+                                         (lambda (header)
+                                           (cons (http-message-kit:http-header-name header)
+                                                 (http-message-kit:http-header-content header)))
+                                         (http-message-kit:qpack-decode-header-block
+                                          payload
+                                          :context qpack-decoder-context
+                                          :stream-id stream-id
+                                          :max-header-bytes max-header-bytes
+                                          :max-fields max-fields)))
+                                    (http-message-kit:http-connection-error (condition)
+                                                                            (%h3-promote-qpack-decompression-error condition :normalize-size-limit-p t))
+                                    (http-message-kit:http-protocol-error (condition)
+                                                                          (%h3-promote-qpack-decompression-error condition :normalize-size-limit-p t)))))
+                             (if (not request-headers-seen-p)
+                                 (progn
+                                   (multiple-value-bind
+                                       (method protocol scheme authority target path query headers)
+                                       (%h3-server-parse-request-fields
+                                        fields :enable-connect-p enable-connect-p)
+                                     (setf request-info
+                                           (list method protocol scheme authority
+                                                 target path query headers)))
+                                   (setf request-headers-seen-p t))
+                               (progn
+                                 (when request-trailers-seen-p
+                                   (%h3-transport-error
+                                    "An HTTP/3 request cannot contain multiple trailer blocks."))
+                                 (setf request-trailers
+                                       (%h3-server-parse-trailer-fields fields)
+                                       request-trailers-seen-p t)))))
+                          ((= type +http3-data-type+)
+                           (unless request-headers-seen-p
+                             (%h3-transport-error
+                              "An HTTP/3 DATA frame arrived before request HEADERS."))
+                           (when request-trailers-seen-p
+                             (%h3-transport-error
+                              "An HTTP/3 DATA frame arrived after request trailers."))
+                           (let ((new-length (+ body-length (length payload))))
+                             (when (and max-body-bytes
+                                        (> new-length max-body-bytes))
+                               (%h3-size-error :body max-body-bytes new-length))
+                             (when (and collect-body-p reserve-body-bytes
+                                        (plusp (length payload)))
+                               (funcall reserve-body-bytes (length payload))
+                               (incf reserved-body-bytes (length payload)))
+                             (setf body-length new-length)
+                             (when collect-body-p
+                               (loop for octet across payload
+                                     do (vector-push-extend octet body)))
+                             (when on-body-chunk
+                               (funcall on-body-chunk
+                                        (%http3-copy-octets payload)))))
+                          ((member type (list #x02 #x06 #x08 #x09
+                                              +http3-settings-type+
+                                              +http3-cancel-push-type+
+                                              +http3-goaway-type+
+                                              +http3-max-push-id-type+
+                                              +http3-push-promise-type+
+                                              +http3-priority-update-request-type+
+                                              +http3-priority-update-push-type+)
+                                   :test #'=)
+                           (if (member type (list #x02 #x06 #x08 #x09))
+                               (%h3-connection-transport-error
+                                "HTTP/2 reserved frame types are invalid on an HTTP/3 request stream."
+                                :h3-frame-unexpected
+                                #x105)
+                             (%h3-transport-error "HTTP/3 control or push frames are invalid on a request stream." type)))
+                          (t
+                           ;; Extension frames are ignored, as required by
+                           ;; the HTTP/3 frame extensibility rules.
+                           nil)))))))
+               (when (or fin-p (null chunk))
+                 (when (plusp (length buffer))
+                   (%h3-transport-error
+                    "The HTTP/3 request stream ended with a truncated frame."))
+                 (unless request-headers-seen-p
+                   (%h3-transport-error
+                    "The HTTP/3 request stream ended before request HEADERS."))
+                 ;; The parsed buffer and request body remain live together
+                 ;; until this worker exits, so account for the request copy.
+                 (when (and collect-body-p reserve-body-bytes
+                            (plusp body-length))
+                   (funcall reserve-body-bytes body-length)
+                   (incf reserved-body-bytes body-length))
+                 (setf request
+                       (%h3-server-make-request
+                        request-info body body-length request-trailers
+                        collect-body-p))
+                 (return
+                  (multiple-value-bind (response information)
+                      (funcall handler request)
+                    (unless (listp information)
+                      (%h3-transport-error
+                       "HTTP/3 informational responses must be supplied as a list."
+                       (type-of information)))
+                    (dolist (informational-response information)
+                      (%h3-server-send-information
+                       stream write-stream informational-response
+                       max-frame-size max-header-bytes qpack-encoder-context
+                       huffman-p timeout deadline))
+                    (%h3-server-send-response
+                     stream write-stream response request
+                     max-frame-size max-header-bytes
+                     qpack-encoder-context huffman-p
+                     timeout deadline))))))
+          (error (condition)
+                 (setf failure condition)
+                 (when on-error
+                   (http-kit::%with-http-cleanup
+                    (funcall on-error condition request)))
+                 (error condition)))
+      (progn
+        (when (plusp reserved-body-bytes)
+          (funcall release-body-bytes reserved-body-bytes))
+        (funcall closer stream :condition failure)))))
 
 (defstruct (%http3-managed-client
              (:constructor %make-http3-managed-client

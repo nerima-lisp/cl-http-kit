@@ -92,6 +92,124 @@
       (http-kit/http3::%h3-decode-response-field-section
        client (octets) context :stream-id 0 :role :response))
     (ensure-equal 1 serializations)))
+(deftest http3-qpack-decompression-size-error-promotion
+  (let* ((size-error
+           (make-condition
+            'http-size-limit-exceeded
+            :message "QPACK field section exceeded its limit"
+            :operation :qpack
+            :detail :qpack-size-limit
+            :kind :fields
+            :limit 1
+            :observed 2))
+         (direct-error
+           (http3-boundary-error
+            (lambda ()
+              (http-kit/http3::%h3-promote-qpack-decompression-error size-error))))
+         (cause
+           (make-condition
+            'http-protocol-error
+            :message "QPACK decompression failed"
+            :operation :qpack
+            :detail (list :qpack-decompression-failed size-error)))
+         (outer
+           (make-condition
+            'http-connection-error
+            :message "The peer sent an invalid QPACK field section"
+            :operation :quic
+            :cause cause))
+         (normalized-error
+           (http3-boundary-error
+            (lambda ()
+              (http-kit/http3::%h3-promote-qpack-decompression-error
+               outer :normalize-size-limit-p t))))
+         (wrapped-error
+           (http3-boundary-error
+            (lambda ()
+              (http-kit/http3::%h3-promote-qpack-decompression-error outer))))
+         (unpromoted-cause
+           (make-condition
+            'http-protocol-error
+            :message "QPACK decompression failed without a size error"
+            :operation :qpack
+            :detail (list :qpack-decompression-failed :invalid-encoding)))
+         (unpromoted-outer
+           (make-condition
+            'http-connection-error
+            :message "The peer sent an invalid QPACK field section"
+            :operation :quic
+            :cause unpromoted-cause))
+         (unpromoted-error
+           (http3-boundary-error
+            (lambda ()
+              (http-kit/http3::%h3-promote-qpack-decompression-error
+               unpromoted-outer))))
+         (other-protocol-error
+           (make-condition
+            'http-protocol-error
+            :message "Unrelated HTTP protocol failure"
+            :operation :http3-transport
+            :detail :h3-frame-unexpected))
+         (passthrough-error
+           (http3-boundary-error
+            (lambda ()
+              (http-kit/http3::%h3-promote-qpack-decompression-error
+               other-protocol-error)))))
+    (ensure-true (typep direct-error 'http-size-limit-exceeded))
+    (ensure-true (eq size-error direct-error))
+    (ensure-equal "QPACK field section exceeded its limit"
+                  (http-error-message direct-error))
+    (ensure-equal :qpack (http-error-operation direct-error))
+    (ensure-equal :qpack-size-limit
+                  (http-protocol-error-detail direct-error))
+    (ensure-equal :fields (http-size-limit-exceeded-kind direct-error))
+    (ensure-equal 1 (http-size-limit-exceeded-limit direct-error))
+    (ensure-equal 2 (http-size-limit-exceeded-observed direct-error))
+    (ensure-true (typep normalized-error 'http-size-limit-exceeded))
+    (ensure-true (eq size-error normalized-error))
+    (ensure-equal "QPACK field section exceeded its limit"
+                  (http-error-message normalized-error))
+    (ensure-equal :qpack (http-error-operation normalized-error))
+    (ensure-equal :qpack-size-limit
+                  (http-protocol-error-detail normalized-error))
+    (ensure-equal :fields (http-size-limit-exceeded-kind normalized-error))
+    (ensure-equal 1 (http-size-limit-exceeded-limit normalized-error))
+    (ensure-equal 2 (http-size-limit-exceeded-observed normalized-error))
+    (ensure-true (typep wrapped-error 'http-connection-error))
+    (ensure-equal "The peer sent an invalid QPACK field section"
+                  (http-error-message wrapped-error))
+    (ensure-equal :http3-transport (http-error-operation wrapped-error))
+    (let* ((wrapped-cause (http-connection-error-cause wrapped-error))
+           (detail (http-protocol-error-detail wrapped-cause))
+           (wrapped-size-error (second detail)))
+      (ensure-true (typep wrapped-cause 'http-protocol-error))
+      (ensure-equal "QPACK decompression failed"
+                    (http-error-message wrapped-cause))
+      (ensure-equal :http3-transport (http-error-operation wrapped-cause))
+      (ensure-equal :qpack-decompression-failed (first detail))
+      (ensure-true (typep wrapped-size-error 'http-size-limit-exceeded))
+      (ensure-true (eq size-error wrapped-size-error))
+      (ensure-equal "QPACK field section exceeded its limit"
+                    (http-error-message wrapped-size-error))
+      (ensure-equal :qpack (http-error-operation wrapped-size-error))
+      (ensure-equal :qpack-size-limit
+                    (http-protocol-error-detail wrapped-size-error))
+      (ensure-equal :fields
+                    (http-size-limit-exceeded-kind wrapped-size-error))
+      (ensure-equal 1 (http-size-limit-exceeded-limit wrapped-size-error))
+      (ensure-equal 2 (http-size-limit-exceeded-observed wrapped-size-error)))
+    (ensure-true (typep unpromoted-error
+                        'http-kit/http3::http3-connection-protocol-error))
+    (ensure-equal #x200
+                  (http-kit/http3::http3-connection-protocol-error-quic-error-code
+                   unpromoted-error))
+    (ensure-equal "The peer sent an invalid QPACK field section"
+                  (http-error-message unpromoted-error))
+    (ensure-equal :http3-transport
+                  (http-error-operation unpromoted-error))
+    (ensure-equal '(:qpack-decompression-failed :invalid-encoding)
+                  (http-protocol-error-detail unpromoted-error))
+    (ensure-true (eq other-protocol-error passthrough-error))))
 
 (deftest http3-native-scheduler-reports-connection-close-callback-failures
   (flet ((connection-condition ()
@@ -744,7 +862,10 @@
                  (:max-body-bytes -1 "HTTP/3 server max-body-bytes must be NIL or a non-negative integer." :value)
                  (:collect-body-p 17 "HTTP/3 server collect-body-p must be boolean." :value)
                  (:on-body-chunk 17 "HTTP/3 server on-body-chunk must be a function or NIL." :type)
-                 (:on-error 17 "HTTP/3 server on-error must be a function or NIL." :type)))
+                 (:on-error 17 "HTTP/3 server on-error must be a function or NIL." :type)
+                 (:reserve-body-bytes 17
+                  "HTTP/3 request body-buffer callbacks must be paired."
+                  (17 nil))))
     (destructuring-bind (key value message detail-kind) row
       (let ((reads 0) (writes 0) (handlers 0) (closes 0))
         (let ((failure
@@ -770,7 +891,11 @@
                                           (declare (ignore stream condition))
                                           (incf closes)))))))))
           (http3-public-error-check failure message
-                                   (if (eq detail-kind :type) (type-of value) value))
+                                   (cond ((eq detail-kind :type)
+                                          (type-of value))
+                                         ((eq detail-kind :value)
+                                          value)
+                                         (t detail-kind)))
           (ensure-equal 0 reads)
           (ensure-equal 0 writes)
           (ensure-equal 0 handlers)

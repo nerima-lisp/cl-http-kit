@@ -267,6 +267,19 @@
                     (ensure-equal (ascii "abc")
                                   (http-kit/http3:http3-frame-payload (second frames))))))))))))
 
+(deftest http3-control-state-default-constructor-initializes-tracking-fields
+  (let ((state (locally
+                  (declare (notinline http-kit/http3:make-http3-control-state))
+                (http-kit/http3:make-http3-control-state))))
+    (ensure-false
+     (http-kit/http3:http3-control-state-settings-received-p state))
+    (ensure-equal
+     nil (http-kit/http3:http3-control-state-promised-push-ids state))
+    (ensure-equal
+     nil (http-kit/http3:http3-control-state-cancelled-push-ids state))
+    (ensure-equal
+     nil (http-kit/http3:http3-control-state-priority-updates state))))
+
 (defun http3-server-push-ready-state ()
   (let ((state (http-kit/http3:make-http3-control-state :peer-role :client)))
     (ensure-equal :settings

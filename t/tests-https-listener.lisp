@@ -430,6 +430,7 @@
                   (:private-key nil)
                   (:max-connections nil)
                   (:max-connections 0)
+                  (:max-active-request-workers nil)
                   (:max-handshakes nil)
                   (:max-concurrent-streams nil)
                   (:max-header-bytes nil)
@@ -1349,6 +1350,28 @@
         (ensure-equal "127.0.0.1"
                       (getf (second (first reported)) :peer-address))
         (ensure-equal 443 (getf (second (first reported)) :peer-port)))
+      (let ((connection-condition
+              (make-condition
+               'http-server-error
+               :reason-code :connection-error
+               :phase :session)))
+        (ensure-true
+         (eq connection-condition
+             (http-kit::%http-server-report-error
+              server connection-condition :session
+              :callback-condition connection-condition))))
+      (let* ((callback-condition
+               (make-condition 'simple-error
+                               :format-control "connection failure"
+                               :format-arguments nil))
+             (safe
+               (http-kit::%http-server-report-error
+                server callback-condition :session
+                :callback-condition callback-condition)))
+        (ensure-true (typep safe 'http-server-error))
+        (ensure-equal :connection-error
+                      (http-server-error-reason-code safe))
+        (ensure-equal :session (http-server-error-phase safe)))
       (http-kit::%http-server-emit-event-once
        server :started '(:type :listener-started))
       (http-kit::%http-server-emit-event-once

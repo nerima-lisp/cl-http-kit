@@ -1,4 +1,9 @@
 (in-package #:http-kit/http2)
+(defun %h2-server-stream-default-value (field)
+  (ecase field
+    (:body-length-seen 0)
+    (:send-window +http2-default-window-size+)
+    (:receive-window +http2-default-window-size+)))
 
 ;;;; HTTP/2 server session
 ;;;;
@@ -12,10 +17,14 @@
                 (id &key request method protocol scheme authority target headers
                     (body (make-array 0 :element-type '(unsigned-byte 8)
                                        :adjustable t :fill-pointer 0))
-                    expected-body-length (body-length-seen 0) trailers
-                    headers-complete-p end-stream-p reset-p responded-p
-                    (send-window +http2-default-window-size+)
-                    (receive-window +http2-default-window-size+))))
+                    expected-body-length
+                    (body-length-seen
+                     (%h2-server-stream-default-value :body-length-seen))
+                    trailers headers-complete-p end-stream-p reset-p responded-p
+                    (send-window
+                     (%h2-server-stream-default-value :send-window))
+                    (receive-window
+                     (%h2-server-stream-default-value :receive-window)))))
   id
   request
   method

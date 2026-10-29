@@ -76,7 +76,7 @@
     };
 
     cl-quic-kit = {
-      url = "github:nerima-lisp/cl-quic-kit/16d6f5987ae8ff75342cfd4d5085c6b936104e96";
+      url = "github:nerima-lisp/cl-quic-kit/852bde960b4749c687e33ce031e55d8dd5c2175e";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.cl-crypto-kit.follows = "cl-crypto-kit";
       inputs.cl-tls-kit.follows = "cl-tls-kit";
@@ -127,7 +127,8 @@
           pname = "cl-http-kit-quic-peer";
           version = "0.1.0";
           src = ./t/fixtures/quic-peer;
-          vendorHash = "sha256-lqos9WjFCedcUHa1Y6lWVxaggTrS4fwlbn352OqLTfw=";
+          go = pkgs.go_1_26;
+          vendorHash = "sha256-e02WaIUINy9tc+wJiaWsXFHsue6VW8iZm/nvA4dT+44=";
         };
       patchedParedit =
         system:

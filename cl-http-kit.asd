@@ -132,14 +132,17 @@
   :author "nerima-lisp"
   :license "MIT"
   :version "0.5.0"
-  :depends-on ("cl-http-kit" (:version "cl-quic-kit" "0.2.6"))
+  :depends-on ("cl-http-kit"
+               "cl-http-kit/tls"
+               (:version "cl-quic-kit" "0.2.7"))
   :pathname "http3"
   :serial t
   :components ((:file "package")
                (:file "varint")
                (:file "frames")
                (:file "transport")
-               (:file "quic-adapter")))
+               (:file "quic-adapter")
+               (:file "server-listener")))
 
 (asdf:defsystem "cl-http-kit/test-core"
   :description "Core tests for cl-http-kit without optional transport or client subsystems."
@@ -216,6 +219,7 @@
                (:file "tests-http3-adapter-contract-boundaries")
                (:file "tests-http3-quic-adapter-contract")
                (:file "tests-http3-peer-settings")
+               (:file "tests-http3-server-listener")
                (:file "tests-client")
                (:file "tests-client-contract-boundaries")
                (:file "tests-multipart-boundaries")

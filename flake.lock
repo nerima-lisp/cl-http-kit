@@ -1366,17 +1366,17 @@
         ]
       },
       "locked": {
-        "lastModified": 1793137864,
-        "narHash": "sha256-ug/T1Kd7obXbeKQIBkZZMtks60tj17dy93k2vEqKQzE=",
+        "lastModified": 1793166855,
+        "narHash": "sha256-qOsXCtn4jtHNi80DQoeoWcs4+LzsSklXagMJWMCqETk=",
         "owner": "nerima-lisp",
         "repo": "cl-quic-kit",
-        "rev": "16d6f5987ae8ff75342cfd4d5085c6b936104e96",
+        "rev": "852bde960b4749c687e33ce031e55d8dd5c2175e",
         "type": "github"
       },
       "original": {
         "owner": "nerima-lisp",
         "repo": "cl-quic-kit",
-        "rev": "16d6f5987ae8ff75342cfd4d5085c6b936104e96",
+        "rev": "852bde960b4749c687e33ce031e55d8dd5c2175e",
         "type": "github"
       }
     },

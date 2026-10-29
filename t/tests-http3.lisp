@@ -9607,6 +9607,46 @@
                   (ensure-equal '(t) (mapcar #'second writes))
                   (ensure-equal nil error-request)))))))))
 
+(deftest http3-public-errors-request-reserved-frames
+  (let ((fields
+          '((":method" . "GET")
+            (":scheme" . "https")
+            (":authority" . "example.test")
+            (":path" . "/"))))
+    (dolist (type '(#x02 #x06 #x08 #x09))
+      (let* ((headers (http3-boundary-headers fields))
+             (reserved-frame
+               (http-kit/http3:encode-http3-frame
+                (http-kit/http3:make-http3-frame
+                 :type type :payload (octets))))
+             (wire (http3-test-concat-octets headers reserved-frame)))
+        (multiple-value-bind
+            (failure response calls writes closed observed request error-request)
+            (http3-public-error-serve
+             (list (list wire t))
+             (lambda (request)
+               (declare (ignore request))
+               (make-http-response :status 204)))
+          (ensure-true
+           (typep failure
+                  'http-kit/http3::http3-connection-protocol-error))
+          (http3-public-error-check
+           failure
+           "HTTP/2 reserved frame types are invalid on an HTTP/3 request stream."
+           :h3-frame-unexpected)
+          (ensure-equal
+           #x105
+           (http-kit/http3::http3-connection-protocol-error-quic-error-code
+            failure))
+          (ensure-equal 1 (length closed))
+          (ensure-true (eq failure (first closed)))
+          (ensure-true (eq failure observed))
+          (ensure-equal nil response)
+          (ensure-equal 0 calls)
+          (ensure-equal nil writes)
+          (ensure-equal nil request)
+          (ensure-equal nil error-request))))))
+
 (deftest http3-public-errors-request-eof
   (let ((headers (http3-boundary-headers
                   '((":method" . "GET") (":scheme" . "https")

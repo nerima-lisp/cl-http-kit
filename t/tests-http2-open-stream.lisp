@@ -2511,6 +2511,70 @@
     (http-kit/http2:close-http2-connection connection)
     (signals http-protocol-error
       (http-kit/http2:send-http2-priority-update connection 1))))
+#+sbcl
+(deftest http2-public-request-waits-for-starting-session
+  (let* ((stream (make-instance 'binary-session-stream
+                                :input (h2-response-wire (octets))))
+         (connection (http-kit/http2:make-http2-connection :stream stream))
+         (wait-reached (sb-thread:make-semaphore :count 0))
+         (done (sb-thread:make-semaphore :count 0))
+         (clock-calls 0)
+         (response nil)
+         (failure nil)
+         (request-thread nil))
+    (http-kit/http2::%h2-with-scheduler-lock (connection)
+      (setf (http-kit/http2::%http2-connection-session-started-p connection) t
+            (http-kit/http2::%http2-connection-session-start-state connection)
+            :starting
+            (http-kit/http2::%http2-connection-scheduler-reader-active-p connection)
+            t))
+    (unwind-protect
+         (progn
+           (setf request-thread
+                 (sb-thread:make-thread
+                  (lambda ()
+                    (unwind-protect
+                         (handler-case
+                             (setf response
+                                   (http-kit/http2:send-http2-request-over-connection
+                                    connection
+                                    (make-http-request
+                                     :method "GET"
+                                     :uri "https://session-start.test/request")
+                                    :timeout 5
+                                    :clock-function
+                                    (lambda ()
+                                      (when (= (incf clock-calls) 5)
+                                        (sb-thread:signal-semaphore wait-reached))
+                                      0)))
+                           (error (condition)
+                             (setf failure condition)))
+                      (sb-thread:signal-semaphore done)))))
+           (ensure-true
+            (sb-thread:wait-on-semaphore wait-reached :timeout 5))
+           (ensure-equal
+            :starting
+            (http-kit/http2::%http2-connection-session-start-state connection))
+           (http-kit/http2::%h2-with-scheduler-lock (connection)
+             (setf (http-kit/http2::%http2-connection-session-start-state connection)
+                   :ready
+                   (http-kit/http2::%http2-connection-scheduler-reader-active-p
+                    connection)
+                   nil)
+             (http-kit/http2::%h2-scheduler-broadcast connection))
+           (ensure-true (sb-thread:wait-on-semaphore done :timeout 5))
+           (sb-thread:join-thread request-thread)
+           (setf request-thread nil)
+           (ensure-false failure)
+           (ensure-equal 200 (http-response-status response))
+           (ensure-equal (octets) (http-response-body response))
+           (ensure-equal
+            :ready
+            (http-kit/http2::%http2-connection-session-start-state connection))
+           (ensure-true (http-kit/http2:http2-connection-open-p connection)))
+      (http-kit/http2:close-http2-connection connection)
+      (when request-thread
+        (sb-thread:join-thread request-thread)))))
 
 #+sbcl
 (deftest http2-public-control-ping-interleaved-frames

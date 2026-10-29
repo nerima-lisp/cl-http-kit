@@ -13,6 +13,10 @@
 (defun check (value name)
   (incf *checks*)
   (unless value (error "Child merge assertion: ~S" name)))
+(defvar *project-source-root* (namestring (truename (uiop:pathname-directory-pathname (merge-pathnames "../" *load-truename*)))))
+(defun project-source-report-p (path)
+  (and (<= (length *project-source-root*) (length path))
+       (string= *project-source-root* path :end2 (length *project-source-root*))))
 
 (defun raw-equal (one two)
   (and (= (length one) (length two))
@@ -332,7 +336,11 @@
           (let ((child (assoc (first record) input :test #'equal)))
             (when child (bit-ior (cddr record) (cddr child) (cddr record)))))))
     (http-coverage-child-merge::write-form (merge-pathnames "before.native" *output*) before)
-    (sb-cover:report (merge-pathnames "before-report/" *output*))
+    (progn
+      (check (some (function project-source-report-p) (mapcar (function first) before))
+             :coverage-report-has-project-source)
+      (sb-cover:report (merge-pathnames "before-report/" *output*)
+                       :if-matches (function project-source-report-p)))
     (http-coverage-child-merge:merge-pending)
     (check (and (equal payload-seal
                        (mapcar (lambda (ticket) (getf ticket :digest)) tickets))
@@ -361,7 +369,8 @@
       (check (and (> delta 0) (> client-delta 0) (> branches 0)) :real-child-only-coverage)
       (check (> negative 0) :unexecuted-native-negatives-preserved)
       (http-coverage-child-merge::write-form (merge-pathnames "after.native" *output*) after)
-      (sb-cover:report (merge-pathnames "after-report/" *output*))
+      (sb-cover:report (merge-pathnames "after-report/" *output*)
+                       :if-matches (function project-source-report-p))
       (check (raw-equal after (sb-cover:save-coverage)) :html-report-does-not-change-native)
       (check (equal (http-coverage-child-merge::collector-manifest collector)
                     (http-coverage-child-merge::hashes

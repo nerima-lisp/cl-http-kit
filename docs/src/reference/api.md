@@ -674,7 +674,8 @@ also clamps peer HPACK table settings to 4096 bytes by default through
 clock-function on-evict on-transient-close`. `max-connections` defaults to `8`
 and limits retained cache entries; request-scoped connections do not count
 toward that limit, so the total number of open connections can exceed it. On
-SBCL, the manager synchronizes its entry state for concurrent callers. Ordinary
+SBCL, the manager synchronizes its entry
+state for concurrent callers. Ordinary
 single-request calls with the same key can share one retained connection; its
 scheduler assigns distinct stream IDs and observes the peer's concurrent-stream
 and flow-control limits together with that connection's local
@@ -814,6 +815,22 @@ encoding only references entries already present, so callers must synchronize
 the peer table before sending a section that has a non-zero required insert
 count.
 
+### HTTP/3 server conditions
+
+Listener-side waits that require peer SETTINGS distinguish three outcomes.
+`http3-server-connection-closed` reports that the QUIC connection closed; its
+`http3-server-connection-close-kind`,
+`http3-server-connection-close-error-code`, and
+`http3-server-connection-close-reason` readers return the close kind, QUIC error
+code, and close reason when available. The close reason is limited to 256
+characters, with control characters replaced by spaces. When the listener
+reports this condition during a session, `on-error` receives the same typed
+condition. It is also an `http-server-error` with reason code `:connection-error`
+and phase `:session`. `http3-server-stopped` reports that the server stopped
+before SETTINGS arrived; ordinary shutdown does not report it through
+`on-error`. `http-kit:http-timeout` is reserved for an operation deadline that
+actually expired; `http-kit:http-timeout-kind` returns the operation kind.
+
 ### HTTP/3 client
 
 #### Callback completion contract
@@ -886,17 +903,22 @@ polling, or two NIL values when the queue is empty. Pass a dequeued stream to
 RECEIVE-HTTP3-PUSH. Unknown extension streams are cancelled when
 CANCEL-STREAM is available, or drained through FIN.
 
-SEND-HTTP3-REQUEST takes an HTTP request and optional ON-BODY-CHUNK,
-ON-INFORMATION, COLLECT-BODY-P, MAX-HEADER-BYTES, MAX-FIELDS, MAX-BODY-BYTES,
-REQUEST-BODY-FUNCTION, REQUEST-BODY-LENGTH, QPACK-ENCODER-CONTEXT,
-QPACK-DECODER-CONTEXT, QPACK-HTTP3-DECODER-CONTEXT, AWAIT-QPACK, HUFFMAN-P,
-ON-STREAM-OPEN, ON-PUSH-PROMISE, TIMEOUT, and DEADLINE arguments. A request-body
-producer receives the client's maximum DATA payload
-size and returns non-empty octet arrays until NIL; a declared length is
-enforced and emitted as Content-Length. It opens a request stream, writes
-request headers, DATA, and trailers, then parses the response. The QPACK tables
-are caller-owned when supplied; otherwise the client uses its connection-owned
-contexts. Public accessors
+```lisp
+(send-http3-request client request
+                    &key on-response-headers on-body-chunk on-information
+                      collect-body-p max-header-bytes max-fields max-body-bytes
+                      request-body-function request-body-length
+                      qpack-encoder-context qpack-decoder-context
+                      qpack-http3-decoder-context await-qpack huffman-p
+                      on-stream-open on-cancel on-push-promise timeout deadline)
+```
+
+A request-body producer receives the client's maximum DATA payload size and
+returns non-empty octet arrays until NIL; a declared length is enforced and
+emitted as Content-Length. The client opens a request stream, writes request
+headers, DATA, and trailers, then parses the response. The client uses its
+connection-owned QPACK contexts by default; callers can supply custom contexts.
+Public accessors
 include `http3-client-open-p`; callback slots `http3-client-open-stream`,
 `http3-client-write-stream`, `http3-client-read-stream`,
 `http3-client-close-stream`, and `http3-client-cancel-stream`; limits
@@ -985,15 +1007,21 @@ client's configured limits, matching ordinary response handling.
 ### serve-http3-request-stream
 
 Serve one HTTP/3 request stream over caller-supplied QUIC stream callbacks.
-The signature is serve-http3-request-stream (stream handler &key read-stream
+The signature is `serve-http3-request-stream (stream handler &key read-stream
 write-stream close-stream max-frame-size max-header-bytes max-fields
-max-body-bytes collect-body-p on-body-chunk qpack-decoder-table
-qpack-decoder-context stream-id await-qpack qpack-serialize qpack-encoder-table
-huffman-p enable-connect-p timeout deadline on-error). The session owns
-HTTP/3 framing, QPACK field sections, request-body limits, and response
-framing; the caller owns QPACK instruction-stream synchronization, QUIC, TLS,
-ALPN, and connection-level stream dispatch. Its callbacks and handler follow
-the callback completion contract above.
+max-body-bytes collect-body-p on-body-chunk qpack-decoder-context
+qpack-http3-decoder-context on-qpack-section-acknowledgment stream-id
+await-qpack qpack-serialize qpack-encoder-context reserve-body-bytes
+release-body-bytes huffman-p enable-connect-p timeout deadline on-error)`. The
+session owns HTTP/3 framing, QPACK field sections, request-body limits, and
+response framing; the caller owns QPACK instruction-stream synchronization,
+QUIC, TLS, ALPN, and connection-level stream dispatch. Supply
+`reserve-body-bytes` and `release-body-bytes` together. When `collect-body-p` is
+true, the reserve callback receives each nonempty DATA payload size before the
+server stores it and the request-body size before it copies the body into the
+request. The release callback receives the total reserved size when request
+processing exits. Its callbacks and handler follow the callback completion
+contract above.
 
 ## Native network package
 
@@ -1023,7 +1051,7 @@ The optional `cl-http-kit/tls` system provides an HTTPS listener on SBCL.
 `http-server-port` are exported from `HTTP-KIT`. `make-http-server` has this
 signature: `(&key (transport :https) host port handler
 certificate-chain private-key ticket-key-store max-connections
-max-handshakes max-concurrent-streams handshake-timeout request-timeout
+max-active-request-workers max-handshakes max-concurrent-streams handshake-timeout request-timeout
 idle-timeout graceful-timeout max-header-bytes max-fields max-body-bytes
 max-buffered-body-bytes on-event on-error)`. HOST, PORT, HANDLER,
 CERTIFICATE-CHAIN, and PRIVATE-KEY
@@ -1032,8 +1060,8 @@ vectors with the leaf first; `private-key` is the matching P-256 ECDSA or
 Ed25519 key object. Construct it with `crypto-kit:make-ec-private-key` using
 `:p256` and scalar octets, or `crypto-kit:make-ed25519-private-key` using a
 32-octet seed. The listener does not parse PEM or DER private-key files. PORT
-may be zero to request an ephemeral port. The only supported transport is
-`:https`.
+may be zero to request an ephemeral port. The supported transports are `:https`
+and `:http3`.
 
 The server advertises `h2` and `http/1.1` through ALPN and dispatches each
 connection to the matching session. A handshake without one of those selected
@@ -1044,6 +1072,10 @@ the response may be an HTTP response or response stream.
 Defaults are 128 concurrent connections, 32 concurrent handshakes, 100 HTTP/2
 streams per connection, a 10-second handshake timeout, a 30-second request
 timeout, a 60-second idle timeout, and a 30-second graceful-stop timeout.
+The server-wide HTTP/3 request-worker limit defaults to 128, matching the
+`max-connections` default. It also bounds request workers waiting for peer
+SETTINGS; excess request streams receive `H3_REQUEST_REJECTED` before a worker
+starts.
 Request headers are limited to 65,536 bytes and 100 fields; request bodies are
 limited to 16,777,216 bytes per request. The aggregate buffered-body limit
 defaults to the larger of 64 MiB and twice MAX-BODY-BYTES. It applies across
