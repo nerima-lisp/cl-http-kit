@@ -4,7 +4,7 @@ This page documents a selected set of primary exports from the registered ASDF
 systems. Package definition files remain authoritative for lower-level and
 auxiliary exports not described here.
 
-The registered systems in this checkout declare version 0.4.1. This reference
+The registered systems in this checkout declare version 0.5.0. This reference
 describes the current checkout and may include unreleased changes.
 
 ## Core package

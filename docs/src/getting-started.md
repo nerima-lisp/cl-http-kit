@@ -2,7 +2,7 @@
 
 cl-http-kit is loaded through ASDF. The core system has no built-in socket
 dependency: an application supplies the binary stream or exchange boundary.
-The instructions on this page describe the checked-in 0.4.1 API. The
+The instructions on this page describe the checked-in 0.5.0 API. The
 migration notes are documented in the
 [migration guide](project/migration.md).
 

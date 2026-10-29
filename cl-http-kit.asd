@@ -4,7 +4,7 @@
   :description "A portable, binary-safe HTTP client substrate."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.4.1"
+  :version "0.5.0"
   :depends-on ((:version "cl-http-message-kit" "2.0.1"))
   :pathname "src"
   :serial t
@@ -41,7 +41,7 @@
   :description "Optional cl-observability-kit metrics for cl-http-kit."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.4.1"
+  :version "0.5.0"
   :depends-on ("cl-http-kit" "cl-observability-kit")
   :pathname "src"
   :serial t
@@ -53,7 +53,7 @@
   :description "The optional HTTP/2 transport for cl-http-kit."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.4.1"
+  :version "0.5.0"
   :depends-on ("cl-http-kit")
   :pathname "http2"
   :serial t
@@ -82,7 +82,7 @@
   :description "The high-level HTTP client policies and request orchestration layer."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.4.1"
+  :version "0.5.0"
   :depends-on ("cl-http-kit" "cl-http-kit/http2" "cl-codec-kit" "cl-deflate-kit")
   :pathname "client"
   :serial t
@@ -107,7 +107,7 @@
   :description "Optional native TCP and DNS boundary for cl-http-kit."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.4.1"
+  :version "0.5.0"
   :depends-on ("cl-http-kit")
   :pathname "network"
   :serial t
@@ -118,7 +118,7 @@
   :description "Optional cl-tls-kit TLS integration for cl-http-kit network streams."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.4.1"
+  :version "0.5.0"
   :depends-on ("cl-http-kit/network" "cl-http-kit/http2"
                (:version "cl-tls-kit" "0.5.2")
                "cl-crypto-kit")
@@ -131,7 +131,7 @@
   :description "Optional HTTP/3 framing, QPACK, and injected QUIC transport boundary."
   :author "nerima-lisp"
   :license "MIT"
-  :version "0.4.1"
+  :version "0.5.0"
   :depends-on ("cl-http-kit" (:version "cl-quic-kit" "0.2.6"))
   :pathname "http3"
   :serial t
@@ -143,7 +143,7 @@
 
 (asdf:defsystem "cl-http-kit/test-core"
   :description "Core tests for cl-http-kit without optional transport or client subsystems."
-  :version "0.4.1"
+  :version "0.5.0"
   :depends-on ("cl-http-kit"
                (:version "cl-weave" "1.5.0"))
   :pathname "t"
@@ -173,7 +173,7 @@
 
 (asdf:defsystem "cl-http-kit/test"
   :description "Tests for cl-http-kit and its optional protocol and network systems."
-  :version "0.4.1"
+  :version "0.5.0"
   :depends-on ("cl-http-kit/test-core"
                "cl-http-kit/client"
                "cl-http-kit/http2"
@@ -240,7 +240,7 @@
              (uiop:symbol-call "HTTP-KIT/TEST" "RUN-TESTS")))
 (asdf:defsystem "cl-http-kit/coverage-tools"
   :description "Coverage tooling helpers for cl-http-kit."
-  :version "0.4.1"
+  :version "0.5.0"
   :depends-on ("cl-http-kit")
   :pathname "scripts"
   :serial t

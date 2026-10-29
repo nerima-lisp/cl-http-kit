@@ -4,7 +4,7 @@ cl-http-kit keeps the HTTP protocol model small and explicit. Applications
 construct values, choose a transport boundary, and decide how deadlines and
 limits should be inherited.
 
-The examples and boundaries here describe the checked-in 0.4.1 systems. The
+The examples and boundaries here describe the checked-in 0.5.0 systems. The
 convenience client path is available without removing
 the compatibility APIs described in the reference pages.
 

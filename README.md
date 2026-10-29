@@ -12,8 +12,8 @@ integrations.
 
 ## Release status
 
-The checked-in ASDF systems remain at version 0.4.1 while the 0.5.0 changes
-are pending. `make-http-client` creates a native TCP/TLS connection pool when
+The checked-in ASDF systems are at version 0.5.0. `make-http-client` creates
+a native TCP/TLS connection pool when
 no transport boundary is supplied, while `http-client-request` and
 `http-client-send` remain supported request paths. `http-client-send` also
 accepts a method and URL convenience form. See the
