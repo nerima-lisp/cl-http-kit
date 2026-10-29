@@ -3886,10 +3886,14 @@
   (defun %http3-listener-test-cancel-callback-error-codes (&rest cancel-arguments)
     (let* ((server (%http3-listener-test-unit-server))
            (quic-connection (cl-quic-kit:make-quic-connection :role :server))
+           (quic-client
+             (cl-quic-kit:make-quic-client
+              :connection quic-connection :disable-hostname-verification-p t))
            (connection
              (%http3-listener-test-unit-connection
               :quic-connection quic-connection))
            (error-codes nil))
+      (ensure-true quic-client)
       (%http3-listener-test-call-with-function-stubs
        (list
         (cons 'http-kit/http3::%http3-server-stream-cancel
