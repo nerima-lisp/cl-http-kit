@@ -423,9 +423,10 @@
 
 #+sbcl
 (deftest http2-coverage-server-stream-omitted-defaults
+  ;; Resolve the constructor dynamically so SBCL cannot inline its defaults.
   (let* ((constructor
            (symbol-function
-            (quote http-kit/http2::%make-h2-server-stream)))
+            (find-symbol "%MAKE-H2-SERVER-STREAM" "HTTP-KIT/HTTP2")))
          (first (funcall constructor 1))
          (second (funcall constructor 3))
          (body (http-kit/http2::%h2-server-stream-body first)))
