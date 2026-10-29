@@ -5,7 +5,7 @@ This guide describes the 0.4.0 integration and the planned migration from the
 historical release behavior.
 
 The 0.4.0 sections describe upgrades from 0.3.x. If you are already on 0.4.1,
-start with [0.5.0 changes](#0-5-0-changes); use the WebSocket/SSE section when
+start with [0.5.0 changes](#050-changes); use the WebSocket/SSE section when
 you use those APIs.
 
 For the WebSocket and SSE API removal, see the

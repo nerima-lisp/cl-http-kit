@@ -18,7 +18,7 @@ historical release behavior, not the current API contract; see the
 - Reject `:verify nil` because the pinned cl-tls-kit client driver does not
   expose a supported way to disable certificate verification.
 - Replace the local HTTP/3 QPACK API with cl-http-message-kit 2.0.1. See the
-  [QPACK migration guide](migration.md#0-5-0-changes).
+  [QPACK migration guide](migration.md#050-changes).
 
 ### Added
 
