@@ -3882,31 +3882,42 @@
         (http-kit::http-server-active-http3-request-workers server))))))
 
 #+sbcl
-(deftest http3-listener-cancel-callback-preserves-error-code-presence
-  (let* ((server (%http3-listener-test-unit-server))
-         (quic-connection (cl-quic-kit:make-quic-connection :role :server))
-         (quic-client
-           (cl-quic-kit:make-quic-client
-            :connection quic-connection :disable-hostname-verification-p t))
-         (connection
-           (%http3-listener-test-unit-connection :quic-connection quic-connection))
-         (error-codes nil))
-    (ensure-true quic-client)
-    (%http3-listener-test-call-with-function-stubs
-     (list
-      (cons 'http-kit/http3::%http3-server-stream-cancel
-            (lambda (actual-server actual-connection stream error-code)
-              (ensure-true (eq server actual-server))
-              (ensure-true (eq connection actual-connection))
-              (ensure-equal :stream stream)
-              (push error-code error-codes))))
-     (lambda ()
-       (let* ((client (http-kit/http3::%http3-server-make-client server connection))
-              (cancel (http-kit/http3::http3-client-cancel-stream client)))
-         (funcall cancel :stream)
-         (funcall cancel :stream :error-code nil)
-         (funcall cancel :stream :error-code #x123 :timeout nil :deadline nil)
-         (ensure-equal '(#x123 nil #x10c) error-codes))))))
+(progn
+  (defun %http3-listener-test-cancel-callback-error-codes (&rest cancel-arguments)
+    (let* ((server (%http3-listener-test-unit-server))
+           (quic-connection (cl-quic-kit:make-quic-connection :role :server))
+           (connection
+             (%http3-listener-test-unit-connection
+              :quic-connection quic-connection))
+           (error-codes nil))
+      (%http3-listener-test-call-with-function-stubs
+       (list
+        (cons 'http-kit/http3::%http3-server-stream-cancel
+              (lambda (actual-server actual-connection stream error-code)
+                (ensure-true (eq server actual-server))
+                (ensure-true (eq connection actual-connection))
+                (ensure-equal :stream stream)
+                (push error-code error-codes))))
+       (lambda ()
+         (let* ((client
+                  (http-kit/http3::%http3-server-make-client server connection))
+                (cancel (http-kit/http3::http3-client-cancel-stream client)))
+           (apply cancel :stream cancel-arguments)
+           (nreverse error-codes))))))
+
+  (deftest http3-listener-cancel-callback-defaults-omitted-error-code
+    (ensure-equal (list #x10c)
+                  (%http3-listener-test-cancel-callback-error-codes)))
+
+  (deftest http3-listener-cancel-callback-defaults-explicit-nil-error-code
+    (ensure-equal (list #x10c)
+                  (%http3-listener-test-cancel-callback-error-codes
+                   :error-code nil)))
+
+  (deftest http3-listener-cancel-callback-preserves-integer-error-code
+    (ensure-equal (list #x101)
+                  (%http3-listener-test-cancel-callback-error-codes
+                   :error-code #x101))))
 #+sbcl
 (deftest http3-listener-coverage-poll-unwind-skips-released-request-reservation
   (let* ((server (%http3-listener-test-unit-server))

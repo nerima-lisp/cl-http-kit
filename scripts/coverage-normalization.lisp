@@ -200,74 +200,22 @@
                (handler-case 1 2) (progn 1 nil)))))
 
 (defun defun-key-candidates (form path)
-  (labels ((cancel-callback-candidates ()
-             ;; The callback's own body anchors decide whether projection may remove it.
-             (when (and (consp form) (eq (first form) 'defun)
-                        (consp (nth 3 form))
-                        (eq (first (nth 3 form)) 'let))
-               (let* ((body-slot 3)
-                      (let-form (nth body-slot form))
-                      (bindings (second let-form))
-                      (binding (and (listp bindings)
-                                    (= (length bindings) 1)
-                                    (first bindings)))
-                      (constructor (and (consp binding)
-                                        (= (length binding) 2)
-                                        (second binding)))
-                      (arguments (and (consp constructor) (rest constructor)))
-                      (cancel-slot (and arguments
-                                        (position :cancel-stream arguments :test #'eq)))
-                      (callback (and cancel-slot
-                                     (nth (1+ cancel-slot) arguments)))
-                      (callback-slot (and cancel-slot (+ 2 cancel-slot)))
-                      (lambda-list (and (consp callback) (second callback)))
-                      (error-code-key (and (listp lambda-list) (third lambda-list))))
-                 (when (and (consp constructor)
-                            (symbolp (first constructor))
-                            (string= (symbol-name (first constructor)) "MAKE-HTTP3-CLIENT")
-                            (evenp (length arguments))
-                            cancel-slot
-                            (evenp cancel-slot)
-                            (= (count :cancel-stream arguments :test #'eq) 1)
-                            (consp callback)
-                            (eq (first callback) 'lambda)
-                            (listp lambda-list)
-                            (= (length lambda-list) 5)
-                            (eq (second lambda-list) '&key)
-                            (consp error-code-key)
-                            (= (length error-code-key) 2)
-                            (symbolp (first error-code-key))
-                            (string= (symbol-name (first error-code-key)) "ERROR-CODE")
-                            (eql (second error-code-key) #x10c)
-                            (symbolp (fourth lambda-list))
-                            (string= (symbol-name (fourth lambda-list)) "TIMEOUT")
-                            (symbolp (fifth lambda-list))
-                            (string= (symbol-name (fifth lambda-list)) "DEADLINE"))
-                   (let ((callback-path (list* callback-slot 1 0 1 body-slot path)))
-                     (key-candidates
-                      lambda-list
-                      (cons 1 callback-path)
-                      nil
-                      (source-body-anchors callback callback-path 2))))))))
-    (when (and (consp form) (eq (first form) 'defun) (listp (third form)))
-      (let* ((callback (callback-key-candidates form path))
-             (macros (when callback (callback-macro-dependencies)))
-             (body-slot (1- (length form)))
-             (body (car (last form))))
-        (values
-         (nconc callback
-                (h3-callback-key-candidates form path)
-                (cancel-callback-candidates)
-                (key-candidates (third form) (cons 2 path) t
-                                (source-body-anchors form path 3))
-                (when (and (>= body-slot 3) (consp body)
-                           (eq (first body) 'lambda) (listp (second body)))
-                  (key-candidates (second body) (list* 1 body-slot path) nil
-                                  (source-body-anchors body
-                                                       (cons body-slot path)
-                                                       2))))
-         macros)))))
-
+  (when (and (consp form) (eq (first form) 'defun) (listp (third form)))
+    (let* ((callback (callback-key-candidates form path))
+           (macros (when callback (callback-macro-dependencies)))
+           (body-slot (1- (length form)))
+           (body (car (last form))))
+      (values
+       (nconc callback (h3-callback-key-candidates form path)
+              (key-candidates (third form) (cons 2 path) t
+                              (source-body-anchors form path 3))
+              (when (and (>= body-slot 3) (consp body)
+                         (eq (first body) 'lambda) (listp (second body)))
+                (key-candidates (second body) (list* 1 body-slot path) nil
+                                (source-body-anchors body
+                                                     (cons body-slot path)
+                                                     2))))
+       macros))))
 
 (defun keyword-nil-slot-candidates (slots top)
   ;; SBCL registers quoted NIL here without emitting a CODE-MAP marker.

@@ -1518,103 +1518,17 @@
           do (check (equalp before (sb-md5:md5sum-file pathname)) :callback-dependency-source-unchanged)
              (manifest pathname))))
 
-(progn
-  (defun h3-placement-form (name keys)
-    `(defun ,name (on-stream-open)
-       (let* ((stream :stream) (stream-id 1))
-         (unwind-protect
-              (handler-case
-                  (progn
-                    (when on-stream-open
-                      (funcall on-stream-open stream stream-id
-                               (lambda ,keys (list error-code)))))
-                (error (condition) (error condition)))
-           (values)))))
-
-  (defun http3-cancel-fixture-form (name call-callback-p)
-    `(defun ,name ()
-       (let ((client
-               (make-http3-client
-                :cancel-stream
-                (lambda (stream &key (error-code #x10c) timeout deadline)
-                  (declare (ignore timeout deadline))
-                  (list stream error-code)))))
-         ,(if call-callback-p '(funcall client :stream) 'client))))
-
-  (defun http3-cancel-key-controls (root directory)
-    (declare (ignore root))
-    (group :cancel-callback-body-evidence)
-    (let* ((http-coverage-normalization:*proofs* (make-hash-table :test 'equal))
-           (forms
-             (list '(defun make-http3-client (&key cancel-stream) cancel-stream)
-                   (http3-cancel-fixture-form 'cancel-callback-called t)
-                   (http3-cancel-fixture-form 'cancel-callback-uncalled nil)))
-           (pathname (fixture directory "cancel-callback-body-evidence" forms))
-           (proof (compile-fixture pathname))
-           (key (namestring (truename pathname)))
-           (file (gethash key (car sb-c::*code-coverage-info*)))
-           (candidates (http-coverage-normalization:source-proof-candidates proof))
-           (called-top
-             (1+ (position 'cancel-callback-called forms :key #'second :test #'eq)))
-           (uncalled-top
-             (1+ (position 'cancel-callback-uncalled forms :key #'second :test #'eq)))
-           (called-candidate
-             (find-if (lambda (candidate)
-                        (let ((path (first candidate)))
-                          (and path (= called-top (car (last path))))))
-                      candidates))
-           (uncalled-candidate
-             (find-if (lambda (candidate)
-                        (let ((path (first candidate)))
-                          (and path (= uncalled-top (car (last path))))))
-                      candidates)))
-      (check file :cancel-callback-coverage-file)
-      (check (= 2 (length candidates)) :two-cancel-callback-candidates)
-      (check called-candidate :called-cancel-callback-candidate)
-      (check uncalled-candidate :uncalled-cancel-callback-candidate)
-      (check (equal '(:stream 268)
-                    (funcall (find-symbol "CANCEL-CALLBACK-CALLED"
-                                          "HTTP-COVERAGE-NORMALIZATION-TESTS")))
-             :called-cancel-callback-default)
-      (check (functionp
-              (funcall (find-symbol "CANCEL-CALLBACK-UNCALLED"
-                                    "HTTP-COVERAGE-NORMALIZATION-TESTS")))
-             :uncalled-cancel-callback-created)
-      (sb-cover::refresh-coverage-bits)
-      (let* ((paths (sb-c::covered-file-paths file))
-             (bits (sb-c::covered-file-executed file)))
-        (labels ((bit-at (path)
-                   (let ((index (position path paths :test #'equal)))
-                     (and index (sbit bits index))))
-                 (body-executed-p (candidate)
-                   (some (lambda (anchor) (eql 1 (bit-at anchor)))
-                         (fourth candidate))))
-          (check (eql 0 (bit-at (first called-candidate)))
-                 :called-default-native-bit-zero)
-          (check (body-executed-p called-candidate)
-                 :called-callback-body-bit-one)
-          (check (eql 0 (bit-at (first uncalled-candidate)))
-                 :uncalled-default-native-bit-zero)
-          (check (not (body-executed-p uncalled-candidate))
-                 :uncalled-callback-body-bits-zero)
-          (http-coverage-normalization:call-with-projection
-           http-coverage-normalization:*proofs*
-           (lambda (removed)
-             (check (= removed 1) :only-called-default-removed)
-             (let* ((projected (gethash key (car sb-c::*code-coverage-info*)))
-                    (projected-paths (sb-c::covered-file-paths projected))
-                    (projected-bits (sb-c::covered-file-executed projected))
-                    (uncalled-index
-                      (position (first uncalled-candidate) projected-paths
-                                :test #'equal)))
-               (check (not (member (first called-candidate) projected-paths
-                                   :test #'equal))
-                      :called-default-removed)
-               (check uncalled-index :uncalled-default-retained)
-               (check (zerop (sbit projected-bits uncalled-index))
-                      :uncalled-default-bit-stays-zero)
-               (compare-projection file projected proof)))))))))
-
+(defun h3-placement-form (name keys)
+  `(defun ,name (on-stream-open)
+     (let* ((stream :stream) (stream-id 1))
+       (unwind-protect
+            (handler-case
+                (progn
+                  (when on-stream-open
+                    (funcall on-stream-open stream stream-id
+                             (lambda ,keys (list error-code)))))
+              (error (condition) (error condition)))
+         (values)))))
 
 (defun placement-key-controls (root directory)
   (group :placement-finite-source-grammar)
@@ -2034,5 +1948,5 @@
   (unless (or identity-only
               (and ci-mode (not (http-coverage-normalization::normalization-supported-p))))
     (callback-key-controls root directory)
-    (progn (placement-key-controls root directory) (http3-cancel-key-controls root directory)))
+    (placement-key-controls root directory))
   (format t "RESULT selected=~D assertions=~D~%" *groups* *assertions*))

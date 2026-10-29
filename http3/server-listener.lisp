@@ -423,11 +423,11 @@
                (%http3-server-stream-read
                 server connection stream :timeout timeout :deadline deadline))
              :cancel-stream
-             (lambda (stream &key (error-code #x10c) timeout deadline)
+             (lambda (stream &key error-code timeout deadline)
                (declare (ignore timeout deadline))
                (%http3-server-stream-cancel
                 server connection stream
-                error-code))
+                (or error-code #x10c)))
              :max-header-bytes
              (http-kit::http-server-max-header-bytes server)
              :max-fields (http-kit::http-server-max-fields server)
