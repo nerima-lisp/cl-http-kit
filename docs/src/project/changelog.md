@@ -6,6 +6,8 @@ historical release behavior, not the current API contract; see the
 
 ## Unreleased
 
+## 0.5.0 - 2026-10-29
+
 ### Breaking changes
 
 - Remove the `http-kit/websocket` package and SSE exports from
@@ -14,7 +16,7 @@ historical release behavior, not the current API contract; see the
   See the
   [WebSocket and SSE migration guide](migration.md#websocket-and-sse-api-migration).
 - Reject `:verify nil` because the pinned cl-tls-kit client driver does not
-  expose a supported way to disable certificate verification;
+  expose a supported way to disable certificate verification.
 - Replace the local HTTP/3 QPACK API with cl-http-message-kit 2.0.1. See the
   [QPACK migration guide](migration.md#0-5-0-changes).
 
@@ -22,23 +24,23 @@ historical release behavior, not the current API contract; see the
 
 - Add an HTTPS listener on SBCL with ALPN negotiation for HTTP/2 and HTTP/1.1,
   bounded connection and request resources, lifecycle callbacks, and graceful
-  shutdown;
+  shutdown.
 - Add `:session-tickets-p` to `make-http-tls-server-wrapper`, allowing server
-  ticket issuance to be disabled;
+  ticket issuance to be disabled.
 
 ### Changed
 
-- Cap buffered request-body bytes across active HTTPS listener sessions;
+- Cap buffered request-body bytes across active HTTPS listener sessions.
 - Destroy per-connection ticket-key stores created by TLS server wrappers when
   their driver closes, while leaving supplied shared stores caller-owned for
-  cross-connection resumption;
+  cross-connection resumption.
 - Require cl-tls-kit 0.5.2 for TLS, cl-quic-kit 0.2.6 for HTTP/3, and
-  cl-weave 1.5.0 for the test and coverage APIs;
+  cl-weave 1.5.0 for the test and coverage APIs.
 - Keep cl-tls-kit and cl-http-message-kit test helpers in separate test-only
-  ASDF systems;
+  ASDF systems.
 - Ignore record `legacy_record_version` in the TLS server wrapper as required by
   RFC 8446 section 5.1 while continuing to validate record content types and
-  lengths;
+  lengths.
 
 ### HTTP/2
 
@@ -51,10 +53,10 @@ historical release behavior, not the current API contract; see the
 
 ### Client
 
-- expose final response headers before body delivery through
+- Expose final response headers before body delivery through
   `http-client-send :on-response-headers`; informational responses continue to
   use `:on-information`.
-- add `make-http-cancellation-token`, `http-client-cancel-request`, and the
+- Add `make-http-cancellation-token`, `http-client-cancel-request`, and the
   `http-client-request-cancelled` condition. Cancellation interrupts direct
   HTTP/1.1 reads and sends HTTP/2 `RST_STREAM`; synchronous HTTP/2 reads may not
   return until a frame arrives or the request deadline expires. HTTP/3 requires
@@ -63,6 +65,15 @@ historical release behavior, not the current API contract; see the
   cancelled and signals `http-protocol-error` with operation
   `:http3-transport` and detail `:unsupported`; it sends no stream reset or
   stop-sending signal, so active I/O can continue until completion or deadline.
+
+### Known limitations
+
+- A nonblocking HTTPS handshake write already in progress can complete after
+  the handshake deadline expires, before the wrapper reports a timeout.
+- The `cl-crypto-kit` 0.2.2 implementation does not explicitly zeroize
+  HMAC/HKDF intermediate buffers. The `cl-tls-kit` 0.5.2 key schedule passes
+  intermediate HKDF outputs directly into extract without explicit erasure.
+  TLS drivers clear some retained secrets on close.
 
 ## 0.4.1 (historical)
 

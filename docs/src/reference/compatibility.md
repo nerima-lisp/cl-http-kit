@@ -6,7 +6,7 @@ and native TCP/DNS integration. This page describes the
 behavior implemented by the registered systems; it is not a claim of complete
 RFC coverage.
 
-The registered systems in this checkout are version 0.4.1. The current
+The registered systems in this checkout are version 0.5.0. The current
 integration source has native default client wiring, proxy-environment
 parsing, and lock-backed pool/cookie state.
 The URL-and-method convenience form is available through `http-client-send`.
