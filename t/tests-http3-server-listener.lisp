@@ -1875,9 +1875,16 @@
  (prepare-close-count 0)
  (queue-close-count 0)
  (flush-count 0))
-      (http-kit/http3::%http3-server-make-client server connection)
       (%http3-listener-test-call-with-function-stubs
        (list
+        (cons 'http-kit/http3::%http3-server-stream-open
+              (lambda (&rest arguments)
+                (declare (ignore arguments))
+                (gensym "HTTP3-TEST-STREAM-")))
+        (cons 'http-kit/http3::%http3-server-stream-write
+              (lambda (&rest arguments)
+                (declare (ignore arguments))
+                t))
         (cons 'http-kit/http3:serve-http3-control-stream
               (lambda (&rest arguments)
                 (declare (ignore arguments))
@@ -1931,6 +1938,7 @@
                 (ensure-true (eq quic-connection actual-connection))
                 (incf flush-count))))
        (lambda ()
+         (http-kit/http3::%http3-server-make-client server connection)
          (ensure-true
           (eq condition
               (handler-case
@@ -1950,7 +1958,7 @@
          (ensure-equal 1 queue-close-count)
          (ensure-equal 1 flush-count)
          (ensure-true (cl-quic-kit::quic-client-closed-p engine))
-         (setf closed-check-results '(nil t))
+         (setf closed-check-results '(nil (:closed)))
          (http-kit/http3::%http3-server-unidirectional-worker
           server listener connection :stream)
          (ensure-equal 2 report-count)
