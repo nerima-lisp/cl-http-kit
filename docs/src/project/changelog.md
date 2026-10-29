@@ -6,10 +6,12 @@ historical release behavior, not the current API contract; see the
 
 ## Unreleased
 
-- Limit each HTTP/3 connection to four active unidirectional-stream workers and
-  queue excess streams. The default 128-connection limit caps these workers at
-  512 while allowing 16 peer unidirectional streams for protocol and GREASE
-  traffic.
+- Add an SBCL HTTP/3 listener with Retry, strict `h3` ALPN negotiation,
+  handshake and request deadlines, resource limits, GOAWAY draining, and
+  sanitized QUIC close reasons. Limit each connection to four active
+  unidirectional-stream workers and queue excess streams. The default
+  128-connection limit caps these workers at 512 while advertising credit for
+  16 peer unidirectional streams for control, QPACK, and GREASE traffic.
 
 ## 0.5.0 - 2026-10-29
 

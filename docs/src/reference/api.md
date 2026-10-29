@@ -672,7 +672,9 @@ also clamps peer HPACK table settings to 4096 bytes by default through
 `make-http2-connection-manager` constructs a reusable connection pool with
 `&key open-connection max-connections idle-timeout max-connection-age
 clock-function on-evict on-transient-close`. `max-connections` defaults to `8`
-and limits retained cache entries. On SBCL, the manager synchronizes its entry
+and limits retained cache entries; request-scoped connections do not count
+toward that limit, so the total number of open connections can exceed it. On
+SBCL, the manager synchronizes its entry
 state for concurrent callers. Ordinary
 single-request calls with the same key can share one retained connection; its
 scheduler assigns distinct stream IDs and observes the peer's concurrent-stream
