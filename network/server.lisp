@@ -80,6 +80,7 @@
   peer-address
   peer-port
   handshake-deadline
+  listener
   protocol)
 
 (defmethod print-object ((server http-server) stream)
@@ -666,6 +667,7 @@
             (http-kit/network::%network-stream-socket raw-stream)
             :peer-address peer-address
             :peer-port peer-port
+            :listener listener
             :handshake-deadline
             (+ accepted-at (http-server-handshake-timeout server))))
          (rejection nil))

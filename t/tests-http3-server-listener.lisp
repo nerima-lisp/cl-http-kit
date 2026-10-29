@@ -3317,7 +3317,7 @@
         (http-kit/http3::%http3-server-connection-active-request-streams
          connection))))))
 #+sbcl
-(deftest http3-listener-peer-unidirectional-stream-worker-limit
+(deftest http3-listener-peer-unidirectional-worker-cap-queues-excess
   (let* ((server (%http3-listener-test-unit-server))
          (transport-parameters
            (http-kit/http3::%http3-server-transport-parameters server))
@@ -3353,60 +3353,160 @@
          (connection
            (%http3-listener-test-unit-connection
             :quic-connection quic-connection))
+         (worker-stream-lock
+           (sb-thread:make-mutex :name "uni worker test observations"))
          (worker-stream-ids nil)
-         (fourth-stream-rejected-p nil))
+         (worker-release (sb-thread:make-semaphore :count 0))
+         (closed-stream-ids nil))
     (setf (cl-quic-kit::quic-connection-stream-engine quic-connection) engine
           (gethash quic-connection
                    (http-kit/http3::%http3-server-listener-connections
                     listener))
-          connection)
-    (dolist (stream-id '(2 6 10))
+          connection
+          (http-kit::%http-server-connection-listener
+           (http-kit/http3::%http3-server-connection-server-connection
+            connection))
+          listener
+          (gethash
+           (http-kit/http3::%http3-server-connection-server-connection
+            connection)
+           (http-kit::http-server-connections server))
+          t
+          (http-kit::http-server-connection-count server)
+          1)
+    (ensure-equal 16 (getf transport-parameters :initial-max-streams-uni))
+    (dolist (stream-id '(2 6 10 14 18))
       (cl-quic-kit::%client-process-received-frame
        engine :1-rtt
        (cl-quic-kit:make-frame :stream :stream-id stream-id :offset 0 :data (make-array 0 :element-type '(unsigned-byte 8)))))
-    (%http3-listener-test-call-with-function-stubs
-     (list
-      (cons 'cl-quic-kit:quic-server-poll
-            (lambda (&rest arguments)
-              (declare (ignore arguments))
-              nil))
-      (cons 'cl-quic-kit:quic-server-accept-connection
-            (lambda (&rest arguments)
-              (declare (ignore arguments))
-              nil))
-      (cons 'http-kit/http3::%http3-server-now (lambda () 10))
-      (cons 'http-kit/http3::%http3-server-stream-stop-snapshot
-            (lambda (actual-listener)
-              (ensure-true (eq listener actual-listener))
-              (make-hash-table :test #'eq)))
-      (cons 'http-kit/http3::%http3-server-connection-closed-p
-            (lambda (&rest arguments)
-              (declare (ignore arguments))
-              nil))
-      (cons 'http-kit/http3::%http3-server-start-unidirectional-worker
-            (lambda (actual-server actual-listener actual-connection stream)
-              (ensure-true (eq server actual-server))
-              (ensure-true (eq listener actual-listener))
-              (ensure-true (eq connection actual-connection))
-              (push (cl-quic-kit:stream-id stream) worker-stream-ids)
-              (cl-quic-kit:quic-connection-close-stream
-               quic-connection stream))))
-     (lambda ()
-       (http-kit/http3::%http3-server-poll-listener server listener)
-       (ensure-equal '(2 6 10) (sort (copy-list worker-stream-ids) #'<))
-       (setf fourth-stream-rejected-p
-             (handler-case
-                 (progn
-                   (cl-quic-kit::%client-process-received-frame
-                    engine :1-rtt
-                    (cl-quic-kit:make-frame
-                     :stream :stream-id 14 :offset 0 :data (make-array 0 :element-type '(unsigned-byte 8))))
-                   nil)
-               (cl-quic-kit::stream-limit-error () t)))
-       (http-kit/http3::%http3-server-poll-listener server listener)
-       (ensure-equal 3 (length worker-stream-ids))
-       (ensure-true fourth-stream-rejected-p)
-       (ensure-equal 3
-                     (getf transport-parameters
-                           :initial-max-streams-uni)))))
+    (unwind-protect
+         (%http3-listener-test-call-with-function-stubs
+          (list
+           (cons 'cl-quic-kit:quic-server-poll
+                 (lambda (&rest arguments)
+                   (declare (ignore arguments))
+                   nil))
+           (cons 'cl-quic-kit:quic-server-accept-connection
+                 (lambda (&rest arguments)
+                   (declare (ignore arguments))
+                   nil))
+           (cons 'http-kit/http3::%http3-server-now (lambda () 10))
+           (cons 'http-kit/http3::%http3-server-stream-stop-snapshot
+                 (lambda (actual-listener)
+                   (ensure-true (eq listener actual-listener))
+                   (make-hash-table :test #'eq)))
+           (cons 'http-kit/http3::%http3-server-connection-closed-p
+                 (lambda (&rest arguments)
+                   (declare (ignore arguments))
+                   nil))
+           (cons 'http-kit/http3::%http3-server-unidirectional-worker
+                 (lambda (actual-server actual-listener actual-connection stream)
+                   (ensure-true (eq server actual-server))
+                   (ensure-true (eq listener actual-listener))
+                   (ensure-true (eq connection actual-connection))
+                   (sb-thread:with-mutex (worker-stream-lock)
+                     (push (cl-quic-kit:stream-id stream) worker-stream-ids))
+                   (sb-thread:wait-on-semaphore worker-release)))
+           (cons 'cl-quic-kit:quic-connection-close-stream
+                 (lambda (actual-quic-connection stream)
+                   (ensure-true (eq quic-connection actual-quic-connection))
+                   (push (cl-quic-kit:stream-id stream) closed-stream-ids)))
+           (cons 'cl-quic-kit:quic-connection-close
+                 (lambda (&rest arguments)
+                   (declare (ignore arguments))
+                   nil))
+           (cons 'http-kit::%http-server-release-connection
+                 (lambda (&rest arguments)
+                   (declare (ignore arguments))
+                   nil))
+           (cons 'http-kit::%http-server-emit-event
+                 (lambda (&rest arguments)
+                   (declare (ignore arguments))
+                   nil)))
+          (lambda ()
+            (http-kit/http3::%http3-server-poll-listener server listener)
+            (ensure-true
+             (%http3-listener-wait-until
+              (lambda ()
+                (sb-thread:with-mutex (worker-stream-lock)
+                  (= 4 (length worker-stream-ids))))))
+            (ensure-equal
+             '(2 6 10 14)
+             (sb-thread:with-mutex (worker-stream-lock)
+               (sort (copy-list worker-stream-ids) #'<)))
+            (ensure-equal
+             4
+             (http-kit::%with-http-server-lock (server)
+               (http-kit/http3::%http3-server-connection-active-unidirectional-workers
+                connection)))
+            (ensure-equal
+             '(18)
+             (mapcar #'cl-quic-kit:stream-id
+                     (http-kit/http3::%http3-server-connection-pending-unidirectional-streams
+                      connection)))
+            (sb-thread:signal-semaphore worker-release)
+            (ensure-true
+             (%http3-listener-wait-until
+              (lambda ()
+                (http-kit::%with-http-server-lock (server)
+                  (= 3
+                     (http-kit/http3::%http3-server-connection-active-unidirectional-workers
+                      connection))))))
+            (http-kit/http3::%http3-server-poll-listener server listener)
+            (ensure-true
+             (%http3-listener-wait-until
+              (lambda ()
+                (sb-thread:with-mutex (worker-stream-lock)
+                  (= 5 (length worker-stream-ids))))))
+            (ensure-equal
+             '(2 6 10 14 18)
+             (sb-thread:with-mutex (worker-stream-lock)
+               (sort (copy-list worker-stream-ids) #'<)))
+            (ensure-equal
+             4
+             (http-kit::%with-http-server-lock (server)
+               (http-kit/http3::%http3-server-connection-active-unidirectional-workers
+                connection)))
+            (ensure-equal
+             nil
+             (http-kit/http3::%http3-server-connection-pending-unidirectional-streams
+              connection))
+            (cl-quic-kit::%client-process-received-frame
+             engine :1-rtt
+             (cl-quic-kit:make-frame
+              :stream :stream-id 22 :offset 0
+              :data (make-array 0 :element-type '(unsigned-byte 8))))
+            (http-kit/http3::%http3-server-poll-listener server listener)
+            (ensure-equal
+             '(22)
+             (mapcar #'cl-quic-kit:stream-id
+                     (http-kit/http3::%http3-server-connection-pending-unidirectional-streams
+                      connection)))
+            ;; Shutdown has already cleared the server's active listener slot.
+            (ensure-false (http-kit::http-server-listener server))
+            (http-kit/http3::%http3-server-force-close-connections server)
+            (ensure-equal '(22) closed-stream-ids)
+            (ensure-equal
+             nil
+             (http-kit/http3::%http3-server-connection-pending-unidirectional-streams
+              connection))
+            (ensure-false
+             (gethash quic-connection
+                      (http-kit/http3::%http3-server-listener-connections
+                       listener)))
+            (ensure-equal
+             4
+             (http-kit::%with-http-server-lock (server)
+               (http-kit/http3::%http3-server-connection-active-unidirectional-workers
+                connection)))))
+      (let ((workers
+              (http-kit::%with-http-server-lock (server)
+                (loop for worker being the hash-keys of
+                      (http-kit::http-server-workers server)
+                      collect worker))))
+        (dotimes (index 16)
+          (declare (ignore index))
+          (sb-thread:signal-semaphore worker-release))
+        (dolist (worker workers)
+          (sb-thread:join-thread worker)))))
 )

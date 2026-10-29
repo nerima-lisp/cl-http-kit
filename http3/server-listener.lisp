@@ -27,12 +27,53 @@
     server-connection
     http3-client
     (active-request-streams 0)
+    (active-unidirectional-workers 0)
+    (pending-unidirectional-streams nil)
     highest-request-stream-id
     peer-goaway-id
     (peer-settings-received-p nil)
     (last-activity 0)
     (released-p nil)
     (qpack-lock (sb-thread:make-mutex :name "HTTP/3 QPACK")))
+
+  (defconstant +http3-server-max-unidirectional-workers+ 4)
+
+  (defun %http3-server-reserve-pending-unidirectional-stream (connection)
+    (when (and (%http3-server-connection-pending-unidirectional-streams connection)
+               (< (%http3-server-connection-active-unidirectional-workers connection)
+                  +http3-server-max-unidirectional-workers+))
+      (incf (%http3-server-connection-active-unidirectional-workers connection))
+      (pop (%http3-server-connection-pending-unidirectional-streams connection))))
+
+  (defun %http3-server-release-unidirectional-worker (server connection)
+    (http-kit::%with-http-server-lock (server)
+      (decf (%http3-server-connection-active-unidirectional-workers connection))
+      (http-kit::%http-server-broadcast server)))
+
+  (defun %http3-server-close-unidirectional-streams
+      (server connection streams)
+    (let ((quic-connection
+            (%http3-server-connection-quic-connection connection))
+          (errors nil))
+      (dolist (stream streams)
+        (handler-case
+            (http-kit::%with-http-server-lock (server)
+              (cl-quic-kit:quic-connection-close-stream quic-connection stream))
+          (error (condition)
+            (push condition errors))))
+      (dolist (condition (nreverse errors))
+        (http-kit::%http-server-report-error
+         server condition :close :protocol :http3))))
+
+  (defun %http3-server-close-pending-unidirectional-streams
+      (server connection)
+    (let ((streams nil))
+      (http-kit::%with-http-server-lock (server)
+        (setf streams
+              (%http3-server-connection-pending-unidirectional-streams connection)
+              (%http3-server-connection-pending-unidirectional-streams connection)
+              nil))
+      (%http3-server-close-unidirectional-streams server connection streams)))
 
   (defun %http3-server-now ()
     (http-kit::%http-server-now))
@@ -66,7 +107,7 @@
           (min (1- (ash 1 60))
                (max 1024
                     (* 64 (http-kit::http-server-max-concurrent-streams server))))
-          :initial-max-streams-uni 3))
+          :initial-max-streams-uni 16))
 
   (defun %http3-server-start (server start-token)
     (declare (ignore start-token))
@@ -138,9 +179,23 @@
 
   (defun %http3-server-force-close-connections (server)
     (dolist (connection (%http3-server-connection-snapshot server))
-      (let ((quic-connection
-              (http-kit::%http-server-connection-raw-stream connection)))
+      (let* ((listener
+               (or (http-kit::%http-server-connection-listener connection)
+                   (http-kit::http-server-listener server)))
+             (quic-connection
+               (http-kit::%http-server-connection-raw-stream connection))
+             (http3-connection
+               (and listener quic-connection
+                    (http-kit::%with-http-server-lock (server)
+                      (gethash
+                       quic-connection
+                       (%http3-server-listener-connections listener)))))
+             (http3-listener
+               (and http3-connection listener)))
         (when quic-connection
+          (when http3-connection
+            (%http3-server-close-pending-unidirectional-streams
+             server http3-connection))
           (handler-case
               (http-kit::%with-http-server-lock (server)
                 (cl-quic-kit:quic-connection-close
@@ -150,7 +205,10 @@
             (error (condition)
               (http-kit::%http-server-report-error
                server condition :close :protocol :http3)))
-          (http-kit::%http-server-release-connection server connection))))
+          (if http3-connection
+              (%http3-server-release-connection
+               server http3-listener http3-connection)
+              (http-kit::%http-server-release-connection server connection)))))
     (http-kit::%http-server-broadcast server)
     nil)
 
@@ -213,6 +271,7 @@
                    :handshake-p nil
                    :peer-address nil
                    :peer-port nil
+                   :listener listener
                    :protocol :http3)
                   :last-activity (%http3-server-now)))
            (incf (http-kit::http-server-connection-count server))
@@ -408,17 +467,24 @@
     (let ((common-connection
             (%http3-server-connection-server-connection connection))
           (client (%http3-server-connection-http3-client connection))
-          (release-p nil))
+          (release-p nil)
+          (pending-streams nil))
       (http-kit::%with-http-server-lock (server)
         (unless (%http3-server-connection-released-p connection)
           (setf (%http3-server-connection-released-p connection) t
-                release-p t)))
+                release-p t
+                pending-streams
+                (%http3-server-connection-pending-unidirectional-streams connection)
+                (%http3-server-connection-pending-unidirectional-streams connection)
+                nil)
+          (remhash (%http3-server-connection-quic-connection connection)
+                   (%http3-server-listener-connections listener))))
       (when release-p
+        (%http3-server-close-unidirectional-streams
+         server connection pending-streams)
         (when client
           (http-kit::%with-http-cleanup
             (close-http3-client client)))
-        (remhash (%http3-server-connection-quic-connection connection)
-                 (%http3-server-listener-connections listener))
         (http-kit::%http-server-release-connection server common-connection)
         (http-kit::%http-server-emit-event
          server
@@ -776,13 +842,22 @@
 
   (defun %http3-server-start-unidirectional-worker
       (server listener connection stream)
-    (%http3-server-start-worker
-     server
-     (lambda ()
-       (%http3-server-unidirectional-worker
-        server listener connection stream))
-     "HTTP/3 unidirectional stream"
-     connection))
+    (handler-case
+        (%http3-server-start-worker
+         server
+         (lambda ()
+           (unwind-protect
+                (%http3-server-unidirectional-worker
+                 server listener connection stream)
+             (%http3-server-release-unidirectional-worker server connection)))
+         "HTTP/3 unidirectional stream"
+         connection)
+      (http-kit::http-server-error (condition)
+        (unwind-protect
+             (%http3-server-close-unidirectional-streams
+              server connection (list stream))
+          (%http3-server-release-unidirectional-worker server connection))
+        (error condition))))
 
   (defun %http3-server-accept-quic-connection
       (server listener quic-connection)
@@ -961,8 +1036,12 @@
                        while stream
                        do (setf (%http3-server-connection-last-activity connection)
                                 now)
-                          (push (cons connection stream)
-                                unidirectional-streams))
+                          (setf (%http3-server-connection-pending-unidirectional-streams
+                                 connection)
+                                (nconc
+                                 (%http3-server-connection-pending-unidirectional-streams
+                                  connection)
+                                 (list stream))))
                  (loop for stream =
                        (cl-quic-kit:quic-connection-accept-stream
                         (%http3-server-connection-quic-connection connection)
@@ -997,6 +1076,10 @@
                                           (+ now (http-kit::http-server-request-timeout server))
                                           reservation)
                                     request-streams))))
+                 (loop for stream =
+                       (%http3-server-reserve-pending-unidirectional-stream connection)
+                       while stream
+                       do (push (cons connection stream) unidirectional-streams))
                  (when (and (zerop
                              (%http3-server-connection-active-request-streams
                               connection))
@@ -1038,9 +1121,11 @@
             (%http3-server-release-connection server listener connection))
           (dolist (quic-connection (nreverse accepted-connections))
             (%http3-server-accept-quic-connection server listener quic-connection))
-          (dolist (entry (nreverse unidirectional-streams))
-            (%http3-server-start-unidirectional-worker
-             server listener (car entry) (cdr entry)))
+          (setf unidirectional-streams (nreverse unidirectional-streams))
+          (loop while unidirectional-streams
+                for entry = (pop unidirectional-streams)
+                do (%http3-server-start-unidirectional-worker
+                    server listener (car entry) (cdr entry)))
           (setf request-streams (nreverse request-streams))
           (loop while request-streams
                 for entry = (first request-streams)
@@ -1059,6 +1144,13 @@
                              (%http3-server-listener-connections listener)
                              collect connection)))
               (%http3-server-release-connection server listener connection)))))
+        (loop while unidirectional-streams
+              for entry = (pop unidirectional-streams)
+              do (unwind-protect
+                     (%http3-server-close-unidirectional-streams
+                      server (car entry) (list (cdr entry)))
+                   (%http3-server-release-unidirectional-worker
+                    server (car entry))))
         (dolist (entry request-streams)
         (let ((connection (first entry))
               (reservation (fifth entry)))

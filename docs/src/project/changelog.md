@@ -6,6 +6,11 @@ historical release behavior, not the current API contract; see the
 
 ## Unreleased
 
+- Limit each HTTP/3 connection to four active unidirectional-stream workers and
+  queue excess streams. The default 128-connection limit caps these workers at
+  512 while allowing 16 peer unidirectional streams for protocol and GREASE
+  traffic.
+
 ## 0.5.0 - 2026-10-29
 
 ### Breaking changes
