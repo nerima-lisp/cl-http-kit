@@ -66,7 +66,7 @@
           (min (1- (ash 1 60))
                (max 1024
                     (* 64 (http-kit::http-server-max-concurrent-streams server))))
-          :initial-max-streams-uni 16))
+          :initial-max-streams-uni 3))
 
   (defun %http3-server-start (server start-token)
     (declare (ignore start-token))

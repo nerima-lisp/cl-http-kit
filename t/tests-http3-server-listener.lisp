@@ -3309,3 +3309,97 @@
         0
         (http-kit/http3::%http3-server-connection-active-request-streams
          connection))))))
+#+sbcl
+(deftest http3-listener-peer-unidirectional-stream-worker-limit
+  (let* ((server (%http3-listener-test-unit-server))
+         (transport-parameters
+           (http-kit/http3::%http3-server-transport-parameters server))
+         (quic-connection
+           (cl-quic-kit::%make-quic-connection
+            :role :server :state :established))
+         (engine
+           (cl-quic-kit::%make-quic-client
+            :connection quic-connection
+            :transport-parameters
+            (list (cons 4 (getf transport-parameters :initial-max-data))
+                  (cons 7
+                        (getf transport-parameters
+                              :initial-max-stream-data-uni))
+                  (cons 8
+                        (getf transport-parameters
+                              :initial-max-streams-bidi))
+                  (cons 9
+                        (getf transport-parameters
+                              :initial-max-streams-uni)))
+            :flow-control
+            (cl-quic-kit:make-flow-control-state
+             :max-data (getf transport-parameters :initial-max-data)
+             :max-receive-data (getf transport-parameters :initial-max-data)
+             :max-streams-bidi
+             (getf transport-parameters :initial-max-streams-bidi)
+             :max-streams-uni
+             (getf transport-parameters :initial-max-streams-uni))
+            :streams (make-hash-table :test #'eql)))
+         (listener
+           (http-kit/http3::%make-http3-server-listener
+            :server server :quic-server :quic-server :socket :udp-socket))
+         (connection
+           (%http3-listener-test-unit-connection
+            :quic-connection quic-connection))
+         (worker-stream-ids nil)
+         (fourth-stream-rejected-p nil))
+    (setf (cl-quic-kit::quic-connection-stream-engine quic-connection) engine
+          (gethash quic-connection
+                   (http-kit/http3::%http3-server-listener-connections
+                    listener))
+          connection)
+    (dolist (stream-id '(2 6 10))
+      (cl-quic-kit::%client-process-received-frame
+       engine :1-rtt
+       (cl-quic-kit:make-frame :stream :stream-id stream-id :offset 0 :data (make-array 0 :element-type '(unsigned-byte 8)))))
+    (%http3-listener-test-call-with-function-stubs
+     (list
+      (cons 'cl-quic-kit:quic-server-poll
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              nil))
+      (cons 'cl-quic-kit:quic-server-accept-connection
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              nil))
+      (cons 'http-kit/http3::%http3-server-now (lambda () 10))
+      (cons 'http-kit/http3::%http3-server-stream-stop-snapshot
+            (lambda (actual-listener)
+              (ensure-true (eq listener actual-listener))
+              (make-hash-table :test #'eq)))
+      (cons 'http-kit/http3::%http3-server-connection-closed-p
+            (lambda (&rest arguments)
+              (declare (ignore arguments))
+              nil))
+      (cons 'http-kit/http3::%http3-server-start-unidirectional-worker
+            (lambda (actual-server actual-listener actual-connection stream)
+              (ensure-true (eq server actual-server))
+              (ensure-true (eq listener actual-listener))
+              (ensure-true (eq connection actual-connection))
+              (push (cl-quic-kit:stream-id stream) worker-stream-ids)
+              (cl-quic-kit:quic-connection-close-stream
+               quic-connection stream))))
+     (lambda ()
+       (http-kit/http3::%http3-server-poll-listener server listener)
+       (ensure-equal '(2 6 10) (sort (copy-list worker-stream-ids) #'<))
+       (setf fourth-stream-rejected-p
+             (handler-case
+                 (progn
+                   (cl-quic-kit::%client-process-received-frame
+                    engine :1-rtt
+                    (cl-quic-kit:make-frame
+                     :stream :stream-id 14 :offset 0 :data (make-array 0 :element-type '(unsigned-byte 8))))
+                   nil)
+               (cl-quic-kit::stream-limit-error () t)))
+       (http-kit/http3::%http3-server-poll-listener server listener)
+       (ensure-equal 3 (length worker-stream-ids))
+       (ensure-true fourth-stream-rejected-p)
+       (ensure-equal 3
+                     (getf transport-parameters
+                           :initial-max-streams-uni)))))
+)
