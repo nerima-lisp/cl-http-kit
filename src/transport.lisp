@@ -368,7 +368,6 @@ Return true only when a socket was shut down."
          (symbol (and package
                       (find-symbol "SHUTDOWN-HTTP-TCP-STREAM" package))))
     (and symbol
-         (fboundp symbol)
          (funcall symbol stream))))
 
 (defun %close-shut-down-http-stream (stream close-function)
@@ -426,9 +425,11 @@ outside this direct function boundary."
                  ;; would free the descriptor while the reader still uses it,
                  ;; and a new connection could reuse that descriptor number.
                  ;; A stream without a native socket keeps the close fallback.
+                 ;; The token runs this at most once, while the exchange holds
+                 ;; the open stream: the cleanup closes it only after the
+                 ;; handler is unregistered.
                  (unless (flet ((shutdown-open-stream ()
                                   (and stream
-                                       (not stream-closed-p)
                                        (setf stream-shut-down-p
                                              (%shutdown-http-stream stream)))))
                            #+sbcl
