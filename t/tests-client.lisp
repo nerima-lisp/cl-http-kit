@@ -5077,6 +5077,109 @@
         (sb-thread:join-thread worker :timeout 5)))))
 
 #+sbcl
+(progn
+  (defun %client-cancel-read-request-head (stream)
+    (let ((window 0))
+      (loop for octet = (read-byte stream nil nil)
+            while octet
+            do (setf window (logand #xFFFFFFFF (logior (ash window 8) octet)))
+            until (= window #x0D0A0D0A))))
+
+  (defun %client-cancel-stalled-native-exchange (response-prefix &key body-chunk-p)
+    "Cancel a request whose native socket read waits on a peer that never finishes.
+
+The server writes RESPONSE-PREFIX after reading the request head and then stalls
+until the cleanup forms release it.  When BODY-CHUNK-P is true, the cancellation
+waits until the client has delivered one body chunk."
+    (let* ((listener (open-http-tcp-listener :host "127.0.0.1" :port 0))
+           (port (http-network-listener-port listener))
+           (request-received (sb-thread:make-semaphore :count 0))
+           (body-chunk-received (sb-thread:make-semaphore :count 0))
+           (release-server (sb-thread:make-semaphore :count 0))
+           (worker-done (sb-thread:make-semaphore :count 0))
+           (token (make-http-cancellation-token))
+           (server-error nil)
+           (outcome nil)
+           (server nil)
+           (worker nil))
+      (unwind-protect
+           (progn
+             (setf server
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (handler-case
+                          (let ((peer (accept-http-tcp-stream listener :timeout 5)))
+                            (unwind-protect
+                                 (progn
+                                   (%client-cancel-read-request-head peer)
+                                   (write-sequence response-prefix peer)
+                                   (finish-output peer)
+                                   (sb-thread:signal-semaphore request-received)
+                                   (sb-thread:wait-on-semaphore release-server
+                                                                :timeout 10))
+                              (close-http-tcp-stream peer)))
+                        (error (condition)
+                          (setf server-error condition))))
+                    :name "client cancel stalled server"))
+             (setf worker
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (unwind-protect
+                           (handler-case
+                               (progn
+                                 (http-client-send
+                                  (make-http-client :cache nil :default-timeout nil)
+                                  "GET"
+                                  (format nil "http://127.0.0.1:~D/stalled" port)
+                                  :cancel-token token
+                                  :on-body-chunk
+                                  (lambda (chunk)
+                                    (declare (ignore chunk))
+                                    (sb-thread:signal-semaphore body-chunk-received)))
+                                 (setf outcome :completed))
+                             (error (condition)
+                               (setf outcome condition)))
+                        (sb-thread:signal-semaphore worker-done)))
+                    :name "client cancel stalled request"))
+             (ensure-true
+              (sb-thread:wait-on-semaphore request-received :timeout 5))
+             (when body-chunk-p
+               (ensure-true
+                (sb-thread:wait-on-semaphore body-chunk-received :timeout 5)))
+             ;; The worker has no observable "blocked in read" signal.  The pause
+             ;; lets it enter the socket read, so the cancellation must wake a
+             ;; blocked read instead of finding the stream closed beforehand.
+             (sleep 0.2)
+             (ensure-true (http-client-cancel-request token))
+             (ensure-true
+              (sb-thread:wait-on-semaphore worker-done :timeout 2))
+             (ensure-true (typep outcome 'http-client-request-cancelled))
+             (ensure-false server-error))
+        ;; Releasing the server closes its end, which also ends a worker that the
+        ;; cancellation failed to wake.
+        (sb-thread:signal-semaphore release-server)
+        (when worker
+          (sb-thread:join-thread worker :default nil :timeout 5))
+        (when server
+          (sb-thread:join-thread server :default nil :timeout 5))
+        (close-http-tcp-listener listener))))
+
+  (deftest client-cancel-wakes-native-read-awaiting-response-head
+    (%client-cancel-stalled-native-exchange
+     (make-array 0 :element-type '(unsigned-byte 8))))
+
+  (deftest client-cancel-wakes-native-read-inside-response-body
+    (let ((sent-body-bytes http-kit::*http-body-read-chunk-size*))
+      (%client-cancel-stalled-native-exchange
+       (concatenate-octets
+        (ascii (format nil "HTTP/1.1 200 OK|CRLF|Content-Length: ~D|CRLF||CRLF|"
+                       (* 2 sent-body-bytes)))
+        (make-array sent-body-bytes
+                    :element-type '(unsigned-byte 8)
+                    :initial-element (char-code #\x)))
+       :body-chunk-p t))))
+
+#+sbcl
 (deftest client-informational-response-over-direct-stream
   (let* ((stream
            (make-instance
