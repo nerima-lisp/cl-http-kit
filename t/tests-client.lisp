@@ -5205,7 +5205,107 @@ native connection pool."
      :body-chunk-p t
      :client-options (list :cache nil
                            :open-stream (make-http-network-stream-opener)
-                           :close-stream #'close-http-tcp-stream))))
+                           :close-stream #'close-http-tcp-stream)))
+
+  (defun %client-cancel-stalled-upload (make-client)
+    "Cancel a streaming upload to a server that accepts and never reads.
+
+MAKE-CLIENT receives a stream opener and returns the client under test.  The
+producer returns chunks smaller than the stream's output buffer, so the writer
+blocks with buffered output that the shutdown makes unsendable.  The stream
+must still end up closed."
+    (let* ((listener (open-http-tcp-listener :host "127.0.0.1" :port 0))
+           (port (http-network-listener-port listener))
+           (accepted (sb-thread:make-semaphore :count 0))
+           (release-server (sb-thread:make-semaphore :count 0))
+           (worker-done (sb-thread:make-semaphore :count 0))
+           (token (make-http-cancellation-token))
+           (chunk-count 0)
+           (opened-stream nil)
+           (outcome nil)
+           (server nil)
+           (worker nil))
+      (unwind-protect
+           (progn
+             (setf server
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (let ((peer (accept-http-tcp-stream listener :timeout 5)))
+                        (unwind-protect
+                             (progn
+                               (sb-thread:signal-semaphore accepted)
+                               (sb-thread:wait-on-semaphore release-server
+                                                            :timeout 10))
+                          (close-http-tcp-stream peer))))
+                    :name "client cancel non-reading server"))
+             (let* ((opener (make-http-network-stream-opener))
+                    (client
+                      (funcall make-client
+                               (lambda (&rest arguments)
+                                 (setf opened-stream (apply opener arguments))))))
+               (setf worker
+                     (sb-thread:make-thread
+                      (lambda ()
+                        (unwind-protect
+                             (handler-case
+                                 (progn
+                                   (http-client-send
+                                    client "POST"
+                                    (format nil "http://127.0.0.1:~D/upload" port)
+                                    :cancel-token token
+                                    :request-body-length (expt 2 30)
+                                    :request-body-function
+                                    (lambda (limit)
+                                      (declare (ignore limit))
+                                      (incf chunk-count)
+                                      (make-array 1000
+                                                  :element-type '(unsigned-byte 8))))
+                                   (setf outcome :completed))
+                               (error (condition)
+                                 (setf outcome condition)))
+                          (sb-thread:signal-semaphore worker-done)))
+                      :name "client cancel stalled upload")))
+             (ensure-true (sb-thread:wait-on-semaphore accepted :timeout 5))
+             ;; The writer is blocked once the producer stops being called.
+             (ensure-true
+              (loop repeat 50
+                    for previous = -1 then current
+                    for current = chunk-count
+                    thereis (and (plusp current) (= previous current))
+                    do (sleep 0.1)))
+             (ensure-true (http-client-cancel-request token))
+             (ensure-true
+              (sb-thread:wait-on-semaphore worker-done :timeout 2))
+             (ensure-true (typep outcome 'http-client-request-cancelled))
+             (ensure-true (streamp opened-stream))
+             (ensure-false (open-stream-p opened-stream)))
+        (sb-thread:signal-semaphore release-server)
+        (when worker
+          (sb-thread:join-thread worker :default nil :timeout 5))
+        (when server
+          (sb-thread:join-thread server :default nil :timeout 5))
+        (close-http-tcp-listener listener))))
+
+  (deftest client-cancel-closes-pooled-stream-with-unsent-upload
+    (%client-cancel-stalled-upload
+     (lambda (open-stream)
+       (make-http-client
+        :cache nil
+        :default-timeout nil
+        :connection-pool
+        (make-http-connection-pool
+         :open-stream open-stream
+         ;; The native default client closes pooled streams with CLOSE.
+         :close-stream #'close)))))
+
+  (deftest client-cancel-closes-boundary-stream-with-unsent-upload
+    (%client-cancel-stalled-upload
+     (lambda (open-stream)
+       (make-http-client
+        :cache nil
+        :default-timeout nil
+        :open-stream open-stream
+        :close-stream #'close)))))
 
 #+sbcl
 (deftest client-informational-response-over-direct-stream

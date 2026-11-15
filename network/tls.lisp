@@ -411,7 +411,11 @@
     nil)
 
   (defmethod open-stream-p ((stream http-tls-stream))
-    (not (%tls-stream-closed-p stream))))
+    (not (%tls-stream-closed-p stream)))
+
+  (defmethod http-kit/network:shutdown-http-tcp-stream ((stream http-tls-stream))
+    (http-kit/network:shutdown-http-tcp-stream
+     (%tls-stream-transport-stream stream))))
 
 (defun %make-http-tls-stream (driver stream)
   #+sbcl

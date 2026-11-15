@@ -324,12 +324,32 @@ be used concurrently from multiple threads."
          (generation nil)
          (retained-p nil)
          (stream-closed-p nil)
+         (stream-shut-down-p nil)
          (stream-close-lock (%make-client-lock "http-pool-active-stream-close")))
     (flet ((close-current-stream ()
              (%with-client-lock (stream-close-lock)
                (when (and stream (not stream-closed-p))
                  (setf stream-closed-p t)
-                 (%pool-close pool stream))
+                 (if stream-shut-down-p
+                     (http-kit::%close-shut-down-http-stream
+                      stream (lambda (shut-down-stream)
+                               (%pool-close pool shut-down-stream)))
+                     (%pool-close pool stream)))
+               nil))
+           (cancel-current-stream ()
+             ;; Closing a socket does not wake a read blocked on it on Linux;
+             ;; shutting it down does.  The exchange closes the stream after the
+             ;; reader unwinds.  Closing here instead would free the descriptor
+             ;; while the reader still uses it, and a new connection could
+             ;; reuse that descriptor number.  A stream without a native socket
+             ;; keeps the close fallback.
+             (%with-client-lock (stream-close-lock)
+               (when (and stream (not stream-closed-p) (not stream-shut-down-p))
+                 (if (http-kit::%shutdown-http-stream stream)
+                     (setf stream-shut-down-p t)
+                     (progn
+                       (setf stream-closed-p t)
+                       (%pool-close pool stream))))
                nil)))
     (handler-case
         (with-http-deadline
@@ -389,12 +409,12 @@ be used concurrently from multiple threads."
                 :on-information on-information
                 :on-response-headers on-response-headers
                 :on-cancel on-cancel
-                :cancel-stream-function #'close-current-stream
+                :cancel-stream-function #'cancel-current-stream
                 :collect-body-p collect-body-p
                 :clock-function #'%pool-monotonic-time)
              (if reusable-p
                  (%with-client-lock (stream-close-lock)
-                   (if stream-closed-p
+                   (if (or stream-closed-p stream-shut-down-p)
                        nil
                        (progn
                          (%with-client-lock ((%http-connection-pool-lock pool))

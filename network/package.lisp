@@ -14,6 +14,7 @@
                 #:http-uri-scheme)
   (:export #:open-http-tcp-stream
            #:close-http-tcp-stream
+           #:shutdown-http-tcp-stream
            #:http-network-resolve-host
            #:make-http-network-stream-opener
            #:http-network-listener-p

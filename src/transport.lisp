@@ -359,6 +359,29 @@ TLS, proxy, or concurrency dependencies on the core system."
             ("The HTTP request over an open stream failed." :transport)
           (funcall unregister-cancel))))))
 
+(defun %shutdown-http-stream (stream)
+  "Shut down STREAM's native socket when the optional network system is loaded.
+
+Return true only when a socket was shut down."
+  ;; The core system cannot depend on HTTP-KIT/NETWORK, so resolve it at run time.
+  (let* ((package (find-package "HTTP-KIT/NETWORK"))
+         (symbol (and package
+                      (find-symbol "SHUTDOWN-HTTP-TCP-STREAM" package))))
+    (and symbol
+         (fboundp symbol)
+         (funcall symbol stream))))
+
+(defun %close-shut-down-http-stream (stream close-function)
+  "Close STREAM, whose socket a cancellation shut down, with CLOSE-FUNCTION.
+
+Output still buffered in STREAM can no longer be sent.  A normal CLOSE of an
+SBCL fd-stream flushes that output first; the flush fails, and the descriptor
+stays open.  Abort the close when CLOSE-FUNCTION leaves STREAM open."
+  (%with-http-cleanup (funcall close-function stream))
+  (when (open-stream-p stream)
+    (%with-http-cleanup (close stream :abort t)))
+  nil)
+
 (defun send-http-request-over-stream
     (request &key open-stream close-stream timeout deadline
                    max-header-bytes max-fields max-body-bytes
@@ -380,6 +403,7 @@ outside this direct function boundary."
       (%validate-stream-boundary open-stream close-stream)
     (let ((stream nil)
           (stream-closed-p nil)
+          (stream-shut-down-p nil)
           #+sbcl (close-lock (sb-thread:make-mutex
                               :name "HTTP stream close")))
       (labels ((close-once ()
@@ -392,7 +416,27 @@ outside this direct function boundary."
                              (when (and stream (not stream-closed-p))
                                (setf stream-closed-p t)))))
                    (when close-p
-                     (funcall close stream)))))
+                     (if stream-shut-down-p
+                         (%close-shut-down-http-stream stream close)
+                         (funcall close stream)))))
+               (cancel-stream ()
+                 ;; Closing a socket does not wake a read blocked on it on
+                 ;; Linux; shutting it down does.  The cleanup below closes the
+                 ;; stream after the reader unwinds.  Closing here instead
+                 ;; would free the descriptor while the reader still uses it,
+                 ;; and a new connection could reuse that descriptor number.
+                 ;; A stream without a native socket keeps the close fallback.
+                 (unless (flet ((shutdown-open-stream ()
+                                  (and stream
+                                       (not stream-closed-p)
+                                       (setf stream-shut-down-p
+                                             (%shutdown-http-stream stream)))))
+                           #+sbcl
+                           (sb-thread:with-mutex (close-lock)
+                             (shutdown-open-stream))
+                           #-sbcl
+                           (shutdown-open-stream))
+                   (close-once))))
         (with-http-deadline (absolute-deadline timeout
                             :inherited deadline
                             :clock-function clock-function)
@@ -420,7 +464,7 @@ outside this direct function boundary."
                     :on-information on-information
                     :on-response-headers on-response-headers
                     :on-cancel on-cancel
-                    :cancel-stream-function #'close-once
+                    :cancel-stream-function #'cancel-stream
                     :request-body-function request-body-function
                     :request-body-length request-body-length
                     :collect-body-p collect-body-p

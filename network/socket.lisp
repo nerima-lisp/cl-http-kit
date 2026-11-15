@@ -375,12 +375,14 @@ stream's read timeout after a connection is accepted."
                (%network-check-deadline deadline clock-function :connect)
                ;; The returned stream takes socket ownership; no setup follows.
                (prog1
-                   (sb-bsd-sockets:socket-make-stream
-                    socket
-                    :input t
-                    :output t
-                    :element-type '(unsigned-byte 8)
-                    :buffering :full)
+                   (%network-record-stream-socket
+                    (sb-bsd-sockets:socket-make-stream
+                     socket
+                     :input t
+                     :output t
+                     :element-type '(unsigned-byte 8)
+                     :buffering :full)
+                    socket)
                  (setf retained-p t)))
           (unless retained-p
             (when socket
@@ -552,6 +554,21 @@ perform TLS or proxy negotiation."
     (http-kit::%with-http-cleanup
       (close stream :abort t)))
   nil)
+
+(defgeneric shutdown-http-tcp-stream (stream)
+  (:documentation
+   "Shut down both directions of the native socket under STREAM without closing it.
+
+A thread blocked reading STREAM wakes with end of file.  STREAM stays open, so
+its owner must still close it.  Return true when a socket was shut down, or NIL
+when STREAM is not backed by a native socket from this package.")
+  (:method (stream)
+    #+sbcl
+    (%network-shutdown-accepted-stream stream)
+    #-sbcl
+    (declare (ignore stream))
+    #-sbcl
+    nil))
 
 #+sbcl
 (progn
