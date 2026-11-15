@@ -811,3 +811,37 @@
       (setf (fdefinition connect-name) original-connect
             (fdefinition close-name) original-close)
       (close-http-tcp-listener listener))))
+
+#+sbcl
+(deftest native-network-shutdown-of-closed-stream-spares-reused-descriptor
+  (dolist (close-function (list #'close-http-tcp-stream #'close))
+    (let ((listener (open-http-tcp-listener :host "127.0.0.1" :port 0))
+          (request nil)
+          (old nil)
+          (old-peer nil)
+          (fresh nil)
+          (fresh-peer nil))
+      (unwind-protect
+           (progn
+             (setf request (make-http-request
+                            :method "GET"
+                            :uri (format nil "http://127.0.0.1:~D/"
+                                         (http-network-listener-port listener)))
+                   old (open-http-tcp-stream request :timeout 5)
+                   old-peer (accept-http-tcp-stream listener :timeout 5))
+             (let ((old-descriptor (sb-sys:fd-stream-fd old)))
+               (funcall close-function old)
+               (setf fresh (open-http-tcp-stream request :timeout 5)
+                     fresh-peer (accept-http-tcp-stream listener :timeout 5))
+               ;; The scenario needs the fresh stream to reuse the old number.
+               (ensure-equal old-descriptor (sb-sys:fd-stream-fd fresh)))
+             (ensure-false (shutdown-http-tcp-stream old))
+             (write-sequence (ascii "ping") fresh)
+             (finish-output fresh)
+             (let ((received (make-array 4 :element-type '(unsigned-byte 8))))
+               (ensure-equal 4 (read-sequence received fresh-peer))
+               (ensure-equal "ping" (octets-as-string received))))
+        (dolist (stream (list fresh-peer fresh old-peer old))
+          (when stream
+            (close-http-tcp-stream stream)))
+        (close-http-tcp-listener listener)))))

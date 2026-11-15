@@ -135,15 +135,20 @@
           t))))
 
   (defun %network-close-accepted-stream (stream &key (abort t))
+    ;; Forget the socket before its descriptor is released: the socket object
+    ;; keeps the old descriptor number, which a new connection may reuse.
     (if abort
         (let ((closed-under-lock-p nil))
           (sb-thread:with-mutex (*network-stream-sockets-lock*)
-            (when (gethash stream *network-stream-sockets*)
+            (when (remhash stream *network-stream-sockets*)
               (setf closed-under-lock-p t)
               (close stream :abort t)))
           (unless closed-under-lock-p
             (close stream :abort t)))
-        (close stream :abort nil))
+        (progn
+          (sb-thread:with-mutex (*network-stream-sockets-lock*)
+            (remhash stream *network-stream-sockets*))
+          (close stream :abort nil)))
     nil)
 
   (defun %network-call-with-accepted-stream-socket-non-blocking-mode
@@ -173,7 +178,14 @@
         (error () nil))))
 
   (defun %network-shutdown-accepted-stream (stream)
-    (%network-shutdown-socket (%network-stream-socket stream)))
+    ;; A closed stream's socket still holds the released descriptor number.
+    ;; Checking under the registry lock that closes and forgets the socket
+    ;; keeps a shutdown from reaching another connection that reused it.
+    (sb-thread:with-mutex (*network-stream-sockets-lock*)
+      (let ((socket (gethash stream *network-stream-sockets*)))
+        (and socket
+             (open-stream-p stream)
+             (%network-shutdown-socket socket)))))
 
   (defun %network-listener-error (operation &optional detail)
     (error 'http-protocol-error
@@ -559,9 +571,12 @@ perform TLS or proxy negotiation."
   (:documentation
    "Shut down both directions of the native socket under STREAM without closing it.
 
-A thread blocked reading STREAM wakes with end of file.  STREAM stays open, so
-its owner must still close it.  Return true when a socket was shut down, or NIL
-when STREAM is not backed by a native socket from this package.")
+A pending read on STREAM is unblocked: it returns end of file or signals a
+transport or TLS error.  STREAM stays open, so its owner must still close it.
+Return true when a socket was shut down, or NIL when STREAM is closed or is not
+backed by a native socket from this package.  Shutting down concurrently with
+CLOSE-HTTP-TCP-STREAM is safe; a stream closed with CL:CLOSE must not be shut
+down by another thread at the same time.")
   (:method (stream)
     #+sbcl
     (%network-shutdown-accepted-stream stream)
