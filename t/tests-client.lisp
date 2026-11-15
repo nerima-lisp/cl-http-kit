@@ -5374,6 +5374,100 @@ must still end up closed."
              (ensure-false (http-kit/client::%http-connection-pool-entries pool)))
         (sb-thread:signal-semaphore release-server)
         (sb-thread:join-thread server :default nil :timeout 5)
+        (close-http-tcp-listener listener))))
+
+  (defun %client-cancel-oversized-error-response-once (listener port iteration)
+    "Run one cancelled oversized error response; return the server outcome.
+
+The client cancels from its body callback at the first chunk, as a caller with
+an input limit does for an oversized non-success response.  The server writes
+the whole response in one call and then waits for the peer.  The outcome is a
+list of the end kind, the condition type or value, and the elapsed seconds, or
+:BLOCKED when the server had not finished 5 seconds after the client did."
+    (let* ((body-length (* 15 1024 1024))
+           (response
+             (concatenate-octets
+              (ascii (format nil "HTTP/1.1 502 Bad Gateway|CRLF|Content-Length: ~D|CRLF||CRLF|"
+                             body-length))
+              (make-array body-length :element-type '(unsigned-byte 8)
+                                      :initial-element 120)))
+           (token (make-http-cancellation-token))
+           (peer nil)
+           (server
+             (sb-thread:make-thread
+              (lambda ()
+                ;; A long accept timeout also leaves the accepted stream
+                ;; without a short read or write timeout.
+                (setf peer (accept-http-tcp-stream listener :timeout 600))
+                (%client-cancel-read-request-head peer)
+                (let ((start (get-internal-real-time)))
+                  (flet ((elapsed ()
+                           (/ (- (get-internal-real-time) start)
+                              internal-time-units-per-second)))
+                    (handler-case
+                        (progn
+                          (write-sequence response peer)
+                          (finish-output peer)
+                          (list :read (read-byte peer nil :eof) (elapsed)))
+                      (error (condition)
+                        (list :error (type-of condition) (elapsed)))))))
+              :name "client cancel oversized error server"))
+           (client-outcome
+             (handler-case
+                 (let ((status nil)
+                       (cancelled-p nil))
+                   (http-client-send
+                    (make-http-client :cache nil)
+                    "GET" (format nil "http://127.0.0.1:~D/oversized" port)
+                    :cancel-token token
+                    :collect-body-p nil
+                    :on-response-headers (lambda (response-status headers)
+                                           (declare (ignore headers))
+                                           (setf status response-status))
+                    :on-body-chunk (lambda (chunk)
+                                     (declare (ignore chunk))
+                                     (when (and (not cancelled-p)
+                                                (not (<= 200 status 299)))
+                                       (setf cancelled-p t)
+                                       (http-client-cancel-request token))))
+                   :completed)
+               (error (condition)
+                 (type-of condition))))
+           (server-outcome
+             (sb-thread:join-thread server :default :blocked :timeout 5)))
+      (let ((*print-pretty* nil))
+        (format *error-output*
+                "~&client-cancel-oversized-error-response iteration ~D: client ~S server ~S~%"
+                iteration client-outcome server-outcome))
+      (when (eq server-outcome :blocked)
+        ;; Release the write so that the thread can be joined.
+        (when peer
+          (shutdown-http-tcp-stream peer))
+        (sb-thread:join-thread server :default nil :timeout 5))
+      (when peer
+        (close-http-tcp-stream peer))
+      (values server-outcome client-outcome)))
+
+  (deftest client-cancel-resets-connection-of-oversized-error-response
+    ;; After a cancellation the reader drains what is queued, so the close finds
+    ;; no unread data.  On Linux an orderly close then leaves the server blocked
+    ;; writing into the zero window for about a minute.  The close of a
+    ;; cancelled connection must reset it instead.  The hang is intermittent,
+    ;; so the scenario repeats until it first fails.
+    (let* ((listener (open-http-tcp-listener :host "127.0.0.1" :port 0))
+           (port (http-network-listener-port listener)))
+      (unwind-protect
+           (loop for iteration from 1 to 20
+                 do (multiple-value-bind (server-outcome client-outcome)
+                        (%client-cancel-oversized-error-response-once
+                         listener port iteration)
+                      (when (eq server-outcome :blocked)
+                        (error "Iteration ~D: the server was still writing 5 seconds ~
+                                after the cancelled request ended (~S); the close ~
+                                did not reset the connection."
+                               iteration client-outcome))
+                      (ensure-equal 'http-client-request-cancelled client-outcome)
+                      (ensure-equal :error (first server-outcome))))
         (close-http-tcp-listener listener)))))
 
 #+sbcl
