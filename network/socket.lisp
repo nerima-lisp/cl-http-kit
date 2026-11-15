@@ -575,8 +575,9 @@ A pending read on STREAM is unblocked: it returns end of file or signals a
 transport or TLS error.  STREAM stays open, so its owner must still close it.
 Return true when a socket was shut down, or NIL when STREAM is closed or is not
 backed by a native socket from this package.  Shutting down concurrently with
-CLOSE-HTTP-TCP-STREAM is safe; a stream closed with CL:CLOSE must not be shut
-down by another thread at the same time.")
+CLOSE-HTTP-TCP-STREAM, or with CLOSE of a TLS stream from HTTP-KIT/TLS, is
+safe.  A raw TCP stream closed with CL:CLOSE must not be shut down by another
+thread at the same time.")
   (:method (stream)
     #+sbcl
     (%network-shutdown-accepted-stream stream)

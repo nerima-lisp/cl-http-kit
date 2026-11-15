@@ -146,6 +146,17 @@
                   (return))
               (cl-tls-kit:tls13-decode-error () nil))))))
     (values ciphertext-p pending)))
+(defun %tls-close-transport (stream &key abort)
+  "Close the TLS transport STREAM through the native socket registry.
+
+Closing it with CL:CLOSE would leave the socket registered under its released
+descriptor number, so a concurrent HTTP-KIT/NETWORK:SHUTDOWN-HTTP-TCP-STREAM on
+the TLS stream could cut another connection that reused the number."
+  #+sbcl
+  (http-kit/network::%network-close-accepted-stream stream :abort abort)
+  #-sbcl
+  (close stream :abort abort))
+
 (defun %tls-transport (stream)
   (let ((ciphertext-p nil)
         (application-read-p nil)
@@ -227,7 +238,7 @@
                      (finish-output stream))
             :close (lambda (driver)
                      (declare (ignore driver))
-                     (close stream)))))))
+                     (%tls-close-transport stream)))))))
 
 (defun %tls-key-exchange ()
   (list
@@ -486,7 +497,7 @@ driver's transport callbacks."
            (setf connected-p t)))
     (unless connected-p
       (http-kit::%with-http-cleanup
-        (close stream :abort t)))))
+        (%tls-close-transport stream :abort t)))))
     #-sbcl
     (%tls-unsupported :tls-native-client)))
 #+sbcl
@@ -822,7 +833,7 @@ driver's transport callbacks."
              (abort-transport ()
                (http-kit::%with-http-cleanup
                  (when (open-stream-p stream)
-                   (close stream :abort t)))))
+                   (%tls-close-transport stream :abort t)))))
         (handler-case
             (progn
               (write-with-deadline (lambda () (write-sequence bytes stream)))
@@ -1429,7 +1440,7 @@ driver's transport callbacks."
       (unless (http-kit/network::%network-shutdown-accepted-stream transport)
         (when (open-stream-p transport)
           (http-kit::%with-http-cleanup
-            (close transport :abort t))))
+            (%tls-close-transport transport :abort t))))
       nil)
 
     (defun %tls-server-close-state-unlocked (state driver)
@@ -1506,7 +1517,7 @@ driver's transport callbacks."
                          (setf abort-transport-p t)
                          (%tls-server-shutdown-transport transport))))
                    (when (open-stream-p transport)
-                     (close transport :abort abort-transport-p))
+                     (%tls-close-transport transport :abort abort-transport-p))
                    (handler-case
                        (progn
                          (%tls-server-call-with-direction-locks
@@ -1526,7 +1537,7 @@ driver's transport callbacks."
                 (%tls-server-shutdown-transport transport)
                 (when (open-stream-p transport)
                   (http-kit::%with-http-cleanup
-                    (close transport :abort t)))
+                    (%tls-close-transport transport :abort t)))
                 (setf completed-p
                       (%tls-server-mark-close-cleanup-pending state)))
               (setf (%tls-stream-closed-p stream) t)
@@ -1554,9 +1565,9 @@ driver's transport callbacks."
                 (unwind-protect
                      (when (open-stream-p transport)
                        (if completed-p
-                           (close transport :abort abort)
+                           (%tls-close-transport transport :abort abort)
                          (http-kit::%with-http-cleanup
-                           (close transport :abort t))))
+                           (%tls-close-transport transport :abort t))))
                   (setf (%tls-stream-closed-p stream) t)))))))
       t))
   (defun %tls-server-finish-deferred-close
@@ -1686,7 +1697,7 @@ driver's transport callbacks."
                     (%tls-server-clear-traffic-states state)
                     (http-kit::%with-http-cleanup
                       (when (open-stream-p stream)
-                        (close stream :abort t))))))
+                        (%tls-close-transport stream :abort t))))))
             (http-timeout (condition)
               (error condition))
             (http-protocol-error (condition)
