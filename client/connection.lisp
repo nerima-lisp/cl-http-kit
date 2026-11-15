@@ -341,12 +341,14 @@ be used concurrently from multiple threads."
              ;; shutting it down does.  The exchange closes the stream after the
              ;; reader unwinds.  Closing here instead would free the descriptor
              ;; while the reader still uses it, and a new connection could
-             ;; reuse that descriptor number.  A stream without a native socket
-             ;; keeps the close fallback.  The token runs this at most once,
-             ;; and only while the exchange holds the open stream: the stream
-             ;; is closed or released after the handler is unregistered.
+             ;; reuse that descriptor number.  That close resets the connection,
+             ;; so a peer blocked writing into a full receive window is released.
+             ;; A stream without a native socket keeps the close fallback.  The
+             ;; token runs this at most once, and only while the exchange holds
+             ;; the open stream: the stream is closed or released after the
+             ;; handler is unregistered.
              (%with-client-lock (stream-close-lock)
-               (if (http-kit::%shutdown-http-stream stream)
+               (if (http-kit::%abort-http-stream stream)
                    (setf stream-shut-down-p t)
                    (progn
                      (setf stream-closed-p t)

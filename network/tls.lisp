@@ -426,6 +426,10 @@ the TLS stream could cut another connection that reused the number."
 
   (defmethod http-kit/network:shutdown-http-tcp-stream ((stream http-tls-stream))
     (http-kit/network:shutdown-http-tcp-stream
+     (%tls-stream-transport-stream stream)))
+
+  (defmethod http-kit/network::%abort-http-tcp-stream ((stream http-tls-stream))
+    (http-kit/network::%abort-http-tcp-stream
      (%tls-stream-transport-stream stream))))
 
 (defun %make-http-tls-stream (driver stream)

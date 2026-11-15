@@ -359,14 +359,15 @@ TLS, proxy, or concurrency dependencies on the core system."
             ("The HTTP request over an open stream failed." :transport)
           (funcall unregister-cancel))))))
 
-(defun %shutdown-http-stream (stream)
-  "Shut down STREAM's native socket when the optional network system is loaded.
+(defun %abort-http-stream (stream)
+  "Shut down STREAM's native socket and make its close reset the connection.
 
-Return true only when a socket was shut down."
+This needs the optional network system.  Return true only when a socket was
+shut down."
   ;; The core system cannot depend on HTTP-KIT/NETWORK, so resolve it at run time.
   (let* ((package (find-package "HTTP-KIT/NETWORK"))
          (symbol (and package
-                      (find-symbol "SHUTDOWN-HTTP-TCP-STREAM" package))))
+                      (find-symbol "%ABORT-HTTP-TCP-STREAM" package))))
     (and symbol
          (funcall symbol stream))))
 
@@ -424,6 +425,8 @@ outside this direct function boundary."
                  ;; stream after the reader unwinds.  Closing here instead
                  ;; would free the descriptor while the reader still uses it,
                  ;; and a new connection could reuse that descriptor number.
+                 ;; That close resets the connection, so a peer blocked writing
+                 ;; into a full receive window is released.
                  ;; A stream without a native socket keeps the close fallback.
                  ;; The token runs this at most once, while the exchange holds
                  ;; the open stream: the cleanup closes it only after the
@@ -431,7 +434,7 @@ outside this direct function boundary."
                  (unless (flet ((shutdown-open-stream ()
                                   (and stream
                                        (setf stream-shut-down-p
-                                             (%shutdown-http-stream stream)))))
+                                             (%abort-http-stream stream)))))
                            #+sbcl
                            (sb-thread:with-mutex (close-lock)
                              (shutdown-open-stream))

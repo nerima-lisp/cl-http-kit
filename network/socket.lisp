@@ -177,7 +177,21 @@
             t)
         (error () nil))))
 
-  (defun %network-shutdown-accepted-stream (stream)
+  (defun %network-reset-socket-on-close (socket)
+    ;; SO_LINGER with a zero timeout makes close send RST instead of FIN.
+    ;; sb-bsd-sockets has no accessor for it.  A failure leaves the orderly
+    ;; close, which only delays the peer, so the result is not checked.
+    (sb-alien:with-alien ((linger (array sb-alien:int 2)))
+      (setf (sb-alien:deref linger 0) 1
+            (sb-alien:deref linger 1) 0)
+      (sb-bsd-sockets-internal::setsockopt
+       (sb-bsd-sockets:socket-file-descriptor socket)
+       sb-bsd-sockets-internal::sol-socket
+       sb-bsd-sockets-internal::so-linger
+       (sb-alien:cast linger (* t))
+       (sb-alien:alien-size (array sb-alien:int 2) :bytes))))
+
+  (defun %network-shutdown-accepted-stream (stream &key reset-on-close)
     ;; A closed stream's socket still holds the released descriptor number.
     ;; Checking under the registry lock that closes and forgets the socket
     ;; keeps a shutdown from reaching another connection that reused it.
@@ -185,7 +199,10 @@
       (let ((socket (gethash stream *network-stream-sockets*)))
         (and socket
              (open-stream-p stream)
-             (%network-shutdown-socket socket)))))
+             (progn
+               (when reset-on-close
+                 (%network-reset-socket-on-close socket))
+               (%network-shutdown-socket socket))))))
 
   (defun %network-listener-error (operation &optional detail)
     (error 'http-protocol-error
@@ -581,6 +598,22 @@ thread at the same time.")
   (:method (stream)
     #+sbcl
     (%network-shutdown-accepted-stream stream)
+    #-sbcl
+    (declare (ignore stream))
+    #-sbcl
+    nil))
+
+(defgeneric %abort-http-tcp-stream (stream)
+  (:documentation
+   "Shut down STREAM like SHUTDOWN-HTTP-TCP-STREAM and make its later close reset.
+
+A cancelled client connection must be reset: after the shutdown the reader
+drains the queued data, and an orderly close then leaves a peer whose write is
+blocked on the zero receive window waiting for about a minute on Linux.  Return
+true when a socket was shut down.")
+  (:method (stream)
+    #+sbcl
+    (%network-shutdown-accepted-stream stream :reset-on-close t)
     #-sbcl
     (declare (ignore stream))
     #-sbcl
