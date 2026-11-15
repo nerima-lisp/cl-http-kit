@@ -5014,7 +5014,12 @@
              (%blocking-client-cancellation-stream-wait stream)
              start))))
 
-  (deftest client-cancel-closes-blocked-stream-and-exits-worker
+  (defun %client-cancel-blocked-gray-stream (make-client)
+    "Cancel a read blocked on a Gray stream that has no native socket.
+
+MAKE-CLIENT receives :OPEN-STREAM and :CLOSE-STREAM functions and returns the
+client under test.  Only closing the stream releases the read, so the
+cancellation must fall back to closing it."
     (let* ((read-started (sb-thread:make-semaphore :count 0))
            (release-read (sb-thread:make-semaphore :count 0))
            (stream
@@ -5035,8 +5040,8 @@
                 (unwind-protect
                      (handler-case
                          (http-client-send
-                          (make-http-client
-                           :cache nil
+                          (funcall
+                           make-client
                            :open-stream
                            (lambda (request &key timeout deadline &allow-other-keys)
                              (declare (ignore request timeout deadline))
@@ -5074,7 +5079,23 @@
              (ensure-false body-callback-called-p))
         (setf (blocking-client-cancellation-stream-closed-p stream) t)
         (sb-thread:signal-semaphore release-read)
-        (sb-thread:join-thread worker :timeout 5)))))
+        (sb-thread:join-thread worker :timeout 5))))
+
+  (deftest client-cancel-closes-blocked-stream-and-exits-worker
+    (%client-cancel-blocked-gray-stream
+     (lambda (&key open-stream close-stream)
+       (make-http-client :cache nil
+                         :open-stream open-stream
+                         :close-stream close-stream))))
+
+  (deftest client-cancel-closes-pooled-blocked-stream-and-exits-worker
+    (%client-cancel-blocked-gray-stream
+     (lambda (&key open-stream close-stream)
+       (make-http-client :cache nil
+                         :connection-pool
+                         (make-http-connection-pool
+                          :open-stream open-stream
+                          :close-stream close-stream))))))
 
 #+sbcl
 (progn
@@ -5305,7 +5326,55 @@ must still end up closed."
         :cache nil
         :default-timeout nil
         :open-stream open-stream
-        :close-stream #'close)))))
+        :close-stream #'close))))
+
+  (deftest client-cancel-after-complete-response-does-not-pool-stream
+    ;; The cancellation lands while the last body chunk is delivered, so the
+    ;; exchange still finishes with a reusable response on a socket that the
+    ;; cancellation has shut down.  That stream must be closed, not pooled.
+    (let* ((listener (open-http-tcp-listener :host "127.0.0.1" :port 0))
+           (port (http-network-listener-port listener))
+           (release-server (sb-thread:make-semaphore :count 0))
+           (token (make-http-cancellation-token))
+           (opened-stream nil)
+           (server
+             (sb-thread:make-thread
+              (lambda ()
+                (let ((peer (accept-http-tcp-stream listener :timeout 5)))
+                  (unwind-protect
+                       (progn
+                         (%client-cancel-read-request-head peer)
+                         (write-sequence
+                          (ascii "HTTP/1.1 200 OK|CRLF|Content-Length: 5|CRLF||CRLF|hello")
+                          peer)
+                         (finish-output peer)
+                         (sb-thread:wait-on-semaphore release-server :timeout 10))
+                    (close-http-tcp-stream peer))))
+              :name "client cancel keep-alive server"))
+           (opener (make-http-network-stream-opener))
+           (pool (make-http-connection-pool
+                  :open-stream (lambda (&rest arguments)
+                                 (setf opened-stream (apply opener arguments)))
+                  :close-stream #'close)))
+      (unwind-protect
+           (progn
+             (handler-case
+                 (http-client-send
+                  (make-http-client :cache nil
+                                    :default-timeout 5
+                                    :connection-pool pool)
+                  "GET" (format nil "http://127.0.0.1:~D/keep-alive" port)
+                  :cancel-token token
+                  :on-body-chunk (lambda (chunk)
+                                   (declare (ignore chunk))
+                                   (http-client-cancel-request token)))
+               (http-client-request-cancelled () nil))
+             (ensure-true (streamp opened-stream))
+             (ensure-false (open-stream-p opened-stream))
+             (ensure-false (http-kit/client::%http-connection-pool-entries pool)))
+        (sb-thread:signal-semaphore release-server)
+        (sb-thread:join-thread server :default nil :timeout 5)
+        (close-http-tcp-listener listener)))))
 
 #+sbcl
 (deftest client-informational-response-over-direct-stream

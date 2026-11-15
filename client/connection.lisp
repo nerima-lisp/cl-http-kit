@@ -342,14 +342,15 @@ be used concurrently from multiple threads."
              ;; reader unwinds.  Closing here instead would free the descriptor
              ;; while the reader still uses it, and a new connection could
              ;; reuse that descriptor number.  A stream without a native socket
-             ;; keeps the close fallback.
+             ;; keeps the close fallback.  The token runs this at most once,
+             ;; and only while the exchange holds the open stream: the stream
+             ;; is closed or released after the handler is unregistered.
              (%with-client-lock (stream-close-lock)
-               (when (and stream (not stream-closed-p) (not stream-shut-down-p))
-                 (if (http-kit::%shutdown-http-stream stream)
-                     (setf stream-shut-down-p t)
-                     (progn
-                       (setf stream-closed-p t)
-                       (%pool-close pool stream))))
+               (if (http-kit::%shutdown-http-stream stream)
+                   (setf stream-shut-down-p t)
+                   (progn
+                     (setf stream-closed-p t)
+                     (%pool-close pool stream)))
                nil)))
     (handler-case
         (with-http-deadline
