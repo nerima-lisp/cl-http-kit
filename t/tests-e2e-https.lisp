@@ -261,3 +261,93 @@
             (when (probe-file file)
               (delete-file file)))
           (uiop:delete-directory-tree directory :validate t))))))
+
+#+sbcl
+(deftest e2e-https-cancel-wakes-tls-read-inside-response-body
+  (let* ((directory
+           (uiop:ensure-directory-pathname
+            (string-trim '(#\Return #\Linefeed)
+                         (uiop:run-program '("mktemp" "-d")
+                                           :output :string
+                                           :error-output :string))))
+         (certificate (namestring (merge-pathnames "server.crt" directory)))
+         (key (namestring (merge-pathnames "server.key" directory)))
+         (openssl (or (uiop:getenv "OPENSSL") "openssl"))
+         (port (multiple-value-bind (listener selected-port)
+                   (%network-test-listener)
+                 (%network-test-close-socket listener)
+                 selected-port))
+         (request-received (sb-thread:make-semaphore :count 0))
+         (process nil)
+         (server-thread nil)
+         (server-error nil))
+    (ensure-directories-exist directory)
+    (uiop:run-program
+     (list openssl "req" "-x509" "-newkey" "rsa:2048" "-nodes"
+           "-days" "1" "-subj" "/CN=127.0.0.1"
+           "-addext" "subjectAltName=IP:127.0.0.1"
+           "-keyout" key "-out" certificate)
+     :output :string :error-output :string)
+    (flet ((stop-server ()
+             (when process
+               (ignore-errors (close (uiop:process-info-input process) :abort t))
+               (ignore-errors (uiop:terminate-process process))
+               (ignore-errors (uiop:wait-process process))
+               (setf process nil))))
+      (unwind-protect
+           (let ((trust-anchor
+                   (cl-tls-kit.x509:parse-certificate-der
+                    (cl-tls-kit:pem-block-der
+                     (first (cl-tls-kit:pem-decode
+                             (uiop:read-file-string certificate)))))))
+             (setf process
+                   (uiop:launch-program
+                    (list openssl "s_server" "-quiet"
+                          "-accept" (princ-to-string port)
+                          "-cert" certificate "-key" key "-tls1_3"
+                          "-alpn" "http/1.1")
+                    :input :stream
+                    :output :stream
+                    :error-output :stream
+                    :element-type '(unsigned-byte 8)
+                    :wait nil))
+             (let ((input (uiop:process-info-input process))
+                   (output (uiop:process-info-output process)))
+               (setf server-thread
+                     (sb-thread:make-thread
+                      (lambda ()
+                        (handler-case
+                            (progn
+                              (%https-e2e-read-headers output)
+                              (write-sequence (%client-cancel-partial-body-response)
+                                              input)
+                              (finish-output input)
+                              (sb-thread:signal-semaphore request-received))
+                          (error (condition)
+                            (setf server-error condition))))
+                      :name "https cancel stalled server")))
+             (%e2e-wait-for-tcp "127.0.0.1" port)
+             ;; Without an explicit opener the client keeps its native
+             ;; connection pool and still uses this TLS upgrader.
+             (%client-assert-cancel-wakes-blocked-send
+              (make-http-client
+               :cache nil
+               :default-timeout nil
+               :tls-upgrade (make-http-tls-upgrader
+                             :verify :required
+                             :trust-anchors (list trust-anchor)
+                             :alpn-protocols '("http/1.1"))
+               :strict-transport-store nil
+               :alternative-service-store nil)
+              (format nil "https://127.0.0.1:~D/stalled" port)
+              request-received
+              #'stop-server
+              :body-chunk-p t)
+             (ensure-false server-error))
+        (stop-server)
+        (when server-thread
+          (sb-thread:join-thread server-thread :default nil :timeout 5))
+        (dolist (file (list certificate key))
+          (when (probe-file file)
+            (delete-file file)))
+        (uiop:delete-directory-tree directory :validate t)))))
